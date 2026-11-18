@@ -1,0 +1,14 @@
+# 本地连接配置与凭据；仅提交无凭据模板。
+.env
+.env.*
+!.env.example
+
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+artifacts/
+.DS_Store

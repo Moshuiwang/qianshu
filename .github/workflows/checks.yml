@@ -1,0 +1,60 @@
+name: qianshu checks
+# 资源约定见 docs/协作约定.md「CI 资源约定」：
+# - 只在面向 main 的正式 PR 上跑；不跑 push、定时任务，草稿 PR 不跑
+# - 只有一个任务（qianshu-checks），它是 main 的必过检查
+# - 只改文档的 PR 几秒内直接通过，不装依赖
+# - 同一 PR 有新提交时取消旧的运行；不上传产物
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: qianshu-checks-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    name: qianshu-checks
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Decide check level
+        id: level
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+          if [ -z "${BASE}" ]; then
+            echo "level=full" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          changed="$(git diff --name-only "$BASE" "$HEAD")"
+          echo "$changed"
+          if echo "$changed" | grep -qvE '^(docs/|README\.md$|CHANGELOG\.md$|AGENTS\.md$|CLAUDE\.md$|\.github/pull_request_template\.md$)'; then
+            echo "level=full" >> "$GITHUB_OUTPUT"
+          else
+            echo "level=docs" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Docs-only change
+        if: steps.level.outputs.level == 'docs'
+        run: echo "只改了文档，跳过代码检查。"
+      - name: Install locked tooling
+        if: steps.level.outputs.level == 'full' && hashFiles('pyproject.toml') != ''
+        run: |
+          set -euo pipefail
+          python3 -m venv "$RUNNER_TEMP/bootstrap"
+          "$RUNNER_TEMP/bootstrap/bin/pip" install uv==0.12.1
+          echo "$RUNNER_TEMP/bootstrap/bin" >> "$GITHUB_PATH"
+      - name: Run tests
+        if: steps.level.outputs.level == 'full' && hashFiles('pyproject.toml') != ''
+        run: uv run --frozen python -m pytest -q
+      - name: No code yet
+        if: steps.level.outputs.level == 'full' && hashFiles('pyproject.toml') == ''
+        run: echo "仓库还没有 pyproject.toml，暂无代码检查。"
