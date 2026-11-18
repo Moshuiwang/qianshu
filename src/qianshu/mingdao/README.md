@@ -7,7 +7,7 @@ uv run --frozen --extra mingdao-check python -m qianshu.mingdao.rehearsal \
   --env-file .env --ui-config .private/ui-example.json .private/draft-example.json
 ```
 
-每个位置参数对应一份 `PolicyDraft.to_dict()` 生成的 JSON。可以顺序传多份草稿。草稿所需字段未确定、拦截出错或行数证据不齐时退出码为 1，批次随即停止。表单加载不完整单独记在报告中。审批件附件按产品文档的待定规则留空。登录状态失效时由编排者核对，演练入口只使用保存的登录状态。
+每个位置参数对应一份 `PolicyDraft.to_dict()` 生成的 JSON。可以顺序传多份草稿。草稿所需字段未确定、拦截出错或行数证据不齐时退出码为 1，批次随即停止。五个视图的基线必须全部读齐，任一读取失败就停止，表单保持关闭。表单加载不完整单独记在报告中。审批件附件按产品文档的待定规则留空。登录状态失效时由编排者核对，演练入口只使用保存的登录状态。
 
 ## 私有配置
 
@@ -23,6 +23,18 @@ uv run --frozen --extra mingdao-check python -m qianshu.mingdao.rehearsal \
 
 ## 拦截与证据
 
-X3 和整合入口复用 `qianshu.mingdao.readonly.readonly_context`，在创建任何页面前对整个浏览器上下文装载拦截。首版只放行配置视图文档的 GET，以及匹配静态资源类型、路径和源的 GET。重定向在首跳截断，Service Worker、WebSocket 和下载均关闭。放行的 GET 无副作用是按网页惯例作出的假设，尚未逐个证实。新增非 GET 放行条目须由守望者逐条审查目标、操作、参数及无副作用依据，写入代码并经审核合并后生效。
+X3 和整合入口复用 `qianshu.mingdao.readonly.readonly_context`，在创建任何页面前对整个浏览器上下文装载拦截。首版只放行同时匹配配置源和路径的视图文档 GET，以及匹配静态资源类型、路径和源的 GET。重定向在首跳截断，Service Worker、WebSocket 和下载均关闭。放行的 GET 无副作用是按网页惯例作出的假设，尚未逐个证实。新增非 GET 放行条目须由守望者逐条审查目标、操作、参数及无副作用依据，写入代码并经审核合并后生效。
+
+页面加载前注入脚本，拒绝并记录 `sendBeacon`、带 `keepalive` 的 fetch，以及非 GET 的 fetch 和 XHR。导航期间的脚本拒绝经 CDP 的会话存储事件传入同一份清单。五个视图及表单分别使用新页面，读完后先屏蔽该页的离开回调，再用 `close(run_before_unload=False)` 关闭。拦截回调和 CDP 审计出错均使冒烟失败。
+
+本机 Chromium 实测中，`Fetch.enable` 单独使用可拦截同页导航引发的 POST，但直接关闭标签页时目标会话可能先于请求处置被拆除。生产入口使用上下文白名单、脚本拦截和受控关闭，CDP 仅用于接收审计事件。残余风险是浏览器内核另有旁路，脚本层拦不到。
 
 每条草稿生成权限为 0700 的私有目录。 `requests.jsonl` 逐条记录请求方法、路径类别及拦截结果。未列入白名单的地址按去掉查询参数的路径生成指纹，同一路径可归并。 `report.json` 保存前后总行数和差值、自动带出的字段、表单报错、观察缺口与请求计数。冒烟通过需要两次各读齐五个视图、总行数分别相等，以及拦截和写控件检查通过。终端摘要只含计数和报告编号，Issue 只回填计数。自动带出字段和报错回写产品文档时只写核实后的字段行为和经脱敏的规则结论。
+
+## 本机浏览器回归
+
+Chromium 已安装时，用以下命令运行真实浏览器回归。测试通过调试管道驱动 Chromium，只访问本机 HTTPS 替身。导航与直接关闭分开测量，每种配置各跑 10 轮。脚本单层用例通过 CDP 传递审计记录，网络拦截保持关闭。
+
+```bash
+UV_CACHE_DIR=$PWD/.uv-cache uv run --frozen python -m pytest -q -s tests/mingdao/test_unload_browser.py
+```

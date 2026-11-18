@@ -17,6 +17,10 @@ _ASSETS = {
     "image": re.compile(r"/[a-zA-Z0-9_./@+-]+\.(?:png|jpe?g|gif|svg|webp|ico|avif)"),
     "font": re.compile(r"/[a-zA-Z0-9_./@+-]+\.(?:woff2?|ttf|otf)"),
 }
+_SCRIPT = Path(__file__).with_name("readonly.js")
+_SCRIPT_BINDING = "__qianshuReadonlyBlocked"
+_SCRIPT_UNLOAD_KEY = "__qianshuReadonlyUnload"
+_ARM_CLOSE = "() => window.__qianshuReadonlyClose?.() === true"
 _METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"})
 
 
@@ -92,6 +96,32 @@ class RequestAudit:
         self._stream.flush()
         self.counts[outcome] += 1
 
+    def _error(self, method: str, pattern: str) -> None:
+        self.failed = True
+        try:
+            self._record(method, pattern, "error")
+        except Exception:
+            # 清单写入失败本身也使冒烟失败，拦截回调仍须收尾。
+            pass
+
+    def script(self, _source, method=None, url=None, *extra) -> None:
+        try:
+            if extra or not isinstance(method, str) or not isinstance(url, str):
+                raise ValueError("脚本拦截未就绪")
+            method = method if method in _METHODS else "OTHER"
+            _, pattern = self._policy.classify(method, url, "other")
+            self._record(method, pattern, "blocked")
+        except Exception:
+            self._error("OTHER", "script")
+
+    def script_unload(self, event: dict) -> None:
+        if event.get("key") != _SCRIPT_UNLOAD_KEY:
+            return
+        try:
+            self.script(None, *json.loads(event["newValue"]))
+        except Exception:
+            self._error("OTHER", "script")
+
     def http(self, route) -> None:
         method = "OTHER"
         pattern = "unknown"
@@ -99,11 +129,11 @@ class RequestAudit:
             request = route.request
             method = request.method if request.method in _METHODS else "OTHER"
             allowed, pattern = self._policy.classify(method, request.url, request.resource_type)
-            if not allowed:
+            if not allowed or self.failed:
                 route.abort()
                 self._record(method, pattern, "blocked")
                 return
-            # continue_ 可能使重定向后续请求绕过路由。单跳取响应，且不把重定向交给页面。
+            # 单跳取响应，拦截重定向，避免后续跳转脱离上下文路由。
             self._record(method, pattern, "allowed")
             response = route.fetch(max_redirects=0, max_retries=0, timeout=15_000)
             try:
@@ -115,20 +145,57 @@ class RequestAudit:
             finally:
                 response.dispose()
         except Exception:
-            self.failed = True
+            self._error(method, pattern)
             try:
                 route.abort()
             except Exception:
                 pass
-            self._record(method, pattern, "error")
 
     def websocket(self, route) -> None:
         try:
             route.close()
             self._record("WEBSOCKET", "websocket", "blocked")
         except Exception:
-            self.failed = True
+            self._error("WEBSOCKET", "websocket")
+
+
+class ReadOnlyContext:
+    def __init__(self, context, audit: RequestAudit) -> None:
+        self._context = context
+        self._audit = audit
+
+    def install(self) -> None:
+        self._context.route_web_socket(re.compile(r".*"), self._audit.websocket)
+        self._context.route(re.compile(r".*"), self._audit.http)
+        self._context.expose_binding(_SCRIPT_BINDING, self._audit.script)
+        self._context.add_init_script(path=_SCRIPT)
+        self._context.set_default_timeout(8_000)
+
+    def new_page(self):
+        if self._audit.failed:
+            raise RuntimeError("请求拦截已失败")
+        page = self._context.new_page()
+        try:
+            session = self._context.new_cdp_session(page)
+            session.on("DOMStorage.domStorageItemAdded", self._audit.script_unload)
+            session.send("DOMStorage.enable")
+        except Exception:
+            self._audit._error("OTHER", "cdp_setup")
+            page.close(run_before_unload=False)
             raise
+        return page
+
+    def close_page(self, page) -> None:
+        try:
+            for frame in page.frames:
+                # 空白文档和浏览器错误页可能没有执行初始化脚本。
+                if frame.url.startswith("https://") and not frame.evaluate(_ARM_CLOSE):
+                    raise RuntimeError("关闭前未能启用脚本拦截")
+        except Exception:
+            self._audit._error("OTHER", "script_close")
+            raise
+        finally:
+            page.close(run_before_unload=False)
 
 
 @contextmanager
@@ -140,9 +207,8 @@ def readonly_context(browser, policy: ReadOnlyPolicy, state: Path, audit_stream:
         locale="zh-CN", viewport={"width": 1280, "height": 900},
     )
     try:
-        context.route_web_socket(re.compile(r".*"), audit.websocket)
-        context.route(re.compile(r".*"), audit.http)
-        context.set_default_timeout(8_000)
-        yield context, audit
+        guarded = ReadOnlyContext(context, audit)
+        guarded.install()
+        yield guarded, audit
     finally:
         context.close()

@@ -132,19 +132,30 @@ def _open_view(page, config: RehearsalConfig, view: View) -> None:
     page.locator(view.ready).wait_for(state="visible")
 
 
-def _read_counts(page, config: RehearsalConfig, issues: dict[str, str], phase: str) -> dict[str, int]:
+def _read_counts(context, audit, config: RehearsalConfig, issues: dict[str, str],
+                 phase: str) -> dict[str, int]:
     counts = {}
     for name, view in config.views.items():
+        if audit.failed:
+            break
         try:
-            _open_view(page, config, view)
-            total = page.locator(view.total)
-            total.wait_for(state="visible")
-            match = re.fullmatch(r"\s*(?:共\s*)?(\d+(?:,\d{3})*)(?:\s*行)?\s*", total.inner_text())
-            if not match:
-                raise ValueError("视图总行数不可读")
-            counts[name] = int(match[1].replace(",", ""))
+            page = context.new_page()
+            try:
+                _open_view(page, config, view)
+                total = page.locator(view.total)
+                total.wait_for(state="visible")
+                match = re.fullmatch(r"\s*(?:共\s*)?(\d+(?:,\d{3})*)(?:\s*行)?\s*", total.inner_text())
+                if not match:
+                    raise ValueError("视图总行数不可读")
+                count = int(match[1].replace(",", ""))
+            finally:
+                context.close_page(page)
         except Exception as exc:
             issues[f"{phase}_{name}"] = type(exc).__name__
+            if phase == "before":
+                break
+        else:
+            counts[name] = count
     return counts
 
 
@@ -279,7 +290,7 @@ def _rehearse(page, config: RehearsalConfig, values: dict, auto_fields: dict,
 
 def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
                   private_dir: Path = Path(".private")) -> RehearsalResult:
-    """演练一条草稿并写私有证据。表单失败时仍关闭该页并回读各视图。"""
+    """基线齐备后才演练草稿，并记录视图回读与私有证据。"""
     values = _draft_values(draft)
     private_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     run_dir = Path(mkdtemp(prefix="mingdao-rehearsal-", dir=private_dir))
@@ -287,23 +298,28 @@ def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
     auto_fields = {}
     form_errors = []
     complete = False
+    after = {}
     with (
         open(run_dir / "requests.jsonl", "x", encoding="utf-8", opener=_private_file) as stream,
         _launch_browser() as browser,
     ):
         with readonly_context(browser, config.policy, config.storage_state, stream) as (context, audit):
-            view_page = context.new_page()
-            before = _read_counts(view_page, config, issues, "before")
-            # 基线不完整也允许只读骨架取证，最终冒烟判定要求五个视图证据齐备。
-            form_page = context.new_page()
-            try:
-                complete = _rehearse(form_page, config, values, auto_fields, form_errors, issues)
-            finally:
+            before = _read_counts(context, audit, config, issues, "before")
+            if set(before) == set(VIEWS) and not audit.failed:
+                form_page = None
                 try:
-                    form_page.close(run_before_unload=False)
+                    form_page = context.new_page()
+                    complete = _rehearse(form_page, config, values, auto_fields, form_errors, issues)
                 except Exception as exc:
-                    issues["close_form"] = type(exc).__name__
-            after = _read_counts(view_page, config, issues, "after")
+                    issues["form"] = type(exc).__name__
+                finally:
+                    if form_page is not None:
+                        try:
+                            context.close_page(form_page)
+                        except Exception as exc:
+                            issues["close_form"] = type(exc).__name__
+                if "close_form" not in issues:
+                    after = _read_counts(context, audit, config, issues, "after")
 
     report = run_dir / "report.json"
     result = RehearsalResult(before, after, complete, auto_fields, form_errors, issues,

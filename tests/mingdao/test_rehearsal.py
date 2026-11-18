@@ -12,7 +12,7 @@ import pytest
 
 from qianshu.draft import DraftField, PackageRow, PolicyDraft
 from qianshu.mingdao import rehearsal
-from qianshu.mingdao.readonly import ReadOnlyPolicy, readonly_context
+from qianshu.mingdao.readonly import _SCRIPT_UNLOAD_KEY, ReadOnlyPolicy, readonly_context
 
 ORIGIN = "https://app.example.invalid"
 STATIC = "https://assets.example.invalid"
@@ -28,6 +28,8 @@ class FakeRoute:
 
     def fetch(self, *, max_redirects=20, max_retries=0, timeout=None):
         request = self.request
+        if self.browser.route_error and request.resource_type == "script":
+            raise RuntimeError(SECRET)
         self.browser.sent.append((request.method, request.url, request.resource_type))
         status = 307 if "redirect=1" in request.url else 200
         if status == 307 and max_redirects:
@@ -53,10 +55,29 @@ class FakeBrowser:
         self.changed_after_form = False
         self.unready = None
         self.routes = []
+        self.blocked_read = None
+        self.route_error = False
+        self.cdp_error = False
+        self.bad_cdp_event = False
 
     def new_context(self, **options):
         self.options = options
-        return FakeContext(self)
+        self.context = FakeContext(self)
+        return self.context
+
+
+class FakeSession:
+    def __init__(self, browser):
+        self.browser = browser
+
+    def on(self, event, handler):
+        assert event == "DOMStorage.domStorageItemAdded"
+        self.handler = handler
+
+    def send(self, command):
+        assert command == "DOMStorage.enable"
+        if self.browser.cdp_error:
+            raise RuntimeError(SECRET)
 
 
 class FakeContext:
@@ -76,9 +97,19 @@ class FakeContext:
     def set_default_timeout(self, timeout):
         pass
 
+    def add_init_script(self, *, path):
+        assert path.is_file()
+
+    def expose_binding(self, name, handler):
+        self.script_handler = handler
+
+    def new_cdp_session(self, page):
+        page.session = FakeSession(self.browser)
+        return page.session
+
     def new_page(self):
         assert self.browser.options["service_workers"] == "block"
-        page = FakePage(self, form=bool(self.pages))
+        page = FakePage(self)
         self.pages.append(page)
         return page
 
@@ -96,26 +127,43 @@ class FakeContext:
 
 
 class FakePage:
-    def __init__(self, context, *, form):
+    def __init__(self, context):
         self.context = context
-        self.form = form
+        self.form = False
         self.url = ""
         self.rows = 0
+        self.frames = [self]
+        self.closed = False
+        self.armed = False
+
+    def evaluate(self, expression):
+        assert "__qianshuReadonlyClose" in expression
+        self.armed = True
+        return True
 
     def goto(self, url, *, wait_until):
+        assert not self.url
         self.url = url
         if self.context.form_closed:
             self.context.browser.actions.append(("after_view", url))
         ok = self.context.request("GET", url, "document")
+        if self.context.browser.bad_cdp_event:
+            self.session.handler({"key": _SCRIPT_UNLOAD_KEY, "newValue": "example-invalid-json"})
+        if url == self.context.browser.blocked_read:
+            assert not self.context.request("GET", ORIGIN + "/example/count")
+            self.missing_counts = True
         return SimpleNamespace(ok=ok)
 
     def locator(self, selector):
         return FakeLocator(self, selector)
 
     def close(self, *, run_before_unload):
-        assert self.form and run_before_unload is False
-        self.context.browser.actions.append(("close_form",))
-        self.context.form_closed = True
+        assert run_before_unload is False and not self.closed
+        assert not self.url or self.armed
+        self.closed = True
+        if self.form:
+            self.context.browser.actions.append(("close_form",))
+            self.context.form_closed = True
 
 
 class FakeLocator:
@@ -128,7 +176,7 @@ class FakeLocator:
 
     def wait_for(self, *, state):
         assert state == "visible"
-        if self.selector == self.browser.unready:
+        if self.selector == self.browser.unready or getattr(self.page, "missing_counts", False):
             raise TimeoutError(SECRET)
 
     @property
@@ -167,6 +215,7 @@ class FakeLocator:
     def click(self):
         self.browser.actions.append(("click", self.selector))
         if self.selector == "#open-example":
+            self.page.form = True
             context = self.page.context
             context.request("GET", STATIC + "/example.js", "script")
             context.request("POST", ORIGIN + f"/example/add-record?private={SECRET}")
@@ -280,6 +329,8 @@ def test_form_network_and_readbacks(tmp_path, draft, browser):
     assert actions.count(("click", "#add-example")) == 2
     assert all(action[0] == "after_view" for action in actions[actions.index(("close_form",)) + 1:])
     assert len([action for action in actions if action[0] == "after_view"]) == 5
+    assert len(browser.context.pages) == 11
+    assert all(page.closed for page in browser.context.pages)
     assert browser.options["storage_state"] == str(tmp_path / "mingdao-state.json")
 
     assert ("POST", ORIGIN + f"/example/add-record?private={SECRET}", "xhr") not in browser.sent
@@ -317,11 +368,45 @@ def test_after_readback_change_fails_smoke(tmp_path, draft, browser):
     assert not result.smoke_passed
 
 
-def test_unready_view_cannot_pass_smoke_with_matching_partial_counts(tmp_path, draft, browser):
-    browser.unready = "#ready-0"
-    result = run(tmp_path, draft, ui_config())
-    assert "新建" not in result.before and "新建" not in result.after
+def test_blocked_baseline_read_stops_before_opening_form(tmp_path, draft, browser):
+    raw = ui_config()
+    browser.blocked_read = ORIGIN + raw["views"]["待配置"]["path"]
+    result = run(tmp_path, draft, raw)
+    assert result.before == {"新建": 0, "待审批": 1}
+    assert result.issues == {"before_待配置": "TimeoutError"}
+    assert result.after == {}
+    assert result.requests == {"allowed": 3, "blocked": 1}
+    assert ("click", "#open-example") not in browser.actions
+    assert len(browser.context.pages) == 3
+    assert all(page.closed for page in browser.context.pages)
     assert not result.smoke_passed
+
+
+def test_cdp_error_stops_smoke(tmp_path, draft, browser):
+    browser.cdp_error = True
+    result = run(tmp_path, draft, ui_config())
+    assert result.guard_failed and not result.smoke_passed
+    assert result.requests["error"] == 1
+    assert browser.sent == []
+    assert len(browser.context.pages) == 1
+    assert browser.context.pages[0].closed
+
+
+def test_invalid_cdp_audit_event_fails_smoke(tmp_path, draft, browser):
+    browser.bad_cdp_event = True
+    result = run(tmp_path, draft, ui_config())
+    assert result.guard_failed and not result.smoke_passed
+    assert result.requests == {"allowed": 1, "error": 1}
+    assert len(browser.context.pages) == 1
+    assert ("click", "#open-example") not in browser.actions
+
+
+def test_route_callback_error_fails_smoke(tmp_path, draft, browser):
+    browser.route_error = True
+    result = run(tmp_path, draft, ui_config())
+    assert set(result.before) == set(rehearsal.VIEWS)
+    assert result.guard_failed and not result.smoke_passed
+    assert result.requests["error"] == 1
 
 
 def test_incomplete_form_is_recorded_without_failing_smoke(tmp_path, draft, browser):
@@ -338,7 +423,8 @@ def test_context_blocks_redirect_and_websocket():
     path = SHEET + "/example-view-0"
     allowed_url = ORIGIN + path + "?redirect=1"
     with readonly_context(fake, ReadOnlyPolicy(ORIGIN, (path,)), Path("example.json"),
-                          StringIO()) as (context, audit):
+                          StringIO()) as (_, audit):
+        context = fake.context
         assert not context.request("GET", allowed_url, "document")
         assert fake.sent == [("GET", allowed_url, "document")]
         pattern, handler = context.socket_handler
@@ -353,6 +439,10 @@ def test_context_blocks_redirect_and_websocket():
 def test_non_get_is_denied_on_an_allowed_address():
     path = SHEET + "/example-view-0"
     policy = ReadOnlyPolicy(ORIGIN, (path,), (STATIC,))
+    assert policy.classify("GET", ORIGIN + path, "document")[0]
+    assert not policy.classify("GET", STATIC + path, "document")[0]
+    assert not policy.classify("GET", "https://other.example.invalid" + path, "document")[0]
+    assert not policy.classify("GET", ORIGIN + path + "-other", "document")[0]
     for method in ("POST", "HEAD", "PUT", "PATCH", "OPTIONS", "DELETE"):
         assert not policy.classify(method, ORIGIN + path, "document")[0]
         assert not policy.classify(method, STATIC + "/example.js", "script")[0]
