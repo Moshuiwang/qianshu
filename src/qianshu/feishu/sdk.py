@@ -8,6 +8,7 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import ContextVar
 from http import HTTPStatus
 from pathlib import Path
@@ -42,7 +43,8 @@ from .state import State
 _LOG = logging.getLogger(__name__)
 _HTTP_TIMEOUT = 2
 _CALLBACK_BUDGET = 3
-_CALLBACK_WRITE_BUDGET = 0.25
+_CALLBACK_RESPONSE_MARGIN = 0.5
+_CALLBACK_TIMEOUT_NOTICE = "处理超时，请重新点击"
 
 
 class _EndpointUnavailable(ws.ServerException):
@@ -175,6 +177,17 @@ class _Transport:
             raise RuntimeError("飞书未返回卡片消息标识。")
         return response.data.message_id
 
+    async def notify_callback_timeout(self) -> None:
+        async with asyncio.timeout(_HTTP_TIMEOUT):
+            self._require_window()
+            option = lark.RequestOption.builder().tenant_access_token(await self._tenant_token()).build()
+            body = CreateMessageRequestBody.builder().receive_id(self.settings.chat_id).msg_type(
+                "text",
+            ).content(json.dumps({"text": _CALLBACK_TIMEOUT_NOTICE}, ensure_ascii=False)).build()
+            request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+            self._require_window()
+            _checked(await self.im.message.acreate(request, option))
+
     def history(self, start: float, end: float) -> Iterator[Message]:
         page = None
         seen_pages = set()
@@ -231,7 +244,7 @@ class _Connection(ws.Client):
 
     def __init__(self, service: "FeishuService"):
         self.service = service
-        self._dispatch = ContextVar("feishu_dispatch", default=(None, 0.0))
+        self._dispatch = ContextVar("feishu_dispatch", default=(None, 0.0, 0.0))
         self.receiver = None
         self.frames = set()
         self._generation = 0
@@ -303,9 +316,22 @@ class _Connection(ws.Client):
     async def _receive_message_loop(self):
         self.receiver = asyncio.current_task()
         try:
-            await super()._receive_message_loop()
+            while self._conn is not None:
+                origin = self._conn
+                msg = await origin.recv()
+                dispatch = self._frame_timing(origin)
+                task = asyncio.create_task(self._handle_message(msg, dispatch))
+                self.frames.add(task)
+                task.add_done_callback(self.frames.discard)
         except Exception:
-            _LOG.error("feishu_connection_receive_failed")
+            try:
+                await self._disconnect()
+                if self._auto_reconnect:
+                    await self._reconnect()
+                else:
+                    _LOG.error("feishu_connection_receive_failed")
+            except Exception:
+                _LOG.error("feishu_connection_receive_failed")
 
     async def _ping_loop(self):
         while True:
@@ -317,14 +343,19 @@ class _Connection(ws.Client):
                 _LOG.error("feishu_connection_ping_failed")
             await asyncio.sleep(self._ping_interval)
 
-    async def _handle_message(self, msg):
-        # SDK 在接收循环的同一事件循环中调度帧。
-        origin = self._conn
+    def _frame_timing(self, origin):
+        received = time.monotonic()
+        return origin, received, received + _CALLBACK_BUDGET - self.service._callback_response_margin
+
+    async def _handle_message(self, msg, dispatch=None):
+        if dispatch is None:
+            dispatch = self._frame_timing(self._conn)
+        origin, _, _ = dispatch
         if origin is None:
             return
         task = asyncio.current_task()
         self.frames.add(task)
-        token = self._dispatch.set((origin, time.monotonic()))
+        token = self._dispatch.set(dispatch)
         try:
             await super()._handle_message(msg)
         finally:
@@ -333,7 +364,7 @@ class _Connection(ws.Client):
 
     async def _handle_data_frame(self, frame):
         # 沿用 SDK 帧格式和分发器，在编码应答前等待审批回调。
-        origin, started = self._dispatch.get()
+        origin, started, _ = self._dispatch.get()
         headers = frame.headers
         frame_type = ws._get_by_key(headers, ws.HEADER_TYPE)
         if frame_type not in (ws.MessageType.EVENT.value, ws.MessageType.CARD.value):
@@ -381,7 +412,7 @@ class _Connection(ws.Client):
         return super()._combine(f"{self._generation}:{msg_id}", count, sequence, data)
 
     def _from_current_app(self, data) -> bool:
-        origin, _ = self._dispatch.get()
+        origin, _, _ = self._dispatch.get()
         tenant_key = self.service.settings.tenant_key
         return (
             origin is not None and origin is self._conn and origin is self.service._origin
@@ -415,12 +446,12 @@ class _Connection(ws.Client):
     async def _approve(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         if not self._from_current_app(data):
             return _approval_warning("审批来源与当前飞书连接配置不符")
-        origin, started = self._dispatch.get()
+        origin, _, deadline = self._dispatch.get()
         try:
-            # 为编码和发送同步应答留出时间。
-            return await self.service._record_action(
-                data, origin, started + _CALLBACK_BUDGET - _CALLBACK_WRITE_BUDGET,
-            )
+            return await self.service._record_action(data, origin, deadline)
+        except TimeoutError:
+            self.service._notify_callback_timeout()
+            return _approval_warning(_CALLBACK_TIMEOUT_NOTICE)
         except Exception:
             _LOG.error("feishu_approval_record_failed")
             return _approval_warning("暂时无法记录审批决定")
@@ -433,14 +464,21 @@ class FeishuService:
         self, settings: Settings, window: Window, state_path: Path,
         process: Callable[[Application], Report], *, clock: Callable[[], float] = time.time,
         membership_check: Callable[[str], Awaitable[bool]] | None = None,
+        callback_response_margin: float = _CALLBACK_RESPONSE_MARGIN,
     ):
+        if not 0 < callback_response_margin < _CALLBACK_BUDGET:
+            raise ValueError("飞书卡片回调的应答预留时间无效。")
         self.settings, self.window, self.clock = settings, window, clock
         self._lock = Lock()
         self._origin = None
         self._connected_at: float | None = None
         self._membership_check = membership_check
+        self._callback_response_margin = callback_response_margin
+        self._callback_notices = set()
+        self._callback_notice_failures = 0
         self._state = State(state_path, settings)
         self._state.close_approvals()
+        self._callback_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feishu-callback")
         # SDK 和 HTTP 请求日志可能包含响应原文或消息标识。
         logging.getLogger("Lark").disabled = True
         logging.getLogger("httpx").disabled = True
@@ -487,6 +525,8 @@ class FeishuService:
     async def _record_action(
         self, data: P2CardActionTrigger, origin, deadline: float,
     ) -> P2CardActionTriggerResponse:
+        if time.monotonic() >= deadline:
+            raise TimeoutError
         event = data.event
         if not event or not event.context or not event.action or not event.operator:
             return _approval_warning("审批回调缺少必要信息")
@@ -501,9 +541,20 @@ class FeishuService:
         ):
             return _approval_warning("审批回调缺少有效标识或决定")
         raw_time = data.header.create_time
-        if not isinstance(raw_time, str) or not re.fullmatch(r"[0-9]{1,16}", raw_time):
+        if isinstance(raw_time, str) and re.fullmatch(r"[0-9]+", raw_time):
+            try:
+                raw_time = int(raw_time)
+            except ValueError:
+                return _approval_warning("审批回调时间缺失或格式无效")
+        if type(raw_time) is not int:
             return _approval_warning("审批回调时间缺失或格式无效")
-        created_at = int(raw_time) / 1000
+        now = self.clock()
+        oldest = now - self.settings.callback_max_age
+        candidates = [
+            raw_time / scale for scale in (1, 1_000, 1_000_000)
+            if oldest * scale <= raw_time <= now * scale
+        ]
+        created_at = candidates[0] if len(candidates) == 1 else None
         connected_at = self._connected_at
 
         def current_time() -> float | None:
@@ -511,52 +562,84 @@ class FeishuService:
             if (
                 origin is not None and origin is self._origin and origin.close_code is None
                 and connected_at is not None and connected_at == self._connected_at
-                and self.window.contains(now) and self.window.contains(created_at)
+                and created_at is not None and self.window.contains(now) and self.window.contains(created_at)
                 and connected_at <= created_at <= now
                 and now - created_at <= self.settings.callback_max_age
             ):
                 return now
             return None
 
-        def write_deadline() -> float:
-            return min(deadline, time.monotonic() + _CALLBACK_WRITE_BUDGET)
-
-        now = current_time()
-        if now is None:
+        if current_time() is None:
             if origin is self._origin and not self.window.contains(self.clock()):
-                self._state.close_approvals(deadline=write_deadline())
+                await self._write_callback(deadline, self._state.close_approvals)
             return _approval_warning("审批回调已过期或与当前连接时间不符")
-        if not self._state.claim_callback(event_id, deadline=write_deadline()):
+        if not await self._write_callback(deadline, self._state.claim_callback, event_id):
             return _approval_warning("该审批回调已处理")
+        remaining = min(
+            _HTTP_TIMEOUT, deadline - time.monotonic(),
+            self.window.end.timestamp() - self.clock(),
+        )
+        if time.monotonic() >= deadline:
+            raise TimeoutError
         try:
-            remaining = min(
-                _HTTP_TIMEOUT, deadline - time.monotonic() - _CALLBACK_WRITE_BUDGET,
-                self.window.end.timestamp() - now,
-            )
-            if remaining <= 0:
-                return _approval_warning("审批回调验证超时")
             async with asyncio.timeout(remaining):
                 check = self._membership_check or self.transport.is_member
                 is_member = await check(operator_id)
         except Exception:
             is_member = False
+        if time.monotonic() >= deadline:
+            raise TimeoutError
         if is_member is not True:
             _LOG.warning("feishu_approval_membership_rejected")
             return _approval_warning("未能确认点击人是汇报群成员")
         if not self.window.contains(self.clock()):
-            self._state.close_approvals(deadline=write_deadline())
+            await self._write_callback(deadline, self._state.close_approvals)
             return _approval_warning("审批验收窗口已关闭")
         if current_time() is None:
             return _approval_warning("审批回调已过期或连接已断开")
-        if self._state.decide(
-            approval_id, context.open_message_id, record_id, decision, event_id, operator_id,
-            current_time, deadline=write_deadline(),
+        response = P2CardActionTriggerResponse({
+            "toast": {"type": "success", "content": "已记录审批决定"},
+            "card": {"type": "raw", "data": decided_approval_card(decision)},
+        })
+        if await self._write_callback(
+            deadline, self._state.decide, approval_id, context.open_message_id, record_id,
+            decision, event_id, operator_id, current_time,
         ):
-            return P2CardActionTriggerResponse({
-                "toast": {"type": "success", "content": "已记录审批决定"},
-                "card": {"type": "raw", "data": decided_approval_card(decision)},
-            })
+            return response
         return _approval_warning("卡片绑定不符、已过期或已处理")
+
+    async def _write_callback(self, deadline, operation, *args):
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        commit = Future()
+
+        def before_commit():
+            if not commit.set_running_or_notify_cancel():
+                raise TimeoutError
+
+        write = asyncio.wrap_future(self._callback_writer.submit(
+            operation, *args, deadline=deadline, before_commit=before_commit,
+        ))
+        try:
+            done, _ = await asyncio.wait((write,), timeout=max(0, deadline - time.monotonic()))
+            # 先取消提交资格才能拒绝。已进入提交阶段时，以 SQLite 的实际结果为准。
+            if not done and commit.cancel():
+                raise TimeoutError
+            return await write
+        finally:
+            if not write.done() and commit.cancel():
+                write.cancel()
+
+    def _notify_callback_timeout(self) -> None:
+        async def notify():
+            try:
+                await self.transport.notify_callback_timeout()
+            except Exception:
+                self._callback_notice_failures += 1
+
+        task = asyncio.create_task(notify())
+        self._callback_notices.add(task)
+        task.add_done_callback(self._callback_notices.discard)
 
     def _remaining(self) -> float:
         return self.window.end.timestamp() - self.clock()
@@ -593,6 +676,11 @@ class FeishuService:
         for frame in frames:
             frame.cancel()
         await asyncio.gather(*frames, return_exceptions=True)
+        self._callback_writer.shutdown(wait=False, cancel_futures=True)
+        notices = tuple(self._callback_notices)
+        for notice in notices:
+            notice.cancel()
+        await asyncio.gather(*notices, return_exceptions=True)
         cron = self._client._cache._cron
         cron.cancel()
         try:

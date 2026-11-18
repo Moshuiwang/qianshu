@@ -91,33 +91,42 @@ class State:
             db.close()
 
     @contextmanager
-    def _write(self, *, deadline: float | None = None):
+    def _write(
+        self, *, deadline: float | None = None, before_commit: Callable[[], None] | None = None,
+    ):
         timeout = -1 if deadline is None else max(0, deadline - time.monotonic())
         if not self._write_lock.acquire(timeout=timeout):
             raise TimeoutError
         db = self._writer
         try:
+            busy_ms = self._busy_ms
             if deadline is not None:
                 remaining_ms = math.floor((deadline - time.monotonic()) * 1000)
                 if remaining_ms <= 0:
                     raise TimeoutError
-                db.execute(f"PRAGMA busy_timeout={min(self._busy_ms, remaining_ms)}")
-            db.execute("BEGIN IMMEDIATE")
+                busy_ms = min(busy_ms, remaining_ms)
+            db.execute(f"PRAGMA busy_timeout={busy_ms}")
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError
             try:
+                db.execute("BEGIN IMMEDIATE")
                 yield db
+                if before_commit is not None:
+                    before_commit()
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError
                 db.execute("COMMIT")
-            except BaseException:
+            except BaseException as error:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
+                if (
+                    deadline is not None and isinstance(error, sqlite3.OperationalError)
+                    and error.sqlite_errorcode == sqlite3.SQLITE_BUSY
+                ):
+                    raise TimeoutError from None
                 raise
         finally:
-            try:
-                if deadline is not None:
-                    db.execute(f"PRAGMA busy_timeout={self._busy_ms}")
-            finally:
-                self._write_lock.release()
+            self._write_lock.release()
 
     def close(self) -> None:
         with self._write_lock:
@@ -155,9 +164,12 @@ class State:
                 VALUES (?, ?, ?, ?, ?)
             """, (self.scope, approval_id, message_id, record_id, expires))
 
-    def claim_callback(self, event_id: str, *, deadline: float | None = None) -> bool:
+    def claim_callback(
+        self, event_id: str, *, deadline: float | None = None,
+        before_commit: Callable[[], None] | None = None,
+    ) -> bool:
         # 在核实成员之前持久认领。查询失败、超时或进程中断时，重推也不能重开审批。
-        with self._write(deadline=deadline) as db:
+        with self._write(deadline=deadline, before_commit=before_commit) as db:
             return db.execute("""
                 INSERT OR IGNORE INTO feishu_callback_events (scope, event_id) VALUES (?, ?)
             """, (self.scope, event_id)).rowcount == 1
@@ -165,9 +177,9 @@ class State:
     def decide(
         self, approval_id: str, message_id: str, record_id: str, decision: str,
         event_id: str, operator_id: str, current_time: Callable[[], float | None],
-        *, deadline: float | None = None,
+        *, deadline: float | None = None, before_commit: Callable[[], None] | None = None,
     ) -> bool:
-        with self._write(deadline=deadline) as db:
+        with self._write(deadline=deadline, before_commit=before_commit) as db:
             now = current_time()
             if now is None:
                 return False
@@ -182,8 +194,10 @@ class State:
             """, (decision, event_id, operator_id, now, self.scope,
                   approval_id, message_id, record_id, now, self.scope, event_id)).rowcount == 1
 
-    def close_approvals(self, *, deadline: float | None = None) -> None:
-        with self._write(deadline=deadline) as db:
+    def close_approvals(
+        self, *, deadline: float | None = None, before_commit: Callable[[], None] | None = None,
+    ) -> None:
+        with self._write(deadline=deadline, before_commit=before_commit) as db:
             db.execute("""
                 UPDATE feishu_approvals SET status = 'closed'
                 WHERE scope = ? AND status IN ('pending', 'approve')

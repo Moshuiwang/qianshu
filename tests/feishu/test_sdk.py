@@ -3,6 +3,7 @@ import base64
 import json
 import sqlite3
 import time
+from contextlib import closing
 from dataclasses import replace
 from threading import Barrier, Event
 from types import SimpleNamespace
@@ -59,17 +60,23 @@ def payload(service, approval_id, message_id, record_id):
     }
 
 
-def dispatch(service, data, *, frame_type=ws.MessageType.EVENT):
+def encoded_frame(data, frame_type=ws.MessageType.EVENT):
     frame = ws.Frame(method=ws.FrameType.DATA.value, SeqID=0, LogID=0, service=1)
     for key, value in {
-        ws.HEADER_TYPE: frame_type.value, ws.HEADER_MESSAGE_ID: "<帧占位>", ws.HEADER_TRACE_ID: "<追踪占位>",
+        ws.HEADER_TYPE: frame_type.value,
+        ws.HEADER_MESSAGE_ID: data.get("header", {}).get("event_id", "<帧占位>"),
+        ws.HEADER_TRACE_ID: "<追踪占位>",
         ws.HEADER_SUM: "1", ws.HEADER_SEQ: "0",
     }.items():
         header = frame.headers.add()
         header.key, header.value = key, value
     frame.payload = json.dumps(data).encode()
+    return frame.SerializeToString()
+
+
+def dispatch(service, data, *, frame_type=ws.MessageType.EVENT):
     # 实际 SDK 帧分发与应答，套接字及 REST 由离线替身提供。
-    ws.loop.run_until_complete(service._client._handle_message(frame.SerializeToString()))
+    ws.loop.run_until_complete(service._client._handle_message(encoded_frame(data, frame_type)))
 
 
 @pytest.fixture
@@ -176,7 +183,12 @@ def test_locked_database_rejects_callback_within_sync_budget(connected, monkeypa
     async def unexpected_lookup(operator_id):
         pytest.fail("无法持久认领的回调触发了群成员查询")
 
+    async def failed_notice():
+        raise RuntimeError("合成发送故障")
+
+    monkeypatch.setattr(service, "_callback_response_margin", 2.75)
     monkeypatch.setattr(service.transport, "is_member", unexpected_lookup)
+    monkeypatch.setattr(service.transport, "notify_callback_timeout", failed_notice)
     try:
         blocker.execute("BEGIN IMMEDIATE")
         started = time.monotonic()
@@ -186,6 +198,191 @@ def test_locked_database_rejects_callback_within_sync_budget(connected, monkeypa
         blocker.close()
     assert socket.responses == ["warning"]
     assert "card" not in socket.callback_responses[0]
+    assert socket.callback_responses[0]["toast"]["content"] == "处理超时，请重新点击"
+    assert service._callback_notice_failures == 1
+    with service._state.connection() as db:
+        assert db.execute("SELECT count(*) FROM feishu_callback_events").fetchone() == (0,)
+    assert states(service) == [("pending",)]
+
+
+def test_concurrent_frames_under_write_lock_match_durable_decisions(connected, monkeypatch):
+    service, socket, _ = connected
+    receipts, replies, notices = {}, {}, []
+    pending = []
+    fast_operator = "<即时核验点击人占位>"
+    for index in range(8):
+        data = publish(connected, monkeypatch, f"<并发卡片占位-{index}>")
+        event_id = f"<并发回调占位-{index}>"
+        data["header"]["event_id"] = event_id
+        if index == 0:
+            data["event"]["operator"]["open_id"] = fast_operator
+        pending.append((event_id, encoded_frame(data, ws.MessageType.CARD)))
+    frames = iter(pending)
+    send = socket.send
+    complete = asyncio.Event()
+
+    async def recv():
+        item = next(frames, None)
+        if item is None:
+            await asyncio.Future()
+        event_id, data = item
+        receipts[event_id] = time.monotonic()
+        return data
+
+    async def record_reply(raw):
+        frame = ws.Frame()
+        frame.ParseFromString(raw)
+        event_id = ws._get_by_key(frame.headers, ws.HEADER_MESSAGE_ID)
+        await send(raw)
+        replies[event_id] = (time.monotonic(), socket.callback_responses[-1])
+        if len(replies) == len(pending):
+            complete.set()
+
+    async def is_member(operator_id):
+        if operator_id != fast_operator:
+            await asyncio.sleep(1)
+        return True
+
+    async def fake_token():
+        return "<令牌占位>"
+
+    async def record_notice(request, option):
+        assert request.receive_id_type == "chat_id"
+        assert request.request_body.receive_id == service.settings.chat_id
+        assert request.request_body.msg_type == "text"
+        notices.append(json.loads(request.request_body.content)["text"])
+        return SimpleNamespace(success=lambda: True)
+
+    monkeypatch.setattr(socket, "recv", recv)
+    monkeypatch.setattr(socket, "send", record_reply)
+    monkeypatch.setattr(service.transport, "is_member", is_member)
+    monkeypatch.setattr(service.transport, "_tenant_token", fake_token)
+    monkeypatch.setattr(service.transport.im.message, "acreate", record_notice)
+
+    async def receive_batch():
+        with closing(sqlite3.connect(service._state.path, autocommit=True)) as blocker:
+            blocker.execute("BEGIN IMMEDIATE")
+            receiver = asyncio.create_task(service._client._receive_message_loop())
+            try:
+                await asyncio.sleep(2)
+                assert len(receipts) == len(pending)
+                assert not replies
+                blocker.execute("ROLLBACK")
+                await asyncio.wait_for(complete.wait(), timeout=1)
+                await asyncio.gather(*service._callback_notices)
+            finally:
+                receiver.cancel()
+                await asyncio.gather(receiver, return_exceptions=True)
+
+    ws.loop.run_until_complete(receive_batch())
+    assert replies.keys() == receipts.keys()
+    with service._state.connection() as db:
+        decisions = dict(db.execute("SELECT event_id, status FROM feishu_approvals WHERE event_id IS NOT NULL"))
+    assert decisions == {pending[0][0]: "approve"}
+    for event_id, (sent_at, reply) in replies.items():
+        assert sent_at - receipts[event_id] < 3
+        if event_id in decisions:
+            assert reply["toast"]["type"] == "success"
+            assert reply["card"]["data"]["elements"][0]["text"]["content"] == "已收到，处理中"
+        else:
+            assert reply == {"toast": {"type": "warning", "content": "处理超时，请重新点击"}}
+    assert notices == ["处理超时，请重新点击"] * (len(pending) - 1)
+    assert service._callback_notice_failures == 0
+
+
+@pytest.mark.parametrize("pause_after_commit", [False, True])
+def test_deadline_racing_with_decision_commit(connected, monkeypatch, pause_after_commit):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    decide = service._state.decide
+    release = Event()
+    entered = asyncio.Event()
+    if not pause_after_commit:
+        queued = publish(connected, monkeypatch, "<排队卡片占位>")
+        queued["header"]["event_id"] = "<排队回调占位>"
+
+    def delayed_decision(*args, deadline, before_commit):
+        def pause_before_commit():
+            if not pause_after_commit:
+                ws.loop.call_soon_threadsafe(entered.set)
+                assert release.wait(2)
+            before_commit()
+
+        result = decide(*args, deadline=deadline, before_commit=pause_before_commit)
+        if pause_after_commit:
+            ws.loop.call_soon_threadsafe(entered.set)
+            assert release.wait(2)
+        return result
+
+    async def record_notice():
+        pass
+
+    async def run_frame():
+        timing = service._client._frame_timing(socket)
+        task = asyncio.create_task(
+            service._client._handle_message(encoded_frame(data, ws.MessageType.CARD), timing),
+        )
+        queued_task = None
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=1)
+            if not pause_after_commit:
+                queued_task = asyncio.create_task(
+                    service._client._handle_message(encoded_frame(queued, ws.MessageType.CARD), timing),
+                )
+            await asyncio.sleep(0.35)
+            assert task.done() is not pause_after_commit
+            if queued_task is not None:
+                assert queued_task.done()
+        finally:
+            release.set()
+            await task
+            if queued_task is not None:
+                await queued_task
+
+    monkeypatch.setattr(service, "_callback_response_margin", 2.75)
+    monkeypatch.setattr(service._state, "decide", delayed_decision)
+    monkeypatch.setattr(service.transport, "notify_callback_timeout", record_notice)
+    ws.loop.run_until_complete(run_frame())
+    # 等待写线程完整退出，再回读事务最终状态。
+    service._callback_writer.submit(lambda: None).result(timeout=2)
+    if pause_after_commit:
+        [reply] = socket.callback_responses
+        assert states(service) == [("approve",)]
+        assert reply["toast"]["type"] == "success"
+        assert "card" in reply
+    else:
+        assert states(service) == [("pending",), ("pending",)]
+        assert socket.callback_responses == [
+            {"toast": {"type": "warning", "content": "处理超时，请重新点击"}},
+        ] * 2
+        with service._state.connection() as db:
+            assert db.execute("SELECT event_id FROM feishu_callback_events").fetchall() == [
+                (data["header"]["event_id"],),
+            ]
+
+
+def test_callback_deadline_includes_delay_before_frame_handler_starts(connected, monkeypatch):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    notified = asyncio.Event()
+
+    async def record_notice():
+        notified.set()
+
+    async def delayed_dispatch():
+        timing = service._client._frame_timing(socket)
+        await asyncio.sleep(0.15)
+        await service._client._handle_message(encoded_frame(data, ws.MessageType.CARD), timing)
+        await asyncio.wait_for(notified.wait(), timeout=1)
+
+    monkeypatch.setattr(service, "_callback_response_margin", 2.9)
+    monkeypatch.setattr(service.transport, "notify_callback_timeout", record_notice)
+    ws.loop.run_until_complete(delayed_dispatch())
+    assert socket.callback_responses == [
+        {"toast": {"type": "warning", "content": "处理超时，请重新点击"}},
+    ]
+    with service._state.connection() as db:
+        assert db.execute("SELECT count(*) FROM feishu_callback_events").fetchone() == (0,)
     assert states(service) == [("pending",)]
 
 
@@ -432,11 +629,23 @@ def test_rejects_invalid_context_or_binding(connected, monkeypatch, location, ke
     assert states(service) == [("pending",)]
 
 
+@pytest.mark.parametrize("scale", [1, 1_000, 1_000_000])
+@pytest.mark.parametrize("encode", [int, str])
+def test_accepts_callback_time_in_seconds_milliseconds_or_microseconds(connected, monkeypatch, scale, encode):
+    service, socket, clock = connected
+    data = publish(connected, monkeypatch)
+    data["header"]["create_time"] = encode(int(clock.now * scale))
+    dispatch(service, data, frame_type=ws.MessageType.CARD)
+    assert socket.responses == ["success"]
+    assert states(service) == [("approve",)]
+
+
 @pytest.mark.parametrize("created,now", [
     ("99000", 150), ("149999", 150), ("150000", 156), ("150001", 150),
-    ("坏时间", 150), (None, 150), (150000, 150),
+    ("坏时间", 150), (None, 150), (150000.0, 150), (True, 150), ("150000.0", 150),
+    ("150000000000000000000000000", 150),
 ], ids=["before-window", "before-connection", "over-age-limit", "future",
-        "malformed", "missing", "not-string"])
+        "malformed", "missing", "float", "boolean", "decimal-string", "out-of-range"])
 def test_rejects_invalid_callback_time(connected, monkeypatch, created, now):
     service, socket, clock = connected
     service.settings = replace(service.settings, callback_max_age=5)
@@ -454,6 +663,17 @@ def test_rejects_invalid_callback_time(connected, monkeypatch, created, now):
     dispatch(service, data)
     assert socket.responses == ["warning"]
     assert "card" not in socket.callback_responses[0]
+    assert states(service) == [("pending",)]
+
+
+def test_rejects_ambiguous_callback_time(connected, monkeypatch):
+    service, socket, _ = connected
+    service.settings = replace(service.settings, callback_max_age=200)
+    data = publish(connected, monkeypatch)
+    # 150 可解释为 150 秒、0.15 秒或 0.00015 秒，都是允许时差内的值。
+    data["header"]["create_time"] = 150
+    dispatch(service, data, frame_type=ws.MessageType.CARD)
+    assert socket.responses == ["warning"]
     assert states(service) == [("pending",)]
 
 
