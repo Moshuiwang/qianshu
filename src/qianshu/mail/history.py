@@ -45,6 +45,8 @@ def export_history(
     request_ids = set()
     with connect(config, factory) as mailbox:
         sent = mailbox.sent_folder(config)
+        if sent is None:
+            raise MailError("IMAP 返回了多个带 \\Sent 属性的文件夹，请配置 MAIL_SENT_FOLDER。")
         mailbox._examine(sent)
         sent_seen = mailbox.seen()
         mailbox.select(inbox)

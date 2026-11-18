@@ -6,6 +6,7 @@ from collections import deque
 from datetime import date
 from email import policy
 from email.message import EmailMessage
+from functools import partial
 from threading import Event, enumerate as running_threads
 from uuid import uuid4
 
@@ -246,6 +247,37 @@ def test_poll_requires_sent_attribute_or_config(config):
     assert fake.calls == [("LIST",), ("SHUTDOWN",)]
 
 
+@pytest.mark.parametrize("configured", ["Sent", None, "missing-fixture"])
+def test_poll_delivers_with_multiple_sent_folders(config, configured):
+    fake = FakeIMAP()
+    fake.list_rows = [rb'(\Sent) "/" "archive-fixture"', rb'(\Sent) "/" "Sent"']
+    inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(inbox, 1, request)
+    fake.add(sent, 2, mail(approver, marker, "同意", reply_to=str(request["Message-ID"])))
+    if configured is None:
+        del config["MAIL_SENT_FOLDER"]
+    else:
+        config["MAIL_SENT_FOLDER"] = configured
+    calls, judged = [], []
+
+    def judge(text):
+        judged.append(text)
+        return ApprovalDecision.APPROVE
+
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                       approval_judge=judge)
+
+    approved = configured == sent
+    assert result.delivered and result.approved is approved
+    [(body, delivered_approval, _)] = calls
+    assert (body, delivered_approval) == ("合成申请", approved)
+    assert judged == (["同意"] if approved else [])
+    folders = [call[1] for call in fake.calls if call[0] == "EXAMINE"]
+    assert folders == ([f'"{inbox}"', f'"{sent}"'] if approved else [f'"{inbox}"'])
+
+
 def test_poll_only_delivers_marked_request_once_and_refreshes_approval(config, caplog):
     inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
     approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
@@ -442,6 +474,20 @@ def test_authored_reply(kind, body, expected):
         ("html", '<p>收到</p><div class="custom-original-fragment"><p>同意</p></div>'),
         ("html", "<p>收到</p><reply-fragment><p>同意</p></reply-fragment>"),
         ("html", '<p>同意</p><div data-customer-quote="1">合成旧文</div>'),
+        ("html", '<p>收到</p><div>Von: 合成发件人</div>'
+         '<div id="OLK_SRC_BODY_SECTION"><p>同意</p></div>'),
+        ("html", '<p>收到</p><div class="OLK_SRC_BODY_SECTION_FWD"><p>同意</p></div>'),
+        ("html", '<p>收到</p><div class="fixture-fragment"><p>同意</p></div>'),
+        ("html", '<p>收到</p><fixture-fragment>同意</fixture-fragment>'),
+        ("html", '<p>收到</p><!-- 合成边界 --><p>同意</p>'),
+        ("plain", "收到\nVon: 合成发件人\n同意"),
+        ("plain", "收到\nDe : 合成发件人\n同意"),
+        ("plain", "收到\nDa: 合成发件人\n同意"),
+        ("plain", "收到\n差出人: 合成发件人\n同意"),
+        ("plain", "收到\n________\n同意"),
+        ("html", "收到<pre>Von: 合成发件人</pre><p>同意</p>"),
+        ("html", "<p>同意</p><blockquote>旧正文</blockquote><p>&gt; 10 万元须另行审批</p>"),
+        ("html", "<p>同意</p><blockquote>旧正文</blockquote><p>＞ 10 万元须另行审批</p>"),
         ("html", '<p>同意</p><hr><div id="divRplyFwdMsg">合成引用头</div>'
          '<blockquote>旧正文</blockquote><p>超过 10 万元须另行审批</p>'
          '<blockquote>旧正文续行</blockquote>'),
@@ -461,14 +507,17 @@ def test_poll_does_not_submit_ambiguous_or_quoted_approval_to_judge(config, kind
     if kind == "html":
         fake.folders[config["MAIL_SENT_FOLDER"]][2]["structure"] = PLAIN.replace(b'"PLAIN"', b'"HTML"')
 
-    judged = []
+    calls, judged = [], []
 
     def judge(text):
         judged.append(text)
         return ApprovalDecision.APPROVE
 
-    result = poll_once(config, lambda *_: None, factory=fake.factory, approval_judge=judge)
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                       approval_judge=judge)
     assert result.delivered and not result.approved
+    [(body, approved, _)] = calls
+    assert (body, approved) == ("合成申请", False)
     assert not judged
 
 
@@ -564,37 +613,36 @@ def test_run_polling_delivers_after_timeout_while_judge_is_still_running(config)
     assert (body, approved) == ("合成申请", False)
 
 
-def test_poll_once_reuses_in_flight_judge_across_three_calls(config):
-    fake = FakeIMAP()
-    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
-    request = mail(approver, marker, "合成申请")
-    fake.add(config["MAIL_FOLDER"], 1, request)
-    fake.add(config["MAIL_SENT_FOLDER"], 2,
-             mail(approver, marker, "同意", reply_to=str(request["Message-ID"])))
+def test_poll_once_limits_judge_threads_across_three_distinct_wrappers(config):
+    approver = config["MAIL_APPROVER"]
     release, started = Event(), Event()
     judged, results, calls = [], [], []
     before = set(running_threads())
 
-    class Judge:
-        def evaluate(self, text):
-            judged.append(text)
-            started.set()
-            release.wait()
-            return ApprovalDecision.APPROVE
+    def judge(text):
+        judged.append(text)
+        started.set()
+        release.wait()
+        return ApprovalDecision.APPROVE
 
-    judge = Judge()
+    bodies = [f"合成申请 {index}" for index in range(3)]
     try:
-        for _ in range(3):
-            results.append(poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
-                                     approval_judge=judge.evaluate, approval_judge_timeout=0.01))
+        for body in bodies:
+            marker = uuid4().hex
+            round_config = dict(config, MAIL_TEST_MARKER=marker)
+            fake = FakeIMAP()
+            request = mail(approver, marker, body)
+            fake.add(config["MAIL_FOLDER"], 1, request)
+            fake.add(config["MAIL_SENT_FOLDER"], 2,
+                     mail(approver, marker, "同意", reply_to=str(request["Message-ID"])))
+            results.append(poll_once(round_config, lambda *args: calls.append(args),
+                                     factory=fake.factory, approval_judge=partial(judge),
+                                     approval_judge_timeout=0.01))
             assert started.wait(1)
-        threads = set(running_threads()) - before
-        assert sum(thread.name == "mail-approval-judge" for thread in threads) <= 1
+            assert sum(thread.name == "mail-approval-judge" for thread in running_threads()) <= 1
         assert judged == ["同意"]
-        assert [(result.delivered, result.approved) for result in results] == [
-            (True, False), (False, False), (False, False),
-        ]
-        assert calls[0][:2] == ("合成申请", False)
+        assert [(result.delivered, result.approved) for result in results] == [(True, False)] * 3
+        assert [call[:2] for call in calls] == [(body, False) for body in bodies]
     finally:
         release.set()
         for thread in set(running_threads()) - before:

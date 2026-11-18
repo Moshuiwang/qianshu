@@ -7,7 +7,6 @@ import re
 import sqlite3
 import stat
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future
 from contextlib import closing
 from dataclasses import dataclass
 from enum import Enum
@@ -15,7 +14,6 @@ from hashlib import sha256
 from pathlib import Path
 from threading import TIMEOUT_MAX, Event, Lock, Thread
 from time import monotonic
-from types import MethodType
 
 from .imap import SUMMARY, MailError, ReadOnlyMailbox, connect
 from .message import authored_reply, body_parts, headers, is_reply, message_id, request_text, sender
@@ -24,7 +22,7 @@ _LOG = logging.getLogger(__name__)
 _PACKAGE_SOURCE_DIR = Path(__file__).resolve().parents[2]
 _DEFAULT_APPROVAL_TIMEOUT = 5.0
 _APPROVAL_TASK_LOCK = Lock()
-_ACTIVE_APPROVAL_TASKS: set[tuple[int, ...]] = set()
+_APPROVAL_THREAD: Thread | None = None
 
 
 @dataclass(frozen=True)
@@ -84,23 +82,14 @@ def _bounded_approval(
         return None
     if not 0 < timeout <= TIMEOUT_MAX:
         raise ValueError("审批判断超时须为有效的正秒数。")
-    # 每次访问实例方法都可能得到一个新的绑定方法对象。
-    key = (id(judge.__self__), id(judge.__func__)) if isinstance(judge, MethodType) else (id(judge),)
-
-    def release() -> None:
-        with _APPROVAL_TASK_LOCK:
-            _ACTIVE_APPROVAL_TASKS.remove(key)
 
     def check(texts: list[str]) -> bool:
-        # 超时后若判断器仍在运行，后续轮询直接按不确定处理。
-        result: Future[bool] = Future()
+        global _APPROVAL_THREAD
+        approved = False
         expired = Event()
-        with _APPROVAL_TASK_LOCK:
-            if key in _ACTIVE_APPROVAL_TASKS:
-                return False
-            _ACTIVE_APPROVAL_TASKS.add(key)
 
         def evaluate() -> None:
+            nonlocal approved
             try:
                 approved = all(
                     not expired.is_set() and judge(text) is ApprovalDecision.APPROVE
@@ -109,29 +98,31 @@ def _bounded_approval(
             except BaseException:
                 # 后台线程的异常也按不确定处理，避免异常文本进入日志。
                 approved = False
-            finally:
-                release()
-            result.set_result(approved)
 
-        try:
-            Thread(target=evaluate, name="mail-approval-judge", daemon=True).start()
-        except RuntimeError:
-            release()
-            return False
-        try:
-            return result.result(timeout=timeout)
-        except TimeoutError:
+        with _APPROVAL_TASK_LOCK:
+            # 判断线程真正退出后才允许下一轮启动，与判断器对象无关。
+            if _APPROVAL_THREAD is not None and _APPROVAL_THREAD.is_alive():
+                return False
+            thread = Thread(target=evaluate, name="mail-approval-judge", daemon=True)
+            try:
+                thread.start()
+            except RuntimeError:
+                return False
+            _APPROVAL_THREAD = thread
+        thread.join(timeout)
+        if thread.is_alive():
             expired.set()
             return False
+        return approved
 
     return check
 
 
 def _approval(
-    mailbox: ReadOnlyMailbox, folder: str, request_id: str | None, approver: str,
+    mailbox: ReadOnlyMailbox, folder: str | None, request_id: str | None, approver: str,
     check: Callable[[list[str]], bool] | None,
 ) -> bool:
-    if request_id is None or check is None:
+    if folder is None or request_id is None or check is None:
         return False
     mailbox._examine(folder)
     texts = []

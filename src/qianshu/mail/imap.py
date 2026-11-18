@@ -69,8 +69,8 @@ class ReadOnlyMailbox:
             raise MailError("IMAP 文件夹计数无效。")
         return int(data[0])
 
-    def sent_folder(self, config: Mapping[str, str]) -> str:
-        """返回已发送文件夹的 IMAP 编码名称。"""
+    def sent_folder(self, config: Mapping[str, str]) -> str | None:
+        """返回已发送文件夹的 IMAP 编码名称，多候选且无法选定时返回 None。"""
         names = set()
         for row in self._checked(self._connection.list):
             if row in (None, b""):
@@ -92,11 +92,14 @@ class ReadOnlyMailbox:
             if not name or not name.isascii():
                 raise MailError("IMAP 返回的已发送文件夹名称无效。")
             names.add(name.decode("ascii"))
+        fallback = config.get("MAIL_SENT_FOLDER", "")
         if len(names) > 1:
-            raise MailError("IMAP 返回了多个带 \\Sent 属性的文件夹。")
-        folder = next(iter(names), None)
-        if folder is None:
-            fallback = config.get("MAIL_SENT_FOLDER", "")
+            folder = _encoded_mailbox_name(fallback)
+            if folder not in names:
+                return None
+        elif names:
+            folder = next(iter(names))
+        else:
             if not fallback.strip():
                 raise MailError("IMAP 未返回带 \\Sent 属性的文件夹，请配置 MAIL_SENT_FOLDER。")
             folder = _encoded_mailbox_name(fallback)

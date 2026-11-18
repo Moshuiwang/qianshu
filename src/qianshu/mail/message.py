@@ -20,10 +20,8 @@ _DIVIDER = re.compile(
     r"\s*(?:-{2,}|[:：])?)",
     re.IGNORECASE,
 )
-_QUOTED_HEADER = re.compile(r"(?:from|发件人)\s*[:：]", re.IGNORECASE)
-_QUOTE_HINT = re.compile(
-    r"quot|cite|reply|rply|forward|fwd|original|reference|signature|引用|引文|原文", re.I,
-)
+_HEADER_FIELD = re.compile(r"[^\W\d_][\w-]*\s*[:：]")
+_UNKNOWN_DIVIDER = re.compile(r"(?:(?:[^\w\s]|_)\s*){3}")
 
 
 def headers(raw: bytes) -> EmailMessage:
@@ -104,6 +102,11 @@ def _text_sections(
 
 class _HTMLText(HTMLParser):
     _BREAKS = {"br", "div", "p", "li", "tr", "td", "hr", "blockquote"}
+    _AUTHORED_BREAKS = _BREAKS | {"h1", "h2", "h3", "h4", "h5", "h6", "pre", "th"}
+    _BODY_TAGS = _AUTHORED_BREAKS | {
+        "a", "b", "body", "em", "font", "head", "html", "i", "img", "meta", "ol",
+        "s", "script", "span", "strong", "style", "table", "tbody", "thead", "u", "ul",
+    }
     _VOID_TAGS = {
         "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
         "param", "source", "track", "wbr",
@@ -113,12 +116,12 @@ class _HTMLText(HTMLParser):
         "netease_mail_quote", "netease-mail-quote", "divneteasemailquote",
     }
     _OUTLOOK_SEPARATOR_IDS = {"divrplyfwdmsg", "x_divrplyfwdmsg"}
-    _AMBIGUOUS_CONTAINERS = {"mail-editor-reference-message-container", "isreplycontent"}
 
     def __init__(self, *, authored_only: bool = False) -> None:
         super().__init__(convert_charrefs=True)
         self.text: list[str] = []
         self.authored_only = authored_only
+        self.breaks = self._AUTHORED_BREAKS if authored_only else self._BREAKS
         self.excluded: list[str] = []
         self.uncertain = False
         self.structured_quote = False
@@ -133,23 +136,19 @@ class _HTMLText(HTMLParser):
             attributes = dict(attrs)
             identifiers = {
                 token.casefold()
-                for name, value in attrs if name in {"id", "class"} and value
+                for name, value in attrs if name in {"id", "class", "name"} and value
                 for token in value.split()
             }
             separator = (attributes.get("id") or "").casefold() in self._OUTLOOK_SEPARATOR_IDS
             quoted = tag == "blockquote" or bool(identifiers & self._QUOTED_CONTAINERS)
-            unknown_hint = any(
-                _QUOTE_HINT.search(token)
-                for token in identifiers - self._QUOTED_CONTAINERS - self._OUTLOOK_SEPARATOR_IDS
-            ) or any(
-                _QUOTE_HINT.search(name) for name, _ in attrs if name.startswith("data-")
-            )
-            # 这些引用标记不足以确认其中的文字归属。
+            known_identifiers = self._QUOTED_CONTAINERS
+            if separator:
+                known_identifiers = known_identifiers | self._OUTLOOK_SEPARATOR_IDS
+            # 旧版 Outlook 的 OLK_SRC_BODY_SECTION 及其变体也无法确认文字归属。
             if (
-                identifiers & self._AMBIGUOUS_CONTAINERS
-                or unknown_hint
-                or ("-" in tag and _QUOTE_HINT.search(tag))
-                or tag in {"q", "cite", "iframe", "object", "template"}
+                tag not in self._BODY_TAGS
+                or identifiers - known_identifiers
+                or any(name.startswith("data-") for name in attributes)
                 or (tag != "blockquote" and (attributes.get("type") or "").casefold() == "cite")
                 or "hidden" in attributes
             ):
@@ -168,7 +167,7 @@ class _HTMLText(HTMLParser):
             if tag == "hr":
                 self.handle_data("\n----\n")
                 return
-        if tag in self._BREAKS:
+        if tag in self.breaks:
             self.handle_data("\n")
 
     def handle_startendtag(self, tag, attrs):
@@ -187,8 +186,14 @@ class _HTMLText(HTMLParser):
             else:
                 self.excluded.pop()
             return
-        if tag in self._BREAKS:
+        if self.authored_only and tag not in self._BODY_TAGS:
+            self.uncertain = True
+        if tag in self.breaks:
             self.handle_data("\n")
+
+    def handle_comment(self, text):
+        if self.authored_only and not self.excluded and text.strip():
+            self.uncertain = True
 
     def handle_data(self, text):
         if not self.excluded:
@@ -258,10 +263,7 @@ def authored_reply(kind: str, content: str) -> str | None:
             parser.close()
         except (AssertionError, ValueError):
             return None
-        if parser.excluded or parser.uncertain:
-            return None
-        tail = "".join(parser.tail).splitlines()
-        if any(line.strip() and not line.lstrip().startswith(_QUOTE_PREFIXES) for line in tail):
+        if parser.excluded or parser.uncertain or "".join(parser.tail).strip():
             return None
         content = parser.get_text()
         structured_quote = parser.structured_quote
@@ -271,11 +273,7 @@ def authored_reply(kind: str, content: str) -> str | None:
         stripped = line.strip()
         if stripped.startswith(_QUOTE_PREFIXES):
             return None
-        if (
-            _DIVIDER.fullmatch(stripped)
-            or _ATTRIBUTION.fullmatch(stripped)
-            or _QUOTED_HEADER.match(stripped)
-        ):
+        if _DIVIDER.fullmatch(stripped) or _ATTRIBUTION.fullmatch(stripped):
             # 连续分隔线可来自同一个 HTML 回复头（如 hr 紧接 Outlook 回复头）。
             for offset in range(index + 1, len(lines)):
                 item = lines[offset].strip()
@@ -288,5 +286,8 @@ def authored_reply(kind: str, content: str) -> str | None:
                 quoted or structured_quote
             ):
                 return "\n".join(lines[:index]).strip()
+            return None
+        # 不靠字段名的语言或拼写推断一个疑似回复头的归属。
+        if _HEADER_FIELD.match(stripped) or _UNKNOWN_DIVIDER.match(stripped):
             return None
     return "\n".join(lines)
