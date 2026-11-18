@@ -6,7 +6,7 @@ from collections import deque
 from datetime import date
 from email import policy
 from email.message import EmailMessage
-from threading import Event
+from threading import Event, enumerate as running_threads
 from uuid import uuid4
 
 import pytest
@@ -32,6 +32,7 @@ class FakeIMAP:
         self.debug = 0
         self.folder = None
         self.newly_seen = None
+        self.list_rows = [None]
 
     def add(self, folder, uid, message, *, multipart=False):
         raw_headers, body = message.as_bytes(policy=policy.SMTP).split(b"\r\n\r\n", 1)
@@ -54,6 +55,10 @@ class FakeIMAP:
 
     def shutdown(self):
         self.calls.append(("SHUTDOWN",))
+
+    def list(self):
+        self.calls.append(("LIST",))
+        return "OK", self.list_rows
 
     def select(self, folder, *, readonly):
         self.calls.append(("EXAMINE" if readonly else "SELECT", folder))
@@ -185,6 +190,8 @@ def test_imaplib_wire_uses_examine_and_peek(config):
             commands.append(command)
             if command == b"CAPABILITY":
                 self.responses.append(b"* CAPABILITY IMAP4rev1\r\n")
+            elif command == b'LIST "" *':
+                self.responses.append(b'* LIST (\\Sent) "/" "&XfJT0ZAB-"\r\n')
             elif command.startswith(b"EXAMINE "):
                 self.responses.append(b"* 1 EXISTS\r\n")
             elif command == b"UID FETCH 1 (BODY.PEEK[TEXT])":
@@ -198,12 +205,45 @@ def test_imaplib_wire_uses_examine_and_peek(config):
         return WireIMAP(host, port, timeout)
 
     with connect(config, factory) as mailbox:
+        assert mailbox._examine(mailbox.sent_folder(config)) == 1
         assert mailbox.select("已发送") == 1
         assert mailbox.section(1, "TEXT") == b"abc"
     assert [command.split(b" ", 1)[0] for command in commands] == [
-        b"CAPABILITY", b"LOGIN", b"EXAMINE", b"UID",
+        b"CAPABILITY", b"LOGIN", b"LIST", b"EXAMINE", b"EXAMINE", b"UID",
     ]
-    assert commands[2].isascii() and b"&" in commands[2]
+    assert commands[3] == commands[4] == b'EXAMINE "&XfJT0ZAB-"'
+
+
+@pytest.mark.parametrize(
+    ("list_row", "discovered"),
+    [(rb'(\HasNoChildren \sEnT) "/" "&XfJT0ZAB-"', "&XfJT0ZAB-"),
+     ((rb'(\Sent) "/" {10}', b"&XfJT0ZAB-"), "&XfJT0ZAB-"),
+     (rb'(\HasNoChildren) "/" "fixture"', None)],
+)
+def test_poll_selects_sent_by_list_attribute_or_config(config, list_row, discovered):
+    fake = FakeIMAP()
+    fake.list_rows = [list_row]
+    sent = discovered or config["MAIL_SENT_FOLDER"]
+    request = mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], "合成申请")
+    fake.add(config["MAIL_FOLDER"], 1, request)
+    fake.add(sent, 2, mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], "同意",
+                           reply_to=str(request["Message-ID"])))
+
+    result = poll_once(config, lambda *_: None, factory=fake.factory,
+                       approval_judge=lambda _: ApprovalDecision.APPROVE)
+
+    assert result.delivered and result.approved
+    assert ("LIST",) in fake.calls
+    assert ("EXAMINE", f'"{sent}"') in fake.calls
+    assert fake.flags[sent] == set()
+
+
+def test_poll_requires_sent_attribute_or_config(config):
+    fake = FakeIMAP()
+    del config["MAIL_SENT_FOLDER"]
+    with pytest.raises(MailError, match="MAIL_SENT_FOLDER"):
+        poll_once(config, lambda *_: None, factory=fake.factory)
+    assert fake.calls == [("LIST",), ("SHUTDOWN",)]
 
 
 def test_poll_only_delivers_marked_request_once_and_refreshes_approval(config, caplog):
@@ -366,16 +406,20 @@ def test_poll_delivers_unapproved_when_judge_raises(config, caplog):
         ("text/html", '<div class="gmail_quote"><div>同意</div></div>', ""),
         ("text/html", "<div>OK</div><div>On a test date, fixture wrote:</div>"
          "<blockquote><blockquote>旧引文</blockquote>旧正文</blockquote><p>仍需核对</p>",
-         "OK\n\n\n\n仍需核对"),
+         None),
         ("text/plain", "同意。\n> 10 万元须另行审批", None),
         ("text/plain", "可以\n\n样例作者写道：\n> 旧正文\n>> 旧引文", "可以"),
         ("text/plain", "可以\n\n样例作者写道：\n> 旧正文\n\n> 仍需另行审批", None),
         ("text/plain", "> 同意", None),
         ("text/html", "<blockquote>同意", None),
         ("text/html", '<div>收到</div><hr><div id="DIVRPLYFWDMSG">合成引用头</div>'
-         '<div>同意</div>', "收到"),
-        ("text/html", '<div id="x_divRplyFwdMsg">合成引用头</div><p>同意</p>', ""),
+         '<div>同意</div>', None),
+        ("text/html", '<div id="x_divRplyFwdMsg">合成引用头</div><p>同意</p>', None),
         ("text/html", '<p>&gt; 边界不明</p><div id="divRplyFwdMsg"></div><p>同意</p>', None),
+        ("text/html", '<div>同意</div><hr><div id="x_divRplyFwdMsg">合成引用头</div>'
+         '<blockquote><p>旧正文</p></blockquote>', "同意"),
+        ("text/html", '<p>同意</p><div id="netease_mail_quote"><p>旧合成正文</p></div>', "同意"),
+        ("text/plain", "同意\n-----原始邮件-----\n> 旧正文", "同意"),
         ("text/html", "<p>收到</p><script>同意</script><style>同意</style>", "收到"),
     ],
 )
@@ -394,6 +438,16 @@ def test_authored_reply(kind, body, expected):
         ("plain", "同意。\n> 10 万元须另行审批"),
         ("plain", "收到\n-----原始邮件-----\n同意"),
         ("html", "<blockquote>同意</blockquote>"),
+        ("html", '<p>收到</p><div class="mail-editor-reference-message-container"><p>同意</p></div>'),
+        ("html", '<p>收到</p><div class="custom-original-fragment"><p>同意</p></div>'),
+        ("html", "<p>收到</p><reply-fragment><p>同意</p></reply-fragment>"),
+        ("html", '<p>同意</p><div data-customer-quote="1">合成旧文</div>'),
+        ("html", '<p>同意</p><hr><div id="divRplyFwdMsg">合成引用头</div>'
+         '<blockquote>旧正文</blockquote><p>超过 10 万元须另行审批</p>'
+         '<blockquote>旧正文续行</blockquote>'),
+        ("html", "<p>收到</p><div>From: 合成发件人</div><div>同意</div>"),
+        ("html", "<p>收到</p><div>发件人：合成发件人</div><div>同意</div>"),
+        ("plain", "同意\n-----原始邮件-----\n> 旧正文\n超过 10 万元须另行审批\n> 旧正文续行"),
     ],
 )
 def test_poll_does_not_submit_ambiguous_or_quoted_approval_to_judge(config, kind, body):
@@ -430,7 +484,7 @@ def test_poll_judges_only_authored_text_in_each_mime_version(config):
         "1": b"OK",
         "2.MIME": b"Content-Type: text/html; charset=utf-8\r\n\r\n",
         "2": ('<p>还需核对</p><hr><div id="divRplyFwdMsg">合成引用头</div>'
-              '<div>旧引文中的同意</div>').encode(),
+              '<blockquote>旧引文中的同意</blockquote>').encode(),
     })
     judged = []
 
@@ -508,6 +562,86 @@ def test_run_polling_delivers_after_timeout_while_judge_is_still_running(config)
     assert judged == ["同意"]
     [(body, approved, _)] = calls
     assert (body, approved) == ("合成申请", False)
+
+
+def test_poll_once_reuses_in_flight_judge_across_three_calls(config):
+    fake = FakeIMAP()
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(config["MAIL_FOLDER"], 1, request)
+    fake.add(config["MAIL_SENT_FOLDER"], 2,
+             mail(approver, marker, "同意", reply_to=str(request["Message-ID"])))
+    release, started = Event(), Event()
+    judged, results, calls = [], [], []
+    before = set(running_threads())
+
+    class Judge:
+        def evaluate(self, text):
+            judged.append(text)
+            started.set()
+            release.wait()
+            return ApprovalDecision.APPROVE
+
+    judge = Judge()
+    try:
+        for _ in range(3):
+            results.append(poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                                     approval_judge=judge.evaluate, approval_judge_timeout=0.01))
+            assert started.wait(1)
+        threads = set(running_threads()) - before
+        assert sum(thread.name == "mail-approval-judge" for thread in threads) <= 1
+        assert judged == ["同意"]
+        assert [(result.delivered, result.approved) for result in results] == [
+            (True, False), (False, False), (False, False),
+        ]
+        assert calls[0][:2] == ("合成申请", False)
+    finally:
+        release.set()
+        for thread in set(running_threads()) - before:
+            if thread.name == "mail-approval-judge":
+                thread.join(timeout=1)
+
+
+def test_poll_delivers_when_reply_has_no_body(config):
+    fake = FakeIMAP()
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    sent = config["MAIL_SENT_FOLDER"]
+    fake.add(config["MAIL_FOLDER"], 1, request)
+    fake.add(sent, 2, mail(approver, marker, "合成占位", reply_to=str(request["Message-ID"])))
+    fake.folders[sent][2]["structure"] = b'("IMAGE" "PNG" NIL NIL NIL "BASE64" 8)'
+    calls, judged = [], []
+
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                       approval_judge=judged.append)
+
+    assert result.delivered and not result.approved
+    assert calls[0][:2] == ("合成申请", False)
+    assert not judged
+    assert not fake.fetched(sent, 2, "TEXT")
+
+
+@pytest.mark.parametrize(("plain", "expected"), [("合成纯文本", "合成纯文本"), (" ", "合成 HTML")])
+def test_related_alternative_prefers_plain_and_skips_inline_image(config, plain, expected):
+    fake = FakeIMAP()
+    inbox = config["MAIL_FOLDER"]
+    fake.add(inbox, 1, mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], "合成占位"))
+    fake.folders[inbox][1].update({
+        "structure": (
+            b"((" + PLAIN.replace(b'"PLAIN"', b'"HTML"') + PLAIN + b' "ALTERNATIVE")'
+            b'("IMAGE" "PNG" NIL "<fixture-image>" NIL "BASE64" 8) "RELATED")'
+        ),
+        "1.1.MIME": b"Content-Type: text/html; charset=utf-8\r\n\r\n",
+        "1.1": '<p>合成 HTML</p><img src="cid:fixture-image">'.encode(),
+        "1.2.MIME": b"Content-Type: text/plain; charset=utf-8\r\n\r\n",
+        "1.2": plain.encode(),
+    })
+    calls = []
+
+    assert poll_once(config, lambda *args: calls.append(args), factory=fake.factory).delivered
+    assert calls[0][0] == expected
+    assert not fake.fetched(inbox, 1, "2.MIME")
+    assert not fake.fetched(inbox, 1, "2")
 
 
 def test_related_text_resources_are_not_fetched(config):

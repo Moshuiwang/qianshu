@@ -15,9 +15,14 @@ _PARSER = BytesParser(policy=policy.default)
 _MESSAGE_ID = re.compile(r"<[!-;=?-~]+>")
 _QUOTE_PREFIXES = (">", "＞")
 _ATTRIBUTION = re.compile(r"(?:On .+ wrote\s*:|.+写道\s*[:：])", re.IGNORECASE)
-_ORIGINAL_MESSAGE = re.compile(
-    r"-{2,}\s*(?:original message|forwarded message|原始邮件|转发邮件)\s*-{2,}",
+_DIVIDER = re.compile(
+    r"(?:-{4,}|(?:-{2,}\s*)?(?:original message|(?:begin )?forwarded message|原始邮件|转发邮件)"
+    r"\s*(?:-{2,}|[:：])?)",
     re.IGNORECASE,
+)
+_QUOTED_HEADER = re.compile(r"(?:from|发件人)\s*[:：]", re.IGNORECASE)
+_QUOTE_HINT = re.compile(
+    r"quot|cite|reply|rply|forward|fwd|original|reference|signature|引用|引文|原文", re.I,
 )
 
 
@@ -99,64 +104,98 @@ def _text_sections(
 
 class _HTMLText(HTMLParser):
     _BREAKS = {"br", "div", "p", "li", "tr", "td", "hr", "blockquote"}
-    _QUOTE_CLASSES = {"gmail_quote", "gmail_quote_container", "yahoo_quoted"}
+    _VOID_TAGS = {
+        "area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta",
+        "param", "source", "track", "wbr",
+    }
+    _QUOTED_CONTAINERS = {
+        "gmail_quote", "gmail_quote_container", "yahoo_quoted",
+        "netease_mail_quote", "netease-mail-quote", "divneteasemailquote",
+    }
     _OUTLOOK_SEPARATOR_IDS = {"divrplyfwdmsg", "x_divrplyfwdmsg"}
+    _AMBIGUOUS_CONTAINERS = {"mail-editor-reference-message-container", "isreplycontent"}
 
     def __init__(self, *, authored_only: bool = False) -> None:
         super().__init__(convert_charrefs=True)
-        self.segments: list[str] = []
         self.text: list[str] = []
         self.authored_only = authored_only
-        self.reply_ended = False
-        self.excluded_tag: str | None = None
-        self.excluded_depth = 0
+        self.excluded: list[str] = []
+        self.uncertain = False
+        self.structured_quote = False
+        self.tail: list[str] = []
 
     def handle_starttag(self, tag, attrs):
-        if self.reply_ended:
-            return
-        if self.excluded_tag is not None:
-            if tag == self.excluded_tag:
-                self.excluded_depth += 1
+        if self.excluded:
+            if tag not in self._VOID_TAGS:
+                self.excluded.append(tag)
             return
         if self.authored_only:
             attributes = dict(attrs)
-            if (attributes.get("id") or "").casefold() in self._OUTLOOK_SEPARATOR_IDS:
-                # Outlook 将原文放在分隔块之后，直到邮件末尾。
-                self.reply_ended = True
+            identifiers = {
+                token.casefold()
+                for name, value in attrs if name in {"id", "class"} and value
+                for token in value.split()
+            }
+            separator = (attributes.get("id") or "").casefold() in self._OUTLOOK_SEPARATOR_IDS
+            quoted = tag == "blockquote" or bool(identifiers & self._QUOTED_CONTAINERS)
+            unknown_hint = any(
+                _QUOTE_HINT.search(token)
+                for token in identifiers - self._QUOTED_CONTAINERS - self._OUTLOOK_SEPARATOR_IDS
+            ) or any(
+                _QUOTE_HINT.search(name) for name, _ in attrs if name.startswith("data-")
+            )
+            # 这些引用标记不足以确认其中的文字归属。
+            if (
+                identifiers & self._AMBIGUOUS_CONTAINERS
+                or unknown_hint
+                or ("-" in tag and _QUOTE_HINT.search(tag))
+                or tag in {"q", "cite", "iframe", "object", "template"}
+                or (tag != "blockquote" and (attributes.get("type") or "").casefold() == "cite")
+                or "hidden" in attributes
+            ):
+                self.uncertain = True
+            if separator or quoted or tag in {"script", "style"}:
+                if tag in self._VOID_TAGS:
+                    self.uncertain = True
+                    return
+                if separator:
+                    self.handle_data("\n----\n")
+                if quoted:
+                    self.handle_data("\n")
+                    self.structured_quote = True
+                self.excluded.append(tag)
                 return
-            classes = (attributes.get("class") or "").split()
-            quoted = tag == "blockquote" or not self._QUOTE_CLASSES.isdisjoint(classes)
-            if quoted:
-                text = "".join(self.text).rstrip()
-                previous, _, last_line = text.rpartition("\n")
-                self.segments.append(previous if _ATTRIBUTION.fullmatch(last_line.strip()) else text)
-                self.text.clear()
-            if quoted or tag in {"script", "style"}:
-                self.excluded_tag = tag
-                self.excluded_depth = 1
-                self.text.append("\n")
+            if tag == "hr":
+                self.handle_data("\n----\n")
                 return
         if tag in self._BREAKS:
-            self.text.append("\n")
+            self.handle_data("\n")
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+        if self.authored_only and tag not in self._VOID_TAGS:
+            # HTML 的自闭合语法无法证明非空元素已经结束。
+            self.uncertain = True
+        self.handle_endtag(tag)
 
     def handle_endtag(self, tag):
-        if self.reply_ended:
-            return
-        if self.excluded_tag is not None:
-            if tag == self.excluded_tag:
-                self.excluded_depth -= 1
-                if self.excluded_depth == 0:
-                    self.excluded_tag = None
+        if self.excluded:
+            if tag in self._VOID_TAGS:
+                return
+            if tag != self.excluded[-1]:
+                self.uncertain = True
+            else:
+                self.excluded.pop()
             return
         if tag in self._BREAKS:
-            self.text.append("\n")
+            self.handle_data("\n")
 
     def handle_data(self, text):
-        if not self.reply_ended and self.excluded_tag is None:
-            self.text.append(text)
+        if not self.excluded:
+            (self.tail if self.structured_quote else self.text).append(text)
 
     def get_text(self) -> str:
-        return "\n".join([*self.segments, "".join(self.text)])
+        return "".join(self.text)
 
 
 def _plain_text(kind: str, content: str) -> str:
@@ -201,12 +240,17 @@ def body_parts(mailbox: ReadOnlyMailbox, uid: int, raw_headers: bytes) -> tuple[
 
 
 def request_text(parts: tuple[tuple[str, str], ...]) -> str:
-    plain = [text for kind, text in parts if kind == "text/plain" and text.strip()]
-    return "\n".join(plain or [_plain_text(kind, text) for kind, text in parts]).strip()
+    # BODYSTRUCTURE 已展开 related 的根段，依次选择纯文本、HTML。
+    for preferred in ("text/plain", "text/html"):
+        body = "\n".join(_plain_text(kind, text) for kind, text in parts if kind == preferred)
+        if body.strip():
+            return body.strip()
+    return ""
 
 
 def authored_reply(kind: str, content: str) -> str | None:
     """提取本次回复文字。无法确认引文边界时返回 None。"""
+    structured_quote = False
     if kind == "text/html":
         parser = _HTMLText(authored_only=True)
         try:
@@ -214,19 +258,35 @@ def authored_reply(kind: str, content: str) -> str | None:
             parser.close()
         except (AssertionError, ValueError):
             return None
-        if parser.excluded_tag is not None:
+        if parser.excluded or parser.uncertain:
+            return None
+        tail = "".join(parser.tail).splitlines()
+        if any(line.strip() and not line.lstrip().startswith(_QUOTE_PREFIXES) for line in tail):
             return None
         content = parser.get_text()
+        structured_quote = parser.structured_quote
 
     lines = content.strip().splitlines()
     for index, line in enumerate(lines):
         stripped = line.strip()
-        if stripped.startswith(_QUOTE_PREFIXES) or _ORIGINAL_MESSAGE.fullmatch(stripped):
+        if stripped.startswith(_QUOTE_PREFIXES):
             return None
-        if _ATTRIBUTION.fullmatch(stripped):
-            # 只有引述人行后全是连续的行首引用时，才确认引文边界。
-            quoted = lines[index + 1:]
-            if quoted and all(item.lstrip().startswith(_QUOTE_PREFIXES) for item in quoted):
+        if (
+            _DIVIDER.fullmatch(stripped)
+            or _ATTRIBUTION.fullmatch(stripped)
+            or _QUOTED_HEADER.match(stripped)
+        ):
+            # 连续分隔线可来自同一个 HTML 回复头（如 hr 紧接 Outlook 回复头）。
+            for offset in range(index + 1, len(lines)):
+                item = lines[offset].strip()
+                if item and not _DIVIDER.fullmatch(item):
+                    break
+            else:
+                offset = len(lines)
+            quoted = lines[offset:]
+            if all(item.lstrip().startswith(_QUOTE_PREFIXES) for item in quoted) and (
+                quoted or structured_quote
+            ):
                 return "\n".join(lines[:index]).strip()
             return None
     return "\n".join(lines)

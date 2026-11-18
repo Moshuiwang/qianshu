@@ -11,7 +11,7 @@ from tempfile import mkdtemp
 
 from qianshu.config import ConfigError, load_config
 
-from . import _private_dir, _sent_folder
+from . import _private_dir
 from .imap import SUMMARY, MailError, ReadOnlyMailbox, connect
 from .message import body_parts, headers, is_reply, message_id
 
@@ -38,14 +38,14 @@ def export_history(
     if since >= before or not 1 <= limit <= 10 or not subject_text:
         raise MailError("请提供有效日期范围、主题关键词和样例封数。")
     inbox = config.get("MAIL_FOLDER") or "INBOX"
-    sent = _sent_folder(config)
     directory = _private_dir(config)
 
     applications = []
     replies = []
     request_ids = set()
     with connect(config, factory) as mailbox:
-        mailbox.select(sent)
+        sent = mailbox.sent_folder(config)
+        mailbox._examine(sent)
         sent_seen = mailbox.seen()
         mailbox.select(inbox)
         inbox_seen = mailbox.seen()
@@ -59,7 +59,7 @@ def export_history(
                 request_ids.add(request_id)
             if len(applications) == limit:
                 break
-        mailbox.select(sent)
+        mailbox._examine(sent)
         candidates: dict[int, set[str]] = {}
         for request_id in sorted(request_ids):
             for uid in mailbox.replies(request_id):

@@ -14,6 +14,8 @@ _BODY_QUERY = re.compile(
     re.ASCII,
 )
 _TOKEN = re.compile(rb'\s*(\(|\)|"(?:[^"\\]|\\.)*"|[^\s()"]+)')
+_LIST_ENTRY = re.compile(rb'\(([^()]*)\) (?:NIL|"(?:[^"\\]|\\["\\])") (.+)', re.IGNORECASE)
+_LIST_QUOTED_NAME = re.compile(rb'"((?:[^"\\]|\\["\\])*)"')
 
 
 class MailError(RuntimeError):
@@ -26,13 +28,13 @@ def _quoted(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _mailbox_name(value: str) -> str:
+def _encoded_mailbox_name(value: str) -> str:
     # IMAP4rev1 用 modified UTF-7 表示中文等非 ASCII 文件夹名。
     def encode(match: re.Match[str]) -> str:
         encoded = base64.b64encode(match[0].encode("utf-16-be")).decode("ascii")
         return "&" + encoded.rstrip("=").replace("/", ",") + "-"
 
-    return _quoted(re.sub(r"[^\x00-\x7f]+", encode, value.replace("&", "&-")))
+    return re.sub(r"[^\x00-\x7f]+", encode, value.replace("&", "&-"))
 
 
 def _imap_date(value: date) -> str:
@@ -41,7 +43,7 @@ def _imap_date(value: date) -> str:
 
 
 class ReadOnlyMailbox:
-    """封装已认证连接，只开放 EXAMINE 和受限的 UID 读取。"""
+    """封装已认证连接，只开放 LIST、EXAMINE 和受限的 UID 读取。"""
 
     def __init__(self, connection: imaplib.IMAP4) -> None:
         self._connection = connection
@@ -59,10 +61,49 @@ class ReadOnlyMailbox:
     def select(self, folder: str, *, readonly: bool = True) -> int:
         if readonly is not True:
             raise MailError("拒绝以可写方式打开邮箱文件夹。")
-        data = self._checked(self._connection.select, _mailbox_name(folder), readonly=True)
+        return self._examine(_encoded_mailbox_name(folder))
+
+    def _examine(self, encoded_folder: str) -> int:
+        data = self._checked(self._connection.select, _quoted(encoded_folder), readonly=True)
         if not data or not isinstance(data[0], bytes) or not data[0].isdigit():
             raise MailError("IMAP 文件夹计数无效。")
         return int(data[0])
+
+    def sent_folder(self, config: Mapping[str, str]) -> str:
+        """返回已发送文件夹的 IMAP 编码名称。"""
+        names = set()
+        for row in self._checked(self._connection.list):
+            if row in (None, b""):
+                continue
+            prefix = row[0].rstrip() if isinstance(row, tuple) else row
+            entry = _LIST_ENTRY.fullmatch(prefix)
+            if entry is None:
+                raise MailError("IMAP 返回了无法解析的文件夹列表。")
+            flags = entry[1].lower().split()
+            if rb"\sent" not in flags:
+                continue
+            name = entry[2]
+            if isinstance(row, tuple) and re.fullmatch(rb"\{[0-9]+\}", name):
+                name = row[1]
+            elif quoted := _LIST_QUOTED_NAME.fullmatch(name):
+                name = re.sub(rb'\\(["\\])', rb'\1', quoted[1])
+            elif not re.fullmatch(rb'[^\s(){%*"\\]+', name):
+                raise MailError("IMAP 返回的已发送文件夹名称无效。")
+            if not name or not name.isascii():
+                raise MailError("IMAP 返回的已发送文件夹名称无效。")
+            names.add(name.decode("ascii"))
+        if len(names) > 1:
+            raise MailError("IMAP 返回了多个带 \\Sent 属性的文件夹。")
+        folder = next(iter(names), None)
+        if folder is None:
+            fallback = config.get("MAIL_SENT_FOLDER", "")
+            if not fallback.strip():
+                raise MailError("IMAP 未返回带 \\Sent 属性的文件夹，请配置 MAIL_SENT_FOLDER。")
+            folder = _encoded_mailbox_name(fallback)
+        inbox = _encoded_mailbox_name(config.get("MAIL_FOLDER") or "INBOX")
+        if folder.casefold() == inbox.casefold():
+            raise MailError("已发送文件夹须与收件箱独立。")
+        return folder
 
     def _read_uid(self, command: str, *args: str) -> list:
         if any("\r" in arg or "\n" in arg or "\x00" in arg for arg in args):

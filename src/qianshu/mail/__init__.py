@@ -15,6 +15,7 @@ from hashlib import sha256
 from pathlib import Path
 from threading import TIMEOUT_MAX, Event, Lock, Thread
 from time import monotonic
+from types import MethodType
 
 from .imap import SUMMARY, MailError, ReadOnlyMailbox, connect
 from .message import authored_reply, body_parts, headers, is_reply, message_id, request_text, sender
@@ -22,6 +23,8 @@ from .message import authored_reply, body_parts, headers, is_reply, message_id, 
 _LOG = logging.getLogger(__name__)
 _PACKAGE_SOURCE_DIR = Path(__file__).resolve().parents[2]
 _DEFAULT_APPROVAL_TIMEOUT = 5.0
+_APPROVAL_TASK_LOCK = Lock()
+_ACTIVE_APPROVAL_TASKS: set[tuple[int, ...]] = set()
 
 
 @dataclass(frozen=True)
@@ -74,13 +77,6 @@ def _fingerprint(*values: str | bytes) -> str:
     return digest.hexdigest()
 
 
-def _sent_folder(config: Mapping[str, str]) -> str:
-    folder = config.get("MAIL_SENT_FOLDER", "")
-    if not folder.strip() or folder.casefold() == (config.get("MAIL_FOLDER") or "INBOX").casefold():
-        raise MailError("请配置独立的已发送文件夹。")
-    return folder
-
-
 def _bounded_approval(
     judge: ApprovalJudge | None, timeout: float,
 ) -> Callable[[list[str]], bool] | None:
@@ -88,14 +84,21 @@ def _bounded_approval(
         return None
     if not 0 < timeout <= TIMEOUT_MAX:
         raise ValueError("审批判断超时须为有效的正秒数。")
-    active = Lock()
+    # 每次访问实例方法都可能得到一个新的绑定方法对象。
+    key = (id(judge.__self__), id(judge.__func__)) if isinstance(judge, MethodType) else (id(judge),)
+
+    def release() -> None:
+        with _APPROVAL_TASK_LOCK:
+            _ACTIVE_APPROVAL_TASKS.remove(key)
 
     def check(texts: list[str]) -> bool:
         # 超时后若判断器仍在运行，后续轮询直接按不确定处理。
-        if not active.acquire(blocking=False):
-            return False
         result: Future[bool] = Future()
         expired = Event()
+        with _APPROVAL_TASK_LOCK:
+            if key in _ACTIVE_APPROVAL_TASKS:
+                return False
+            _ACTIVE_APPROVAL_TASKS.add(key)
 
         def evaluate() -> None:
             try:
@@ -107,13 +110,13 @@ def _bounded_approval(
                 # 后台线程的异常也按不确定处理，避免异常文本进入日志。
                 approved = False
             finally:
-                active.release()
+                release()
             result.set_result(approved)
 
         try:
-            Thread(target=evaluate, daemon=True).start()
+            Thread(target=evaluate, name="mail-approval-judge", daemon=True).start()
         except RuntimeError:
-            active.release()
+            release()
             return False
         try:
             return result.result(timeout=timeout)
@@ -130,13 +133,16 @@ def _approval(
 ) -> bool:
     if request_id is None or check is None:
         return False
-    mailbox.select(folder)
+    mailbox._examine(folder)
     texts = []
     for uid in mailbox.replies(request_id):
         summary = headers(mailbox.section(uid, SUMMARY))
         if sender(summary).casefold() == approver and is_reply(summary, request_id):
-            raw_headers = mailbox.section(uid, "HEADER")
-            parts = body_parts(mailbox, uid, raw_headers)
+            try:
+                raw_headers = mailbox.section(uid, "HEADER")
+                parts = body_parts(mailbox, uid, raw_headers)
+            except MailError:
+                return False
             authored = dict.fromkeys(authored_reply(kind, content) for kind, content in parts)
             if not authored or None in authored or "" in authored:
                 return False
@@ -180,9 +186,9 @@ def _poll_once(
     if not approver or not re.fullmatch(r"[A-Za-z0-9_-]+", marker):
         raise MailError("请配置产品负责人邮箱和一次性测试标记。")
     inbox = config.get("MAIL_FOLDER") or "INBOX"
-    sent = _sent_folder(config)
 
     with connect(config, factory) as mailbox:
+        sent = mailbox.sent_folder(config)
         scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"], inbox, marker)
         total = mailbox.select(inbox)
         matches = []
