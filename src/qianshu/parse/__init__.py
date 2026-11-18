@@ -25,10 +25,15 @@ _LISTS = {"user_tags", "approval_attachments"}
 _DATES = {"start_date", "end_date"}
 _OPTIONS = {"policy_type", "benefit_type"}
 _MUTEX = "maintain_mutual_exclusion_group"
+_MUTEX_NO_HINT = "申请要求不维护互斥组，需人工确认"
+_BOUNDARY_HINT = "段落边界无法确定，需人工确认"
+_MUTEX_NEGATIVE = r"不需要|不需|无需|不用"
 _MUTEX_ANSWER = re.compile(
-    r"(?:是否(?:需要)?|需不需要|需要)?(?:维护)?互斥组\s*[:：=]\s*([是否])(?=$|\s|[（(.])"
+    r"(?:是否(?:需要)?|需不需要|需要)?(?:维护)?互斥组\s*[:：=]\s*"
+    rf"(是|否|(?:{_MUTEX_NEGATIVE})(?:\s*维护(?:\s*互斥组)?)?|不\s*维护(?:\s*互斥组)?)"
+    r"(?=$|\s|[（(.])"
 )
-_MUTEX_NO = re.compile(r"(?:不需要|不需|无需|不用|不)维护互斥组")
+_MUTEX_NO = re.compile(rf"(?:{_MUTEX_NEGATIVE}|不)\s*维护\s*互斥组")
 _MUTEX_YES = re.compile(r"(?:需要|需|须|必须)维护互斥组")
 _MUTEX_BREAKS = "。；;，,！!？?\r\n"
 _DATE_LABELS = {
@@ -79,7 +84,15 @@ class ParsedPolicyDraft(PolicyDraft):
     @property
     def hints(self) -> list[str]:
         mutex = self.maintain_mutual_exclusion_group
-        return ["互斥组按默认填是"] if mutex.value == "是" and not mutex.evidence else []
+        if mutex.value == "是" and not mutex.evidence:
+            return ["互斥组按默认填是"]
+        hints = []
+        if mutex.uncertainty is not None:
+            if mutex.uncertainty.reason == _BOUNDARY_HINT:
+                hints.append(_BOUNDARY_HINT)
+            if any(candidate.value == "否" for candidate in mutex.uncertainty.candidates):
+                hints.append(_MUTEX_NO_HINT)
+        return hints
 
     def to_dict(self) -> dict[str, object]:
         return {**super().to_dict(), "hints": self.hints}
@@ -214,9 +227,6 @@ def _validate_mutex_shape(raw: dict) -> None:
 
 
 def _mutex(body: str, scope: Scope) -> DraftField:
-    if scope.local is None:
-        return DraftField(uncertainty=Uncertainty(reason="无法唯一定位政策段落以核对互斥组。"))
-
     answers: dict[str, list[SourceExcerpt]] = {}
     excerpts: dict[tuple[int, int], SourceExcerpt] = {}
     unresolved = False
@@ -228,7 +238,7 @@ def _mutex(body: str, scope: Scope) -> DraftField:
                 continue
             statement = without_list_prefix(without_batch_intro(without_list_prefix(clause))).strip()
             if answer := _MUTEX_ANSWER.match(statement):
-                value = answer[1]
+                value = "是" if answer[1] == "是" else "否"
             elif answer := _MUTEX_NO.match(statement):
                 value = "否"
             elif answer := _MUTEX_YES.match(statement):
@@ -239,39 +249,49 @@ def _mutex(body: str, scope: Scope) -> DraftField:
             end += left
             bare = answer is not None and answer[0] == statement.removesuffix(".").rstrip()
             limit = right if (left, right) == scope.local else len(body)
-            supplement = _mutex_supplement(body[end:limit]) if value == "否" and bare else 0
+            supplement = _mutex_supplement(body[end:limit]) if value == "否" else 0
             clause = body[start:end + supplement].rstrip()
             excerpt = excerpts.setdefault((start, start + len(clause)), SourceExcerpt(text=clause, start=start))
-            unresolved |= not bare or bool(supplement)
+            unresolved |= not bare
             if value is not None:
                 evidence = answers.setdefault(value, [])
                 if excerpt not in evidence:
                     evidence.append(excerpt)
 
-    if not answers and not unresolved:
-        return DraftField(value="是")
-    if len(answers) == 1 and not unresolved:
-        value, evidence = next(iter(answers.items()))
-        return DraftField(value=value, evidence=evidence)
+    if not scope.boundary_uncertain and not unresolved:
+        if not answers:
+            return DraftField(value="是")
+        if answers.keys() == {"是"}:
+            return DraftField(value="是", evidence=answers["是"])
     return DraftField(
         evidence=list(excerpts.values()),
         uncertainty=Uncertainty(
-            reason="原文对互斥组的说明有保留、存在矛盾或无法确认。",
+            reason=_BOUNDARY_HINT if scope.boundary_uncertain else (
+                _MUTEX_NO_HINT if "否" in answers else "原文对互斥组的说明有保留、存在矛盾或无法确认。"
+            ),
             candidates=[Candidate(value=value, evidence=evidence) for value, evidence in answers.items()],
         ),
     )
 
 
 def _mutex_supplement(tail: str) -> int:
-    """保留紧接否定答复的逗号说明或独立括注。"""
-    prefix = re.match(r"(?:[。；;.!！?？]?\s*(?=[（(])|[，,][ \t]*)", tail)
+    """保留紧接否定答复的问号、同一行补充说明或独立括注。"""
+    prefix = re.match(r"(?:[。；;.!！?？]?\s*(?=[（(])|[，,；;][ \t]*)", tail)
     if prefix is None:
-        return 0
+        return int(tail.startswith(("?", "？")))
     rest = tail[prefix.end():]
     if without_list_prefix(rest) != rest:
         return 0
     span = next(clause_spans(rest, punctuation="。；;！!？?\r\n"), None)
-    return prefix.end() + span[1] if span and span[0] == 0 else 0
+    if span is None or span[0] != 0:
+        return 0
+    end = span[1]
+    if tail.startswith(("；", ";")):
+        if re.match(r"[^，,（(]*[:：=]", rest[:end]) or "互斥组" in rest[:end]:
+            return 0
+        if rest[end:end + 1] in ("。", "！", "!", "？", "?"):
+            end += 1
+    return prefix.end() + end
 
 
 def _evidence(body: str, scope: Scope, quotes: object) -> tuple[list[SourceExcerpt], bool]:
@@ -308,7 +328,9 @@ def _draft_field(name: str, *, raw: dict, body: str, scope: Scope, options: dict
             if candidate not in candidates:
                 candidates.append(candidate)
 
-    if name in _PENDING:
+    if scope.boundary_uncertain:
+        reason = _BOUNDARY_HINT
+    elif name in _PENDING:
         reason = "取值规则待确认。"
     elif proposed:
         reason = "申请存在待确认的候选值。"

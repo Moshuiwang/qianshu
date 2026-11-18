@@ -9,7 +9,9 @@ from qianshu.draft import SourceExcerpt
 type Span = tuple[int, int]
 
 _ITEM = re.compile(r"^[ \t]*(?:[①-⑳]|\d{1,3}[、)）]|\d{1,3}[.．](?!\d)|[（(]\d{1,3}[)）])[ \t]*")
-_BULLET = re.compile(r"^[ \t]*[-*•][ \t]+")
+_BULLET = re.compile(r"^[ \t]*[-+*•][ \t]+")
+_TITLE_PREFIX = re.compile(r"^(?:#{1,6}(?=[ \t]|$)|>+|第[一二三四五六七八九十百\d]+[条项节章])\s*")
+_TITLE_WRAPPER = re.compile(r"^(?:(\*\*|__)(.+?)\1|【([^】]+)】)\s*[:：]?\s*$")
 _COMPANY = re.compile(r"^\s*(?:(?:申请|适用)公司(?:名称)?|公司(?:名称)?)\s*[:：]\s*")
 _COMPANY_HEADING = re.compile(
     r"^\s*[\w&· -]{1,40}?公司(?:[甲乙丙丁戊己庚辛壬癸\da-zA-Z]+)?"
@@ -19,7 +21,7 @@ _COMPANY_APPLICATION = re.compile(r"^\s*的?(?:定向|通用)?政策(?:申请|[�
 _NUMBERED_FIELD = re.compile(
     r"^(?:(?:申请|政策|活动)?(?:开始|起始|结束|终止|截止)(?:日期|时间|日)|"
     r"(?:(?:application|policy|campaign)\s+)?(?:start|end)\s+date)\s*(?=[:：\d])|"
-    r"^(?:用户标签|用户范围|优惠政策名称|优惠类型|政策类型|审批件附件|"
+    r"^(?:用户标签|用户范围|优惠政策名称|优惠类型|政策类型|审批件附件|当前节目包|"
     r"是否只触发一次|只触发一次|多买多送|生效倍数|降包用户取消优惠|充值天数|赠送天数)"
     r"\s*[:：]|"
     r"^(?:(?:是否(?:需要)?|需不需要|需要|无需|不需要|不需|不用|不)?(?:维护)?互斥组)",
@@ -43,6 +45,7 @@ _BATCH_ARCHIVE = re.compile(r"^\s*(?:本批(?:次)?|全批)(?:的)?(?:存档|归
 class Scope:
     local: Span | None
     shared: tuple[Span, ...]
+    boundary_uncertain: bool = False
 
     def spans(self) -> tuple[Span, ...]:
         return self.shared if self.local is None else (self.local, *self.shared)
@@ -71,6 +74,7 @@ class Heading:
     text: str
     company: str | None
     numbered: bool
+    prefixed: bool
 
 
 def policy_scopes(body: str, companies: list[tuple[str | None, list[str]]]) -> list[Scope]:
@@ -84,9 +88,23 @@ def policy_scopes(body: str, companies: list[tuple[str | None, list[str]]]) -> l
     }
     if not headings:
         local = (0, len(body)) if len(companies) == 1 and len(batch_companies) <= 1 else None
-        return [Scope(local, shared) for _ in companies]
+        return [Scope(local, shared, boundary_uncertain=local is None) for _ in companies]
 
     ends = [heading.start for heading in headings[1:]] + [len(body)]
+    uncertain_starts = set()
+    for index, (heading, end) in enumerate(zip(headings, ends, strict=True)):
+        # 共用公司下的编号标题须有对应草稿引用，才能与编号字段区分。
+        if not heading.prefixed and (not heading.numbered or heading.company is not None):
+            continue
+        if not heading.prefixed and len(companies) > 1 and any(
+            batch_companies == {company} and _quotes_heading(body, heading, end, quotes)
+            for company, quotes in companies
+        ):
+            continue
+        uncertain_starts.add(heading.start)
+        if index:
+            uncertain_starts.add(headings[index - 1].start)
+
     matches = []
     for company, quotes in companies:
         locations = [
@@ -105,7 +123,11 @@ def policy_scopes(body: str, companies: list[tuple[str | None, list[str]]]) -> l
                 if _quotes_heading(body, heading, end, quotes)
             ]
         matches.append((locations[0][0].start, locations[0][1]) if len(locations) == 1 else None)
-    return [Scope(span if matches.count(span) == 1 else None, shared) for span in matches]
+    scopes = []
+    for span in matches:
+        local = span if matches.count(span) == 1 else None
+        scopes.append(Scope(local, shared, boundary_uncertain=local is None or local[0] in uncertain_starts))
+    return scopes
 
 
 def _headings(body: str, company_names: set[str]) -> list[Heading]:
@@ -113,16 +135,28 @@ def _headings(body: str, company_names: set[str]) -> list[Heading]:
     for line in re.finditer(r"[^\r\n]+", body):
         if _SHARED.match(line[0]):
             continue
-        item = _ITEM.match(line[0])
-        content = line[0][item.end():] if item else line[0].lstrip()
+        bullet = _BULLET.match(line[0])
+        content = line[0][bullet.end():] if bullet else line[0].lstrip()
+        item = _ITEM.match(content)
+        if item:
+            content = content[item.end():]
+        prefix = _TITLE_PREFIX.match(content)
+        wrapper = _TITLE_WRAPPER.fullmatch(content)
+        if prefix:
+            content = content[prefix.end():].lstrip("：:、.． \t")
+        elif wrapper:
+            content = wrapper[2] or wrapper[3]
+        prefixed = prefix is not None or wrapper is not None
         company_label = _COMPANY.match(content)
         name_text = content[company_label.end():] if company_label else content
         if company_label or _COMPANY_HEADING.match(content) or any(
             _starts_with_company(content, name) for name in company_names
         ):
-            heading = Heading(line.start(), content, _company_name(name_text, company_names), bool(item))
-        elif item and not _NUMBERED_FIELD.match(content):
-            heading = Heading(line.start(), content, None, True)
+            heading = Heading(
+                line.start(), content, _company_name(name_text, company_names), bool(item), prefixed or bool(bullet),
+            )
+        elif prefixed or (item and not _NUMBERED_FIELD.match(content)):
+            heading = Heading(line.start(), content, None, bool(item), prefixed)
         else:
             continue
         headings.append(heading)
@@ -133,6 +167,7 @@ def _headings(body: str, company_names: set[str]) -> list[Heading]:
         and not headings[0].numbered
         and re.search(r"政策申请\s*[:：]\s*$", headings[0].text)
         and headings[1].numbered
+        and not headings[1].prefixed
         and _NUMBERED_DEAL.fullmatch(headings[1].text.rstrip())
         and any(
             _NUMBERED_FIELD.match(line[item.end():])
