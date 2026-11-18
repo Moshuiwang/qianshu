@@ -7,12 +7,13 @@ import re
 import sqlite3
 import stat
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from contextlib import closing
 from dataclasses import dataclass
 from enum import Enum
 from hashlib import sha256
 from pathlib import Path
-from threading import Event
+from threading import TIMEOUT_MAX, Event, Lock, Thread
 from time import monotonic
 
 from .imap import SUMMARY, MailError, ReadOnlyMailbox, connect
@@ -20,6 +21,7 @@ from .message import authored_reply, body_parts, headers, is_reply, message_id, 
 
 _LOG = logging.getLogger(__name__)
 _PACKAGE_SOURCE_DIR = Path(__file__).resolve().parents[2]
+_DEFAULT_APPROVAL_TIMEOUT = 5.0
 
 
 @dataclass(frozen=True)
@@ -79,30 +81,67 @@ def _sent_folder(config: Mapping[str, str]) -> str:
     return folder
 
 
-def _reply_approved(parts: tuple[tuple[str, str], ...], judge: ApprovalJudge) -> bool:
-    texts = dict.fromkeys(authored_reply(kind, content) for kind, content in parts)
-    if not texts or None in texts or "" in texts:
-        return False
-    try:
-        return all(judge(text) is ApprovalDecision.APPROVE for text in texts if text is not None)
-    except Exception:
-        return False
+def _bounded_approval(
+    judge: ApprovalJudge | None, timeout: float,
+) -> Callable[[list[str]], bool] | None:
+    if judge is None:
+        return None
+    if not 0 < timeout <= TIMEOUT_MAX:
+        raise ValueError("审批判断超时须为有效的正秒数。")
+    active = Lock()
+
+    def check(texts: list[str]) -> bool:
+        # 超时后若判断器仍在运行，后续轮询直接按不确定处理。
+        if not active.acquire(blocking=False):
+            return False
+        result: Future[bool] = Future()
+        expired = Event()
+
+        def evaluate() -> None:
+            try:
+                approved = all(
+                    not expired.is_set() and judge(text) is ApprovalDecision.APPROVE
+                    for text in texts
+                )
+            except BaseException:
+                # 后台线程的异常也按不确定处理，避免异常文本进入日志。
+                approved = False
+            finally:
+                active.release()
+            result.set_result(approved)
+
+        try:
+            Thread(target=evaluate, daemon=True).start()
+        except RuntimeError:
+            active.release()
+            return False
+        try:
+            return result.result(timeout=timeout)
+        except TimeoutError:
+            expired.set()
+            return False
+
+    return check
 
 
 def _approval(
     mailbox: ReadOnlyMailbox, folder: str, request_id: str | None, approver: str,
-    judge: ApprovalJudge | None,
+    check: Callable[[list[str]], bool] | None,
 ) -> bool:
-    if request_id is None or judge is None:
+    if request_id is None or check is None:
         return False
     mailbox.select(folder)
-    decisions = []
+    texts = []
     for uid in mailbox.replies(request_id):
         summary = headers(mailbox.section(uid, SUMMARY))
         if sender(summary).casefold() == approver and is_reply(summary, request_id):
             raw_headers = mailbox.section(uid, "HEADER")
-            decisions.append(_reply_approved(body_parts(mailbox, uid, raw_headers), judge))
-    return bool(decisions) and all(decisions)
+            parts = body_parts(mailbox, uid, raw_headers)
+            authored = dict.fromkeys(authored_reply(kind, content) for kind, content in parts)
+            if not authored or None in authored or "" in authored:
+                return False
+            texts.extend(text for text in authored if text is not None)
+    return bool(texts) and check(texts)
 
 
 def _open_ledger(config: Mapping[str, str]) -> sqlite3.Connection:
@@ -124,8 +163,18 @@ def poll_once(
     *,
     factory: Callable = imaplib.IMAP4_SSL,
     approval_judge: ApprovalJudge | None = None,
+    approval_judge_timeout: float = _DEFAULT_APPROVAL_TIMEOUT,
 ) -> PollResult:
     """处理单封 X7 邮件。回调接收正文、当前审批结果和去重指纹。"""
+    return _poll_once(config, process, factory, _bounded_approval(approval_judge, approval_judge_timeout))
+
+
+def _poll_once(
+    config: Mapping[str, str],
+    process: Callable[[str, bool, str], None],
+    factory: Callable,
+    check_approval: Callable[[list[str]], bool] | None,
+) -> PollResult:
     marker = config.get("MAIL_TEST_MARKER", "")
     approver = config.get("MAIL_APPROVER", "").strip().casefold()
     if not approver or not re.fullmatch(r"[A-Za-z0-9_-]+", marker):
@@ -141,7 +190,13 @@ def poll_once(
             raw = mailbox.section(uid, SUMMARY)
             summary = headers(raw)
             subjects = summary.get_all("Subject", [])
-            if sender(summary).casefold() == approver and len(subjects) == 1 and marker in str(subjects[0]):
+            if (
+                sender(summary).casefold() == approver
+                and len(subjects) == 1
+                and marker in str(subjects[0])
+                and "In-Reply-To" not in summary
+                and "References" not in summary
+            ):
                 matches.append((uid, summary, _fingerprint(scope, str(uid), raw)))
         if not matches:
             _LOG.info("mail_poll total=%d matched=0 delivered=0", total)
@@ -157,13 +212,6 @@ def poll_once(
                     binding = ledger.execute(
                         "SELECT fingerprint, delivered FROM delivery WHERE scope = ?", (scope,)
                     ).fetchone()
-                    if binding is not None:
-                        stored, _ = binding
-                        bound_id = next((message_id(summary) for _, summary, fingerprint in matches
-                                         if fingerprint == stored), None)
-                        if bound_id is not None:
-                            matches = [match for match in matches
-                                       if match[2] == stored or not is_reply(match[1], bound_id)]
                     if len(matches) != 1:
                         _LOG.info("mail_poll total=%d matched=%d delivered=0", total, len(matches))
                         return PollResult(total, len(matches))
@@ -185,7 +233,7 @@ def poll_once(
                         body = request_text(body_parts(mailbox, uid, raw_headers))
                         if not body:
                             raise MailError("测试邮件没有可处理的正文。")
-                    approved = _approval(mailbox, sent, message_id(summary), approver, approval_judge)
+                    approved = _approval(mailbox, sent, message_id(summary), approver, check_approval)
                     if not delivered:
                         try:
                             process(body, approved, fingerprint)
@@ -208,14 +256,16 @@ def run_polling(
     clock: Callable[[], float] = monotonic,
     wait: Callable[[float], bool] | None = None,
     approval_judge: ApprovalJudge | None = None,
+    approval_judge_timeout: float = _DEFAULT_APPROVAL_TIMEOUT,
     on_result: Callable[[PollResult], None] | None = None,
 ) -> None:
     """立即轮询，每轮结束后等待 60 秒。wait 超时返回 False，收到停止信号返回 True。"""
     if wait is None:
         wait = stop.wait
+    check_approval = _bounded_approval(approval_judge, approval_judge_timeout)
     while not stop.is_set():
         try:
-            result = poll_once(config, process, factory=factory, approval_judge=approval_judge)
+            result = _poll_once(config, process, factory, check_approval)
         except MailError:
             _LOG.warning("mail_poll_failed count=1")
         else:

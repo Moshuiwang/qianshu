@@ -100,22 +100,31 @@ def _text_sections(
 class _HTMLText(HTMLParser):
     _BREAKS = {"br", "div", "p", "li", "tr", "td", "hr", "blockquote"}
     _QUOTE_CLASSES = {"gmail_quote", "gmail_quote_container", "yahoo_quoted"}
+    _OUTLOOK_SEPARATOR_IDS = {"divrplyfwdmsg", "x_divrplyfwdmsg"}
 
     def __init__(self, *, authored_only: bool = False) -> None:
         super().__init__(convert_charrefs=True)
         self.segments: list[str] = []
         self.text: list[str] = []
         self.authored_only = authored_only
+        self.reply_ended = False
         self.excluded_tag: str | None = None
         self.excluded_depth = 0
 
     def handle_starttag(self, tag, attrs):
+        if self.reply_ended:
+            return
         if self.excluded_tag is not None:
             if tag == self.excluded_tag:
                 self.excluded_depth += 1
             return
         if self.authored_only:
-            classes = (dict(attrs).get("class") or "").split()
+            attributes = dict(attrs)
+            if (attributes.get("id") or "").casefold() in self._OUTLOOK_SEPARATOR_IDS:
+                # Outlook 将原文放在分隔块之后，直到邮件末尾。
+                self.reply_ended = True
+                return
+            classes = (attributes.get("class") or "").split()
             quoted = tag == "blockquote" or not self._QUOTE_CLASSES.isdisjoint(classes)
             if quoted:
                 text = "".join(self.text).rstrip()
@@ -131,6 +140,8 @@ class _HTMLText(HTMLParser):
             self.text.append("\n")
 
     def handle_endtag(self, tag):
+        if self.reply_ended:
+            return
         if self.excluded_tag is not None:
             if tag == self.excluded_tag:
                 self.excluded_depth -= 1
@@ -141,7 +152,7 @@ class _HTMLText(HTMLParser):
             self.text.append("\n")
 
     def handle_data(self, text):
-        if self.excluded_tag is None:
+        if not self.reply_ended and self.excluded_tag is None:
             self.text.append(text)
 
     def get_text(self) -> str:

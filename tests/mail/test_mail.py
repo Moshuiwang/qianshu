@@ -280,6 +280,30 @@ def test_poll_rejects_ambiguous_marker_and_prevents_rebinding(config):
     assert poll_once(config, lambda *_: None, factory=fake.factory).delivered
 
 
+@pytest.mark.parametrize("reply_header", ["reply_to", "references"])
+def test_poll_delivers_original_when_self_reply_arrived_before_first_poll(config, reply_header):
+    fake = FakeIMAP()
+    inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
+    config["MAIL_APPROVER"] = config["MAIL_USER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    reply = mail(approver, f"Re: {marker}", "同意",
+                 **{reply_header: str(request["Message-ID"])})
+    fake.add(inbox, 1, request)
+    fake.add(inbox, 2, reply)
+    fake.add(sent, 3, reply)
+    calls = []
+
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                       approval_judge=lambda _: ApprovalDecision.APPROVE)
+
+    assert (result.total, result.matched, result.delivered, result.approved) == (2, 1, True, True)
+    [(body, approved, _)] = calls
+    assert (body, approved) == ("合成申请", True)
+    assert fake.fetched(inbox, 2, SUMMARY)
+    assert not fake.fetched(inbox, 2, "HEADER")
+
+
 @pytest.mark.parametrize(
     ("body", "decision", "approved"),
     [
@@ -314,6 +338,27 @@ def test_poll_uses_only_the_injected_approval_decision(config, body, decision, a
     assert judged == ([] if decision is None else [body])
 
 
+def test_poll_delivers_unapproved_when_judge_raises(config, caplog):
+    fake = FakeIMAP()
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(config["MAIL_FOLDER"], 1, request)
+    fake.add(config["MAIL_SENT_FOLDER"], 2,
+             mail(approver, marker, "同意", reply_to=str(request["Message-ID"])))
+    calls = []
+
+    def judge(_):
+        raise ValueError("合成异常内容")
+
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                       approval_judge=judge)
+
+    assert result.delivered and not result.approved
+    [(body, approved, _)] = calls
+    assert (body, approved) == ("合成申请", False)
+    assert "合成异常内容" not in caplog.text
+
+
 @pytest.mark.parametrize(
     ("kind", "body", "expected"),
     [
@@ -327,6 +372,11 @@ def test_poll_uses_only_the_injected_approval_decision(config, body, decision, a
         ("text/plain", "可以\n\n样例作者写道：\n> 旧正文\n\n> 仍需另行审批", None),
         ("text/plain", "> 同意", None),
         ("text/html", "<blockquote>同意", None),
+        ("text/html", '<div>收到</div><hr><div id="DIVRPLYFWDMSG">合成引用头</div>'
+         '<div>同意</div>', "收到"),
+        ("text/html", '<div id="x_divRplyFwdMsg">合成引用头</div><p>同意</p>', ""),
+        ("text/html", '<p>&gt; 边界不明</p><div id="divRplyFwdMsg"></div><p>同意</p>', None),
+        ("text/html", "<p>收到</p><script>同意</script><style>同意</style>", "收到"),
     ],
 )
 def test_authored_reply(kind, body, expected):
@@ -342,6 +392,7 @@ def test_authored_reply(kind, body, expected):
     ("kind", "body"),
     [
         ("plain", "同意。\n> 10 万元须另行审批"),
+        ("plain", "收到\n-----原始邮件-----\n同意"),
         ("html", "<blockquote>同意</blockquote>"),
     ],
 )
@@ -356,10 +407,15 @@ def test_poll_does_not_submit_ambiguous_or_quoted_approval_to_judge(config, kind
     if kind == "html":
         fake.folders[config["MAIL_SENT_FOLDER"]][2]["structure"] = PLAIN.replace(b'"PLAIN"', b'"HTML"')
 
-    def judge(_):
-        pytest.fail("不应把引文或边界不明的文字交给判断器")
+    judged = []
 
-    assert not poll_once(config, lambda *_: None, factory=fake.factory, approval_judge=judge).approved
+    def judge(text):
+        judged.append(text)
+        return ApprovalDecision.APPROVE
+
+    result = poll_once(config, lambda *_: None, factory=fake.factory, approval_judge=judge)
+    assert result.delivered and not result.approved
+    assert not judged
 
 
 def test_poll_judges_only_authored_text_in_each_mime_version(config):
@@ -373,7 +429,8 @@ def test_poll_judges_only_authored_text_in_each_mime_version(config):
         "structure": b"(" + PLAIN + PLAIN.replace(b'"PLAIN"', b'"HTML"') + b' "ALTERNATIVE")',
         "1": b"OK",
         "2.MIME": b"Content-Type: text/html; charset=utf-8\r\n\r\n",
-        "2": "<p>还需核对</p><blockquote>旧引文中的同意</blockquote>".encode(),
+        "2": ('<p>还需核对</p><hr><div id="divRplyFwdMsg">合成引用头</div>'
+              '<div>旧引文中的同意</div>').encode(),
     })
     judged = []
 
@@ -407,6 +464,50 @@ def test_poll_verifies_reply_sender_and_requires_all_approver_replies(config, se
     assert result.approved is (second_decision is ApprovalDecision.APPROVE)
     assert judged == ["OK", "后续回复"]
     assert not fake.fetched(sent, 2, "HEADER")
+
+
+def test_run_polling_delivers_after_timeout_while_judge_is_still_running(config):
+    fake = FakeIMAP()
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(config["MAIL_FOLDER"], 1, request)
+    fake.add(config["MAIL_SENT_FOLDER"], 2,
+             mail(approver, marker, "同意", reply_to=str(request["Message-ID"])))
+    stop, started, release, finished = Event(), Event(), Event(), Event()
+    calls, results, judged = [], [], []
+    now = 0.0
+
+    def judge(text):
+        judged.append(text)
+        started.set()
+        release.wait(5)
+        finished.set()
+        return ApprovalDecision.APPROVE
+
+    def on_result(result):
+        results.append(result)
+        assert started.wait(1) and not finished.is_set()
+        if len(results) == 2:
+            stop.set()
+
+    def wait(seconds):
+        nonlocal now
+        now += seconds
+        return False
+
+    try:
+        run_polling(config, lambda *args: calls.append(args), stop, factory=fake.factory,
+                    clock=lambda: now, wait=wait, on_result=on_result,
+                    approval_judge=judge, approval_judge_timeout=0.01)
+    finally:
+        release.set()
+        if started.is_set():
+            assert finished.wait(1)
+
+    assert [(result.delivered, result.approved) for result in results] == [(True, False), (False, False)]
+    assert judged == ["同意"]
+    [(body, approved, _)] = calls
+    assert (body, approved) == ("合成申请", False)
 
 
 def test_related_text_resources_are_not_fetched(config):
