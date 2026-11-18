@@ -1,31 +1,52 @@
 """工作区外的私有 SQLite 状态。"""
 
 import hashlib
+import math
 import sqlite3
+import time
+from collections.abc import Callable
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 
 from .settings import Settings
 
 
 class State:
-    def __init__(self, path: Path, settings: Settings):
+    def __init__(self, path: Path, settings: Settings, *, busy_timeout: float = 5):
         self.path = path
         self.scope = hashlib.sha256(
             f"{settings.app_id}\0{settings.chat_id}".encode()
         ).hexdigest()
+        self._busy_ms = math.floor(busy_timeout * 1000)
+        if not 0 <= self._busy_ms <= 2**31 - 1:
+            raise ValueError("飞书状态库的等待时限无效。")
+        self._write_lock = Lock()
         # 新库权限从创建时起即为 0600。部署时目录也应为私有目录。
         path.touch(mode=0o600, exist_ok=True)
         if path.stat().st_mode & 0o077:
             raise ValueError("飞书状态文件须设为私有权限。")
-        with self.connection() as db:
-            db.executescript("""
+        self._writer = self._connect(check_same_thread=False)
+        try:
+            journal = self._writer.execute("PRAGMA journal_mode=WAL").fetchone()
+            if journal != ("wal",):
+                raise RuntimeError("飞书状态库无法开启 WAL。")
+            self._initialize()
+        except BaseException:
+            self._writer.close()
+            raise
+
+    def _initialize(self) -> None:
+        with self._write() as db:
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS feishu_messages (
                     scope TEXT NOT NULL,
                     digest TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'done',
                     PRIMARY KEY (scope, digest)
-                );
+                )
+            """)
+            db.execute("""
                 CREATE TABLE IF NOT EXISTS feishu_approvals (
                     scope TEXT NOT NULL,
                     approval_id TEXT NOT NULL,
@@ -39,25 +60,73 @@ class State:
                     PRIMARY KEY (scope, approval_id),
                     UNIQUE (scope, message_id),
                     UNIQUE (scope, event_id)
-                );
+                )
             """)
-            db.execute("BEGIN IMMEDIATE")
+            db.execute("""
+                CREATE TABLE IF NOT EXISTS feishu_callback_events (
+                    scope TEXT NOT NULL,
+                    event_id TEXT NOT NULL,
+                    PRIMARY KEY (scope, event_id)
+                )
+            """)
+            db.execute("""
+                INSERT OR IGNORE INTO feishu_callback_events (scope, event_id)
+                SELECT scope, event_id FROM feishu_approvals WHERE event_id IS NOT NULL
+            """)
             if not any(column[1] == "status" for column in db.execute("PRAGMA table_info(feishu_messages)")):
                 db.execute("ALTER TABLE feishu_messages ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
-            db.execute("COMMIT")
+
+    def _connect(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
+        db = sqlite3.connect(self.path, autocommit=True, check_same_thread=check_same_thread)
+        db.execute(f"PRAGMA busy_timeout={self._busy_ms}")
+        return db
 
     @contextmanager
     def connection(self):
-        db = sqlite3.connect(self.path, timeout=0.15, autocommit=True)
+        db = self._connect()
         try:
+            db.execute("PRAGMA query_only=ON")
             yield db
         finally:
             db.close()
 
+    @contextmanager
+    def _write(self, *, deadline: float | None = None):
+        timeout = -1 if deadline is None else max(0, deadline - time.monotonic())
+        if not self._write_lock.acquire(timeout=timeout):
+            raise TimeoutError
+        db = self._writer
+        try:
+            if deadline is not None:
+                remaining_ms = math.floor((deadline - time.monotonic()) * 1000)
+                if remaining_ms <= 0:
+                    raise TimeoutError
+                db.execute(f"PRAGMA busy_timeout={min(self._busy_ms, remaining_ms)}")
+            db.execute("BEGIN IMMEDIATE")
+            try:
+                yield db
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError
+                db.execute("COMMIT")
+            except BaseException:
+                if db.in_transaction:
+                    db.execute("ROLLBACK")
+                raise
+        finally:
+            try:
+                if deadline is not None:
+                    db.execute(f"PRAGMA busy_timeout={self._busy_ms}")
+            finally:
+                self._write_lock.release()
+
+    def close(self) -> None:
+        with self._write_lock:
+            self._writer.close()
+
     def claim_message(self, message_id: str, status: str = "done") -> bool:
         # 保存指纹即可跨重推和重启去重。
         digest = hashlib.sha256(message_id.encode()).hexdigest()
-        with self.connection() as db:
+        with self._write() as db:
             return db.execute(
                 "INSERT OR IGNORE INTO feishu_messages (scope, digest, status) VALUES (?, ?, ?)",
                 (self.scope, digest, status),
@@ -73,34 +142,48 @@ class State:
 
     def complete_notice(self, message_id: str) -> None:
         digest = hashlib.sha256(message_id.encode()).hexdigest()
-        with self.connection() as db:
+        with self._write() as db:
             db.execute("""
                 UPDATE feishu_messages SET status = 'done'
                 WHERE scope = ? AND digest = ? AND status = 'notice_pending'
             """, (self.scope, digest))
 
     def bind(self, approval_id: str, message_id: str, record_id: str, expires: float) -> None:
-        with self.connection() as db:
+        with self._write() as db:
             db.execute("""
                 INSERT INTO feishu_approvals (scope, approval_id, message_id, record_id, expires)
                 VALUES (?, ?, ?, ?, ?)
             """, (self.scope, approval_id, message_id, record_id, expires))
 
+    def claim_callback(self, event_id: str, *, deadline: float | None = None) -> bool:
+        # 在核实成员之前持久认领。查询失败、超时或进程中断时，重推也不能重开审批。
+        with self._write(deadline=deadline) as db:
+            return db.execute("""
+                INSERT OR IGNORE INTO feishu_callback_events (scope, event_id) VALUES (?, ?)
+            """, (self.scope, event_id)).rowcount == 1
+
     def decide(
         self, approval_id: str, message_id: str, record_id: str, decision: str,
-        event_id: str, operator_id: str, now: float,
+        event_id: str, operator_id: str, current_time: Callable[[], float | None],
+        *, deadline: float | None = None,
     ) -> bool:
-        with self.connection() as db:
+        with self._write(deadline=deadline) as db:
+            now = current_time()
+            if now is None:
+                return False
             return db.execute("""
                 UPDATE OR IGNORE feishu_approvals
                 SET status = ?, event_id = ?, operator_id = ?, decided_at = ?
                 WHERE scope = ? AND approval_id = ? AND message_id = ? AND record_id = ?
                   AND status = 'pending' AND expires > ?
+                  AND EXISTS (
+                    SELECT 1 FROM feishu_callback_events WHERE scope = ? AND event_id = ?
+                  )
             """, (decision, event_id, operator_id, now, self.scope,
-                  approval_id, message_id, record_id, now)).rowcount == 1
+                  approval_id, message_id, record_id, now, self.scope, event_id)).rowcount == 1
 
-    def close_approvals(self) -> None:
-        with self.connection() as db:
+    def close_approvals(self, *, deadline: float | None = None) -> None:
+        with self._write(deadline=deadline) as db:
             db.execute("""
                 UPDATE feishu_approvals SET status = 'closed'
                 WHERE scope = ? AND status IN ('pending', 'approve')

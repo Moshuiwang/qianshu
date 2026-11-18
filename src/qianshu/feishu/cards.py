@@ -40,17 +40,31 @@ def mention(open_id: str, name: str) -> str:
 
 
 def approval_card(summary: str, approval_id: str, record_id: str) -> dict:
-    return _card("测试单审批", [
+    return _approval_card(summary, {"approval_id": approval_id, "record_id": record_id})
+
+
+def decided_approval_card(decision: str) -> dict:
+    status = {"approve": "已收到，处理中", "reject": "已驳回"}[decision]
+    return _approval_card(status, None)
+
+
+def _approval_card(summary: str, binding: dict[str, str] | None) -> dict:
+    actions = []
+    for decision, label, style in (("approve", "同意", "primary"), ("reject", "驳回", "danger")):
+        button = {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": style,
+        }
+        if binding is None:
+            button["disabled"] = True
+            button["disabled_tips"] = {"tag": "plain_text", "content": "审批决定已记录"}
+        else:
+            button["value"] = {"decision": decision, **binding}
+        actions.append(button)
+    card = _card("测试单审批", [
         {"tag": "div", "text": {"tag": "plain_text", "content": summary}},
-        {"tag": "action", "actions": [
-            {
-                "tag": "button",
-                "text": {"tag": "plain_text", "content": label},
-                "type": style,
-                "value": {"decision": decision, "approval_id": approval_id, "record_id": record_id},
-            }
-            for decision, label, style in (
-                ("approve", "同意", "primary"), ("reject", "驳回", "danger"),
-            )
-        ]},
+        {"tag": "action", "actions": actions},
     ])
+    card["config"] = {"update_multi": True}
+    return card

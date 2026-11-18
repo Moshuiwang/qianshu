@@ -1,7 +1,9 @@
 import asyncio
 import base64
 import json
+import sqlite3
 import time
+from dataclasses import replace
 from threading import Barrier, Event
 from types import SimpleNamespace
 
@@ -19,6 +21,7 @@ class FakeSocket:
 
     def __init__(self):
         self.responses = []
+        self.callback_responses = []
 
     async def recv(self):
         await asyncio.Future()
@@ -32,7 +35,9 @@ class FakeSocket:
         response = json.loads(frame.payload)
         assert response["code"] == 200
         if "data" in response:
-            self.responses.append(json.loads(base64.b64decode(response["data"]))["toast"]["type"])
+            callback = json.loads(base64.b64decode(response["data"]))
+            self.callback_responses.append(callback)
+            self.responses.append(callback["toast"]["type"])
         else:
             self.responses.append("event_ack")
 
@@ -42,7 +47,7 @@ def payload(service, approval_id, message_id, record_id):
         "schema": "2.0",
         "header": {
             "app_id": service.settings.app_id, "event_id": "<回调占位>",
-            "event_type": "card.action.trigger",
+            "event_type": "card.action.trigger", "create_time": str(int(service.clock() * 1000)),
         },
         "event": {
             "operator": {"open_id": "<点击人占位>"},
@@ -54,10 +59,10 @@ def payload(service, approval_id, message_id, record_id):
     }
 
 
-def dispatch(service, data):
+def dispatch(service, data, *, frame_type=ws.MessageType.EVENT):
     frame = ws.Frame(method=ws.FrameType.DATA.value, SeqID=0, LogID=0, service=1)
     for key, value in {
-        ws.HEADER_TYPE: "event", ws.HEADER_MESSAGE_ID: "<帧占位>", ws.HEADER_TRACE_ID: "<追踪占位>",
+        ws.HEADER_TYPE: frame_type.value, ws.HEADER_MESSAGE_ID: "<帧占位>", ws.HEADER_TRACE_ID: "<追踪占位>",
         ws.HEADER_SUM: "1", ws.HEADER_SEQ: "0",
     }.items():
         header = frame.headers.add()
@@ -95,6 +100,7 @@ def connected(tmp_path, settings, window, monkeypatch):
     finally:
         loop.run_until_complete(service._stop())
         service.entrance.close()
+        service._state.close()
         loop.close()
         asyncio.set_event_loop(None)
 
@@ -126,13 +132,83 @@ def test_authenticated_decision_and_callback_replay(connected, monkeypatch):
         service._client._event_handler._do_without_validation(json.dumps(data).encode()),
     )
     assert direct.toast.type == "warning"
+    membership_queries = []
+
+    async def is_member(operator_id):
+        membership_queries.append(operator_id)
+        return True
+
+    monkeypatch.setattr(service.transport, "is_member", is_member)
     dispatch(service, data)
     dispatch(service, data)
+    assert membership_queries == [data["event"]["operator"]["open_id"]]
     data["event"]["action"]["value"]["decision"] = "reject"
     data["header"]["event_id"] = "<另一回调占位>"
     dispatch(service, data)
     assert socket.responses == ["success", "warning", "warning"]
     assert states(service) == [("approve",)]
+    assert all("card" not in response for response in socket.callback_responses[1:])
+    assert len(membership_queries) == 2
+
+
+def test_card_frame_missing_header_returns_warning(connected):
+    service, socket, _ = connected
+    dispatch(service, {"schema": "2.0"}, frame_type=ws.MessageType.CARD)
+    assert socket.responses == ["warning"]
+    assert "card" not in socket.callback_responses[0]
+
+
+def test_replayed_event_cannot_be_used_with_another_card(connected, monkeypatch):
+    service, socket, _ = connected
+    dispatch(service, publish(connected, monkeypatch))
+    other_card = publish(connected, monkeypatch, "<第二张卡占位>")
+    dispatch(service, other_card)
+    assert socket.responses == ["success", "warning"]
+    assert "card" not in socket.callback_responses[1]
+    assert states(service) == [("approve",), ("pending",)]
+
+
+def test_locked_database_rejects_callback_within_sync_budget(connected, monkeypatch):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    blocker = sqlite3.connect(service._state.path, autocommit=True)
+
+    async def unexpected_lookup(operator_id):
+        pytest.fail("无法持久认领的回调触发了群成员查询")
+
+    monkeypatch.setattr(service.transport, "is_member", unexpected_lookup)
+    try:
+        blocker.execute("BEGIN IMMEDIATE")
+        started = time.monotonic()
+        dispatch(service, data, frame_type=ws.MessageType.CARD)
+        assert time.monotonic() - started < 3
+    finally:
+        blocker.close()
+    assert socket.responses == ["warning"]
+    assert "card" not in socket.callback_responses[0]
+    assert states(service) == [("pending",)]
+
+
+@pytest.mark.parametrize("decision,status", [("approve", "已收到，处理中"), ("reject", "已驳回")])
+def test_card_frame_returns_disabled_raw_card(connected, monkeypatch, decision, status):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    data["event"]["action"]["value"]["decision"] = decision
+
+    started = time.monotonic()
+    dispatch(service, data, frame_type=ws.MessageType.CARD)
+    assert time.monotonic() - started < 3
+
+    [response] = socket.callback_responses
+    assert response["card"]["type"] == "raw"
+    summary, actions = response["card"]["data"]["elements"]
+    assert summary["text"]["content"] == status
+    assert len(actions["actions"]) == 2
+    for button in actions["actions"]:
+        assert button["disabled"] is True
+        assert button["disabled_tips"]["content"]
+        assert "value" not in button
+    assert states(service) == [(decision,)]
 
 
 @pytest.mark.parametrize("outcome", [False, None, "error", "timeout"])
@@ -158,17 +234,23 @@ def test_rejects_unconfirmed_membership(connected, monkeypatch, caplog, outcome)
     assert caplog.messages == ["feishu_approval_membership_rejected"]
 
 
-def test_membership_checks_configured_group_and_open_id_across_pages(connected, monkeypatch):
+@pytest.mark.parametrize("outcome", ["found", "failed", "timeout"])
+def test_membership_checks_configured_group_and_open_id_across_pages(connected, monkeypatch, outcome):
     service, socket, _ = connected
     data = publish(connected, monkeypatch)
     operator_id = data["event"]["operator"]["open_id"]
     pages = []
 
-    def get_members(request):
+    async def get_members(request, option):
+        assert option.tenant_access_token == token
         assert request.chat_id == service.settings.chat_id
         assert request.member_id_type == "open_id"
         pages.append(request.page_token)
         next_page = request.page_token is None
+        if not next_page and outcome == "failed":
+            return SimpleNamespace(success=lambda: False)
+        if not next_page and outcome == "timeout":
+            await asyncio.Future()
         return SimpleNamespace(success=lambda: True, data=SimpleNamespace(
             items=[SimpleNamespace(member_id_type="user_id" if next_page else "open_id",
                                    member_id=operator_id)],
@@ -176,11 +258,23 @@ def test_membership_checks_configured_group_and_open_id_across_pages(connected, 
         ))
 
     monkeypatch.delattr(service.transport, "is_member")
-    monkeypatch.setattr(service.transport.im.chat_members, "get", get_members)
+    token = "<租户令牌占位>"
+
+    async def fetch_token():
+        return token
+
+    monkeypatch.setattr(service.transport, "_tenant_token", fetch_token)
+    monkeypatch.setattr(service.transport.im.chat_members, "aget", get_members)
+    monkeypatch.setattr("qianshu.feishu.sdk._HTTP_TIMEOUT", 0.05)
     dispatch(service, data)
     assert pages == [None, "<群成员分页占位>"]
-    assert socket.responses == ["success"]
-    assert states(service) == [("approve",)]
+    if outcome == "found":
+        assert socket.responses == ["success"]
+        assert states(service) == [("approve",)]
+    else:
+        assert socket.responses == ["warning"]
+        assert "card" not in socket.callback_responses[0]
+        assert states(service) == [("pending",)]
 
 
 def test_reply_retries_send_the_same_platform_deduplication_key(connected, monkeypatch):
@@ -289,7 +383,7 @@ def test_reply_deadline_cancels_token_exchange_or_send(connected, monkeypatch, s
     assert stages == expected
 
 
-@pytest.mark.parametrize("change", ["disconnect", "expiry"])
+@pytest.mark.parametrize("change", ["disconnect", "expiry", "age"])
 def test_rechecks_approval_after_membership_lookup(connected, monkeypatch, change):
     service, socket, clock = connected
     data = publish(connected, monkeypatch)
@@ -297,14 +391,16 @@ def test_rechecks_approval_after_membership_lookup(connected, monkeypatch, chang
     async def is_member(operator_id):
         if change == "disconnect":
             service._disconnected()
-        else:
+        elif change == "expiry":
             clock.now = 200
+        else:
+            clock.now += service.settings.callback_max_age + 1
         return True
 
     monkeypatch.setattr(service.transport, "is_member", is_member)
     dispatch(service, data)
     assert socket.responses == ["warning"]
-    assert states(service) == [("closed",)]
+    assert states(service) == [("pending" if change == "age" else "closed",)]
 
 
 @pytest.mark.parametrize("location,key,replacement", [
@@ -317,6 +413,7 @@ def test_rechecks_approval_after_membership_lookup(connected, monkeypatch, chang
     ("value", "approval_id", None),
     ("value", "approval_id", "<另一审批占位>"),
     ("header", "app_id", "<他应用占位>"),
+    ("header", "app_id", None),
     ("header", "event_id", None),
 ])
 def test_rejects_invalid_context_or_binding(connected, monkeypatch, location, key, replacement):
@@ -333,6 +430,82 @@ def test_rejects_invalid_context_or_binding(connected, monkeypatch, location, ke
     dispatch(service, data)
     assert socket.responses == ["warning"]
     assert states(service) == [("pending",)]
+
+
+@pytest.mark.parametrize("created,now", [
+    ("99000", 150), ("149999", 150), ("150000", 156), ("150001", 150),
+    ("坏时间", 150), (None, 150), (150000, 150),
+], ids=["before-window", "before-connection", "over-age-limit", "future",
+        "malformed", "missing", "not-string"])
+def test_rejects_invalid_callback_time(connected, monkeypatch, created, now):
+    service, socket, clock = connected
+    service.settings = replace(service.settings, callback_max_age=5)
+    data = publish(connected, monkeypatch)
+    if created is None:
+        del data["header"]["create_time"]
+    else:
+        data["header"]["create_time"] = created
+    clock.now = now
+
+    async def unexpected_lookup(operator_id):
+        pytest.fail("无效时间触发了群成员查询")
+
+    monkeypatch.setattr(service.transport, "is_member", unexpected_lookup)
+    dispatch(service, data)
+    assert socket.responses == ["warning"]
+    assert "card" not in socket.callback_responses[0]
+    assert states(service) == [("pending",)]
+
+
+def test_rejects_backlog_on_reconnect_even_with_valid_new_card_binding(connected, monkeypatch):
+    service, _, clock = connected
+    service._disconnected()
+    clock.now += 2
+    socket = FakeSocket()
+    service._client._conn = socket
+    service._connected(socket)
+
+    data = publish(connected, monkeypatch)
+    data["header"]["create_time"] = str(int((clock.now - 1) * 1000))
+    dispatch(service, data)
+    assert states(service) == [("pending",)]
+    data["header"]["create_time"] = str(int(clock.now * 1000))
+    dispatch(service, data)
+    assert socket.responses == ["warning", "success"]
+    assert states(service) == [("approve",)]
+
+
+@pytest.mark.parametrize("key,match", [
+    ("app_id", None), ("app_id", False),
+    ("tenant_key", None), ("tenant_key", False), ("tenant_key", True),
+])
+def test_validates_app_and_configured_tenant_for_both_event_types(connected, monkeypatch, key, match):
+    service, socket, _ = connected
+    service.settings = replace(service.settings, tenant_key="<本租户占位>")
+    settings = service.settings
+    data = publish(connected, monkeypatch)
+    data["header"]["tenant_key"] = settings.tenant_key
+    if match is None:
+        del data["header"][key]
+    elif not match:
+        data["header"][key] = "<不匹配占位>"
+
+    dispatch(service, data)
+    received = []
+    monkeypatch.setattr(service.entrance, "inject_message", received.append)
+    dispatch(service, {
+        "schema": "2.0",
+        "header": {**data["header"], "event_type": "im.message.receive_v1"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": next(iter(settings.allowed_senders))}},
+            "message": {
+                "message_id": "<来源校验消息占位>", "chat_id": settings.chat_id, "chat_type": "group",
+                "create_time": "150000", "message_type": "text", "content": '{"text":"合成样例"}',
+            },
+        },
+    })
+    assert socket.responses == ["success" if match else "warning", "event_ack"]
+    assert len(received) == int(bool(match))
 
 
 def test_reject_disconnect_reconnect_and_timeout(connected, monkeypatch):

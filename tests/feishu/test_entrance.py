@@ -266,3 +266,7 @@ def test_config_reads_from_dotenv(tmp_path, settings):
         encoding="utf-8",
     )
     assert load_settings(path) == settings
+    tenant = "<租户配置占位>"
+    with path.open("a", encoding="utf-8") as stream:
+        stream.write(f"FEISHU_TENANT_KEY={tenant}\nFEISHU_CALLBACK_MAX_AGE_SECONDS=2.5\n")
+    assert load_settings(path) == replace(settings, tenant_key=tenant, callback_max_age=2.5)

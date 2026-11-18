@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import math
+import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
@@ -33,13 +34,15 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 )
 from lark_oapi.ws import client as ws
 
-from .cards import Report, approval_card
+from .cards import Report, approval_card, decided_approval_card
 from .entrance import Application, Attachment, Entrance, Message
 from .settings import Settings, Window
 from .state import State
 
 _LOG = logging.getLogger(__name__)
 _HTTP_TIMEOUT = 2
+_CALLBACK_BUDGET = 3
+_CALLBACK_WRITE_BUDGET = 0.25
 
 
 class _EndpointUnavailable(ws.ServerException):
@@ -50,6 +53,10 @@ def _checked(response):
     if not response.success():
         raise RuntimeError("飞书 API 请求失败。")
     return response
+
+
+def _approval_warning(content: str) -> P2CardActionTriggerResponse:
+    return P2CardActionTriggerResponse({"toast": {"type": "warning", "content": content}})
 
 
 def _message(message, sender_id: str, kind: str, content: str, bot_keys, bot_open_id: str) -> Message:
@@ -96,7 +103,7 @@ class _Transport:
             if remaining <= 0:
                 raise TimeoutError
             async with asyncio.timeout(remaining):
-                token = await self._reply_token()
+                token = await self._tenant_token()
                 self._require_window()
                 if time.monotonic() >= deadline:
                     raise TimeoutError
@@ -105,7 +112,7 @@ class _Transport:
 
         asyncio.run(send())
 
-    async def _reply_token(self) -> str:
+    async def _tenant_token(self) -> str:
         # 复用 SDK 1.8 的令牌缓存和请求模型，用可取消的异步传输处理缓存未命中。
         config = self.im.message.config
         cache_key = f"self_tenant_token:{config.app_id}"
@@ -131,6 +138,8 @@ class _Transport:
         return token
 
     async def is_member(self, operator_id: str) -> bool:
+        self._require_window()
+        option = lark.RequestOption.builder().tenant_access_token(await self._tenant_token()).build()
         seen_pages = set()
         page = None
         while True:
@@ -141,8 +150,7 @@ class _Transport:
             )
             if page:
                 request.page_token(page)
-            # SDK 的异步 REST 方法也会同步获取租户令牌。
-            response = await asyncio.to_thread(self.im.chat_members.get, request.build())
+            response = await self.im.chat_members.aget(request.build(), option)
             data = _checked(response).data
             if data.trigger_security_conf_limit or type(data.has_more) is not bool:
                 return False
@@ -152,7 +160,7 @@ class _Transport:
             if not data.has_more:
                 return False
             page = data.page_token
-            if not page or page in seen_pages:
+            if not isinstance(page, str) or not page.strip() or page in seen_pages:
                 return False
             seen_pages.add(page)
 
@@ -223,7 +231,7 @@ class _Connection(ws.Client):
 
     def __init__(self, service: "FeishuService"):
         self.service = service
-        self.dispatch_origin = ContextVar("feishu_dispatch_origin", default=None)
+        self._dispatch = ContextVar("feishu_dispatch", default=(None, 0.0))
         self.receiver = None
         self.frames = set()
         self._generation = 0
@@ -316,17 +324,19 @@ class _Connection(ws.Client):
             return
         task = asyncio.current_task()
         self.frames.add(task)
-        token = self.dispatch_origin.set(origin)
+        token = self._dispatch.set((origin, time.monotonic()))
         try:
             await super()._handle_message(msg)
         finally:
-            self.dispatch_origin.reset(token)
+            self._dispatch.reset(token)
             self.frames.discard(task)
 
     async def _handle_data_frame(self, frame):
         # 沿用 SDK 帧格式和分发器，在编码应答前等待审批回调。
+        origin, started = self._dispatch.get()
         headers = frame.headers
-        if ws._get_by_key(headers, ws.HEADER_TYPE) != ws.MessageType.EVENT.value:
+        frame_type = ws._get_by_key(headers, ws.HEADER_TYPE)
+        if frame_type not in (ws.MessageType.EVENT.value, ws.MessageType.CARD.value):
             return
         payload = frame.payload
         count = int(ws._get_by_key(headers, ws.HEADER_SUM))
@@ -338,33 +348,46 @@ class _Connection(ws.Client):
             if payload is None:
                 return
 
-        started = time.monotonic()
         response = ws.Response(code=HTTPStatus.OK)
         try:
+            if frame_type == ws.MessageType.CARD.value:
+                header = json.loads(payload).get("header")
+                if not isinstance(header, dict) or header.get("event_type") != "card.action.trigger":
+                    raise ValueError("卡片帧缺少卡片回调类型。")
             result = self._event_handler._do_without_validation(payload)
             if result is not None:
                 response.data = base64.b64encode(ws.JSON.marshal(await result).encode())
         except Exception:
             _LOG.error("feishu_event_dispatch_failed")
-            response = ws.Response(code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            if frame_type == ws.MessageType.CARD.value:
+                warning = _approval_warning("卡片回调格式无效")
+                response.data = base64.b64encode(ws.JSON.marshal(warning).encode())
+            else:
+                response = ws.Response(code=HTTPStatus.INTERNAL_SERVER_ERROR)
         header = headers.add()
         header.key = ws.HEADER_BIZ_RT
         header.value = str(round((time.monotonic() - started) * 1000))
         frame.payload = ws.JSON.marshal(response).encode()
-        origin = self.dispatch_origin.get()
-        async with self._lock:
-            if origin is not None and origin is self._conn and origin.close_code is None:
-                await origin.send(frame.SerializeToString())
+        remaining = started + _CALLBACK_BUDGET - time.monotonic()
+        if remaining <= 0:
+            return
+        async with asyncio.timeout(remaining):
+            async with self._lock:
+                if origin is not None and origin is self._conn and origin.close_code is None:
+                    await origin.send(frame.SerializeToString())
 
     def _combine(self, msg_id, count, sequence, data):
         # SDK 分片缓存跨重连保留，给每次连接独立的缓存键。
         return super()._combine(f"{self._generation}:{msg_id}", count, sequence, data)
 
     def _from_current_app(self, data) -> bool:
-        origin = self.dispatch_origin.get()
+        origin, _ = self._dispatch.get()
+        tenant_key = self.service.settings.tenant_key
         return (
-            origin is not None and origin is self._conn and origin.close_code is None
-            and data.header is not None and data.header.app_id == self.service.settings.app_id
+            origin is not None and origin is self._conn and origin is self.service._origin
+            and origin.close_code is None and data.header is not None
+            and data.header.app_id == self.service.settings.app_id
+            and (tenant_key is None or data.header.tenant_key == tenant_key)
         )
 
     def _receive(self, data) -> None:
@@ -390,18 +413,17 @@ class _Connection(ws.Client):
         self.service.entrance.inject_message(incoming)
 
     async def _approve(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
-        accepted = False
+        if not self._from_current_app(data):
+            return _approval_warning("审批来源与当前飞书连接配置不符")
+        origin, started = self._dispatch.get()
         try:
-            if self._from_current_app(data):
-                accepted = await self.service._record_action(data, self.dispatch_origin.get())
+            # 为编码和发送同步应答留出时间。
+            return await self.service._record_action(
+                data, origin, started + _CALLBACK_BUDGET - _CALLBACK_WRITE_BUDGET,
+            )
         except Exception:
             _LOG.error("feishu_approval_record_failed")
-        return P2CardActionTriggerResponse({
-            "toast": {
-                "type": "success" if accepted else "warning",
-                "content": "已记录审批决定" if accepted else "审批无效或已处理",
-            },
-        })
+            return _approval_warning("暂时无法记录审批决定")
 
 
 class FeishuService:
@@ -415,6 +437,7 @@ class FeishuService:
         self.settings, self.window, self.clock = settings, window, clock
         self._lock = Lock()
         self._origin = None
+        self._connected_at: float | None = None
         self._membership_check = membership_check
         self._state = State(state_path, settings)
         self._state.close_approvals()
@@ -427,6 +450,7 @@ class FeishuService:
 
     def _connected(self, origin) -> None:
         with self._lock:
+            self._connected_at = self.clock()
             self._state.close_approvals()
             self._origin = origin
         _LOG.info("feishu_connected")
@@ -436,6 +460,7 @@ class FeishuService:
         with self._lock:
             was_connected = self._origin is not None
             self._origin = None
+            self._connected_at = None
             self._state.close_approvals()
         if was_connected:
             _LOG.info("feishu_disconnected")
@@ -459,47 +484,79 @@ class FeishuService:
             self._state.bind(approval_id, message_id, record_id, self.window.end.timestamp())
         return approval_id
 
-    async def _record_action(self, data, origin) -> bool:
+    async def _record_action(
+        self, data: P2CardActionTrigger, origin, deadline: float,
+    ) -> P2CardActionTriggerResponse:
         event = data.event
         if not event or not event.context or not event.action or not event.operator:
-            return False
+            return _approval_warning("审批回调缺少必要信息")
         context, value = event.context, event.action.value
         if context.open_chat_id != self.settings.chat_id or not isinstance(value, dict):
-            return False
+            return _approval_warning("审批群或卡片信息不符")
         approval_id, record_id, decision = (value.get(key) for key in ("approval_id", "record_id", "decision"))
         event_id, operator_id = data.header.event_id, event.operator.open_id
         if decision not in ("approve", "reject") or not all(
             isinstance(item, str) and item.strip()
             for item in (context.open_message_id, approval_id, record_id, event_id, operator_id)
         ):
-            return False
-        with self._lock:
+            return _approval_warning("审批回调缺少有效标识或决定")
+        raw_time = data.header.create_time
+        if not isinstance(raw_time, str) or not re.fullmatch(r"[0-9]{1,16}", raw_time):
+            return _approval_warning("审批回调时间缺失或格式无效")
+        created_at = int(raw_time) / 1000
+        connected_at = self._connected_at
+
+        def current_time() -> float | None:
             now = self.clock()
-            if origin is None or origin is not self._origin or origin.close_code is not None:
-                return False
-            if not self.window.contains(now):
-                self._state.close_approvals()
-                return False
+            if (
+                origin is not None and origin is self._origin and origin.close_code is None
+                and connected_at is not None and connected_at == self._connected_at
+                and self.window.contains(now) and self.window.contains(created_at)
+                and connected_at <= created_at <= now
+                and now - created_at <= self.settings.callback_max_age
+            ):
+                return now
+            return None
+
+        def write_deadline() -> float:
+            return min(deadline, time.monotonic() + _CALLBACK_WRITE_BUDGET)
+
+        now = current_time()
+        if now is None:
+            if origin is self._origin and not self.window.contains(self.clock()):
+                self._state.close_approvals(deadline=write_deadline())
+            return _approval_warning("审批回调已过期或与当前连接时间不符")
+        if not self._state.claim_callback(event_id, deadline=write_deadline()):
+            return _approval_warning("该审批回调已处理")
         try:
-            remaining = self.window.end.timestamp() - now
-            async with asyncio.timeout(min(_HTTP_TIMEOUT, remaining)):
+            remaining = min(
+                _HTTP_TIMEOUT, deadline - time.monotonic() - _CALLBACK_WRITE_BUDGET,
+                self.window.end.timestamp() - now,
+            )
+            if remaining <= 0:
+                return _approval_warning("审批回调验证超时")
+            async with asyncio.timeout(remaining):
                 check = self._membership_check or self.transport.is_member
                 is_member = await check(operator_id)
         except Exception:
             is_member = False
         if is_member is not True:
             _LOG.warning("feishu_approval_membership_rejected")
-            return False
-        with self._lock:
-            now = self.clock()
-            if origin is None or origin is not self._origin or origin.close_code is not None:
-                return False
-            if not self.window.contains(now):
-                self._state.close_approvals()
-                return False
-            return self._state.decide(
-                approval_id, context.open_message_id, record_id, decision, event_id, operator_id, now,
-            )
+            return _approval_warning("未能确认点击人是汇报群成员")
+        if not self.window.contains(self.clock()):
+            self._state.close_approvals(deadline=write_deadline())
+            return _approval_warning("审批验收窗口已关闭")
+        if current_time() is None:
+            return _approval_warning("审批回调已过期或连接已断开")
+        if self._state.decide(
+            approval_id, context.open_message_id, record_id, decision, event_id, operator_id,
+            current_time, deadline=write_deadline(),
+        ):
+            return P2CardActionTriggerResponse({
+                "toast": {"type": "success", "content": "已记录审批决定"},
+                "card": {"type": "raw", "data": decided_approval_card(decision)},
+            })
+        return _approval_warning("卡片绑定不符、已过期或已处理")
 
     def _remaining(self) -> float:
         return self.window.end.timestamp() - self.clock()
@@ -539,7 +596,8 @@ class FeishuService:
         cron = self._client._cache._cron
         cron.cancel()
         try:
-            await self._client._disconnect()
+            if self._client._conn is not None or self._origin is not None:
+                await self._client._disconnect()
         finally:
             await asyncio.gather(cron, return_exceptions=True)
 
@@ -558,4 +616,7 @@ class FeishuService:
             try:
                 ws.loop.run_until_complete(self._stop())
             finally:
-                self.entrance.close()
+                try:
+                    self.entrance.close()
+                finally:
+                    self._state.close()
