@@ -80,7 +80,7 @@ def _required_fields(draft: PolicyDraft, errors: list[Finding]) -> None:
             errors.append(Finding("R5", item.name, "字段尚未确认，请申请人确认。"))
         elif item.name not in {
             "maintain_mutual_exclusion_group", "company", "approval_url",
-            "user_scope", "approval_attachments",
+            "user_scope", "approval_attachments", "user_tags",
         }:
             value = field.value
             if value is None or (isinstance(value, str) and not value.strip()):
@@ -134,6 +134,7 @@ def validate_draft(
     company.uncertainty。公司值只有在匹配已确定时才能填写。
     """
     errors: list[Finding] = []
+    warnings: list[Finding] = []
     adjustments: list[Finding] = []
     _required_fields(draft, errors)
 
@@ -145,11 +146,12 @@ def validate_draft(
         errors.append(Finding("R1", "start_date", "请申请人提供 YYYY-MM-DD 格式的有效开始日期。"))
     if end is None and end_value and end_value.strip():
         errors.append(Finding("R8", "end_date", "请申请人提供 YYYY-MM-DD 格式的有效结束日期。"))
-    # BOSS 截止时间待确认，目前只按今天校正开始日期。
     if start is not None and start < today:
         start = today
         draft = replace(draft, start_date=replace(draft.start_date, value=today.isoformat()))
         adjustments.append(Finding("R1", "start_date", "开始日期早于今天，已调整为今天。"))
+    if start == today:
+        warnings.append(Finding("R1", "start_date", "BOSS 配置截止时间尚未确认，生效日期暂不顺延。"))
     if start is not None and end is not None and start > end:
         errors.append(Finding("R1", "start_date", "生效开始日期晚于结束日期，请申请人确认活动周期。"))
 
@@ -179,7 +181,7 @@ def validate_draft(
     if not (_value(draft.company) or "").strip():
         errors.append(Finding("R10", "company", "无法确定适用公司，请申请人明确公司名称。"))
 
-    return draft, ValidationResult(tuple(errors), adjustments=tuple(adjustments))
+    return draft, ValidationResult(tuple(errors), tuple(warnings), tuple(adjustments))
 
 
 def validate_batch(
@@ -193,7 +195,7 @@ def validate_batch(
     for draft, facts in policies:
         normalized, result = validate_draft(draft, today=today, facts=facts)
         if counts[facts.user_count] > 1:
-            result = replace(result, warnings=(Finding(
+            result = replace(result, warnings=(*result.warnings, Finding(
                 "R4", "user_count", "同批有多条政策的用户数相同，可能选重了标签。",
             ),))
         results.append((normalized, result))
