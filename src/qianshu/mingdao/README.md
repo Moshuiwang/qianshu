@@ -23,18 +23,40 @@ uv run --frozen --extra mingdao-check python -m qianshu.mingdao.rehearsal \
 
 ## 拦截与证据
 
-X3 和整合入口复用 `qianshu.mingdao.readonly.readonly_context`，在创建任何页面前对整个浏览器上下文装载拦截。首版只放行同时匹配配置源和路径的视图文档 GET，以及匹配静态资源类型、路径和源的 GET。重定向在首跳截断，Service Worker、WebSocket 和下载均关闭。放行的 GET 无副作用是按网页惯例作出的假设，尚未逐个证实。新增非 GET 放行条目须由守望者逐条审查目标、操作、参数及无副作用依据，写入代码并经审核合并后生效。
+X2、X3 和整合入口复用 `qianshu.mingdao.readonly.readonly_context`。第一层在创建任何页面前安装 `context.route`，默认拒绝，覆盖弹窗的首个请求。在线阶段只放行同时匹配配置源和路径的视图文档 GET，以及匹配静态资源类型、路径和源的 GET。重定向在首跳截断。带预取或预渲染标记的 `Sec-Purpose` 或 `Purpose` 请求直接中止。上下文禁用 Service Worker 注册和下载，所有 WebSocket 都在握手前关闭并记录。
 
-页面加载前注入脚本，拒绝并记录 `sendBeacon`、带 `keepalive` 的 fetch，以及非 GET 的 fetch 和 XHR。导航期间的脚本拒绝经 CDP 的会话存储事件传入同一份清单。五个视图及表单分别使用新页面，读完后先屏蔽该页的离开回调，再用 `close(run_before_unload=False)` 关闭。拦截回调和 CDP 审计出错均使冒烟失败。
+X2 读齐五个基线行数后，在线预载「新建」视图。页面就绪后调用 `context.set_offline(True)`，且禁止路由通过 `route.fetch` 转发，此后才打开表单并填写。离线期间 Playwright 上报的网络尝试记为 `offline_attempt`，路由和脚本的拒绝仍另记 `blocked`。同一请求可以产生一条尝试记录和一条拒绝记录。联网取数型控件可能无法在离线状态加载，观察缺口记入报告。演练结束后受控关闭演练上下文里的页面及弹窗，销毁该上下文，再使用同一登录状态文件、同一拦截规则创建新的联网上下文，独立回读五个视图。
 
-本机 Chromium 实测中，`Fetch.enable` 单独使用可拦截同页导航引发的 POST，但直接关闭标签页时目标会话可能先于请求处置被拆除。生产入口使用上下文白名单、脚本拦截和受控关闭，CDP 仅用于接收审计事件。残余风险是浏览器内核另有旁路，脚本层拦不到。
+第二层在页面加载前注入脚本，移除解析或动态插入的 `script[type=speculationrules]`，拒绝并记录 `sendBeacon`、带 `keepalive` 的 fetch，以及非 GET 的 fetch 和 XHR。导航期间的脚本拒绝通过 CDP 会话存储事件写入同一份清单。受控关闭先屏蔽页面离开回调，再调用 `close(run_before_unload=False)`。拦截初始化、离线切换、拦截和审计回调以及受控关闭出错均使冒烟失败。
+
+直接关页时，独立 CDP 拦截和离线模式均出现 POST 到达替身的轮次。正式流程保留脚本拦截与受控关闭来保护页面离开阶段，离线用于削减填表期间的网络请求，CDP 用于接收审计事件。意外关页时，浏览器可能在目标销毁前放行请求，脚本拒绝的审计事件也可能随目标销毁而丢失。浏览器内部绕过路由和页面脚本的路径仍有残余风险。放行的 GET 无副作用是按网页惯例作出的假设，尚未逐个证实。新增非 GET 放行条目须由守望者逐条审查目标、操作、参数及无副作用依据，写入代码并经审核合并后生效。
 
 每条草稿生成权限为 0700 的私有目录。 `requests.jsonl` 逐条记录请求方法、路径类别及拦截结果。未列入白名单的地址按去掉查询参数的路径生成指纹，同一路径可归并。 `report.json` 保存前后总行数和差值、自动带出的字段、表单报错、观察缺口与请求计数。冒烟通过需要两次各读齐五个视图、总行数分别相等，以及拦截和写控件检查通过。终端摘要只含计数和报告编号，Issue 只回填计数。自动带出字段和报错回写产品文档时只写核实后的字段行为和经脱敏的规则结论。
 
 ## 本机浏览器回归
 
-Chromium 已安装时，用以下命令运行真实浏览器回归。测试通过调试管道驱动 Chromium，只访问本机 HTTPS 替身。导航与直接关闭分开测量，每种配置各跑 10 轮。脚本单层用例通过 CDP 传递审计记录，网络拦截保持关闭。
+Chromium 和 Playwright Python 已安装时，用以下命令运行真实浏览器回归。测试只访问本机 HTTPS 替身。
 
 ```bash
-UV_CACHE_DIR=$PWD/.uv-cache uv run --frozen python -m pytest -q -s tests/mingdao/test_unload_browser.py
+UV_CACHE_DIR=$PWD/.uv-cache uv run --frozen --offline python -m pytest -q -s -rs tests/mingdao/test_unload_browser.py
 ```
+
+Playwright 1.65.2、Chromium 159.0.8154.6 的一次直接关页对照。每轮用同源见证页确认两个离开事件都执行过，四列请求数均按替身实际收到的 POST 计。
+
+| 直接关页防线 | 无 POST 的轮次 | pagehide beacon | pagehide keepalive | visibilitychange beacon | visibilitychange keepalive |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Playwright 上下文路由 + 独立 CDP `Fetch.enable` | 0/10 | 10 | 10 | 10 | 10 |
+| 仅 `set_offline(True)` | 4/10 | 0 | 0 | 2 | 6 |
+
+该次独立 CDP 对照收到了 5 个 POST 暂停事件，5 次 `failRequest` 均在关页时失效。离线对照中，关页前的普通 GET 在 10 轮均未到达替身。关页存在竞态，重复测量的漏过数可能变化。
+
+| 调试管道单层对照（各 10 轮，每轮尝试 4 个 POST） | 替身收到 | 清单记录的 POST 拒绝 |
+| --- | ---: | ---: |
+| 无防线，同页导航／直接关页 | 各 40 | 各 0 |
+| 仅 CDP，同页导航 | 0 | 40 |
+| 仅 CDP，直接关页 | 34 | 6 |
+| 仅脚本，同页导航 | 0 | 40 |
+| 仅脚本，直接关页 | 0 | 0，关页时审计事件可能丢失 |
+| 脚本 + 受控关闭 | 0 | 0，离开回调未执行 |
+
+上下文回归还验证了弹窗首个 POST 拒绝并记录，Service Worker 注册与控制均为 0，WebSocket 握手与帧均为 0 且有拒绝记录。四种预取或预渲染请求头、浏览器发出的链接预取均被拒绝。解析与动态插入的预取规则节点均被移除，替身未收到规则指向的请求。离线时，原本在白名单内的静态资源 GET 产生尝试和拒绝记录，替身收到 0 条。

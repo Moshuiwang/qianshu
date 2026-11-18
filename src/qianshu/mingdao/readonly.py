@@ -22,6 +22,7 @@ _SCRIPT_BINDING = "__qianshuReadonlyBlocked"
 _SCRIPT_UNLOAD_KEY = "__qianshuReadonlyUnload"
 _ARM_CLOSE = "() => window.__qianshuReadonlyClose?.() === true"
 _METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"})
+_SPECULATIVE = re.compile(r"(?:^|[;,\s])(?:prefetch|prerender)(?=$|[;,\s])", re.IGNORECASE)
 
 
 def https_origin(url: str) -> str:
@@ -88,6 +89,8 @@ class RequestAudit:
         self._policy = policy
         self.counts: Counter[str] = Counter()
         self.failed = False
+        self.offline = False
+        self.active_fetches = 0
 
     def _record(self, method: str, pattern: str, outcome: str) -> None:
         self._stream.write(json.dumps({
@@ -115,12 +118,21 @@ class RequestAudit:
             self._error("OTHER", "script")
 
     def script_unload(self, event: dict) -> None:
-        if event.get("key") != _SCRIPT_UNLOAD_KEY:
-            return
         try:
-            self.script(None, *json.loads(event["newValue"]))
+            if event.get("key") == _SCRIPT_UNLOAD_KEY:
+                self.script(None, *json.loads(event["newValue"]))
         except Exception:
             self._error("OTHER", "script")
+
+    def offline_request(self, request) -> None:
+        if not self.offline:
+            return
+        try:
+            method = request.method if request.method in _METHODS else "OTHER"
+            _, pattern = self._policy.classify(method, request.url, request.resource_type)
+            self._record(method, pattern, "offline_attempt")
+        except Exception:
+            self._error("OTHER", "request_observer")
 
     def http(self, route) -> None:
         method = "OTHER"
@@ -129,17 +141,27 @@ class RequestAudit:
             request = route.request
             method = request.method if request.method in _METHODS else "OTHER"
             allowed, pattern = self._policy.classify(method, request.url, request.resource_type)
-            if not allowed or self.failed:
+            headers = request.all_headers()
+            if any(_SPECULATIVE.search(headers.get(name, "")) for name in ("sec-purpose", "purpose")):
+                allowed, pattern = False, "speculative"
+            if not allowed or self.failed or self.offline:
                 route.abort()
                 self._record(method, pattern, "blocked")
                 return
             # 单跳取响应，拦截重定向，避免后续跳转脱离上下文路由。
             self._record(method, pattern, "allowed")
-            response = route.fetch(max_redirects=0, max_retries=0, timeout=15_000)
+            self.active_fetches += 1
+            try:
+                response = route.fetch(max_redirects=0, max_retries=0, timeout=15_000)
+            finally:
+                self.active_fetches -= 1
             try:
                 if 300 <= response.status < 400 and response.status != 304:
                     route.abort()
                     self._record(method, "redirect", "blocked")
+                elif self.offline or self.failed:
+                    route.abort()
+                    self._record(method, pattern, "blocked")
                 else:
                     route.fulfill(response=response)
             finally:
@@ -167,9 +189,23 @@ class ReadOnlyContext:
     def install(self) -> None:
         self._context.route_web_socket(re.compile(r".*"), self._audit.websocket)
         self._context.route(re.compile(r".*"), self._audit.http)
+        self._context.on("request", self._audit.offline_request)
         self._context.expose_binding(_SCRIPT_BINDING, self._audit.script)
         self._context.add_init_script(path=_SCRIPT)
         self._context.set_default_timeout(8_000)
+
+    def go_offline(self) -> None:
+        if self._audit.failed:
+            raise RuntimeError("请求拦截已失败")
+        # route.fetch 通过 APIRequestContext 转发，不受浏览器离线状态约束。
+        self._audit.offline = True
+        try:
+            self._context.set_offline(True)
+            if self._audit.active_fetches:
+                raise RuntimeError("仍有在线读取尚未结束")
+        except Exception:
+            self._audit._error("OTHER", "offline_setup")
+            raise
 
     def new_page(self):
         if self._audit.failed:
@@ -189,26 +225,51 @@ class ReadOnlyContext:
         try:
             for frame in page.frames:
                 # 空白文档和浏览器错误页可能没有执行初始化脚本。
-                if frame.url.startswith("https://") and not frame.evaluate(_ARM_CLOSE):
+                if (frame.url.startswith(("https://", "about:srcdoc", "blob:", "data:"))
+                        and not frame.evaluate(_ARM_CLOSE)):
                     raise RuntimeError("关闭前未能启用脚本拦截")
         except Exception:
             self._audit._error("OTHER", "script_close")
             raise
         finally:
-            page.close(run_before_unload=False)
+            try:
+                page.close(run_before_unload=False)
+            except Exception:
+                self._audit._error("OTHER", "page_close")
+                raise
+
+    def close_pages(self) -> None:
+        # 包括页面自行创建的弹窗；关闭失败由外层关闭整个上下文并判失败。
+        while pages := self._context.pages:
+            self.close_page(pages[0])
 
 
 @contextmanager
 def readonly_context(browser, policy: ReadOnlyPolicy, state: Path, audit_stream: TextIO):
     """先安装整个上下文的拦截，再提供能打开页面的上下文。"""
     audit = RequestAudit(audit_stream, policy)
-    context = browser.new_context(
-        storage_state=str(state), service_workers="block", accept_downloads=False,
-        locale="zh-CN", viewport={"width": 1280, "height": 900},
-    )
+    try:
+        context = browser.new_context(
+            storage_state=str(state), service_workers="block", accept_downloads=False,
+            locale="zh-CN", viewport={"width": 1280, "height": 900},
+        )
+    except Exception:
+        audit._error("OTHER", "context_setup")
+        raise
     try:
         guarded = ReadOnlyContext(context, audit)
-        guarded.install()
-        yield guarded, audit
+        try:
+            guarded.install()
+        except Exception:
+            audit._error("OTHER", "guard_setup")
+            raise
+        try:
+            yield guarded, audit
+        finally:
+            guarded.close_pages()
     finally:
-        context.close()
+        try:
+            context.close()
+        except Exception:
+            audit._error("OTHER", "context_close")
+            raise

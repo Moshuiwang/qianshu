@@ -21,6 +21,23 @@
     };
 
     try {
+        const stripSpeculationRules = node => {
+            if (node.nodeType !== Node.ELEMENT_NODE) return;
+            if (node.matches('script[type="speculationrules" i]')) node.remove();
+            for (const script of node.querySelectorAll('script[type="speculationrules" i]')) script.remove();
+        };
+        new MutationObserver(records => {
+            try {
+                for (const record of records) {
+                    if (record.type === "attributes") stripSpeculationRules(record.target);
+                    else for (const node of record.addedNodes) stripSpeculationRules(node);
+                }
+            } catch {
+                void report(null, null);
+            }
+        }).observe(document, {childList: true, subtree: true, attributes: true, attributeFilter: ["type"]});
+        for (const script of document.querySelectorAll('script[type="speculationrules" i]')) script.remove();
+
         const leaving = event => {
             if (closing) {
                 event.stopImmediatePropagation();

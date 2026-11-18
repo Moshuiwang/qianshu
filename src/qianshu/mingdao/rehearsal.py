@@ -5,6 +5,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -268,7 +269,6 @@ def _rehearse(page, config: RehearsalConfig, values: dict, auto_fields: dict,
     root = page.locator(form["root"])
     complete = False
     try:
-        _open_view(page, config, config.views["新建"])
         _click(page.locator(form["open"]), form)
         root.wait_for(state="visible")
         _fill_form(page, root, form, values)
@@ -299,38 +299,49 @@ def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
     form_errors = []
     complete = False
     after = {}
+    audits = []
     with (
         open(run_dir / "requests.jsonl", "x", encoding="utf-8", opener=_private_file) as stream,
         _launch_browser() as browser,
     ):
         with readonly_context(browser, config.policy, config.storage_state, stream) as (context, audit):
+            audits.append(audit)
             before = _read_counts(context, audit, config, issues, "before")
             if set(before) == set(VIEWS) and not audit.failed:
-                form_page = None
                 try:
                     form_page = context.new_page()
-                    complete = _rehearse(form_page, config, values, auto_fields, form_errors, issues)
+                    # 预载视图后切离线。打开表单和填写均在离线状态下执行。
+                    _open_view(form_page, config, config.views["新建"])
+                    form_page.wait_for_load_state("load")
+                    context.go_offline()
+                    if not audit.failed:
+                        complete = _rehearse(form_page, config, values, auto_fields, form_errors, issues)
                 except Exception as exc:
                     issues["form"] = type(exc).__name__
                 finally:
-                    if form_page is not None:
-                        try:
-                            context.close_page(form_page)
-                        except Exception as exc:
-                            issues["close_form"] = type(exc).__name__
-                if "close_form" not in issues:
-                    after = _read_counts(context, audit, config, issues, "after")
+                    try:
+                        context.close_pages()
+                    except Exception as exc:
+                        issues["close_form"] = type(exc).__name__
+        if set(before) == set(VIEWS) and not audit.failed and "close_form" not in issues:
+            with readonly_context(browser, config.policy, config.storage_state, stream) as (context, audit):
+                audits.append(audit)
+                after = _read_counts(context, audit, config, issues, "after")
 
     report = run_dir / "report.json"
+    requests = Counter()
+    for audit in audits:
+        requests.update(audit.counts)
+    guard_failed = any(audit.failed for audit in audits)
     result = RehearsalResult(before, after, complete, auto_fields, form_errors, issues,
-                             dict(audit.counts), audit.failed, report)
+                             dict(requests), guard_failed, report)
     with open(report, "x", encoding="utf-8", opener=_private_file) as stream:
         json.dump({
             "before": before, "after": after,
             "delta": {name: after[name] - before[name] for name in before.keys() & after.keys()},
             "smoke_passed": result.smoke_passed, "form_complete": complete,
             "auto_fields": auto_fields, "form_errors": form_errors,
-            "issues": issues, "requests": result.requests, "guard_failed": audit.failed,
+            "issues": issues, "requests": result.requests, "guard_failed": guard_failed,
         }, stream, ensure_ascii=False, indent=2)
     return result
 

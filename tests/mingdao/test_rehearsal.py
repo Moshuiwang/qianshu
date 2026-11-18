@@ -24,12 +24,16 @@ class FakeRoute:
     def __init__(self, browser, method, url, resource):
         self.browser = browser
         self.request = SimpleNamespace(method=method, url=url, resource_type=resource)
+        self.request.all_headers = self.all_headers
         self.terminal = None
+
+    def all_headers(self):
+        if self.browser.route_error and self.request.resource_type == "script":
+            raise RuntimeError(SECRET)
+        return {}
 
     def fetch(self, *, max_redirects=20, max_retries=0, timeout=None):
         request = self.request
-        if self.browser.route_error and request.resource_type == "script":
-            raise RuntimeError(SECRET)
         self.browser.sent.append((request.method, request.url, request.resource_type))
         status = 307 if "redirect=1" in request.url else 200
         if status == 307 and max_redirects:
@@ -52,6 +56,8 @@ class FakeBrowser:
         self.sent = []
         self.actions = []
         self.options = {}
+        self.contexts = []
+        self.form_closed = False
         self.changed_after_form = False
         self.unready = None
         self.routes = []
@@ -59,10 +65,12 @@ class FakeBrowser:
         self.route_error = False
         self.cdp_error = False
         self.bad_cdp_event = False
+        self.offline_error = False
 
     def new_context(self, **options):
         self.options = options
         self.context = FakeContext(self)
+        self.contexts.append(self.context)
         return self.context
 
 
@@ -85,14 +93,30 @@ class FakeContext:
         self.browser = browser
         self.handler = None
         self.socket_handler = None
-        self.form_closed = False
-        self.pages = []
+        self.all_pages = []
+        self.offline = False
+        self.closed = False
+
+    @property
+    def pages(self):
+        return [page for page in self.all_pages if not page.closed]
 
     def route(self, pattern, handler):
         self.handler = (pattern, handler)
 
     def route_web_socket(self, pattern, handler):
         self.socket_handler = (pattern, handler)
+
+    def on(self, event, handler):
+        assert event == "request"
+        self.request_handler = handler
+
+    def set_offline(self, offline):
+        assert offline
+        self.offline = offline
+        self.browser.actions.append(("offline",))
+        if self.browser.offline_error:
+            raise RuntimeError(SECRET)
 
     def set_default_timeout(self, timeout):
         pass
@@ -110,12 +134,13 @@ class FakeContext:
     def new_page(self):
         assert self.browser.options["service_workers"] == "block"
         page = FakePage(self)
-        self.pages.append(page)
+        self.all_pages.append(page)
         return page
 
     def request(self, method, url, resource="xhr"):
         route = FakeRoute(self.browser, method, url, resource)
         self.browser.routes.append(route)
+        self.request_handler(route.request)
         if self.handler and self.handler[0].fullmatch(url):
             self.handler[1](route)
         if route.terminal is None:
@@ -123,7 +148,9 @@ class FakeContext:
         return route.terminal != "blocked"
 
     def close(self):
-        pass
+        assert not self.pages
+        self.closed = True
+        self.browser.actions.append(("close_context",))
 
 
 class FakePage:
@@ -144,7 +171,8 @@ class FakePage:
     def goto(self, url, *, wait_until):
         assert not self.url
         self.url = url
-        if self.context.form_closed:
+        if self.context.browser.form_closed:
+            assert not self.context.offline and self.context.browser.contexts[0].closed
             self.context.browser.actions.append(("after_view", url))
         ok = self.context.request("GET", url, "document")
         if self.context.browser.bad_cdp_event:
@@ -153,6 +181,9 @@ class FakePage:
             assert not self.context.request("GET", ORIGIN + "/example/count")
             self.missing_counts = True
         return SimpleNamespace(ok=ok)
+
+    def wait_for_load_state(self, state):
+        assert state == "load"
 
     def locator(self, selector):
         return FakeLocator(self, selector)
@@ -163,7 +194,7 @@ class FakePage:
         self.closed = True
         if self.form:
             self.context.browser.actions.append(("close_form",))
-            self.context.form_closed = True
+            self.context.browser.form_closed = True
 
 
 class FakeLocator:
@@ -186,7 +217,7 @@ class FakeLocator:
     def inner_text(self):
         index = int(urlsplit(self.page.url).path.rsplit("-", 1)[-1])
         assert self.selector == f"#total-{index}"
-        if self.page.context.form_closed and self.browser.changed_after_form and index == 3:
+        if self.browser.form_closed and self.browser.changed_after_form and index == 3:
             return "共 12 行"
         return f"共 {index} 行"
 
@@ -217,6 +248,7 @@ class FakeLocator:
         if self.selector == "#open-example":
             self.page.form = True
             context = self.page.context
+            assert context.offline
             context.request("GET", STATIC + "/example.js", "script")
             context.request("POST", ORIGIN + f"/example/add-record?private={SECRET}")
             context.request("POST", ORIGIN + f"/example/unknown/{SECRET}", "xhr")
@@ -327,17 +359,17 @@ def test_form_network_and_readbacks(tmp_path, draft, browser):
     ):
         assert action in actions
     assert actions.count(("click", "#add-example")) == 2
-    assert all(action[0] == "after_view" for action in actions[actions.index(("close_form",)) + 1:])
+    assert actions.index(("offline",)) < actions.index(("click", "#open-example"))
+    assert actions.index(("close_form",)) < actions.index(("close_context",))
     assert len([action for action in actions if action[0] == "after_view"]) == 5
-    assert len(browser.context.pages) == 11
-    assert all(page.closed for page in browser.context.pages)
+    assert [len(context.all_pages) for context in browser.contexts] == [6, 5]
+    assert all(context.closed and not context.pages for context in browser.contexts)
     assert browser.options["storage_state"] == str(tmp_path / "mingdao-state.json")
 
     assert ("POST", ORIGIN + f"/example/add-record?private={SECRET}", "xhr") not in browser.sent
     assert ("POST", ORIGIN + f"/example/unknown/{SECRET}", "xhr") not in browser.sent
-    assert all(method == "GET" and (SHEET in url or url == STATIC + "/example.js")
-               for method, url, _ in browser.sent)
-    assert result.requests == {"allowed": 12, "blocked": 4}
+    assert all(method == "GET" and SHEET in url for method, url, _ in browser.sent)
+    assert result.requests == {"allowed": 11, "blocked": 5, "offline_attempt": 5}
 
     audit_file = result.private_report.with_name("requests.jsonl")
     audit = audit_file.read_text()
@@ -377,8 +409,8 @@ def test_blocked_baseline_read_stops_before_opening_form(tmp_path, draft, browse
     assert result.after == {}
     assert result.requests == {"allowed": 3, "blocked": 1}
     assert ("click", "#open-example") not in browser.actions
-    assert len(browser.context.pages) == 3
-    assert all(page.closed for page in browser.context.pages)
+    assert len(browser.context.all_pages) == 3
+    assert not browser.context.pages
     assert not result.smoke_passed
 
 
@@ -388,8 +420,8 @@ def test_cdp_error_stops_smoke(tmp_path, draft, browser):
     assert result.guard_failed and not result.smoke_passed
     assert result.requests["error"] == 1
     assert browser.sent == []
-    assert len(browser.context.pages) == 1
-    assert browser.context.pages[0].closed
+    assert len(browser.context.all_pages) == 1
+    assert not browser.context.pages
 
 
 def test_invalid_cdp_audit_event_fails_smoke(tmp_path, draft, browser):
@@ -397,7 +429,7 @@ def test_invalid_cdp_audit_event_fails_smoke(tmp_path, draft, browser):
     result = run(tmp_path, draft, ui_config())
     assert result.guard_failed and not result.smoke_passed
     assert result.requests == {"allowed": 1, "error": 1}
-    assert len(browser.context.pages) == 1
+    assert len(browser.context.all_pages) == 1
     assert ("click", "#open-example") not in browser.actions
 
 
@@ -407,6 +439,33 @@ def test_route_callback_error_fails_smoke(tmp_path, draft, browser):
     assert set(result.before) == set(rehearsal.VIEWS)
     assert result.guard_failed and not result.smoke_passed
     assert result.requests["error"] == 1
+
+
+def test_offline_setup_error_keeps_form_closed(tmp_path, draft, browser):
+    browser.offline_error = True
+    result = run(tmp_path, draft, ui_config())
+    assert result.guard_failed and not result.smoke_passed
+    assert result.requests["error"] == 1
+    assert result.after == {}
+    assert ("click", "#open-example") not in browser.actions
+    assert len(browser.contexts) == 1 and browser.context.closed
+
+
+def test_guard_installation_error_closes_context_and_records_failure(monkeypatch):
+    def unavailable(*args):
+        raise RuntimeError(SECRET)
+
+    monkeypatch.setattr(FakeContext, "route_web_socket", unavailable)
+    fake = FakeBrowser()
+    stream = StringIO()
+    policy = ReadOnlyPolicy(ORIGIN, (SHEET,))
+    with pytest.raises(RuntimeError):
+        with readonly_context(fake, policy, Path("example.json"), stream):
+            pytest.fail("拦截未就绪时不能提供上下文")
+    assert fake.context.closed and not fake.context.all_pages
+    assert json.loads(stream.getvalue()) == {
+        "method": "OTHER", "path_pattern": "guard_setup", "outcome": "error",
+    }
 
 
 def test_incomplete_form_is_recorded_without_failing_smoke(tmp_path, draft, browser):
