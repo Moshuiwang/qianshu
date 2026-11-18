@@ -123,6 +123,10 @@ class RehearsalResult:
             and self.before == self.after
         )
 
+    @property
+    def rehearsal_valid(self) -> bool:
+        return self.smoke_passed and self.form_complete
+
 
 @contextmanager
 def _launch_browser():
@@ -377,7 +381,8 @@ def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
         json.dump({
             "before": before, "after": after,
             "delta": {name: after[name] - before[name] for name in before.keys() & after.keys()},
-            "smoke_passed": result.smoke_passed, "form_complete": complete,
+            "smoke_passed": result.smoke_passed, "rehearsal_valid": result.rehearsal_valid,
+            "form_complete": complete,
             "evidence": asdict(evidence),
             "auto_fields": auto_fields, "form_errors": form_errors,
             "issues": issues, "requests": result.requests, "guard_failed": guard_failed,
@@ -422,6 +427,7 @@ def main(argv: list[str] | None = None) -> int:
             result = run_rehearsal(draft, settings, private_dir=args.private_dir)
             print(json.dumps({
                 "policy_index": index, "smoke_passed": result.smoke_passed,
+                "rehearsal_valid": result.rehearsal_valid,
                 "form_complete": result.form_complete, "requests": result.requests,
                 "before": result.before, "after": result.after,
                 "form_error_count": len(result.form_errors),

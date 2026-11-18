@@ -1,11 +1,13 @@
 """从正式入口运行替身浏览器，并独立记录请求是否发出、写按钮是否点击。"""
 
 import json
-from contextlib import contextmanager
+import sys
+from contextlib import contextmanager, nullcontext
 from dataclasses import fields
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 from urllib.parse import urlsplit
 
 import pytest
@@ -259,6 +261,8 @@ class FakeLocator:
         return other
 
     def fill(self, value):
+        if self.selector == self.browser.unready:
+            raise TimeoutError(SECRET)
         self.browser.actions.append(("fill", self.selector, value))
 
     def select_option(self, *, label):
@@ -370,6 +374,7 @@ def run(tmp_path, draft, raw):
 def test_form_network_and_readbacks(tmp_path, draft, browser):
     result = run(tmp_path, draft, ui_config())
     assert result.smoke_passed and result.form_complete
+    assert result.rehearsal_valid
     assert result.before == result.after == dict(zip(rehearsal.VIEWS, range(5), strict=True))
     assert result.auto_fields == {"价格计划": ["合成价格"]}
     assert result.form_errors == ["合成报错"]
@@ -536,7 +541,7 @@ def test_guard_installation_error_closes_context_and_records_failure(monkeypatch
 def test_incomplete_form_is_recorded_without_failing_smoke(tmp_path, draft, browser):
     browser.unready = "#example-form-ready"
     result = run(tmp_path, draft, ui_config())
-    assert result.smoke_passed
+    assert result.smoke_passed and not result.rehearsal_valid
     assert not result.form_complete
     assert result.issues["form"] == "TimeoutError"
     assert result.form_errors == ["合成报错"]
@@ -576,7 +581,20 @@ def test_non_get_is_denied_on_an_allowed_address():
     assert not policy.classify("GET", ORIGIN + "/other/app/example.js/../example.js", "script")[0]
 
 
-def test_fixed_cli_reports_counts_only(tmp_path, draft, browser, capsys):
+@pytest.mark.parametrize("unready, expected_valid", [
+    pytest.param(None, True, id="complete"),
+    pytest.param("#example-start_date", False, id="mid-fill-timeout"),
+])
+def test_fixed_cli_reports_counts_and_disables_fetch_later(tmp_path, draft, capsys, monkeypatch,
+                                                         unready, expected_valid):
+    browser = FakeBrowser()
+    browser.unready = unready
+    browser.close = Mock()
+    launch = Mock(return_value=browser)
+    playwright = SimpleNamespace(chromium=SimpleNamespace(launch=launch))
+    monkeypatch.setitem(sys.modules, "playwright.sync_api", SimpleNamespace(
+        sync_playwright=lambda: nullcontext(playwright),
+    ))
     env_file = tmp_path / ".env"
     env_file.write_text(f"MINGDAO_BASE_URL={ORIGIN}\n")
     ui_file = tmp_path / "ui.json"
@@ -587,14 +605,24 @@ def test_fixed_cli_reports_counts_only(tmp_path, draft, browser, capsys):
         "--env-file", str(env_file), "--private-dir", str(tmp_path),
         "--ui-config", str(ui_file), str(draft_file),
     ])
+    launch.assert_called_once()
+    assert "--disable-blink-features=FetchLaterAPI" in launch.call_args.kwargs["args"]
     captured = capsys.readouterr()
     summary = json.loads(captured.out)
     assert result == 0 and not captured.err
-    assert summary["smoke_passed"] and summary["before"] == summary["after"]
+    assert summary["smoke_passed"] is True
+    assert summary["before"] == summary["after"] and set(summary["before"]) == set(rehearsal.VIEWS)
+    assert summary["form_complete"] is expected_valid
+    assert summary["rehearsal_valid"] is expected_valid
     report = json.loads((tmp_path / summary["report_id"] / "report.json").read_text())
+    assert report["smoke_passed"] is True and report["rehearsal_valid"] is expected_valid
     assert report["auto_fields"] == {"价格计划": ["合成价格"]}
     assert report["form_errors"] == ["合成报错"]
     assert report["evidence"] == {
         "offline_switched": True, "form_opened": True, "write_controls_checked": True,
     }
+    if unready:
+        assert report["issues"]["form"] == "TimeoutError"
+        assert ("fill", "#example-policy_name", "合成值") in browser.actions
+        assert not any(action[:2] == ("fill", "#example-end_date") for action in browser.actions)
     assert "合成价格" not in captured.out and "合成报错" not in captured.out
