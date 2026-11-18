@@ -76,6 +76,11 @@ def main() -> int:
         page.goto(sheet_url, wait_until="domcontentloaded")
         try:
             page.get_by_text(re.compile(r"共\s*\d+\s*行")).first.wait_for(timeout=30_000)
+            # 行数先显示 0，记录加载完才更新；等网络空闲后再读，避免误读成 0 行
+            try:
+                page.wait_for_load_state("networkidle", timeout=20_000)
+            except PwTimeout:
+                pass
             total = re.search(r"共\s*(\d+)\s*行", page.inner_text("body")).group(1)
             print(f"[通过] 打开「优惠政策申请」表：当前视图共 {total} 行")
         except PwTimeout:
