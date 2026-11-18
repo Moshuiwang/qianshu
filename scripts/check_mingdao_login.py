@@ -1,9 +1,9 @@
 """明道云登录检查：用 .env 里的账号登录，打开「优惠政策申请」表确认可见，只读不改。
 
 用法（首次需安装浏览器内核，约 150MB）：
-    uv run --with playwright python -m playwright install chromium
-    uv run --with playwright python scripts/check_mingdao_login.py          # 无界面
-    uv run --with playwright python scripts/check_mingdao_login.py --show   # 弹出浏览器，遇到验证码可手动处理（需要有显示器，服务器上不可用）
+    uv run --extra mingdao-check python -m playwright install chromium
+    uv run --extra mingdao-check python scripts/check_mingdao_login.py          # 无界面
+    uv run --extra mingdao-check python scripts/check_mingdao_login.py --show   # 弹出浏览器，遇到验证码可手动处理（需要有显示器，服务器上不可用）
 
 登录状态保存到 .private/mingdao-state.json（已被 git 忽略），之后的建单程序复用它。
 登录失败时截图保存到 .private/mingdao-login-fail.png，便于判断原因。
@@ -15,26 +15,27 @@ import pathlib
 import re
 import sys
 
-from playwright.sync_api import TimeoutError as PwTimeout
-from playwright.sync_api import sync_playwright
+from qianshu.config import ConfigError, load_config
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 STATE = ROOT / ".private" / "mingdao-state.json"
 
 
-def load_env() -> dict:
-    env = {}
-    for line in (ROOT / ".env").read_text(encoding="utf-8").splitlines():
-        if "=" in line and not line.lstrip().startswith("#"):
-            k, v = line.split("=", 1)
-            env[k.strip()] = v.strip()
-    return env
-
-
 def main() -> int:
-    env = load_env()
-    base = env.get("MINGDAO_BASE_URL", "https://www.mingdao.com")
-    sheet_url = f"{base}/app/{env['MINGDAO_APP_ID']}/{env['MINGDAO_WORKSHEET_ID']}"
+    try:
+        config = load_config(
+            "MINGDAO_ACCOUNT", "MINGDAO_PASSWORD", "MINGDAO_APP_ID",
+            "MINGDAO_WORKSHEET_ID", env_file=ROOT / ".env",
+        )
+    except ConfigError as exc:
+        print(f"[失败] {exc}", file=sys.stderr)
+        return 1
+
+    from playwright.sync_api import TimeoutError as PwTimeout
+    from playwright.sync_api import sync_playwright
+
+    base = config.get("MINGDAO_BASE_URL", "https://www.mingdao.com")
+    sheet_url = f"{base}/app/{config['MINGDAO_APP_ID']}/{config['MINGDAO_WORKSHEET_ID']}"
     show = "--show" in sys.argv
     # 登录状态与截图含会话信息：新建文件一律只有本人可读写
     os.umask(0o077)
@@ -51,8 +52,8 @@ def main() -> int:
             password = page.locator("input[type=password]").first
             password.wait_for(timeout=30_000)
             password.locator("xpath=preceding::input[not(@type='checkbox') and not(@type='hidden')][1]").fill(
-                env["MINGDAO_ACCOUNT"])
-            password.fill(env["MINGDAO_PASSWORD"])
+                config["MINGDAO_ACCOUNT"])
+            password.fill(config["MINGDAO_PASSWORD"])
             # 页面标题也叫「登录」，按钮是 .btnForLogin；找不到按钮时在密码框按回车
             button = page.locator(".btnForLogin")
             if button.count():
