@@ -20,7 +20,7 @@ class ParseModel(Protocol):
 def configured_model(config: Mapping[str, str]) -> ParseModel:
     """用配置建立调用，调用方只接触系统消息、用户消息及文本回复。"""
     if config.get("AI_PLATFORM", "anthropic") != "anthropic":
-        raise ConfigError("申请解析目前只支持 Anthropic 平台。")
+        raise ConfigError("AI_PLATFORM 配置不受支持，申请解析目前只支持 Anthropic（anthropic）。")
     api_key = config.get("ANTHROPIC_API_KEY")
     if not api_key:
         raise ConfigError("缺少配置，请在 .env 中填写 ANTHROPIC_API_KEY。")
