@@ -62,7 +62,8 @@ def test_unsupported_platform_is_rejected():
         configured_model({"AI_PLATFORM": "placeholder-platform"})
 
 
-def test_truncated_reply_is_rejected(monkeypatch):
+@pytest.mark.parametrize("stop_reason", ["refusal", "max_tokens"])
+def test_unsuccessful_stop_reason_rejects_even_valid_json(monkeypatch, stop_reason):
     class StubClient:
         def __enter__(self):
             return self
@@ -81,8 +82,8 @@ def test_truncated_reply_is_rejected(monkeypatch):
                 role="assistant",
                 model="placeholder-model",
                 usage=anthropic.types.Usage(input_tokens=1, output_tokens=1),
-                content=[],
-                stop_reason="max_tokens",
+                content=[anthropic.types.TextBlock(type="text", text="[]")],
+                stop_reason=stop_reason,
             )
 
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: StubClient())

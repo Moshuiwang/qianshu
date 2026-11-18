@@ -4,7 +4,7 @@ import json
 import math
 import re
 from calendar import month_abbr, month_name
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import fields
 from datetime import date
 from pathlib import Path
@@ -14,7 +14,7 @@ from qianshu.config import load_config
 from qianshu.draft import Candidate, DraftField, PackageRow, PolicyDraft, SourceExcerpt, Uncertainty
 
 from .model import ModelError, ParseModel, configured_model
-from .scope import Scope, policy_scopes, without_batch_intro
+from .scope import Scope, clause_spans, policy_scopes, without_batch_intro, without_list_prefix
 
 __all__ = ["ModelError", "ParseError", "parse_application"]
 
@@ -26,11 +26,11 @@ _DATES = {"start_date", "end_date"}
 _OPTIONS = {"policy_type", "benefit_type"}
 _MUTEX = "maintain_mutual_exclusion_group"
 _MUTEX_ANSWER = re.compile(
-    r"(?:是否(?:需要)?|需不需要|需要)?(?:维护)?互斥组\s*[:：=]\s*([是否])"
-    r"(?:\s*[（(][^（）()]+[）)])?"
+    r"(?:是否(?:需要)?|需不需要|需要)?(?:维护)?互斥组\s*[:：=]\s*([是否])(?=$|\s|[（(.])"
 )
 _MUTEX_NO = re.compile(r"(?:不需要|不需|无需|不用|不)维护互斥组")
 _MUTEX_YES = re.compile(r"(?:需要|需|须|必须)维护互斥组")
+_MUTEX_BREAKS = "。；;，,！!？?\r\n"
 _DATE_LABELS = {
     "start_date": r"(?:申请|政策|活动)?(?:开始|起始)(?:日期|时间|日)?|"
                   r"(?:(?:application|policy|campaign)\s+)?start(?:\s+date)?|(?:活动)?自",
@@ -44,6 +44,19 @@ _DATE_TEXT = (
 )
 _LABEL_BOUNDARY = r"(?<![^\W_])"
 _DATE_SEPARATOR = r"\s*[:：]?\s*"
+_DATE_CLAUSE_BREAK = re.compile(r"[。！!？?；;]")
+_DATE_PARENT = re.compile(
+    r"(?:申请|政策|活动)(?:日期|时间|起止(?:日期|时间))?\s*[:：]|"
+    r"(?:application|policy|campaign)(?:\s+dates?)?\s*[:：]",
+    re.IGNORECASE,
+)
+_DATE_LINE = re.compile(
+    rf"(?:{_DATE_LABELS['start_date']}|{_DATE_LABELS['end_date']}){_DATE_SEPARATOR}{_DATE_TEXT}",
+    re.IGNORECASE,
+)
+_APPLICATION_HEADING = re.compile(r"[^：:，,。；;]{1,60}(?:定向|通用)?政策申请\s*[:：]")
+_DAYS_ACTION = {"recharge_days": r"充(?:值)?", "gift_days": r"赠送|赠|(?<![配运发寄推赠])送"}
+_DAYS_NEGATION = re.compile(r"[不无未免非否]|取消|停止|拒绝|避免")
 _ARCHIVE_LABEL = re.compile(
     rf"{_LABEL_BOUNDARY}(?:(?:本批(?:次)?|全批)(?:的)?)?"
     r"(?:存档|归档)(?:文档(?:链接)?|链接|网址|地址)?"
@@ -53,7 +66,7 @@ _NO_GIFT_PACKAGE = re.compile(
     r"(?<![非并])无赠送(?:节目)?包|(?:不赠送|没有赠送)(?:节目)?包|赠送(?:节目)?包\s*[:：=]\s*无"
 )
 _INTRO = re.compile(r"[^\[\]{}！!？?。.:：\u0060\r\n]+[！!？?。.:：]?(?:[ \t]*\r?\n|(?<=[！!？?。.:：])[ \t]*)")
-_FENCE = re.compile(r"\u0060{3}json[ \t]*\r?\n(.*?)\r?\n[ \t]*\u0060{3}", re.DOTALL | re.IGNORECASE)
+_FENCE = re.compile(r"\u0060{3}(?:json)?[ \t]*\r?\n(.*?)\r?\n[ \t]*\u0060{3}", re.DOTALL | re.IGNORECASE)
 
 
 class ParseError(ValueError):
@@ -114,7 +127,11 @@ def parse_application(
         _check_object(company, {"value", "evidence", "candidates"})
         quotes = company.get("evidence", [])
         _check_quotes(quotes)
-        companies.append((_value("company", company.get("value")), quotes))
+        heading_quotes = list(quotes)
+        for raw in policy.values():
+            if isinstance(raw, dict) and isinstance(raw.get("evidence"), list):
+                heading_quotes.extend(quote for quote in raw["evidence"] if isinstance(quote, str))
+        companies.append((_value("company", company.get("value")), heading_quotes))
 
     drafts = []
     for policy, scope in zip(policies, policy_scopes(body, companies), strict=True):
@@ -201,50 +218,74 @@ def _mutex(body: str, scope: Scope) -> DraftField:
         return DraftField(uncertainty=Uncertainty(reason="无法唯一定位政策段落以核对互斥组。"))
 
     answers: dict[str, list[SourceExcerpt]] = {}
+    excerpts: dict[tuple[int, int], SourceExcerpt] = {}
+    unresolved = False
     for left, right in scope.spans():
-        for match in re.finditer(r"[^。；;，,！!.\r\n]+", body[left:right]):
-            clause = match[0].strip()
-            statement = without_batch_intro(clause)
-            if answer := _MUTEX_ANSWER.fullmatch(statement):
+        for start, end in clause_spans(body[left:right], punctuation=_MUTEX_BREAKS):
+            raw_clause = body[left + start:left + end]
+            clause = raw_clause.strip()
+            if "互斥组" not in clause:
+                continue
+            statement = without_list_prefix(without_batch_intro(without_list_prefix(clause))).strip()
+            if answer := _MUTEX_ANSWER.match(statement):
                 value = answer[1]
-            elif _MUTEX_NO.fullmatch(statement):
+            elif answer := _MUTEX_NO.match(statement):
                 value = "否"
-            elif _MUTEX_YES.fullmatch(statement):
+            elif answer := _MUTEX_YES.match(statement):
                 value = "是"
             else:
-                continue
-            start = left + match.start() + len(match[0]) - len(match[0].lstrip())
-            excerpt = SourceExcerpt(text=clause, start=start)
-            evidence = answers.setdefault(value, [])
-            if excerpt not in evidence:
-                evidence.append(excerpt)
+                value = None
+            start += left + len(raw_clause) - len(raw_clause.lstrip())
+            end += left
+            bare = answer is not None and answer[0] == statement.removesuffix(".").rstrip()
+            limit = right if (left, right) == scope.local else len(body)
+            supplement = _mutex_supplement(body[end:limit]) if value == "否" and bare else 0
+            clause = body[start:end + supplement].rstrip()
+            excerpt = excerpts.setdefault((start, start + len(clause)), SourceExcerpt(text=clause, start=start))
+            unresolved |= not bare or bool(supplement)
+            if value is not None:
+                evidence = answers.setdefault(value, [])
+                if excerpt not in evidence:
+                    evidence.append(excerpt)
 
-    if not answers:
+    if not answers and not unresolved:
         return DraftField(value="是")
-    if len(answers) == 1:
+    if len(answers) == 1 and not unresolved:
         value, evidence = next(iter(answers.items()))
         return DraftField(value=value, evidence=evidence)
     return DraftField(
-        evidence=[excerpt for excerpts in answers.values() for excerpt in excerpts],
+        evidence=list(excerpts.values()),
         uncertainty=Uncertainty(
-            reason="原文对互斥组有相互矛盾的说明。",
+            reason="原文对互斥组的说明有保留、存在矛盾或无法确认。",
             candidates=[Candidate(value=value, evidence=evidence) for value, evidence in answers.items()],
         ),
     )
 
 
-def _evidence(body: str, scope: Scope, quotes: object, *, at_boundary: bool = False) -> tuple[list[SourceExcerpt], bool]:
+def _mutex_supplement(tail: str) -> int:
+    """保留紧接否定答复的逗号说明或独立括注。"""
+    prefix = re.match(r"(?:[。；;.!！?？]?\s*(?=[（(])|[，,][ \t]*)", tail)
+    if prefix is None:
+        return 0
+    rest = tail[prefix.end():]
+    if without_list_prefix(rest) != rest:
+        return 0
+    span = next(clause_spans(rest, punctuation="。；;！!？?\r\n"), None)
+    return prefix.end() + span[1] if span and span[0] == 0 else 0
+
+
+def _evidence(body: str, scope: Scope, quotes: object) -> tuple[list[SourceExcerpt], bool]:
     _check_quotes(quotes)
     evidence = []
     for quote in dict.fromkeys(quotes):
-        if excerpt := scope.excerpt(body, quote, at_boundary=at_boundary):
+        if excerpt := scope.excerpt(body, quote):
             evidence.append(excerpt)
     return evidence, len(evidence) == len(set(quotes))
 
 
 def _draft_field(name: str, *, raw: dict, body: str, scope: Scope, options: dict[str, str]) -> DraftField:
     _check_object(raw, {"value", "evidence", "candidates"})
-    value_evidence, complete = _evidence(body, scope, raw.get("evidence", []), at_boundary=name in _DATES)
+    value_evidence, complete = _evidence(body, scope, raw.get("evidence", []))
     evidence = list(value_evidence)
     value = _value(name, raw.get("value"))
     if name in _OPTIONS and value is not None:
@@ -253,16 +294,16 @@ def _draft_field(name: str, *, raw: dict, body: str, scope: Scope, options: dict
     proposed = _candidate_items(raw)
     candidates = []
     for item in proposed:
-        candidate_evidence, candidate_complete = _evidence(
-            body, scope, item.get("evidence", []), at_boundary=name in _DATES,
-        )
+        candidate_evidence, candidate_complete = _evidence(body, scope, item.get("evidence", []))
         candidate_value = _value(name, item.get("value"))
         if name in _OPTIONS and candidate_value is not None:
             candidate_value = options.get(candidate_value, candidate_value)
         for excerpt in candidate_evidence:
             if excerpt not in evidence:
                 evidence.append(excerpt)
-        if candidate_complete and _supports_candidate(name, candidate_value, candidate_evidence, options):
+        if candidate_complete and _supports_value(
+            name, candidate_value, candidate_evidence, options, body=body, scope=scope, candidate=True,
+        ):
             candidate = Candidate(value=candidate_value, evidence=candidate_evidence)
             if candidate not in candidates:
                 candidates.append(candidate)
@@ -273,12 +314,14 @@ def _draft_field(name: str, *, raw: dict, body: str, scope: Scope, options: dict
         reason = "申请存在待确认的候选值。"
     elif value is None:
         reason = "申请未提供明确且格式有效的取值。"
-    elif not evidence or not complete or not _supports(name, value, evidence, options):
+    elif not complete or not _supports_value(name, value, evidence, options, body=body, scope=scope):
         reason = "取值缺少可核对的原文依据或已知选项。"
     else:
         return DraftField(value=value, evidence=evidence)
 
-    if complete and _supports_candidate(name, value, value_evidence, options):
+    if complete and _supports_value(
+        name, value, value_evidence, options, body=body, scope=scope, candidate=True,
+    ):
         candidate = Candidate(value=value, evidence=value_evidence)
         if candidate not in candidates:
             candidates.insert(0, candidate)
@@ -334,26 +377,15 @@ def _package(value: object) -> bool:
     )
 
 
-def _supports_candidate(
-    name: str, value: object, evidence: list[SourceExcerpt], options: dict[str, str]
-) -> bool:
-    return value is not None and bool(evidence) and _supports_value(name, value, evidence, options, candidate=True)
-
-
-def _supports(
-    name: str, value: object, evidence: list[SourceExcerpt], options: dict[str, str]
-) -> bool:
-    if name in _OPTIONS and value not in options.values():
-        return False
-    return _supports_value(name, value, evidence, options)
-
-
 def _supports_value(
-    name: str, value: object, evidence: list[SourceExcerpt], options: dict[str, str], *, candidate: bool = False,
+    name: str, value: object, evidence: list[SourceExcerpt], options: dict[str, str], *,
+    body: str, scope: Scope, candidate: bool = False,
 ) -> bool:
+    if value is None or not evidence or (not candidate and name in _OPTIONS and value not in options.values()):
+        return False
     excerpts = [item.text for item in evidence]
     if name in _DATES:
-        return _date_evidence(name, value, excerpts, candidate=candidate)
+        return _supports_in_context(_date_pattern(name, value, candidate=candidate), excerpts, body, scope, _date_context)
     if name in _OPTIONS:
         terms = {value, *(term for term, option in options.items() if option == value)}
         return any(term in snippet for term in terms for snippet in excerpts)
@@ -368,12 +400,12 @@ def _supports_value(
         )
     if name in _LISTS:
         return all(any(item in excerpt for excerpt in excerpts) for item in value)
-    if name == "gift_days":
-        return any(
-            re.search(rf"(?:赠送|赠|(?<![配运发寄推赠])送)(?:时长|天数)?\s*[:：]?\s*{value}(?!\d|\.\d)", excerpt)
-            for excerpt in excerpts
+    if name in _DAYS_ACTION:
+        pattern = re.compile(rf"(?:{_DAYS_ACTION[name]})[ \t]*{value}[ \t]*天")
+        return _supports_in_context(
+            pattern, excerpts, body, scope, _days_context,
         )
-    if name in {"recharge_days", "effective_multiplier"}:
+    if name == "effective_multiplier":
         number = re.escape(str(value))
         return any(re.search(rf"(?<![\d.]){number}(?!\d|\.\d)", excerpt) for excerpt in excerpts)
     if name == "packages":
@@ -397,7 +429,61 @@ def _supports_value(
     return True
 
 
-def _date_evidence(name: str, value: str, excerpts: list[str], *, candidate: bool) -> bool:
+def _supports_in_context(
+    pattern: re.Pattern[str], excerpts: list[str], body: str, scope: Scope,
+    context: Callable[[str, int, int], bool],
+) -> bool:
+    for excerpt in excerpts:
+        locations = tuple(scope.occurrences(body, excerpt))
+        for match in pattern.finditer(excerpt):
+            if locations and all(
+                context(body, start + match.start(), start + match.end())
+                for start in locations
+            ):
+                return True
+    return False
+
+
+def _days_context(body: str, start: int, end: int) -> bool:
+    return any(
+        left <= start and end <= right and not _DAYS_NEGATION.search(body, left, right)
+        for left, right in clause_spans(body, punctuation=_MUTEX_BREAKS)
+    )
+
+
+def _date_context(body: str, start: int, end: int) -> bool:
+    if re.match(r"\d|[-./]\d", body[end:]):
+        return False
+    previous_lines = re.split(r"[\r\n]", body[:start])
+    prefix = _DATE_CLAUSE_BREAK.split(previous_lines.pop())[-1]
+    pieces = re.split(r"[，,]", prefix)
+    if label := without_batch_intro(without_list_prefix(pieces.pop())).strip():
+        return _application_date_parent(label)
+    for piece in reversed(pieces):
+        label = without_batch_intro(without_list_prefix(piece)).strip()
+        parent = re.match(r"[^：:]+[:：]", label)
+        if parent and not _DATE_LINE.match(label):
+            return _application_date_parent(parent[0])
+
+    # 同一上级标签可引出连续的日期字段，空行或其他字段结束该上下文。
+    for line in reversed(previous_lines):
+        previous = without_list_prefix(_DATE_CLAUSE_BREAK.split(line)[-1]).strip()
+        if previous.endswith(("：", ":")):
+            return _application_date_parent(previous) or not without_batch_intro(previous).strip()
+        if _DATE_LINE.match(previous):
+            continue
+        parent = re.match(r"[^：:]+[:：]", previous)
+        if parent and _DATE_LINE.match(previous[parent.end():].lstrip()):
+            return _application_date_parent(parent[0])
+        break
+    return True
+
+
+def _application_date_parent(label: str) -> bool:
+    return bool(_DATE_PARENT.fullmatch(label) or _APPLICATION_HEADING.fullmatch(label))
+
+
+def _date_pattern(name: str, value: str, *, candidate: bool) -> re.Pattern[str]:
     year, month, day = map(int, value.split("-"))
     month_text = rf"(?:{month_name[month]}|{month_abbr[month]}\.?)"
     formats = [
@@ -416,8 +502,7 @@ def _date_evidence(name: str, value: str, excerpts: list[str], *, candidate: boo
     if name == "end_date":
         # 区间连接词只有紧接申请起始日期时才可作为结束标签。
         label += rf"|(?:{_DATE_LABELS['start_date']}){_DATE_SEPARATOR}{_DATE_TEXT}\s*[至到~～–—]"
-    pattern = re.compile(
-        rf"{_LABEL_BOUNDARY}(?:{label}){_DATE_SEPARATOR}(?:{'|'.join(formats)})(?!\d|[-./]\d)",
+    return re.compile(
+        rf"(?:{label}){_DATE_SEPARATOR}(?:{'|'.join(formats)})(?!\d|[-./]\d)",
         re.IGNORECASE,
     )
-    return any(pattern.search(without_batch_intro(excerpt)) for excerpt in excerpts)

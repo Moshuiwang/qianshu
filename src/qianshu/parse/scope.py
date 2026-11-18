@@ -1,15 +1,31 @@
 """定位政策段落与明确共享的原文范围。"""
 
 import re
+from collections.abc import Iterator
 from dataclasses import dataclass
 
 from qianshu.draft import SourceExcerpt
 
 type Span = tuple[int, int]
 
-_ITEM = re.compile(r"^\s*(?:[①-⑳]|\d{1,3}[、)）]|\d{1,3}[.．](?!\d)|[（(]\d{1,3}[)）])\s*")
+_ITEM = re.compile(r"^[ \t]*(?:[①-⑳]|\d{1,3}[、)）]|\d{1,3}[.．](?!\d)|[（(]\d{1,3}[)）])[ \t]*")
+_BULLET = re.compile(r"^[ \t]*[-*•][ \t]+")
 _COMPANY = re.compile(r"^\s*(?:(?:申请|适用)公司(?:名称)?|公司(?:名称)?)\s*[:：]\s*")
-_COMPANY_HEADING = re.compile(r"^\s*[\w&· -]{1,40}?公司(?:[甲乙丙丁戊己庚辛壬癸\da-zA-Z]+)?(?=[：:，,。；;]|$)")
+_COMPANY_HEADING = re.compile(
+    r"^\s*[\w&· -]{1,40}?公司(?:[甲乙丙丁戊己庚辛壬癸\da-zA-Z]+)?"
+    r"(?=\s*(?:的?(?:定向|通用)?政策(?:申请)?)?(?:[：:，,。；;…]|$))"
+)
+_COMPANY_APPLICATION = re.compile(r"^\s*的?(?:定向|通用)?政策(?:申请|[：:，,。；;…]|$)")
+_NUMBERED_FIELD = re.compile(
+    r"^(?:(?:申请|政策|活动)?(?:开始|起始|结束|终止|截止)(?:日期|时间|日)|"
+    r"(?:(?:application|policy|campaign)\s+)?(?:start|end)\s+date)\s*(?=[:：\d])|"
+    r"^(?:用户标签|用户范围|优惠政策名称|优惠类型|政策类型|审批件附件|"
+    r"是否只触发一次|只触发一次|多买多送|生效倍数|降包用户取消优惠|充值天数|赠送天数)"
+    r"\s*[:：]|"
+    r"^(?:(?:是否(?:需要)?|需不需要|需要|无需|不需要|不需|不用|不)?(?:维护)?互斥组)",
+    re.IGNORECASE,
+)
+_NUMBERED_DEAL = re.compile(r"^充(?:值)?\s*\d+\s*天\s*(?:送|赠送|赠)\s*\d+\s*天[。.]?$")
 _BATCH_PREFIX = (
     r"以下各(?:条|项)(?:政策|申请)?(?:均|全部)?|"
     r"(?:本批(?:次)?|全批)(?:的)?(?:"
@@ -31,84 +47,159 @@ class Scope:
     def spans(self) -> tuple[Span, ...]:
         return self.shared if self.local is None else (self.local, *self.shared)
 
-    def excerpt(self, body: str, quote: str, *, at_boundary: bool = False) -> SourceExcerpt | None:
-        if not quote.strip():
+    def excerpt(self, body: str, quote: str) -> SourceExcerpt | None:
+        start = next(self.occurrences(body, quote), None)
+        if start is None:
             return None
+        first = body.find(quote)
+        unique = body.find(quote, first + 1) < 0
+        return SourceExcerpt(text=quote, start=start if unique else None)
+
+    def occurrences(self, body: str, quote: str) -> Iterator[int]:
+        if not quote.strip():
+            return
         for left, right in self.spans():
             start = body.find(quote, left, right)
             while start >= 0:
-                if not at_boundary or start == 0 or not body[start - 1].isalnum():
-                    first = body.find(quote)
-                    unique = body.find(quote, first + 1) < 0
-                    return SourceExcerpt(text=quote, start=start if unique else None)
+                yield start
                 start = body.find(quote, start + 1, right)
-        return None
+
+
+@dataclass(frozen=True)
+class Heading:
+    start: int
+    text: str
+    company: str | None
+    numbered: bool
 
 
 def policy_scopes(body: str, companies: list[tuple[str | None, list[str]]]) -> list[Scope]:
     """按原文标题划分段落，用公司名绑定草稿，无法唯一绑定时保留待确认。"""
-    lines = list(re.finditer(r"[^\r\n]+", body))
-    headings = [
-        (line.start(), line.start() + marker.end())
-        for line in lines
-        if (marker := _ITEM.match(line[0]))
-    ]
-    if not headings:
-        company_names = {name for name, _ in companies if name is not None}
-        for line in lines:
-            if marker := _COMPANY.match(line[0]):
-                headings.append((line.start(), line.start() + marker.end()))
-            elif _COMPANY_HEADING.match(line[0]) or any(
-                _starts_with_company(line[0].lstrip(), name) for name in company_names
-            ):
-                headings.append((line.start(), line.start()))
-
+    company_names = {name for name, _ in companies if name is not None}
+    headings = _headings(body, company_names)
     shared = _shared_spans(body, headings)
-    if len(companies) == 1 and len(headings) <= 1:
-        left = headings[0][0] if headings else 0
-        return [Scope((left, len(body)), shared)]
+    batch_companies = {
+        name for left, right in shared
+        if (name := _batch_company(body[left:right], company_names)) is not None
+    }
+    if not headings:
+        local = (0, len(body)) if len(companies) == 1 and len(batch_companies) <= 1 else None
+        return [Scope(local, shared) for _ in companies]
 
-    ends = [start for start, _ in headings[1:]] + [len(body)]
+    ends = [heading.start for heading in headings[1:]] + [len(body)]
     matches = []
     for company, quotes in companies:
-        locations = []
-        if company is not None:
-            for (start, content), end in zip(headings, ends):
-                heading = body[content:end].lstrip()
-                if marker := _COMPANY.match(heading):
-                    heading = heading[marker.end():]
-                if _starts_with_company(heading, company) or any(
-                    _starts_with_company(line[marker.end():], company)
-                    for line in heading.splitlines()
-                    if (marker := _COMPANY.match(line))
-                ):
-                    locations.append((start, end))
+        locations = [
+            (heading, end) for heading, end in zip(headings, ends)
+            if len(batch_companies) <= 1
+            and (not batch_companies or batch_companies == {company})
+            and (
+                (company is not None and heading.company == company)
+                or (heading.company is None and heading.numbered and batch_companies == {company})
+                or (len(companies) == len(headings) == 1 and (heading.company is None or company is None))
+            )
+        ]
         if len(locations) > 1:
             locations = [
-                (left, right) for left, right in locations
-                if any(company in quote and body.find(quote, left, right) >= 0 for quote in quotes)
+                (heading, end) for heading, end in locations
+                if _quotes_heading(body, heading, end, quotes)
             ]
-        matches.append(locations[0] if len(locations) == 1 else None)
+        matches.append((locations[0][0].start, locations[0][1]) if len(locations) == 1 else None)
     return [Scope(span if matches.count(span) == 1 else None, shared) for span in matches]
 
 
+def _headings(body: str, company_names: set[str]) -> list[Heading]:
+    headings = []
+    for line in re.finditer(r"[^\r\n]+", body):
+        if _SHARED.match(line[0]):
+            continue
+        item = _ITEM.match(line[0])
+        content = line[0][item.end():] if item else line[0].lstrip()
+        company_label = _COMPANY.match(content)
+        name_text = content[company_label.end():] if company_label else content
+        if company_label or _COMPANY_HEADING.match(content) or any(
+            _starts_with_company(content, name) for name in company_names
+        ):
+            heading = Heading(line.start(), content, _company_name(name_text, company_names), bool(item))
+        elif item and not _NUMBERED_FIELD.match(content):
+            heading = Heading(line.start(), content, None, True)
+        else:
+            continue
+        headings.append(heading)
+    # 充送行在明确的单条申请标题及编号字段之后时，可作为清单中的优惠描述。
+    if (
+        len(headings) == 2
+        and headings[0].company is not None
+        and not headings[0].numbered
+        and re.search(r"政策申请\s*[:：]\s*$", headings[0].text)
+        and headings[1].numbered
+        and _NUMBERED_DEAL.fullmatch(headings[1].text.rstrip())
+        and any(
+            _NUMBERED_FIELD.match(line[item.end():])
+            for line in body[headings[0].start:headings[1].start].splitlines()
+            if (item := _ITEM.match(line))
+        )
+    ):
+        headings.pop()
+    return headings
+
+
+def _company_name(text: str, names: set[str]) -> str | None:
+    matching = [name for name in names if _starts_with_company(text, name)]
+    if matching:
+        return max(matching, key=len)
+    if match := _COMPANY_HEADING.match(text):
+        return match[0].strip()
+    return None
+
+
 def _starts_with_company(heading: str, company: str) -> bool:
-    return re.match(rf"{re.escape(company)}(?=$|[\s，,、。；;：:（(—-])", heading) is not None
+    return heading.startswith(company) and (
+        re.match(r"$|[\s，,、。；;：:（(—-]", heading[len(company):]) is not None
+        or _COMPANY_APPLICATION.match(heading[len(company):]) is not None
+    )
 
 
-def _shared_spans(body: str, headings: list[Span]) -> tuple[Span, ...]:
+def _batch_company(clause: str, names: set[str]) -> str | None:
+    if not _SHARED.match(clause):
+        return None
+    content = re.sub(r"^(?:均)?(?:为|是|属于|适用于?)\s*", "", without_batch_intro(clause).lstrip())
+    if label := _COMPANY.match(content):
+        return _company_name(content[label.end():], names)
+    company = _company_name(content, names)
+    return company if company and _COMPANY_APPLICATION.match(content[len(company):]) else None
+
+
+def _quotes_heading(body: str, heading: Heading, end: int, quotes: list[str]) -> bool:
+    text = heading.text
+    if _COMPANY.match(heading.text):
+        text = _COMPANY.sub("", text, count=1)
+    title = re.split(r"[：:，,。；;]", text, maxsplit=1)[0].strip()
+    title_start = body.find(title, heading.start, end)
+    return bool(title) and any(
+        title in quote and any(
+            start <= title_start and start + len(quote) >= title_start + len(title)
+            for start in Scope((heading.start, end), ()).occurrences(body, quote)
+        )
+        for quote in quotes
+    )
+
+
+def _shared_spans(body: str, headings: list[Heading]) -> tuple[Span, ...]:
     # 存档链接也可写在单条政策之后。独立的批次标题可引出一个共享段落。
     spans = []
-    for match in re.finditer(r"[^。\r\n！？；;]+[。！？；;]?", body):
-        if _BATCH_ARCHIVE.match(match[0]):
-            comma = re.search(r"[，,]", match[0])
-            spans.append((match.start(), match.start() + comma.start() if comma else match.end()))
+    for start, end in clause_spans(body, punctuation="。！？；;\r\n"):
+        clause = body[start:end]
+        if end < len(body) and body[end] in "。！？；;":
+            end += 1
+        if _BATCH_ARCHIVE.match(clause):
+            comma = re.search(r"[，,]", clause)
+            spans.append((start, start + comma.start() if comma else end))
             continue
-        if not _SHARED.match(match[0]):
+        if not _SHARED.match(clause):
             continue
-        start, end = match.span()
-        if not without_batch_intro(match[0]).strip() and match[0].rstrip().endswith(("：", ":")):
-            stops = [left for left, _ in headings if left > end]
+        if not without_batch_intro(clause).strip() and clause.rstrip().endswith(("：", ":")):
+            stops = [heading.start for heading in headings if heading.start > end]
             blank = re.search(r"\r?\n[ \t]*\r?\n", body[end:])
             if blank:
                 stops.append(end + blank.start())
@@ -119,3 +210,23 @@ def _shared_spans(body: str, headings: list[Span]) -> tuple[Span, ...]:
 
 def without_batch_intro(clause: str) -> str:
     return _BATCH_INTRO.sub("", clause, count=1)
+
+
+def without_list_prefix(clause: str) -> str:
+    return _ITEM.sub("", _BULLET.sub("", clause, count=1), count=1)
+
+
+def clause_spans(text: str, *, punctuation: str) -> Iterator[Span]:
+    """括号内的标点属于括注，不切断原文。"""
+    left = depth = 0
+    for match in re.finditer(rf"[（）(){re.escape(punctuation)}]", text):
+        if match[0] in "（(":
+            depth += 1
+        elif match[0] in "）)":
+            depth = max(0, depth - 1)
+        elif depth == 0:
+            if left < match.start():
+                yield left, match.start()
+            left = match.end()
+    if left < len(text):
+        yield left, len(text)
