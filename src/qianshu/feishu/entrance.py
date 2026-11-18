@@ -46,7 +46,7 @@ class Application:
 
 class Transport(Protocol):
     def react(self, message_id: str) -> None: ...
-    def reply(self, message_id: str, text: str) -> None: ...
+    def reply(self, message_id: str, text: str, *, deadline: float) -> None: ...
     def send_card(self, card: dict) -> str: ...
     def history(self, start: float, end: float) -> Iterable[Message]: ...
     def download(self, message_id: str, attachment: Attachment) -> bytes: ...
@@ -120,55 +120,69 @@ class Entrance:
 
     def inject_message(self, message: Message) -> Future | None:
         """进程内注入，使用离线 Transport 时整个处理链无需 TCP。"""
-        if self._in_scope(message):
-            return self._receipts.submit(self._receive, message)
+        deadline = time.monotonic() + 3
+        if self._in_scope(message) and message.bot_mention_keys:
+            return self._receipts.submit(self._receive, message, deadline)
         return None
 
-    def _receive(self, message: Message) -> Future | None:
+    def _receive(self, message: Message, deadline: float) -> Future | None:
         with self._lock:
             if message.message_id in self._pending:
                 return None
             self._pending.add(message.message_id)
+        work = None
         try:
-            if self.window.contains(self.clock()) and not self.state.has_message(message.message_id):
-                self.transport.react(message.message_id)
-                work = self._work.submit(self._handle_once, message)
-                work.add_done_callback(lambda _: self._release(message.message_id))
-                return work
+            if not self.window.contains(self.clock()):
+                return None
+            status = self.state.message_status(message.message_id)
+            if status == "done":
+                return None
+            text = self._approved_text(message) if status is None else None
+            if text is None:
+                if status is None and not self.state.claim_message(message.message_id, "notice_pending"):
+                    return None
+                if time.monotonic() < deadline:
+                    self.transport.reply(message.message_id, _NOTICE, deadline=deadline)
+                    self.state.complete_notice(message.message_id)
+                return None
+
+            self.transport.react(message.message_id)
+            work = self._work.submit(self._handle_once, message, text)
+            work.add_done_callback(lambda _: self._release(message.message_id))
         except Exception:
             _LOG.error("feishu_receipt_failed")
-        self._release(message.message_id)
-        return None
+        finally:
+            if work is None:
+                self._release(message.message_id)
+        return work
 
     def _release(self, message_id: str) -> None:
         with self._lock:
             self._pending.discard(message_id)
 
-    def _handle_once(self, message: Message) -> None:
+    def _handle_once(self, message: Message, text: str) -> None:
         try:
             if self.window.contains(self.clock()) and self.state.claim_message(message.message_id):
-                self._handle(message)
+                self._handle(message, text)
         except Exception:
             _LOG.error("feishu_message_processing_failed")
 
-    def _handle(self, message: Message) -> None:
-        if not self.window.contains(self.clock()):
-            return
-        accepted = False
-        if message.sender_id in self.settings.allowed_senders and message.bot_mention_keys:
-            try:
-                text, attachments = _application_body(message)
-                accepted = bool(text.strip()) and fingerprint(text) == self.settings.approved_fingerprint
-            except (AttributeError, ValueError, TypeError, KeyError):
-                pass
-        if not accepted:
-            self.transport.reply(message.message_id, _NOTICE)
-            return
+    def _approved_text(self, message: Message) -> str | None:
+        if message.sender_id not in self.settings.allowed_senders:
+            return None
         try:
-            contents = tuple(self.transport.download(message.message_id, item) for item in attachments)
+            text, attachments = _application_body(message)
+            if not attachments and text.strip() and fingerprint(text) == self.settings.approved_fingerprint:
+                return text
+        except (AttributeError, ValueError, TypeError, KeyError):
+            pass
+        return None
+
+    def _handle(self, message: Message, text: str) -> None:
+        try:
             if not self.window.contains(self.clock()):
                 return
-            report = self.process(Application(message, text, contents))
+            report = self.process(Application(message, text, ()))
         except Exception:
             _LOG.error("feishu_message_processing_failed")
             report = Report("飞书群申请", failures=("处理未完成，请核对处理状态。",))
@@ -185,8 +199,8 @@ class Entrance:
                 for message in self.transport.history(self.window.start.timestamp(), end):
                     if not self.window.contains(self.clock()):
                         break
-                    if self._in_scope(message):
-                        self._receive(message)
+                    if self._in_scope(message) and message.bot_mention_keys:
+                        self._receive(message, time.monotonic() + 3)
         except Exception:
             _LOG.error("feishu_history_failed")
 

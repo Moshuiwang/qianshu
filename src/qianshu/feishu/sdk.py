@@ -1,22 +1,29 @@
 """飞书官方 SDK 适配。只通过本应用长连接分发审批事件。"""
 
 import asyncio
+import base64
 import json
 import logging
 import math
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextvars import ContextVar
+from http import HTTPStatus
 from pathlib import Path
 from secrets import token_urlsafe
 from threading import Lock
+from urllib.parse import parse_qs, urlparse
+from uuid import NAMESPACE_OID, uuid5
 
+import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequest, CreateMessageReactionRequestBody,
     CreateMessageRequest, CreateMessageRequestBody, Emoji,
-    GetMessageResourceRequest, ListMessageRequest, ReplyMessageRequest, ReplyMessageRequestBody,
+    GetChatMembersRequest, GetMessageResourceRequest, ListMessageRequest,
+    ReplyMessageRequest, ReplyMessageRequestBody,
 )
+from lark_oapi.core.token.manager import TokenManager
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse,
 )
@@ -28,6 +35,7 @@ from .settings import Settings, Window
 from .state import State
 
 _LOG = logging.getLogger(__name__)
+_HTTP_TIMEOUT = 2
 
 
 def _checked(response):
@@ -51,7 +59,7 @@ class _Transport:
         self.settings, self.window, self.clock = settings, window, clock
         self.im = (
             lark.Client.builder().app_id(settings.app_id).app_secret(settings.app_secret)
-            .log_level(lark.LogLevel.ERROR).timeout(2).build().im.v1
+            .log_level(lark.LogLevel.ERROR).timeout(_HTTP_TIMEOUT).enable_set_token(True).build().im.v1
         )
 
     def _require_window(self) -> None:
@@ -66,13 +74,56 @@ class _Transport:
         self._require_window()
         _checked(self.im.message_reaction.create(request.build()))
 
-    def reply(self, message_id: str, text: str) -> None:
+    def reply(self, message_id: str, text: str, *, deadline: float) -> None:
+        self._require_window()
+        if time.monotonic() >= deadline:
+            raise TimeoutError
+        token = TokenManager.get_self_tenant_token(self.im.message.config)
+        if not token:
+            raise RuntimeError("飞书未返回租户令牌。")
         body = ReplyMessageRequestBody.builder().msg_type("text").content(
             json.dumps({"text": text}, ensure_ascii=False),
+        ).uuid(
+            str(uuid5(NAMESPACE_OID, message_id)),
         ).build()
-        request = ReplyMessageRequest.builder().message_id(message_id).request_body(body)
-        self._require_window()
-        _checked(self.im.message.reply(request.build()))
+        request = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
+        option = lark.RequestOption.builder().tenant_access_token(token).build()
+
+        async def send():
+            self._require_window()
+            remaining = min(deadline - time.monotonic(), self.window.end.timestamp() - self.clock())
+            if remaining <= 0:
+                raise TimeoutError
+            async with asyncio.timeout(remaining):
+                _checked(await self.im.message.areply(request, option))
+
+        asyncio.run(send())
+
+    async def is_member(self, operator_id: str) -> bool:
+        seen_pages = set()
+        page = None
+        while True:
+            self._require_window()
+            request = (
+                GetChatMembersRequest.builder().chat_id(self.settings.chat_id)
+                .member_id_type("open_id").page_size(100)
+            )
+            if page:
+                request.page_token(page)
+            # SDK 的异步 REST 方法也会同步获取租户令牌。
+            response = await asyncio.to_thread(self.im.chat_members.get, request.build())
+            data = _checked(response).data
+            if data.trigger_security_conf_limit or type(data.has_more) is not bool:
+                return False
+            if any(member.member_id_type == "open_id" and member.member_id == operator_id
+                   for member in data.items or ()):
+                return True
+            if not data.has_more:
+                return False
+            page = data.page_token
+            if not page or page in seen_pages:
+                return False
+            seen_pages.add(page)
 
     def send_card(self, card: dict) -> str:
         body = CreateMessageRequestBody.builder().receive_id(self.settings.chat_id).msg_type(
@@ -143,6 +194,7 @@ class _Connection(ws.Client):
         self.service = service
         self.dispatch_origin = ContextVar("feishu_dispatch_origin", default=None)
         self.receiver = None
+        self.frames = set()
         self._generation = 0
         dispatcher = (
             lark.EventDispatcherHandler.builder("", "")
@@ -157,10 +209,44 @@ class _Connection(ws.Client):
 
     async def _connect(self):
         self.service.transport._require_window()
-        await super()._connect()
-        self.service.transport._require_window()
-        self._generation += 1
-        self.service._connected(self._conn)
+        async with asyncio.timeout(self.service._remaining()):
+            async with self._lock:
+                if self._conn is not None:
+                    return
+                conn_url = await self._discover_endpoint()
+                query = parse_qs(urlparse(conn_url).query)
+                conn_id, service_id = query[ws.DEVICE_ID][0], query[ws.SERVICE_ID][0]
+                self.service.transport._require_window()
+                try:
+                    self._conn = await ws.websockets.connect(
+                        conn_url, close_timeout=1, **ws._ws_connect_kwargs(),
+                    )
+                except ws.InvalidHandshake as error:
+                    ws._parse_ws_conn_exception(error)
+                self._conn_url, self._conn_id, self._service_id = conn_url, conn_id, service_id
+                self.service.transport._require_window()
+                self._generation += 1
+                self.service._connected(self._conn)
+                self.receiver = asyncio.create_task(self._receive_message_loop())
+
+    async def _discover_endpoint(self) -> str:
+        # 固定版本的 SDK 在这里直接调用无超时的 requests.post。
+        headers = {"locale": "zh", ws.USER_AGENT: self._user_agent}
+        body = {"AppID": self._app_id, "AppSecret": self._app_secret}
+        limit = min(_HTTP_TIMEOUT, self.service._remaining())
+        async with asyncio.timeout(limit):
+            async with httpx.AsyncClient(timeout=httpx.Timeout(limit, connect=limit)) as client:
+                response = await client.post(self._domain + ws.GEN_ENDPOINT_URI, headers=headers, json=body)
+        if response.status_code != HTTPStatus.OK:
+            raise ws.ServerException(response.status_code, "飞书长连接地址请求失败。")
+        endpoint = ws.JSON.unmarshal(response.text, ws.EndpointResp)
+        if endpoint.code in (ws.SYSTEM_BUSY, ws.INTERNAL_ERROR):
+            raise ws.ServerException(endpoint.code, "飞书长连接地址暂不可用。")
+        if endpoint.code != ws.OK:
+            raise ws.ClientException(endpoint.code, "飞书长连接地址请求被拒绝。")
+        if endpoint.data.ClientConfig is not None:
+            self._configure(endpoint.data.ClientConfig)
+        return endpoint.data.URL
 
     async def _disconnect(self):
         try:
@@ -175,16 +261,62 @@ class _Connection(ws.Client):
         except Exception:
             _LOG.error("feishu_connection_receive_failed")
 
+    async def _ping_loop(self):
+        while True:
+            try:
+                if self._conn is not None:
+                    frame = ws._new_ping_frame(int(self._service_id))
+                    await self._write_message(frame.SerializeToString())
+            except Exception:
+                _LOG.error("feishu_connection_ping_failed")
+            await asyncio.sleep(self._ping_interval)
+
     async def _handle_message(self, msg):
-        # SDK 在接收循环的同一事件循环中调度帧，分发回调时同步执行。
+        # SDK 在接收循环的同一事件循环中调度帧。
         origin = self._conn
         if origin is None:
             return
+        task = asyncio.current_task()
+        self.frames.add(task)
         token = self.dispatch_origin.set(origin)
         try:
             await super()._handle_message(msg)
         finally:
             self.dispatch_origin.reset(token)
+            self.frames.discard(task)
+
+    async def _handle_data_frame(self, frame):
+        # 沿用 SDK 帧格式和分发器，在编码应答前等待审批回调。
+        headers = frame.headers
+        if ws._get_by_key(headers, ws.HEADER_TYPE) != ws.MessageType.EVENT.value:
+            return
+        payload = frame.payload
+        count = int(ws._get_by_key(headers, ws.HEADER_SUM))
+        if count > 1:
+            payload = self._combine(
+                ws._get_by_key(headers, ws.HEADER_MESSAGE_ID), count,
+                int(ws._get_by_key(headers, ws.HEADER_SEQ)), payload,
+            )
+            if payload is None:
+                return
+
+        started = time.monotonic()
+        response = ws.Response(code=HTTPStatus.OK)
+        try:
+            result = self._event_handler._do_without_validation(payload)
+            if result is not None:
+                response.data = base64.b64encode(ws.JSON.marshal(await result).encode())
+        except Exception:
+            _LOG.error("feishu_event_dispatch_failed")
+            response = ws.Response(code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        header = headers.add()
+        header.key = ws.HEADER_BIZ_RT
+        header.value = str(round((time.monotonic() - started) * 1000))
+        frame.payload = ws.JSON.marshal(response).encode()
+        origin = self.dispatch_origin.get()
+        async with self._lock:
+            if origin is not None and origin is self._conn and origin.close_code is None:
+                await origin.send(frame.SerializeToString())
 
     def _combine(self, msg_id, count, sequence, data):
         # SDK 分片缓存跨重连保留，给每次连接独立的缓存键。
@@ -219,11 +351,11 @@ class _Connection(ws.Client):
             return
         self.service.entrance.inject_message(incoming)
 
-    def _approve(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
+    async def _approve(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         accepted = False
         try:
             if self._from_current_app(data):
-                accepted = self.service._record_action(data, self.dispatch_origin.get())
+                accepted = await self.service._record_action(data, self.dispatch_origin.get())
         except Exception:
             _LOG.error("feishu_approval_record_failed")
         return P2CardActionTriggerResponse({
@@ -240,14 +372,17 @@ class FeishuService:
     def __init__(
         self, settings: Settings, window: Window, state_path: Path,
         process: Callable[[Application], Report], *, clock: Callable[[], float] = time.time,
+        membership_check: Callable[[str], Awaitable[bool]] | None = None,
     ):
         self.settings, self.window, self.clock = settings, window, clock
         self._lock = Lock()
         self._origin = None
+        self._membership_check = membership_check
         self._state = State(state_path, settings)
         self._state.close_approvals()
-        # SDK 原生日志可能包含响应原文或连接标识。
+        # SDK 和 HTTP 请求日志可能包含响应原文或消息标识。
         logging.getLogger("Lark").disabled = True
+        logging.getLogger("httpx").disabled = True
         self.transport = _Transport(settings, window, clock)
         self.entrance = Entrance(settings, window, self._state, self.transport, process, clock=clock)
         self._client = _Connection(self)
@@ -286,7 +421,7 @@ class FeishuService:
             self._state.bind(approval_id, message_id, record_id, self.window.end.timestamp())
         return approval_id
 
-    def _record_action(self, data, origin) -> bool:
+    async def _record_action(self, data, origin) -> bool:
         event = data.event
         if not event or not event.context or not event.action or not event.operator:
             return False
@@ -302,7 +437,24 @@ class FeishuService:
             return False
         with self._lock:
             now = self.clock()
-            if origin is not self._origin:
+            if origin is None or origin is not self._origin or origin.close_code is not None:
+                return False
+            if not self.window.contains(now):
+                self._state.close_approvals()
+                return False
+        try:
+            remaining = self.window.end.timestamp() - now
+            async with asyncio.timeout(min(_HTTP_TIMEOUT, remaining)):
+                check = self._membership_check or self.transport.is_member
+                is_member = await check(operator_id)
+        except Exception:
+            is_member = False
+        if is_member is not True:
+            _LOG.warning("feishu_approval_membership_rejected")
+            return False
+        with self._lock:
+            now = self.clock()
+            if origin is None or origin is not self._origin or origin.close_code is not None:
                 return False
             if not self.window.contains(now):
                 self._state.close_approvals()
@@ -311,19 +463,31 @@ class FeishuService:
                 approval_id, context.open_message_id, record_id, decision, event_id, operator_id, now,
             )
 
+    def _remaining(self) -> float:
+        return self.window.end.timestamp() - self.clock()
+
     async def _serve(self) -> None:
-        await self._client._connect()
-        ping = asyncio.create_task(self._client._ping_loop())
         try:
-            await asyncio.sleep(max(0, self.window.end.timestamp() - self.clock()))
-        finally:
-            ping.cancel()
-            await asyncio.gather(ping, return_exceptions=True)
+            async with asyncio.timeout(self._remaining()):
+                await self._client._connect()
+                ping = asyncio.create_task(self._client._ping_loop())
+                try:
+                    await asyncio.sleep(max(0, self._remaining()))
+                finally:
+                    ping.cancel()
+                    await asyncio.gather(ping, return_exceptions=True)
+        except TimeoutError:
+            if self._remaining() > 0:
+                raise
 
     async def _stop(self) -> None:
         if self._client.receiver is not None:
             self._client.receiver.cancel()
             await asyncio.gather(self._client.receiver, return_exceptions=True)
+        frames = tuple(self._client.frames)
+        for frame in frames:
+            frame.cancel()
+        await asyncio.gather(*frames, return_exceptions=True)
         cron = self._client._cache._cron
         cron.cancel()
         try:

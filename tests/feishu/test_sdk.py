@@ -9,8 +9,8 @@ import pytest
 
 from lark_oapi.api.im.v1 import Message as HistoryMessage
 
-from qianshu.feishu import FeishuService, Report
-from qianshu.feishu.sdk import ws
+from qianshu.feishu import FeishuService, Message, Report
+from qianshu.feishu.sdk import TokenManager, ws
 
 
 class FakeSocket:
@@ -18,6 +18,12 @@ class FakeSocket:
 
     def __init__(self):
         self.responses = []
+
+    async def recv(self):
+        await asyncio.Future()
+
+    async def close(self):
+        self.close_code = 1000
 
     async def send(self, data):
         frame = ws.Frame()
@@ -69,17 +75,20 @@ def connected(tmp_path, settings, window, monkeypatch):
     service = FeishuService(settings, window, tmp_path / "private.sqlite",
                             lambda app: pytest.fail("意外进入业务处理"), clock=lambda: clock.now)
     monkeypatch.setattr(service.transport, "history", lambda start, end: iter(()))
+
+    async def is_member(operator_id):
+        return True
+
+    monkeypatch.setattr(service.transport, "is_member", is_member)
     socket = FakeSocket()
     service._client._conn = socket
     service._connected(socket)
+    service.entrance._history.submit(lambda: None).result(timeout=2)
     try:
         yield service, socket, clock
     finally:
-        service._disconnected()
+        loop.run_until_complete(service._stop())
         service.entrance.close()
-        cron = service._client._cache._cron
-        cron.cancel()
-        loop.run_until_complete(asyncio.gather(cron, return_exceptions=True))
         loop.close()
         asyncio.set_event_loop(None)
 
@@ -107,7 +116,9 @@ def test_authenticated_decision_and_callback_replay(connected, monkeypatch):
     service, socket, _ = connected
     data = publish(connected, monkeypatch)
     # 直接调用 SDK 分发器，只有相同的 app_id，仍缺当前长连接来源。
-    direct = service._client._event_handler._do_without_validation(json.dumps(data).encode())
+    direct = ws.loop.run_until_complete(
+        service._client._event_handler._do_without_validation(json.dumps(data).encode()),
+    )
     assert direct.toast.type == "warning"
     dispatch(service, data)
     dispatch(service, data)
@@ -116,6 +127,93 @@ def test_authenticated_decision_and_callback_replay(connected, monkeypatch):
     dispatch(service, data)
     assert socket.responses == ["success", "warning", "warning"]
     assert states(service) == [("approve",)]
+
+
+@pytest.mark.parametrize("outcome", [False, None, "error", "timeout"])
+def test_rejects_unconfirmed_membership(connected, monkeypatch, caplog, outcome):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    calls = []
+    monkeypatch.setattr("qianshu.feishu.sdk._HTTP_TIMEOUT", 0.05)
+
+    async def is_member(operator_id):
+        calls.append(operator_id)
+        if outcome == "error":
+            raise RuntimeError("合成查询故障")
+        if outcome == "timeout":
+            await asyncio.Future()
+        return outcome
+
+    monkeypatch.setattr(service.transport, "is_member", is_member)
+    dispatch(service, data)
+    assert calls == [data["event"]["operator"]["open_id"]]
+    assert socket.responses == ["warning"]
+    assert states(service) == [("pending",)]
+    assert caplog.messages == ["feishu_approval_membership_rejected"]
+
+
+def test_membership_checks_configured_group_and_open_id_across_pages(connected, monkeypatch):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    operator_id = data["event"]["operator"]["open_id"]
+    pages = []
+
+    def get_members(request):
+        assert request.chat_id == service.settings.chat_id
+        assert request.member_id_type == "open_id"
+        pages.append(request.page_token)
+        next_page = request.page_token is None
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(
+            items=[SimpleNamespace(member_id_type="user_id" if next_page else "open_id",
+                                   member_id=operator_id)],
+            has_more=next_page, page_token="<群成员分页占位>", trigger_security_conf_limit=False,
+        ))
+
+    monkeypatch.delattr(service.transport, "is_member")
+    monkeypatch.setattr(service.transport.im.chat_members, "get", get_members)
+    dispatch(service, data)
+    assert pages == [None, "<群成员分页占位>"]
+    assert socket.responses == ["success"]
+    assert states(service) == [("approve",)]
+
+
+def test_reply_retries_send_the_same_platform_deduplication_key(connected, monkeypatch):
+    service, _, _ = connected
+    token = "<租户令牌占位>"
+    message_id = "<合成拒绝消息占位>"
+    requests = []
+
+    async def reply(request, option):
+        assert option.tenant_access_token == token
+        assert request.message_id == message_id
+        assert json.loads(request.body.content) == {"text": "概念验证期不处理"}
+        requests.append(request.body.uuid)
+        return SimpleNamespace(success=lambda: True)
+
+    monkeypatch.setattr(TokenManager, "get_self_tenant_token", lambda config: token)
+    monkeypatch.setattr(service.transport.im.message, "areply", reply)
+    for _ in range(2):
+        service.transport.reply(message_id, "概念验证期不处理", deadline=time.monotonic() + 3)
+    assert len(requests) == 2
+    assert requests[0] and requests[0] == requests[1]
+
+
+@pytest.mark.parametrize("change", ["disconnect", "expiry"])
+def test_rechecks_approval_after_membership_lookup(connected, monkeypatch, change):
+    service, socket, clock = connected
+    data = publish(connected, monkeypatch)
+
+    async def is_member(operator_id):
+        if change == "disconnect":
+            service._disconnected()
+        else:
+            clock.now = 200
+        return True
+
+    monkeypatch.setattr(service.transport, "is_member", is_member)
+    dispatch(service, data)
+    assert socket.responses == ["warning"]
+    assert states(service) == [("closed",)]
 
 
 @pytest.mark.parametrize("location,key,replacement", [
@@ -229,6 +327,85 @@ def test_live_event_and_paginated_history_deduplicate(connected, monkeypatch):
         assert [kind for kind, message_id in calls if message_id == mid] == ["reaction", "work"]
 
 
+def test_event_mentioning_another_user_is_ignored(connected, monkeypatch):
+    service, socket, _ = connected
+    settings = service.settings
+    reactions = []
+    receipts = []
+    inject = service.entrance.inject_message
+
+    def track_receipt(message):
+        receipt = inject(message)
+        receipts.append(receipt)
+        return receipt
+
+    monkeypatch.setattr(service.entrance, "inject_message", track_receipt)
+    monkeypatch.setattr(service.transport, "react", reactions.append)
+    monkeypatch.setattr(service.transport, "reply", lambda *args, **kwargs: reactions.append(args))
+    monkeypatch.setattr(service.transport, "send_card", reactions.append)
+    dispatch(service, {
+        "schema": "2.0",
+        "header": {"app_id": settings.app_id, "event_type": "im.message.receive_v1"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": next(iter(settings.allowed_senders))}},
+            "message": {
+                "message_id": "<他人提及消息占位>", "chat_id": settings.chat_id, "chat_type": "group",
+                "create_time": "120000", "message_type": "text",
+                "content": json.dumps({"text": "@_user_1 合成样例 ABC"}),
+                "mentions": [{"key": "@_user_1", "id": {"open_id": "<他人占位>"}}],
+            },
+        },
+    })
+    for receipt in receipts:
+        if receipt is not None:
+            work = receipt.result(timeout=2)
+            if work is not None:
+                work.result(timeout=2)
+    assert socket.responses == ["event_ack"]
+    assert receipts == [None]
+    assert reactions == []
+
+
+def test_reconnect_recovers_messages_received_during_disconnect(connected, monkeypatch):
+    service, first, _ = connected
+    client = service._client
+    replacement = FakeSocket()
+    recovered = Event()
+    calls = []
+
+    async def endpoint():
+        return f"wss://example.invalid/ws?{ws.DEVICE_ID}=1&{ws.SERVICE_ID}=1"
+
+    async def connect(url, **kwargs):
+        return replacement
+
+    message = Message(
+        "<断线消息占位>", service.settings.chat_id, next(iter(service.settings.allowed_senders)),
+        120_000, "text", json.dumps({"text": "@_user_1 合成样例 ABC"}), ("@_user_1",),
+    )
+
+    def history(start, end):
+        assert service._origin is replacement
+        calls.append((start, end))
+        yield message
+
+    async def disconnect_and_reconnect():
+        await client._disconnect()
+        await client._reconnect()
+
+    monkeypatch.setattr(client, "_discover_endpoint", endpoint)
+    monkeypatch.setattr(client, "_reconnect_nonce", 0)
+    monkeypatch.setattr(ws.websockets, "connect", connect)
+    monkeypatch.setattr(service.transport, "history", history)
+    monkeypatch.setattr(service.transport, "react", lambda mid: calls.append(mid))
+    monkeypatch.setattr(service.entrance, "process", lambda app: Report("合成来源"))
+    monkeypatch.setattr(service.transport, "send_card", lambda card: recovered.set())
+    ws.loop.run_until_complete(disconnect_and_reconnect())
+    assert first.close_code == 1000
+    assert recovered.wait(1)
+    assert calls == [(100, 150), message.message_id]
+
+
 def test_run_closes_connection_and_approvals_on_window_end(connected, monkeypatch):
     service, socket, _ = connected
     deadline = time.monotonic() + 0.2
@@ -249,3 +426,59 @@ def test_run_closes_connection_and_approvals_on_window_end(connected, monkeypatc
     service.run()
     assert socket.close_code == 1000
     assert states(service) == [("closed",)]
+
+
+@pytest.mark.parametrize("reconnect", [False, True], ids=["initial", "reconnect"])
+def test_stalled_endpoint_does_not_prevent_window_cleanup(connected, monkeypatch, reconnect):
+    service, original, _ = connected
+    first = FakeSocket()
+    calls = []
+    cancelled = []
+    ticks = []
+
+    class Http:
+        def __init__(self, *, timeout):
+            assert 0 < timeout.connect <= 2
+            assert 0 < timeout.read <= 2
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            pass
+
+        async def post(self, url, *, headers, json):
+            assert url.endswith(ws.GEN_ENDPOINT_URI)
+            assert json == {"AppID": service.settings.app_id, "AppSecret": service.settings.app_secret}
+            calls.append(url)
+            if reconnect and len(calls) == 1:
+                endpoint = f"wss://example.invalid/ws?{ws.DEVICE_ID}=1&{ws.SERVICE_ID}=1"
+                return SimpleNamespace(status_code=200, text='{"code":0,"data":{"URL":"' + endpoint + '"}}')
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.append(True)
+
+    async def connect(url, **kwargs):
+        return first
+
+    async def drop():
+        raise OSError("合成长连接断开")
+
+    monkeypatch.setattr("qianshu.feishu.sdk.httpx.AsyncClient", Http)
+    monkeypatch.setattr(ws.websockets, "connect", connect)
+    monkeypatch.setattr(first, "recv", drop)
+    monkeypatch.setattr(service._client, "_reconnect_nonce", 0)
+    ws.loop.run_until_complete(service._client._disconnect())
+    deadline = time.monotonic() + 0.25
+    clock = lambda: service.window.end.timestamp() - deadline + time.monotonic()
+    monkeypatch.setattr(service, "clock", clock)
+    monkeypatch.setattr(service.transport, "clock", clock)
+    ws.loop.call_later(0.1, ticks.append, True)
+    service.run()
+    assert len(calls) == (2 if reconnect else 1)
+    assert ticks == cancelled == [True]
+    assert original.close_code == 1000
+    if reconnect:
+        assert first.close_code == 1000
+    assert service._client._conn is service._origin is None

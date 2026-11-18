@@ -260,6 +260,7 @@ name = "qianshu"
 version = "0.1.0.dev0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "lark-oapi" },
     { name = "python-dotenv" },
 ]
@@ -276,6 +277,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28,<1" },
     { name = "lark-oapi", specifier = "==1.8.0" },
     { name = "playwright", marker = "extra == 'mingdao-check'", specifier = ">=1.50,<2" },
     { name = "python-dotenv", specifier = ">=1.0,<2" },

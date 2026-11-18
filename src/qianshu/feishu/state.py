@@ -23,6 +23,7 @@ class State:
                 CREATE TABLE IF NOT EXISTS feishu_messages (
                     scope TEXT NOT NULL,
                     digest TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'done',
                     PRIMARY KEY (scope, digest)
                 );
                 CREATE TABLE IF NOT EXISTS feishu_approvals (
@@ -40,6 +41,10 @@ class State:
                     UNIQUE (scope, event_id)
                 );
             """)
+            db.execute("BEGIN IMMEDIATE")
+            if not any(column[1] == "status" for column in db.execute("PRAGMA table_info(feishu_messages)")):
+                db.execute("ALTER TABLE feishu_messages ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
+            db.execute("COMMIT")
 
     @contextmanager
     def connection(self):
@@ -49,20 +54,30 @@ class State:
         finally:
             db.close()
 
-    def claim_message(self, message_id: str) -> bool:
+    def claim_message(self, message_id: str, status: str = "done") -> bool:
         # 保存指纹即可跨重推和重启去重。
         digest = hashlib.sha256(message_id.encode()).hexdigest()
         with self.connection() as db:
             return db.execute(
-                "INSERT OR IGNORE INTO feishu_messages VALUES (?, ?)", (self.scope, digest),
+                "INSERT OR IGNORE INTO feishu_messages (scope, digest, status) VALUES (?, ?, ?)",
+                (self.scope, digest, status),
             ).rowcount == 1
 
-    def has_message(self, message_id: str) -> bool:
+    def message_status(self, message_id: str) -> str | None:
         digest = hashlib.sha256(message_id.encode()).hexdigest()
         with self.connection() as db:
-            return db.execute(
-                "SELECT 1 FROM feishu_messages WHERE scope = ? AND digest = ?", (self.scope, digest),
-            ).fetchone() is not None
+            row = db.execute(
+                "SELECT status FROM feishu_messages WHERE scope = ? AND digest = ?", (self.scope, digest),
+            ).fetchone()
+            return row[0] if row else None
+
+    def complete_notice(self, message_id: str) -> None:
+        digest = hashlib.sha256(message_id.encode()).hexdigest()
+        with self.connection() as db:
+            db.execute("""
+                UPDATE feishu_messages SET status = 'done'
+                WHERE scope = ? AND digest = ? AND status = 'notice_pending'
+            """, (self.scope, digest))
 
     def bind(self, approval_id: str, message_id: str, record_id: str, expires: float) -> None:
         with self.connection() as db:
