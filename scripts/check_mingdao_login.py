@@ -10,6 +10,7 @@
 只尝试一次，不自动重试（避免多次失败触发账号锁定）。不输出账号、密码或任何 Cookie。
 """
 
+import os
 import pathlib
 import re
 import sys
@@ -35,25 +36,33 @@ def main() -> int:
     base = env.get("MINGDAO_BASE_URL", "https://www.mingdao.com")
     sheet_url = f"{base}/app/{env['MINGDAO_APP_ID']}/{env['MINGDAO_WORKSHEET_ID']}"
     show = "--show" in sys.argv
-    STATE.parent.mkdir(exist_ok=True)
+    # 登录状态与截图含会话信息：新建文件一律只有本人可读写
+    os.umask(0o077)
+    STATE.parent.mkdir(mode=0o700, exist_ok=True)
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=not show)
         ctx = browser.new_context(locale="zh-CN", viewport={"width": 1280, "height": 900})
         page = ctx.new_page()
-        page.goto(f"{base}/login", wait_until="domcontentloaded")
-        # 页面右上角的语言选择也是文本框，所以账号框取「密码框之前最近的输入框」，不取第一个文本框
-        password = page.locator("input[type=password]").first
-        password.wait_for(timeout=30_000)
-        password.locator("xpath=preceding::input[not(@type='checkbox') and not(@type='hidden')][1]").fill(
-            env["MINGDAO_ACCOUNT"])
-        password.fill(env["MINGDAO_PASSWORD"])
-        # 页面标题也叫「登录」，按钮是 .btnForLogin；找不到按钮时在密码框按回车
-        button = page.locator(".btnForLogin")
-        if button.count():
-            button.first.click()
-        else:
-            password.press("Enter")
+        # 填表出错时，浏览器组件的报错原文会带出所填的值（账号、密码），所以这里不打印报错原文
+        try:
+            page.goto(f"{base}/login", wait_until="domcontentloaded")
+            # 页面右上角的语言选择也是文本框，所以账号框取「密码框之前最近的输入框」，不取第一个文本框
+            password = page.locator("input[type=password]").first
+            password.wait_for(timeout=30_000)
+            password.locator("xpath=preceding::input[not(@type='checkbox') and not(@type='hidden')][1]").fill(
+                env["MINGDAO_ACCOUNT"])
+            password.fill(env["MINGDAO_PASSWORD"])
+            # 页面标题也叫「登录」，按钮是 .btnForLogin；找不到按钮时在密码框按回车
+            button = page.locator(".btnForLogin")
+            if button.count():
+                button.first.click()
+            else:
+                password.press("Enter")
+        except Exception:
+            print("[失败] 登录：打开登录页或填写账号密码时出错（可能是登录页改版），细节已隐藏以免泄露账号密码")
+            browser.close()
+            return 1
         try:
             page.wait_for_url(lambda u: "/login" not in u, timeout=(120_000 if show else 30_000))
         except PwTimeout:
@@ -73,8 +82,8 @@ def main() -> int:
         STATE.chmod(0o600)
         print("[通过] 已保存登录状态到 .private/（git 忽略）")
 
-        page.goto(sheet_url, wait_until="domcontentloaded")
         try:
+            page.goto(sheet_url, wait_until="domcontentloaded")
             page.get_by_text(re.compile(r"共\s*\d+\s*行")).first.wait_for(timeout=30_000)
             # 行数先显示 0，记录加载完才更新；等网络空闲后再读，避免误读成 0 行
             try:
@@ -83,8 +92,9 @@ def main() -> int:
                 pass
             total = re.search(r"共\s*(\d+)\s*行", page.inner_text("body")).group(1)
             print(f"[通过] 打开「优惠政策申请」表：当前视图共 {total} 行")
-        except PwTimeout:
-            print("[失败] 打开「优惠政策申请」表：30 秒内没有看到记录列表")
+        except Exception:
+            # 报错原文可能带出含应用、表标识的网址，不打印
+            print("[失败] 打开「优惠政策申请」表：30 秒内没有看到记录列表，或页面打开出错（细节已隐藏）")
             browser.close()
             return 1
         browser.close()
