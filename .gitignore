@@ -12,3 +12,6 @@ dist/
 build/
 artifacts/
 .DS_Store
+
+# 本机私有资料（录制的接口、内部 ID），不进仓库
+.private/
