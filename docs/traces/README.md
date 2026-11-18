@@ -1,6 +1,6 @@
 # Execution Trace 索引
 
-多批次工作使用 [trace-kit `METHOD.md` v27（v0.10.0）](https://github.com/Moshuiwang/trace-kit/blob/v0.10.0/METHOD.md)。Issue 分类、合同批准与审查规则见[协作约定](../协作约定.md#execution-trace)。
+多批次工作使用 trace-kit `METHOD.md` v27（v0.10.0；方法所在仓库不公开，只写名称与版本号）。Issue 分类、合同批准与审查规则见[协作约定](../协作约定.md#execution-trace)。
 
 ## 目录约定
 
