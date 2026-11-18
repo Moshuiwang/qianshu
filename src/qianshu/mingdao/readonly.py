@@ -7,6 +7,7 @@ from collections import Counter
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from time import monotonic
 from typing import TextIO
 from urllib.parse import urlsplit
 
@@ -20,7 +21,12 @@ _ASSETS = {
 _SCRIPT = Path(__file__).with_name("readonly.js")
 _SCRIPT_BINDING = "__qianshuReadonlyBlocked"
 _SCRIPT_UNLOAD_KEY = "__qianshuReadonlyUnload"
+_SCRIPT_READY = """
+Object.defineProperty(window, "__qianshuReadonlyAuditReady", {value: true});
+"""
 _ARM_CLOSE = "() => window.__qianshuReadonlyClose?.() === true"
+_DISABLE_FETCH_LATER = "--disable-blink-features=FetchLaterAPI"
+_CLOSE_SCHEMES = ("http://", "https://", "about:blank", "about:srcdoc", "blob:", "data:")
 _METHODS = frozenset({"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "CONNECT", "TRACE"})
 _SPECULATIVE = re.compile(r"(?:^|[;,\s])(?:prefetch|prerender)(?=$|[;,\s])", re.IGNORECASE)
 
@@ -185,14 +191,62 @@ class ReadOnlyContext:
     def __init__(self, context, audit: RequestAudit) -> None:
         self._context = context
         self._audit = audit
+        self._ready_pages = {}
 
     def install(self) -> None:
-        self._context.route_web_socket(re.compile(r".*"), self._audit.websocket)
+        self._context.on("page", self._prepare_page)
+        self._context.route_web_socket(re.compile(r".*"), lambda route: self._websocket(None, route))
         self._context.route(re.compile(r".*"), self._audit.http)
-        self._context.on("request", self._audit.offline_request)
-        self._context.expose_binding(_SCRIPT_BINDING, self._audit.script)
+        self._context.on("request", self._request)
+        self._context.expose_binding(_SCRIPT_BINDING, self._script)
         self._context.add_init_script(path=_SCRIPT)
         self._context.set_default_timeout(8_000)
+
+    def _check_ready(self, page) -> None:
+        if page not in self._ready_pages:
+            self._audit._error("OTHER", "page_audit_not_ready")
+
+    def _request(self, request) -> None:
+        try:
+            page = request.frame.page
+        except Exception:
+            # 弹窗的首个导航请求可能早于 Playwright 创建其 Frame。
+            page = None
+        self._check_ready(page)
+        self._audit.offline_request(request)
+
+    def _script(self, source, *args) -> None:
+        try:
+            self._check_ready(source["page"])
+            self._audit.script(source, *args)
+        except Exception:
+            self._audit._error("OTHER", "script")
+
+    def _script_unload(self, page, event) -> None:
+        if event.get("key") == _SCRIPT_UNLOAD_KEY:
+            self._check_ready(page)
+            self._audit.script_unload(event)
+
+    def _websocket(self, page, route) -> None:
+        self._check_ready(page)
+        self._audit.websocket(route)
+
+    def _prepare_page(self, page) -> None:
+        try:
+            page.on("close", lambda _: self._ready_pages.pop(page, None))
+            session = self._context.new_cdp_session(page)
+            session.on("DOMStorage.domStorageItemAdded", lambda event: self._script_unload(page, event))
+            session.send("DOMStorage.enable")
+            session.send("Page.enable")
+            page.route_web_socket(re.compile(r".*"), lambda route: self._websocket(page, route))
+            session.send("Page.addScriptToEvaluateOnNewDocument", {
+                "source": _SCRIPT_READY, "runImmediately": True,
+            })
+            if page.is_closed():
+                raise RuntimeError("页面在审计就绪前关闭")
+            self._ready_pages[page] = session
+        except Exception:
+            self._audit._error("OTHER", "cdp_setup")
 
     def go_offline(self) -> None:
         if self._audit.failed:
@@ -211,22 +265,22 @@ class ReadOnlyContext:
         if self._audit.failed:
             raise RuntimeError("请求拦截已失败")
         page = self._context.new_page()
-        try:
-            session = self._context.new_cdp_session(page)
-            session.on("DOMStorage.domStorageItemAdded", self._audit.script_unload)
-            session.send("DOMStorage.enable")
-        except Exception:
-            self._audit._error("OTHER", "cdp_setup")
-            page.close(run_before_unload=False)
-            raise
+        # Playwright 可在 page 监听仍等待 CDP 应答时返回 new_page。
+        deadline = monotonic() + 8
+        while page not in self._ready_pages and not self._audit.failed and monotonic() < deadline:
+            page.wait_for_timeout(10)
+        if page not in self._ready_pages or self._audit.failed:
+            if not self._audit.failed:
+                self._check_ready(page)
+            raise RuntimeError("页面审计未就绪")
         return page
 
     def close_page(self, page) -> None:
+        if not self._audit.failed:
+            self._check_ready(page)
         try:
             for frame in page.frames:
-                # 空白文档和浏览器错误页可能没有执行初始化脚本。
-                if (frame.url.startswith(("https://", "about:srcdoc", "blob:", "data:"))
-                        and not frame.evaluate(_ARM_CLOSE)):
+                if not self._arm_frame(frame):
                     raise RuntimeError("关闭前未能启用脚本拦截")
         except Exception:
             self._audit._error("OTHER", "script_close")
@@ -237,6 +291,18 @@ class ReadOnlyContext:
             except Exception:
                 self._audit._error("OTHER", "page_close")
                 raise
+
+    @staticmethod
+    def _arm_frame(frame) -> bool:
+        deadline = monotonic() + 1
+        while frame.url.startswith(_CLOSE_SCHEMES):
+            try:
+                return frame.evaluate(_ARM_CLOSE)
+            except Exception as exc:
+                # 被拒绝的导航可能正在从空白页切换到 Chromium 错误页。
+                if "Execution context was destroyed" not in str(exc) or monotonic() >= deadline:
+                    raise
+        return True
 
     def close_pages(self) -> None:
         # 包括页面自行创建的弹窗；关闭失败由外层关闭整个上下文并判失败。

@@ -12,7 +12,7 @@ import pytest
 
 from qianshu.draft import DraftField, PackageRow, PolicyDraft
 from qianshu.mingdao import rehearsal
-from qianshu.mingdao.readonly import _SCRIPT_UNLOAD_KEY, ReadOnlyPolicy, readonly_context
+from qianshu.mingdao.readonly import _SCRIPT_UNLOAD_KEY, ReadOnlyContext, ReadOnlyPolicy, readonly_context
 
 ORIGIN = "https://app.example.invalid"
 STATIC = "https://assets.example.invalid"
@@ -66,6 +66,7 @@ class FakeBrowser:
         self.cdp_error = False
         self.bad_cdp_event = False
         self.offline_error = False
+        self.preload_unready = False
 
     def new_context(self, **options):
         self.options = options
@@ -82,8 +83,8 @@ class FakeSession:
         assert event == "DOMStorage.domStorageItemAdded"
         self.handler = handler
 
-    def send(self, command):
-        assert command == "DOMStorage.enable"
+    def send(self, command, params=None):
+        assert command in {"DOMStorage.enable", "Page.enable", "Page.addScriptToEvaluateOnNewDocument"}
         if self.browser.cdp_error:
             raise RuntimeError(SECRET)
 
@@ -108,8 +109,11 @@ class FakeContext:
         self.socket_handler = (pattern, handler)
 
     def on(self, event, handler):
-        assert event == "request"
-        self.request_handler = handler
+        if event == "request":
+            self.request_handler = handler
+        else:
+            assert event == "page"
+            self.page_handler = handler
 
     def set_offline(self, offline):
         assert offline
@@ -135,10 +139,12 @@ class FakeContext:
         assert self.browser.options["service_workers"] == "block"
         page = FakePage(self)
         self.all_pages.append(page)
+        self.page_handler(page)
         return page
 
     def request(self, method, url, resource="xhr"):
         route = FakeRoute(self.browser, method, url, resource)
+        route.request.frame = SimpleNamespace(page=self.pages[-1] if self.pages else None)
         self.browser.routes.append(route)
         self.request_handler(route.request)
         if self.handler and self.handler[0].fullmatch(url):
@@ -162,6 +168,16 @@ class FakePage:
         self.frames = [self]
         self.closed = False
         self.armed = False
+
+    def on(self, event, handler):
+        assert event == "close"
+        self.close_handler = handler
+
+    def is_closed(self):
+        return self.closed
+
+    def route_web_socket(self, pattern, handler):
+        self.socket_handler = (pattern, handler)
 
     def evaluate(self, expression):
         assert "__qianshuReadonlyClose" in expression
@@ -192,6 +208,7 @@ class FakePage:
         assert run_before_unload is False and not self.closed
         assert not self.url or self.armed
         self.closed = True
+        self.close_handler(self)
         if self.form:
             self.context.browser.actions.append(("close_form",))
             self.context.browser.form_closed = True
@@ -207,6 +224,10 @@ class FakeLocator:
 
     def wait_for(self, *, state):
         assert state == "visible"
+        context = self.page.context
+        if (self.browser.preload_unready and self.selector == "#ready-0"
+                and len(self.browser.contexts) == 1 and len(context.all_pages) == 6):
+            raise TimeoutError(SECRET)
         if self.selector == self.browser.unready or getattr(self.page, "missing_counts", False):
             raise TimeoutError(SECRET)
 
@@ -258,6 +279,10 @@ class FakeLocator:
             self.page.rows += 1
 
     def evaluate(self, script, forbidden):
+        if script == rehearsal._CHECK_FORM:
+            assert self.page.form and self.selector == "#example-form"
+            self.browser.actions.append(("check_write_controls",))
+            return self.selector not in forbidden
         assert script == rehearsal._CLICK
         if self.selector in forbidden:
             return False
@@ -360,6 +385,8 @@ def test_form_network_and_readbacks(tmp_path, draft, browser):
         assert action in actions
     assert actions.count(("click", "#add-example")) == 2
     assert actions.index(("offline",)) < actions.index(("click", "#open-example"))
+    assert actions.index(("click", "#open-example")) < actions.index(("check_write_controls",))
+    assert actions.index(("check_write_controls",)) < actions.index(("fill", "#example-recharge_days", "0"))
     assert actions.index(("close_form",)) < actions.index(("close_context",))
     assert len([action for action in actions if action[0] == "after_view"]) == 5
     assert [len(context.all_pages) for context in browser.contexts] == [6, 5]
@@ -451,6 +478,44 @@ def test_offline_setup_error_keeps_form_closed(tmp_path, draft, browser):
     assert len(browser.contexts) == 1 and browser.context.closed
 
 
+def test_preload_ready_timeout_fails_smoke_even_with_matching_counts(tmp_path, draft, browser):
+    browser.preload_unready = True
+    result = run(tmp_path, draft, ui_config())
+    assert result.before == result.after and set(result.before) == set(rehearsal.VIEWS)
+    assert result.issues == {"preload": "TimeoutError"}
+    assert not result.smoke_passed
+    assert result.evidence == rehearsal.RehearsalEvidence()
+    assert ("offline",) not in browser.actions and ("click", "#open-example") not in browser.actions
+
+
+def test_skipped_offline_switch_fails_smoke_even_with_matching_counts(tmp_path, draft, browser, monkeypatch):
+    monkeypatch.setattr(ReadOnlyContext, "go_offline", lambda self: None)
+    result = run(tmp_path, draft, ui_config())
+    assert result.before == result.after and set(result.before) == set(rehearsal.VIEWS)
+    assert result.issues == {"offline": "RuntimeError"}
+    assert not result.smoke_passed
+    assert result.evidence == rehearsal.RehearsalEvidence()
+    assert ("offline",) not in browser.actions and ("click", "#open-example") not in browser.actions
+
+
+def test_unopened_form_fails_smoke(tmp_path, draft, browser):
+    browser.unready = "#example-form"
+    result = run(tmp_path, draft, ui_config())
+    assert result.before == result.after and not result.smoke_passed
+    assert result.evidence == rehearsal.RehearsalEvidence(offline_switched=True)
+    assert ("check_write_controls",) not in browser.actions
+
+
+def test_write_controls_check_must_succeed(tmp_path, draft, browser):
+    raw = ui_config()
+    raw["form"]["write_controls"].append(raw["form"]["root"])
+    result = run(tmp_path, draft, raw)
+    assert result.before == result.after and not result.smoke_passed
+    assert result.evidence == rehearsal.RehearsalEvidence(offline_switched=True, form_opened=True)
+    assert ("check_write_controls",) in browser.actions
+    assert not any(action[0] == "fill" for action in browser.actions)
+
+
 def test_guard_installation_error_closes_context_and_records_failure(monkeypatch):
     def unavailable(*args):
         raise RuntimeError(SECRET)
@@ -482,11 +547,12 @@ def test_context_blocks_redirect_and_websocket():
     path = SHEET + "/example-view-0"
     allowed_url = ORIGIN + path + "?redirect=1"
     with readonly_context(fake, ReadOnlyPolicy(ORIGIN, (path,)), Path("example.json"),
-                          StringIO()) as (_, audit):
+                          StringIO()) as (guard, audit):
         context = fake.context
+        page = guard.new_page()
         assert not context.request("GET", allowed_url, "document")
         assert fake.sent == [("GET", allowed_url, "document")]
-        pattern, handler = context.socket_handler
+        pattern, handler = page.socket_handler
         events = []
         assert pattern.fullmatch("wss://example.invalid")
         handler(SimpleNamespace(close=lambda: events.append("closed")))
@@ -528,4 +594,7 @@ def test_fixed_cli_reports_counts_only(tmp_path, draft, browser, capsys):
     report = json.loads((tmp_path / summary["report_id"] / "report.json").read_text())
     assert report["auto_fields"] == {"价格计划": ["合成价格"]}
     assert report["form_errors"] == ["合成报错"]
+    assert report["evidence"] == {
+        "offline_switched": True, "form_opened": True, "write_controls_checked": True,
+    }
     assert "合成价格" not in captured.out and "合成报错" not in captured.out

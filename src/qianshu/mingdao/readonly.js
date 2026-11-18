@@ -1,6 +1,7 @@
 (() => {
     const binding = "__qianshuReadonlyBlocked";
     const auditKey = "__qianshuReadonlyUnload";
+    const missedKey = "__qianshuReadonlyEarlyUnload";
     let departing = false;
     let closing = false;
 
@@ -9,18 +10,28 @@
     const report = (method, url) => {
         if (departing && window === window.top) {
             try {
-                const address = new URL(url);
-                sessionStorage.setItem(auditKey, JSON.stringify([method, address.origin + address.pathname]));
-                sessionStorage.removeItem(auditKey);
-                return;
+                if (window.__qianshuReadonlyAuditReady === true) {
+                    const address = new URL(url);
+                    sessionStorage.setItem(auditKey, JSON.stringify([method, address.origin + address.pathname]));
+                    sessionStorage.removeItem(auditKey);
+                    return;
+                }
+                // 监听尚未就绪时保留失败标记，供同源的下一份文档检查。
+                sessionStorage.setItem(missedKey, "1");
             } catch {
                 void window[binding](null, null);
             }
+            if (window.__qianshuReadonlyAuditReady !== true) void window[binding](null, null);
         }
         void window[binding](method, url);
     };
 
     try {
+        // 不透明源的文档没有会话存储，普通拒绝仍走绑定。
+        try {
+            if (sessionStorage.getItem(missedKey)) void window[binding](null, null);
+        } catch {}
+
         const stripSpeculationRules = node => {
             if (node.nodeType !== Node.ELEMENT_NODE) return;
             if (node.matches('script[type="speculationrules" i]')) node.remove();
@@ -64,6 +75,20 @@
             void report("POST", new URL(url, document.baseURI).href);
             return false;
         };
+
+        if (typeof window.fetchLater === "function") {
+            window.fetchLater = function (input, init) {
+                let request;
+                try {
+                    request = new NativeRequest(input, init);
+                } catch (error) {
+                    void report("OTHER", "about:invalid");
+                    throw error;
+                }
+                void report(request.method, request.url);
+                throw new TypeError("只读演练已拒绝 fetchLater");
+            };
+        }
 
         const xhr = XMLHttpRequest.prototype;
         const nativeOpen = xhr.open;

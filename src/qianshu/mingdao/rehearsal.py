@@ -7,14 +7,14 @@ import re
 import sys
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from tempfile import mkdtemp
 from time import sleep
 
 from qianshu.config import load_config
 from qianshu.draft import DraftField, PackageRow, PolicyDraft
-from qianshu.mingdao.readonly import ReadOnlyPolicy, readonly_context
+from qianshu.mingdao.readonly import _DISABLE_FETCH_LATER, ReadOnlyPolicy, readonly_context
 
 VIEWS = ("新建", "待审批", "待配置", "配置完成", "生效政策")
 MAIN_FIELDS = (
@@ -46,6 +46,9 @@ _CLICK = r"""(element, forbidden) => {
 _READ_VALUES = """nodes => nodes
     .filter(node => node.getClientRects().length && getComputedStyle(node).visibility === "visible")
     .map(node => node.value ?? node.innerText ?? node.textContent)"""
+
+_CHECK_FORM = """(root, forbidden) =>
+    forbidden.every(selector => !root.closest(selector))"""
 
 
 class UnsafeControl(ValueError):
@@ -88,6 +91,13 @@ class RehearsalConfig:
 
 
 @dataclass(frozen=True, repr=False)
+class RehearsalEvidence:
+    offline_switched: bool = False
+    form_opened: bool = False
+    write_controls_checked: bool = False
+
+
+@dataclass(frozen=True, repr=False)
 class RehearsalResult:
     before: dict[str, int]
     after: dict[str, int]
@@ -98,6 +108,7 @@ class RehearsalResult:
     requests: dict[str, int]
     guard_failed: bool
     private_report: Path
+    evidence: RehearsalEvidence = RehearsalEvidence()
 
     @property
     def smoke_passed(self) -> bool:
@@ -105,6 +116,9 @@ class RehearsalResult:
             not self.guard_failed
             and "unsafe_control" not in self.issues
             and "close_form" not in self.issues
+            and self.evidence.offline_switched
+            and self.evidence.form_opened
+            and self.evidence.write_controls_checked
             and set(self.before) == set(VIEWS)
             and self.before == self.after
         )
@@ -118,6 +132,7 @@ def _launch_browser():
         browser = playwright.chromium.launch(headless=True, args=[
             "--disable-quic", "--disable-background-networking",
             "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            _DISABLE_FETCH_LATER,
         ])
         try:
             yield browser
@@ -264,28 +279,40 @@ def _observe(page, root, form: dict, auto_fields: dict, form_errors: list, issue
 
 
 def _rehearse(page, config: RehearsalConfig, values: dict, auto_fields: dict,
-              form_errors: list, issues: dict) -> bool:
+              form_errors: list, issues: dict, evidence: RehearsalEvidence) -> tuple[bool, RehearsalEvidence]:
     form = config.form
     root = page.locator(form["root"])
-    complete = False
     try:
         _click(page.locator(form["open"]), form)
         root.wait_for(state="visible")
+        evidence = replace(evidence, form_opened=True)
+        if not root.evaluate(_CHECK_FORM, form["write_controls"]):
+            raise UnsafeControl("表单位于写控件内")
+        evidence = replace(evidence, write_controls_checked=True)
+    except UnsafeControl:
+        issues["unsafe_control"] = "UnsafeControl"
+        return False, evidence
+    except Exception as exc:
+        issues["form"] = type(exc).__name__
+        return False, evidence
+
+    complete = False
+    try:
         _fill_form(page, root, form, values)
         if ready := form.get("observations_ready"):
             root.locator(ready).wait_for(state="visible")
         complete = True
     except UnsafeControl:
         issues["unsafe_control"] = "UnsafeControl"
-        return False
+        return False, evidence
     except Exception as exc:
         issues["form"] = type(exc).__name__
     try:
         _observe(page, root, form, auto_fields, form_errors, issues)
     except UnsafeControl:
         issues["unsafe_control"] = "UnsafeControl"
-        return False
-    return complete and not any(key.startswith("observe_") for key in issues)
+        return False, evidence
+    return complete and not any(key.startswith("observe_") for key in issues), evidence
 
 
 def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
@@ -298,6 +325,7 @@ def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
     auto_fields = {}
     form_errors = []
     complete = False
+    evidence = RehearsalEvidence()
     after = {}
     audits = []
     with (
@@ -313,11 +341,21 @@ def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
                     # 预载视图后切离线。打开表单和填写均在离线状态下执行。
                     _open_view(form_page, config, config.views["新建"])
                     form_page.wait_for_load_state("load")
-                    context.go_offline()
-                    if not audit.failed:
-                        complete = _rehearse(form_page, config, values, auto_fields, form_errors, issues)
                 except Exception as exc:
-                    issues["form"] = type(exc).__name__
+                    issues["preload"] = type(exc).__name__
+                else:
+                    try:
+                        context.go_offline()
+                        if not audit.offline:
+                            raise RuntimeError("离线切换未执行")
+                        evidence = RehearsalEvidence(offline_switched=True)
+                    except Exception as exc:
+                        issues["offline"] = type(exc).__name__
+                    else:
+                        if not audit.failed:
+                            complete, evidence = _rehearse(
+                                form_page, config, values, auto_fields, form_errors, issues, evidence,
+                            )
                 finally:
                     try:
                         context.close_pages()
@@ -334,12 +372,13 @@ def run_rehearsal(draft: PolicyDraft, config: RehearsalConfig, *,
         requests.update(audit.counts)
     guard_failed = any(audit.failed for audit in audits)
     result = RehearsalResult(before, after, complete, auto_fields, form_errors, issues,
-                             dict(requests), guard_failed, report)
+                             dict(requests), guard_failed, report, evidence)
     with open(report, "x", encoding="utf-8", opener=_private_file) as stream:
         json.dump({
             "before": before, "after": after,
             "delta": {name: after[name] - before[name] for name in before.keys() & after.keys()},
             "smoke_passed": result.smoke_passed, "form_complete": complete,
+            "evidence": asdict(evidence),
             "auto_fields": auto_fields, "form_errors": form_errors,
             "issues": issues, "requests": result.requests, "guard_failed": guard_failed,
         }, stream, ensure_ascii=False, indent=2)

@@ -17,7 +17,8 @@ from types import SimpleNamespace
 import pytest
 
 from qianshu.mingdao.readonly import (
-    _ARM_CLOSE, _SCRIPT, _SCRIPT_BINDING, ReadOnlyPolicy, RequestAudit, readonly_context,
+    _ARM_CLOSE, _DISABLE_FETCH_LATER, _SCRIPT, _SCRIPT_BINDING, _SCRIPT_READY,
+    ReadOnlyPolicy, RequestAudit, readonly_context,
 )
 
 TRIALS = 10
@@ -31,12 +32,14 @@ LOCAL_ARGS = [
 
 
 @pytest.fixture
-def playwright_browser():
+def playwright_browser(request):
     sync_api = pytest.importorskip("playwright.sync_api", reason="需要 Playwright Python 可选依赖")
     with sync_api.sync_playwright() as playwright:
         if not Path(playwright.chromium.executable_path).is_file():
             pytest.skip("需要本机 Playwright Chromium")
-        browser = playwright.chromium.launch(args=[*LOCAL_ARGS, "--ignore-certificate-errors"])
+        browser = playwright.chromium.launch(args=[
+            *LOCAL_ARGS, "--ignore-certificate-errors", *getattr(request, "param", ()),
+        ])
         try:
             yield browser
         finally:
@@ -238,7 +241,7 @@ def enable_script(chromium, session, audit):
     chromium.call("Runtime.addBinding", {"name": binding}, session)
     chromium.call("Page.addScriptToEvaluateOnNewDocument", {
         "source": f"window.{_SCRIPT_BINDING} = (...args) => window.{binding}(JSON.stringify(args));\n"
-                  + _SCRIPT.read_text(encoding="utf-8"),
+                  + _SCRIPT_READY + _SCRIPT.read_text(encoding="utf-8"),
     }, session)
 
 
@@ -418,8 +421,8 @@ def test_playwright_direct_close(playwright_browser, server, layer):
 
 
 @pytest.fixture
-def guarded_context(playwright_browser, server, tmp_path):
-    origin, page_path, _, _, _ = server
+def guarded_context(playwright_browser, server, tmp_path, request):
+    origin, page_path, done_path, _, _ = server
     state = tmp_path / "example-state.json"
     state.write_text('{"cookies": [], "origins": []}', encoding="utf-8")
     stream = StringIO()
@@ -427,11 +430,12 @@ def guarded_context(playwright_browser, server, tmp_path):
     browser = SimpleNamespace(new_context=lambda **options: playwright_browser.new_context(
         **options, ignore_https_errors=True,
     ))
-    with readonly_context(browser, ReadOnlyPolicy(origin, (page_path,)), state, stream) as (context, audit):
+    with readonly_context(browser, ReadOnlyPolicy(origin, (page_path, done_path)), state, stream) as (context, audit):
         yield context, audit, stream
-    assert not audit.failed
+    assert audit.failed == getattr(request, "param", False), stream.getvalue()
 
 
+@pytest.mark.parametrize("guarded_context", [True], indirect=True)
 def test_popup_first_post_is_denied(guarded_context, server):
     origin, path, _, posts, _ = server
     context, audit, stream = guarded_context
@@ -448,10 +452,154 @@ def test_popup_first_post_is_denied(guarded_context, server):
         }""")
     assert popup.value is not page
     assert posts == set()
+    assert audit.failed
+    assert audit.counts["error"] >= 1
     assert audit.counts["blocked"] == 1
     assert {"method": "POST", "path_pattern": "worksheet_view", "outcome": "blocked"} in [
         json.loads(line) for line in stream.getvalue().splitlines()
     ]
+
+
+def test_popup_navigation_audits_pagehide_beacon(guarded_context, server):
+    origin, path, done_path, posts, _ = server
+    context, audit, stream = guarded_context
+    page = context.new_page()
+    assert page.goto(origin + done_path).ok
+    with page.expect_popup() as opened:
+        page.evaluate("() => { window.open('about:blank'); }")
+    popup = opened.value
+    popup.wait_for_function("window.__qianshuReadonlyAuditReady === true")
+    assert popup.goto(origin + done_path).ok
+    assert popup.evaluate("window.__qianshuReadonlyAuditReady") is True
+    popup.evaluate("""() => addEventListener('pagehide', () => {
+        localStorage.setItem('example-popup-pagehide', 'ran');
+        navigator.sendBeacon('/example-popup-beacon', 'example');
+    })""")
+    assert popup.goto(origin + path).ok
+    assert page.evaluate("localStorage.getItem('example-popup-pagehide')") == "ran"
+    context.close_page(popup)
+    assert posts == set()
+    assert not audit.failed, stream.getvalue()
+    assert [json.loads(line) for line in stream.getvalue().splitlines()
+            if json.loads(line)["outcome"] == "blocked"] == [{
+        "method": "POST", "path_pattern": "unlisted_path:" + hashlib.sha256(b"/example-popup-beacon").hexdigest(),
+        "outcome": "blocked",
+    }]
+
+
+@pytest.mark.parametrize("guarded_context", [True], indirect=True)
+def test_popup_rejection_before_audit_is_ready_fails_smoke(guarded_context, server):
+    origin, _, done_path, posts, _ = server
+    context, audit, stream = guarded_context
+    opener = context.new_page()
+    assert opener.goto(origin + done_path).ok
+    prepare = context._prepare_page
+
+    def attempt_before_prepare(page):
+        assert page.evaluate("""() =>
+            navigator.sendBeacon(document.baseURI + '?early=1', 'example')""") is False
+        prepare(page)
+
+    # 在启用 CDP 之前触发脚本拒绝。
+    context._context.remove_listener("page", prepare)
+    context._context.on("page", attempt_before_prepare)
+    with opener.expect_popup() as opened:
+        opener.evaluate("() => { window.open('about:blank'); }")
+    popup = opened.value
+    popup.wait_for_function("window.__qianshuReadonlyAuditReady === true")
+    context.close_page(popup)
+    assert posts == set()
+    assert audit.failed
+    entries = [json.loads(line) for line in stream.getvalue().splitlines()]
+    assert any(entry["outcome"] == "error" and entry["path_pattern"] == "page_audit_not_ready"
+               for entry in entries)
+    assert [entry["method"] for entry in entries if entry["outcome"] == "blocked"] == ["POST"]
+
+
+@pytest.mark.parametrize("offline", [False, True], ids=["online", "offline"])
+def test_fetch_later_is_denied_before_controlled_close(guarded_context, server, offline):
+    origin, _, done_path, posts, _ = server
+    context, audit, stream = guarded_context
+    page = context.new_page()
+    assert page.goto(origin + done_path).ok
+    assert page.evaluate("typeof window.fetchLater") == "function"
+    witness = context.new_page()
+    if offline:
+        context.go_offline()
+    assert page.evaluate("""() => {
+        try {
+            window.fetchLater('/example-fetch-later?example=1', {
+                method: 'POST', body: 'example', activateAfter: 60_000,
+            });
+        } catch (error) {
+            return error.message;
+        }
+    }""") == "只读演练已拒绝 fetchLater"
+    context.close_page(page)
+    witness.wait_for_timeout(250)
+    assert posts == set()
+    assert audit.counts == {"allowed": 1, "blocked": 1}
+    assert json.loads(stream.getvalue().splitlines()[1]) == {
+        "method": "POST", "path_pattern": "unlisted_path:" + hashlib.sha256(b"/example-fetch-later").hexdigest(),
+        "outcome": "blocked",
+    }
+
+
+@pytest.mark.parametrize("playwright_browser", [(_DISABLE_FETCH_LATER,)], indirect=True)
+def test_chromium_can_disable_fetch_later(playwright_browser, server):
+    origin, _, done_path, _, _ = server
+    page = playwright_browser.new_page()
+    assert page.goto(origin + done_path).ok
+    assert page.evaluate("typeof window.fetchLater") == "undefined"
+
+
+def test_chromium_has_no_legacy_pending_beacons(playwright_browser, server):
+    origin, _, done_path, _, _ = server
+    page = playwright_browser.new_page()
+    assert page.goto(origin + done_path).ok
+    assert page.evaluate("""() => [
+        typeof window.PendingBeacon, typeof window.PendingGetBeacon, typeof window.PendingPostBeacon,
+    ]""") == ["undefined"] * 3
+
+
+def test_navigation_hyperlink_ping_is_denied_by_routing(guarded_context, server):
+    origin, path, done_path, posts, _ = server
+    context, audit, stream = guarded_context
+    page = context.new_page()
+    assert page.goto(origin + done_path).ok
+    page.evaluate("""path => {
+        const link = document.createElement('a');
+        link.href = path;
+        link.ping = '/example-hyperlink-ping';
+        link.textContent = 'example link';
+        document.body.append(link);
+    }""", path)
+    page.get_by_text("example link").click()
+    page.wait_for_url(origin + path)
+    context.close_page(page)
+    assert posts == set()
+    assert audit.counts["blocked"] == 1, stream.getvalue()
+
+
+def test_controlled_close_arms_blank_frame_and_popup(guarded_context, server):
+    origin, _, done_path, posts, _ = server
+    context, _, _ = guarded_context
+    page = context.new_page()
+    assert page.goto(origin + done_path).ok
+    with page.expect_popup() as opened:
+        page.evaluate("() => { window.open('about:blank'); }")
+    popup = opened.value
+    popup.wait_for_function("window.__qianshuReadonlyAuditReady === true")
+    popup.evaluate("() => document.body.append(document.createElement('iframe'))")
+    assert [frame.url for frame in popup.frames] == ["about:blank", "about:blank"]
+    for frame in popup.frames:
+        frame.evaluate("""() => addEventListener('pagehide', () => {
+            localStorage.setItem('example-blank-pagehide', 'ran');
+            navigator.sendBeacon(location.origin + '/example-blank-pagehide', 'example');
+        })""")
+    context.close_page(popup)
+    assert page.evaluate("localStorage.getItem('example-blank-pagehide')") is None
+    assert posts == set()
 
 
 def test_service_worker_cannot_register_or_control_page(guarded_context, server):
