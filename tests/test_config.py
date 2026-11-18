@@ -50,6 +50,19 @@ def test_missing_required_values_list_only_key_names(tmp_path):
         load_config("FEISHU_APP_ID", "FEISHU_APP_SECRET", env_file=env_file)
 
 
+def test_ai_platform_is_loaded_and_redacted(tmp_path):
+    from qianshu.parse.model import configured_model
+
+    env_file = tmp_path / "synthetic.env"
+    env_file.write_text("AI_PLATFORM=placeholder-platform\n", encoding="utf-8")
+    config = load_config("AI_PLATFORM", env_file=env_file)
+    assert config["AI_PLATFORM"] == "placeholder-platform"
+    assert "AI_PLATFORM=[已脱敏]" in repr(config)
+    with pytest.raises(ConfigError, match="AI_PLATFORM.*只支持 Anthropic") as error:
+        configured_model(config)
+    assert "placeholder-platform" not in str(error.value)
+
+
 def test_env_example_contains_only_config_keys():
     template = ROOT / ".env.example"
     entries = [
