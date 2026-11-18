@@ -2,13 +2,14 @@ import io
 import json
 import logging
 import sys
+from collections import UserDict
 from hashlib import sha256
 from uuid import uuid4
 
 import pytest
 
 from qianshu.config import CONFIG_KEYS, LOGGABLE_CONFIG_KEYS, Config
-from qianshu.logs import JsonFormatter, JsonStreamHandler
+from qianshu.logs import JsonFormatter, JsonStreamHandler, setup_logging
 
 
 # 独立列出应脱敏项，避免测试与实现同时跳过被误放行的配置。
@@ -149,7 +150,7 @@ def test_json_log_redacts_escaped_values(message, argument, expected):
 @pytest.mark.parametrize(
     ("message", "args", "expected"),
     [
-        ("密码=%.21s", lambda secret: (secret,), "密码=[已脱敏]"),
+        ("密码=%.10s", lambda secret: (secret,), "密码=[已脱敏]"),
         (
             "配置=%(details)a",
             lambda secret: ({"details": [(secret,)]},),
@@ -160,9 +161,19 @@ def test_json_log_redacts_escaped_values(message, argument, expected):
             lambda secret: (json.dumps({"token": secret}),),
             """配置='{"token": "[已脱敏]"}'""",
         ),
-        ("异常=%s", lambda secret: (ValueError(secret[:21]),), "异常=[已脱敏]"),
+        (
+            "异常=%s",
+            lambda secret: (ValueError("登录失败 " + secret[:10]),),
+            "异常=登录失败 [已脱敏]",
+        ),
+        ("配置=%.10s", lambda secret: (b"\xff" + secret.encode(),), "配置=�[已脱敏]"),
+        (
+            "配置=%.10s",
+            lambda secret: (bytearray(secret.encode()),),
+            "配置=[已脱敏]",
+        ),
     ],
-    ids=["truncated", "ascii-nested-mapping", "repr-of-json", "exception-prefix"],
+    ids=["truncated", "ascii-nested-mapping", "repr-of-json", "exception-prefix", "bytes", "bytearray"],
 )
 def test_json_log_redacts_arguments_before_rendering(message, args, expected):
     fingerprint = sha256(uuid4().bytes).hexdigest()[:12]
@@ -173,8 +184,54 @@ def test_json_log_redacts_arguments_before_rendering(message, args, expected):
 
     output = JsonFormatter([secret]).format(record)
 
-    assert_redacted(output, fingerprint)
+    assert_redacted(output, secret[:8])
     assert json.loads(output)["message"] == expected
+
+
+def test_json_log_redacts_user_dict_values_without_changing_keys():
+    secret = f"fake-{uuid4().hex}"
+    args = UserDict({secret: secret})
+    record = logging.LogRecord(
+        "qianshu.tests", logging.INFO, "", 0, f"配置=%({secret}).7s", (args,), None
+    )
+
+    output = JsonFormatter([secret]).format(record)
+
+    assert json.loads(output)["message"] == "配置=[已脱敏]"
+    assert args[secret] == secret
+
+
+@pytest.mark.parametrize("collection_type", [set, frozenset])
+def test_json_log_redacts_sets_and_objects_using_str(collection_type):
+    secret = f"fake-{uuid4().hex}"
+
+    class SyntheticArgument:
+        def __str__(self):
+            return "合成参数 " + secret[:8]
+
+    record = logging.LogRecord(
+        "qianshu.tests", logging.INFO, "", 0, "配置=%s",
+        (collection_type([SyntheticArgument()]),), None,
+    )
+
+    output = JsonFormatter([secret]).format(record)
+
+    assert_redacted(output, secret[:8])
+    assert json.loads(output)["message"] == f"配置={collection_type(['合成参数 [已脱敏]'])}"
+
+
+def test_json_log_redacts_prefixes_at_configured_length_boundaries():
+    secret = "fake-" + uuid4().hex
+    long_value = secret[:12]
+    short_value = "test-" + uuid4().hex[:6]
+    message = f"{long_value[:7]} {long_value[:8]} {short_value[:8]} {short_value}"
+    record = logging.LogRecord("qianshu.tests", logging.INFO, "", 0, message, (), None)
+
+    output = JsonFormatter([long_value, short_value]).format(record)
+
+    assert json.loads(output)["message"] == (
+        f"{long_value[:7]} [已脱敏] {short_value[:8]} [已脱敏]"
+    )
 
 
 def test_json_log_handles_rendering_error_with_standard_stream_handler(capsys, monkeypatch):
@@ -194,20 +251,44 @@ def test_json_log_handles_rendering_error_with_standard_stream_handler(capsys, m
     assert json.loads(stdout) == {"message": "log_format_failed", "exception_type": "TypeError"}
 
 
-def test_json_stream_handler_suppresses_write_error_diagnostics(capsys, monkeypatch):
-    class FailingStream(io.StringIO):
-        def write(self, text):
-            raise OSError("合成写入错误")
-
+def test_json_stream_handler_reports_only_encoding_error_type(capsys, monkeypatch):
     fingerprint = sha256(uuid4().bytes).hexdigest()[:12]
     secret = f"占位-{fingerprint}-合成密码"
     logger = logging.Logger("qianshu.tests")
-    logger.addHandler(JsonStreamHandler(FailingStream(), sensitive_values=[secret]))
     monkeypatch.setattr(logging, "raiseExceptions", True)
 
-    logger.info("配置=%s", secret)
+    raw_stream = io.BytesIO()
+    with io.TextIOWrapper(raw_stream, encoding="ascii") as stream:
+        logger.addHandler(JsonStreamHandler(stream, sensitive_values=[secret]))
+        logger.info("配置=%s", secret)
+        assert raw_stream.getvalue() == b""
 
-    assert capsys.readouterr() == ("", "")
+    stdout, stderr = capsys.readouterr()
+    assert stdout == ""
+    assert_redacted(stderr, secret, fingerprint)
+    assert json.loads(stderr) == {
+        "message": "log_write_failed", "exception_type": "UnicodeEncodeError",
+    }
+
+
+def test_setup_logging_replaces_root_handlers_and_redacts_config(capsys, monkeypatch):
+    root = logging.getLogger()
+    original_level = root.level
+    monkeypatch.setattr(root, "handlers", [logging.StreamHandler(io.StringIO())])
+    secret = f"fake-{uuid4().hex}"
+
+    try:
+        setup_logging(Config({"MAIL_PASSWORD": secret}))
+        setup_logging(Config({"MAIL_PASSWORD": secret}))
+        assert len(root.handlers) == 1
+        assert type(root.handlers[0]) is JsonStreamHandler
+        logging.getLogger("qianshu.tests").info("处理 %d 条，配置=%s", 2, secret)
+    finally:
+        root.setLevel(original_level)
+
+    output = capsys.readouterr().err
+    assert_redacted(output, secret)
+    assert json.loads(output)["message"] == "处理 2 条，配置=[已脱敏]"
 
 
 def test_json_log_redacts_rendered_message_without_modifying_record():
@@ -264,13 +345,14 @@ def test_json_log_redacts_named_argument_from_config():
     fingerprint = sha256(uuid4().bytes).hexdigest()[:12]
     config = Config({"MAIL_PASSWORD": f"占位-{fingerprint}-合成密码"})
     record = logging.LogRecord(
-        "qianshu.tests", logging.INFO, "", 0, "配置=%(MAIL_PASSWORD).21s", (config,), None
+        "qianshu.tests", logging.INFO, "", 0, "配置=%(MAIL_PASSWORD)12.10s", (config,), None
     )
 
     output = JsonFormatter(config).format(record)
 
-    assert_redacted(output, fingerprint)
-    assert json.loads(output)["message"] == "配置=[已脱敏]"
+    assert_redacted(output, config["MAIL_PASSWORD"][:10])
+    # 字段宽度按脱敏后的值计算，验证遮蔽发生在格式化之前。
+    assert json.loads(output)["message"] == f"配置={'[已脱敏]':>12}"
 
 
 def test_json_log_treats_single_extra_string_as_one_value():

@@ -3,6 +3,7 @@
 import json
 import logging
 import re
+import sys
 from collections.abc import Iterable, Mapping
 from copy import copy
 from datetime import UTC, datetime
@@ -11,30 +12,70 @@ from typing import TextIO
 from qianshu.config import LOGGABLE_CONFIG_KEYS, REDACTED, Config
 
 
-def _redact_argument(
-    argument: object, pattern: re.Pattern[str], sensitive_values: frozenset[str]
-) -> object:
-    if isinstance(argument, BaseException):
-        argument = str(argument)
-        # 异常消息可能只保留了凭据前缀。
-        if argument and any(value.startswith(argument) for value in sensitive_values):
-            return REDACTED
-    if isinstance(argument, str):
-        return pattern.sub(REDACTED, argument)
+class _Redactor:
+    _MIN_PREFIX_LENGTH = 8
+    _MIN_SECRET_LENGTH = 12
+
+    def __init__(self, values: Iterable[str]) -> None:
+        literals = set()
+        self._prefix_values: dict[str, list[str]] = {}
+        for value in values:
+            literals.update((
+                value,
+                repr(value)[1:-1],
+                json.dumps(value)[1:-1],
+                json.dumps(value, ensure_ascii=False)[1:-1],
+            ))
+            if len(value) >= self._MIN_SECRET_LENGTH:
+                prefix = value[:self._MIN_PREFIX_LENGTH]
+                self._prefix_values.setdefault(prefix, []).append(value)
+                literals.add(prefix)
+        self._pattern = re.compile("|".join(
+            re.escape(value) for value in sorted(literals, key=len, reverse=True)
+        ))
+
+    def __call__(self, text: str) -> str:
+        parts = []
+        end = 0
+        while match := self._pattern.search(text, end):
+            start = match.start()
+            parts.extend((text[end:start], REDACTED))
+            end = match.end()
+            prefix = text[start:start + self._MIN_PREFIX_LENGTH]
+            # 找到最长的匹配前缀，无需为长正文枚举所有前缀。
+            for value in self._prefix_values.get(prefix, ()):
+                if text.startswith(value, start):
+                    end = max(end, start + len(value))
+                    continue
+                limit = min(len(value), len(text) - start)
+                length = self._MIN_PREFIX_LENGTH
+                while length < limit and value[length] == text[start + length]:
+                    length += 1
+                end = max(end, start + length)
+        parts.append(text[end:])
+        return "".join(parts)
+
+
+def _redact_argument(argument: object, redact: _Redactor) -> object:
     if isinstance(argument, Config):
-        return Config({key: pattern.sub(REDACTED, argument[key]) for key in argument})
-    if isinstance(argument, dict):
-        return {
-            _redact_argument(key, pattern, sensitive_values): _redact_argument(
-                value, pattern, sensitive_values
-            )
-            for key, value in argument.items()
-        }
+        return Config({key: redact(value) for key, value in argument.items()})
+    if isinstance(argument, Mapping):
+        return {key: _redact_argument(value, redact) for key, value in argument.items()}
     if isinstance(argument, list):
-        return [_redact_argument(item, pattern, sensitive_values) for item in argument]
+        return [_redact_argument(item, redact) for item in argument]
     if isinstance(argument, tuple):
-        return tuple(_redact_argument(item, pattern, sensitive_values) for item in argument)
-    return argument
+        return tuple(_redact_argument(item, redact) for item in argument)
+    if isinstance(argument, (set, frozenset)):
+        collection_type = frozenset if isinstance(argument, frozenset) else set
+        return collection_type(_redact_argument(item, redact) for item in argument)
+    if isinstance(argument, (bytes, bytearray)):
+        return redact(argument.decode("utf-8", errors="replace"))
+    text = str(argument)
+    redacted = redact(text)
+    # 保留未命中脱敏的内置数字，供 %d、%f 和动态宽度等格式使用。
+    if type(argument) in (int, float, bool) and redacted == text:
+        return argument
+    return redacted
 
 
 class JsonFormatter(logging.Formatter):
@@ -55,41 +96,26 @@ class JsonFormatter(logging.Formatter):
         elif isinstance(sensitive_values, str):
             sensitive_values = (sensitive_values,)
         self._sensitive_values = frozenset(value for value in sensitive_values if value)
-        self._pattern = self._redaction_pattern(self._sensitive_values)
-
-    @staticmethod
-    def _redaction_pattern(values: Iterable[str]) -> re.Pattern[str] | None:
-        variants = set()
-        for value in values:
-            variants.update((
-                value,
-                repr(value)[1:-1],
-                json.dumps(value)[1:-1],
-                json.dumps(value, ensure_ascii=False)[1:-1],
-            ))
-        literals = sorted(variants, key=len, reverse=True)
-        if literals:
-            return re.compile("|".join(re.escape(value) for value in literals))
-        return None
+        self._redact = _Redactor(self._sensitive_values) if self._sensitive_values else None
 
     def format(self, record: logging.LogRecord) -> str:
-        pattern = self._pattern
-        sensitive_values = self._sensitive_values
+        redact = self._redact
         try:
             extra_values = getattr(record, "redact_values", ())
             if isinstance(extra_values, str):
                 extra_values = (extra_values,)
             if extra_values:
-                sensitive_values = sensitive_values.union(value for value in extra_values if value)
-                pattern = self._redaction_pattern(sensitive_values)
-            if pattern and record.args:
+                sensitive_values = self._sensitive_values.union(value for value in extra_values if value)
+                if sensitive_values:
+                    redact = _Redactor(sensitive_values)
+            if redact and record.args:
                 record = copy(record)
-                record.args = _redact_argument(record.args, pattern, sensitive_values)
+                record.args = _redact_argument(record.args, redact)
             message = record.getMessage()
         except Exception as exc:
             exception_type = type(exc).__name__
-            if pattern:
-                exception_type = pattern.sub(REDACTED, exception_type)
+            if redact:
+                exception_type = redact(exception_type)
             return json.dumps(
                 {"message": "log_format_failed", "exception_type": exception_type},
                 ensure_ascii=False,
@@ -105,15 +131,15 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info and record.exc_info[0]:
             fields["exception_type"] = record.exc_info[0].__name__
-        if pattern:
+        if redact:
             for key in ("logger", "message", "exception_type"):
                 if key in fields:
-                    fields[key] = pattern.sub(REDACTED, fields[key])
+                    fields[key] = redact(fields[key])
         return json.dumps(fields, ensure_ascii=False)
 
 
 class JsonStreamHandler(logging.StreamHandler):
-    """写出项目 JSON 日志，输出失败时静默丢弃该条日志。"""
+    """写出项目 JSON 日志，输出失败时只记录事件与异常类型。"""
 
     def __init__(
         self,
@@ -125,4 +151,21 @@ class JsonStreamHandler(logging.StreamHandler):
         self.setFormatter(JsonFormatter(sensitive_values))
 
     def handleError(self, record: logging.LogRecord) -> None:
-        """丢弃故障记录，避免标准诊断直接输出原始消息和参数。"""
+        diagnostic = {
+            "message": "log_write_failed",
+            "exception_type": type(sys.exception()).__name__,
+        }
+        try:
+            sys.stderr.write(json.dumps(diagnostic) + "\n")
+        except Exception:
+            # stderr 本身也可能是发生故障的流。
+            pass
+
+
+def setup_logging(config: Mapping[str, str]) -> None:
+    """为根日志器配置项目 JSON 日志。"""
+    logging.basicConfig(
+        handlers=[JsonStreamHandler(sensitive_values=config)],
+        level=logging.INFO,
+        force=True,
+    )
