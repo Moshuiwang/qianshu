@@ -1,5 +1,6 @@
 import subprocess
 import sys
+from hashlib import sha256
 from pathlib import Path
 from uuid import uuid4
 
@@ -19,7 +20,26 @@ def test_load_config_reads_synthetic_values_for_all_services(tmp_path):
         encoding="utf-8",
     )
 
-    assert load_config(*CONFIG_KEYS, env_file=env_file) == values
+    config = load_config(*CONFIG_KEYS, env_file=env_file)
+    assert {key: config[key] for key in CONFIG_KEYS} == values
+
+
+def test_config_representations_hide_values(tmp_path):
+    env_file = tmp_path / "synthetic.env"
+    secret_fingerprint = sha256(uuid4().bytes).hexdigest()[:12]
+    identifier_fingerprint = sha256(uuid4().bytes).hexdigest()[:12]
+    env_file.write_text(
+        f"FEISHU_APP_ID=占位-{identifier_fingerprint}\n"
+        f"FEISHU_APP_SECRET=占位-{secret_fingerprint}\n",
+        encoding="utf-8",
+    )
+    config = load_config(env_file=env_file)
+
+    for output in (repr(config), str(config), str(ValueError(config))):
+        assert secret_fingerprint not in output, "配置表示泄露了合成密钥"
+        assert identifier_fingerprint not in output, "配置表示泄露了合成标识"
+        assert "FEISHU_APP_ID=[已脱敏]" in output
+        assert "FEISHU_APP_SECRET=[已脱敏]" in output
 
 
 def test_missing_required_values_list_only_key_names(tmp_path):

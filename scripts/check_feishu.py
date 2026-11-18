@@ -44,12 +44,12 @@ def report(name: str, resp: dict, detail: str = "") -> bool:
 
 def main() -> int:
     try:
-        env = load_config("FEISHU_APP_ID", "FEISHU_APP_SECRET", env_file=ROOT / ".env")
+        config = load_config("FEISHU_APP_ID", "FEISHU_APP_SECRET", env_file=ROOT / ".env")
     except ConfigError as exc:
         print(f"[失败] {exc}", file=sys.stderr)
         return 1
     r = call("POST", "/auth/v3/tenant_access_token/internal",
-             body={"app_id": env["FEISHU_APP_ID"], "app_secret": env["FEISHU_APP_SECRET"]})
+             body={"app_id": config["FEISHU_APP_ID"], "app_secret": config["FEISHU_APP_SECRET"]})
     expire = r.get("expire")
     detail = f"有效期 {expire} 秒" if type(expire) is int else ""
     if not report("用 App ID / Secret 换取应用令牌", r, detail):
@@ -59,14 +59,14 @@ def main() -> int:
     r = call("GET", "/bot/v3/info", token)
     report("读取机器人信息", r)
 
-    chat = env.get("FEISHU_CHAT_ID", "")
+    chat = config.get("FEISHU_CHAT_ID", "")
     if chat:
         r = call("GET", f"/im/v1/chats/{chat}", token)
         report("读取汇报群信息（需机器人已在群内）", r)
     else:
         print("[跳过] 读取汇报群信息：.env 未填 FEISHU_CHAT_ID")
 
-    node = env.get("FEISHU_WIKI_CHECK_NODE", "")
+    node = config.get("FEISHU_WIKI_CHECK_NODE", "")
     if node:
         r = call("GET", f"/wiki/v2/spaces/get_node?token={node}", token)
         n = (r.get("data") or {}).get("node") or {}

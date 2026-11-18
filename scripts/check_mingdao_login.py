@@ -23,7 +23,7 @@ STATE = ROOT / ".private" / "mingdao-state.json"
 
 def main() -> int:
     try:
-        env = load_config(
+        config = load_config(
             "MINGDAO_ACCOUNT", "MINGDAO_PASSWORD", "MINGDAO_APP_ID",
             "MINGDAO_WORKSHEET_ID", env_file=ROOT / ".env",
         )
@@ -34,8 +34,8 @@ def main() -> int:
     from playwright.sync_api import TimeoutError as PwTimeout
     from playwright.sync_api import sync_playwright
 
-    base = env.get("MINGDAO_BASE_URL", "https://www.mingdao.com")
-    sheet_url = f"{base}/app/{env['MINGDAO_APP_ID']}/{env['MINGDAO_WORKSHEET_ID']}"
+    base = config.get("MINGDAO_BASE_URL", "https://www.mingdao.com")
+    sheet_url = f"{base}/app/{config['MINGDAO_APP_ID']}/{config['MINGDAO_WORKSHEET_ID']}"
     show = "--show" in sys.argv
     # 登录状态与截图含会话信息：新建文件一律只有本人可读写
     os.umask(0o077)
@@ -52,8 +52,8 @@ def main() -> int:
             password = page.locator("input[type=password]").first
             password.wait_for(timeout=30_000)
             password.locator("xpath=preceding::input[not(@type='checkbox') and not(@type='hidden')][1]").fill(
-                env["MINGDAO_ACCOUNT"])
-            password.fill(env["MINGDAO_PASSWORD"])
+                config["MINGDAO_ACCOUNT"])
+            password.fill(config["MINGDAO_PASSWORD"])
             # 页面标题也叫「登录」，按钮是 .btnForLogin；找不到按钮时在密码框按回车
             button = page.locator(".btnForLogin")
             if button.count():
