@@ -1,7 +1,7 @@
 """邮件头关联与 MIME 正文提取。"""
 
 import re
-import unicodedata
+from collections.abc import Callable, Iterator
 from email import policy
 from email.errors import MessageError
 from email.message import EmailMessage
@@ -13,9 +13,11 @@ from .imap import MailError, ReadOnlyMailbox
 _HEADERS = BytesHeaderParser(policy=policy.default)
 _PARSER = BytesParser(policy=policy.default)
 _MESSAGE_ID = re.compile(r"<[!-;=?-~]+>")
-_APPROVAL = re.compile(
-    r"(?:审批结果\s*[:：]\s*)?(?:我)?同意(?:(?:该|本次|这次|这个)?申请)?"
-    r"(?:[，,]\s*请按原申请执行)?[。.!！]*"
+_QUOTE_PREFIXES = (">", "＞")
+_ATTRIBUTION = re.compile(r"(?:On .+ wrote\s*:|.+写道\s*[:：])", re.IGNORECASE)
+_ORIGINAL_MESSAGE = re.compile(
+    r"-{2,}\s*(?:original message|forwarded message|原始邮件|转发邮件)\s*-{2,}",
+    re.IGNORECASE,
 )
 
 
@@ -49,7 +51,9 @@ def is_reply(message: EmailMessage, request_id: str) -> bool:
     return bool(chain) and chain[-1] == request_id
 
 
-def _text_sections(node: list, section: str = ""):
+def _text_sections(
+    node: list, read_mime: Callable[[str], EmailMessage], section: str = "",
+) -> Iterator[str]:
     if not node:
         raise MailError("IMAP 返回了空邮件结构。")
     if isinstance(node[0], list):
@@ -73,16 +77,21 @@ def _text_sections(node: list, section: str = ""):
                 start = next((value for key, value in zip(params[::2], params[1::2])
                               if key.upper() == b"START"), None)
             for index, part in enumerate(parts, 1):
-                if (start is None and index == 1) or (
-                    len(part) > 3 and not isinstance(part[0], list) and part[3] == start
-                ):
-                    child = f"{section}.{index}" if section else str(index)
-                    yield from _text_sections(part, child)
+                child = f"{section}.{index}" if section else str(index)
+                if start is None:
+                    yield from _text_sections(part, read_mime, child)
+                    return
+                content_id = part[3] if len(part) > 3 and not isinstance(part[0], list) else None
+                if content_id in {None, b"NIL"}:
+                    values = read_mime(child).get_all("Content-ID", [])
+                    content_id = str(values[0]).strip().encode("utf-8") if len(values) == 1 else None
+                if content_id == start:
+                    yield from _text_sections(part, read_mime, child)
                     return
             raise MailError("IMAP 未返回内嵌资源邮件的正文根段。")
         for index, part in enumerate(parts, 1):
             child = f"{section}.{index}" if section else str(index)
-            yield from _text_sections(part, child)
+            yield from _text_sections(part, read_mime, child)
     elif len(node) >= 2 and node[0].upper() == b"TEXT":
         if node[1].upper() in {b"PLAIN", b"HTML"}:
             yield section
@@ -90,21 +99,53 @@ def _text_sections(node: list, section: str = ""):
 
 class _HTMLText(HTMLParser):
     _BREAKS = {"br", "div", "p", "li", "tr", "td", "hr", "blockquote"}
+    _QUOTE_CLASSES = {"gmail_quote", "gmail_quote_container", "yahoo_quoted"}
 
-    def __init__(self) -> None:
+    def __init__(self, *, authored_only: bool = False) -> None:
         super().__init__(convert_charrefs=True)
+        self.segments: list[str] = []
         self.text: list[str] = []
+        self.authored_only = authored_only
+        self.excluded_tag: str | None = None
+        self.excluded_depth = 0
 
     def handle_starttag(self, tag, attrs):
+        if self.excluded_tag is not None:
+            if tag == self.excluded_tag:
+                self.excluded_depth += 1
+            return
+        if self.authored_only:
+            classes = (dict(attrs).get("class") or "").split()
+            quoted = tag == "blockquote" or not self._QUOTE_CLASSES.isdisjoint(classes)
+            if quoted:
+                text = "".join(self.text).rstrip()
+                previous, _, last_line = text.rpartition("\n")
+                self.segments.append(previous if _ATTRIBUTION.fullmatch(last_line.strip()) else text)
+                self.text.clear()
+            if quoted or tag in {"script", "style"}:
+                self.excluded_tag = tag
+                self.excluded_depth = 1
+                self.text.append("\n")
+                return
         if tag in self._BREAKS:
             self.text.append("\n")
 
     def handle_endtag(self, tag):
+        if self.excluded_tag is not None:
+            if tag == self.excluded_tag:
+                self.excluded_depth -= 1
+                if self.excluded_depth == 0:
+                    self.excluded_tag = None
+            return
         if tag in self._BREAKS:
             self.text.append("\n")
 
     def handle_data(self, text):
-        self.text.append(text)
+        if self.excluded_tag is None:
+            self.text.append(text)
+
+    def get_text(self) -> str:
+        return "\n".join([*self.segments, "".join(self.text)])
 
 
 def _plain_text(kind: str, content: str) -> str:
@@ -113,16 +154,22 @@ def _plain_text(kind: str, content: str) -> str:
     parser = _HTMLText()
     parser.feed(content)
     parser.close()
-    return "".join(parser.text)
+    return parser.get_text()
 
 
 def body_parts(mailbox: ReadOnlyMailbox, uid: int, raw_headers: bytes) -> tuple[tuple[str, str], ...]:
     """只读取正文用的文本段，跳过文件附件、转发邮件及内嵌资源。"""
+    mime_sections: dict[str, bytes] = {"": raw_headers}
+
+    def read_mime(section: str) -> EmailMessage:
+        if section not in mime_sections:
+            mime_sections[section] = mailbox.section(uid, f"{section}.MIME")
+        return headers(mime_sections[section])
+
     parts = []
     try:
-        for section in _text_sections(mailbox.structure(uid)):
-            raw_mime = mailbox.section(uid, f"{section}.MIME") if section else raw_headers
-            mime = headers(raw_mime)
+        for section in _text_sections(mailbox.structure(uid), read_mime):
+            mime = read_mime(section)
             kind = mime.get_content_type()
             if (
                 kind not in {"text/plain", "text/html"}
@@ -131,6 +178,7 @@ def body_parts(mailbox: ReadOnlyMailbox, uid: int, raw_headers: bytes) -> tuple[
             ):
                 continue
             raw_body = mailbox.section(uid, section or "TEXT")
+            raw_mime = mime_sections[section]
             part = _PARSER.parsebytes(raw_mime.rstrip(b"\r\n") + b"\r\n\r\n" + raw_body)
             decoded = part.get_content(errors="strict")
             if part.defects or "\x00" in decoded:
@@ -146,12 +194,28 @@ def request_text(parts: tuple[tuple[str, str], ...]) -> str:
     return "\n".join(plain or [_plain_text(kind, text) for kind, text in parts]).strip()
 
 
-def explicit_approval(parts: tuple[tuple[str, str], ...]) -> bool:
-    def approves(text: str) -> bool:
-        normalized = unicodedata.normalize("NFKC", text)
-        authored = "\n".join(line.strip() for line in normalized.splitlines()
-                             if not line.lstrip().startswith(">")).strip()
-        return _APPROVAL.fullmatch(authored) is not None
+def authored_reply(kind: str, content: str) -> str | None:
+    """提取本次回复文字。无法确认引文边界时返回 None。"""
+    if kind == "text/html":
+        parser = _HTMLText(authored_only=True)
+        try:
+            parser.feed(content)
+            parser.close()
+        except (AssertionError, ValueError):
+            return None
+        if parser.excluded_tag is not None:
+            return None
+        content = parser.get_text()
 
-    # 所有正文版本均须明确同意。有附加文字或意见冲突时交人工判断。
-    return bool(parts) and all(approves(_plain_text(kind, text)) for kind, text in parts)
+    lines = content.strip().splitlines()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(_QUOTE_PREFIXES) or _ORIGINAL_MESSAGE.fullmatch(stripped):
+            return None
+        if _ATTRIBUTION.fullmatch(stripped):
+            # 只有引述人行后全是连续的行首引用时，才确认引文边界。
+            quoted = lines[index + 1:]
+            if quoted and all(item.lstrip().startswith(_QUOTE_PREFIXES) for item in quoted):
+                return "\n".join(lines[:index]).strip()
+            return None
+    return "\n".join(lines)

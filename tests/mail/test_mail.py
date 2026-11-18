@@ -11,10 +11,10 @@ from uuid import uuid4
 
 import pytest
 
-from qianshu.mail import _private_dir, poll_once, run_polling
+from qianshu.mail import ApprovalDecision, _private_dir, poll_once, run_polling
 from qianshu.mail.history import export_history, main
 from qianshu.mail.imap import SUMMARY, MailError, ReadOnlyMailbox, connect
-from qianshu.mail.message import explicit_approval
+from qianshu.mail.message import authored_reply
 
 
 PLAIN = b'("TEXT" "PLAIN" NIL NIL NIL "8BIT" 20 1)'
@@ -219,19 +219,25 @@ def test_poll_only_delivers_marked_request_once_and_refreshes_approval(config, c
     fake.flags[inbox].add(2)
     fake.flags[sent].add(7)
     calls = []
+    judged = []
 
     def process(*args):
         calls.append(args)
 
+    def judge(text):
+        judged.append(text)
+        return ApprovalDecision.APPROVE
+
     with caplog.at_level(logging.INFO):
-        first = poll_once(config, process, factory=fake.factory)
-        fake.add(sent, 8, mail(approver, "关联回复", "同意。\n\n> 合成正文",
+        first = poll_once(config, process, factory=fake.factory, approval_judge=judge)
+        fake.add(sent, 8, mail(approver, "关联回复", "同意。\n\nOn a test date, fixture wrote:\n> 合成正文",
                                reply_to=str(request["Message-ID"])))
         # 再次从配置打开私有台账，覆盖进程重启后的行为。
-        second = poll_once(dict(config), process, factory=fake.factory)
+        second = poll_once(dict(config), process, factory=fake.factory, approval_judge=judge)
 
     assert (first.total, first.matched, first.delivered, first.approved) == (3, 1, True, False)
     assert (second.total, second.matched, second.delivered, second.approved) == (3, 1, False, True)
+    assert judged == ["同意。"]
     [(body, approved, digest)] = calls
     assert (body, approved, len(digest)) == ("合成正文", False, 64)
     assert fake.flags == {inbox: {2}, sent: {7}}
@@ -275,25 +281,132 @@ def test_poll_rejects_ambiguous_marker_and_prevents_rebinding(config):
 
 
 @pytest.mark.parametrize(
-    ("body", "expected"),
+    ("body", "decision", "approved"),
     [
-        (" 同意 ", True),
-        ("我同意该申请！", True),
-        ("审批结果：同意，请按原申请执行。", True),
-        ("不同意", False),
-        ("同意，但需要确认", False),
-        ("同意。\n\n请先把条件改掉。", False),
-        ("待核对后同意", False),
-        ("> 同意", False),
-        ("是否同意？", False),
+        ("OK", ApprovalDecision.APPROVE, True),
+        ("可以", ApprovalDecision.APPROVE, True),
+        ("没问题", ApprovalDecision.APPROVE, True),
+        ("不同意", ApprovalDecision.REJECT, False),
+        ("同意，但需要确认", ApprovalDecision.CONDITIONAL, False),
+        ("待核对", ApprovalDecision.UNCERTAIN, False),
+        ("同意", None, False),
+        ("同意", "同意", False),
     ],
 )
-def test_conservative_approval(body, expected):
-    assert explicit_approval((("text/plain", body),)) is expected
+def test_poll_uses_only_the_injected_approval_decision(config, body, decision, approved):
+    fake = FakeIMAP()
+    inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(inbox, 1, request)
+    fake.add(sent, 2, mail(approver, marker, body, reply_to=str(request["Message-ID"])))
+    calls = []
+    judged = []
+
+    def judge(text):
+        judged.append(text)
+        return decision
+
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                       approval_judge=judge if decision is not None else None)
+    assert result.delivered and result.approved is approved
+    assert calls[0][:2] == ("合成申请", approved)
+    assert judged == ([] if decision is None else [body])
 
 
-def test_conflicting_mime_alternatives_do_not_approve():
-    assert not explicit_approval((("text/plain", "同意"), ("text/html", "不同意")))
+@pytest.mark.parametrize(
+    ("kind", "body", "expected"),
+    [
+        ("text/html", '<blockquote><div>同意</div></blockquote>', ""),
+        ("text/html", '<div class="gmail_quote"><div>同意</div></div>', ""),
+        ("text/html", "<div>OK</div><div>On a test date, fixture wrote:</div>"
+         "<blockquote><blockquote>旧引文</blockquote>旧正文</blockquote><p>仍需核对</p>",
+         "OK\n\n\n\n仍需核对"),
+        ("text/plain", "同意。\n> 10 万元须另行审批", None),
+        ("text/plain", "可以\n\n样例作者写道：\n> 旧正文\n>> 旧引文", "可以"),
+        ("text/plain", "可以\n\n样例作者写道：\n> 旧正文\n\n> 仍需另行审批", None),
+        ("text/plain", "> 同意", None),
+        ("text/html", "<blockquote>同意", None),
+    ],
+)
+def test_authored_reply(kind, body, expected):
+    extracted = authored_reply(kind, body)
+    if expected is None:
+        assert extracted is None
+    else:
+        assert extracted is not None
+        assert extracted.split() == expected.split()
+
+
+@pytest.mark.parametrize(
+    ("kind", "body"),
+    [
+        ("plain", "同意。\n> 10 万元须另行审批"),
+        ("html", "<blockquote>同意</blockquote>"),
+    ],
+)
+def test_poll_does_not_submit_ambiguous_or_quoted_approval_to_judge(config, kind, body):
+    fake = FakeIMAP()
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(config["MAIL_FOLDER"], 1, request)
+    reply = mail(approver, marker, body, reply_to=str(request["Message-ID"]))
+    reply.set_content(body, subtype=kind)
+    fake.add(config["MAIL_SENT_FOLDER"], 2, reply)
+    if kind == "html":
+        fake.folders[config["MAIL_SENT_FOLDER"]][2]["structure"] = PLAIN.replace(b'"PLAIN"', b'"HTML"')
+
+    def judge(_):
+        pytest.fail("不应把引文或边界不明的文字交给判断器")
+
+    assert not poll_once(config, lambda *_: None, factory=fake.factory, approval_judge=judge).approved
+
+
+def test_poll_judges_only_authored_text_in_each_mime_version(config):
+    fake = FakeIMAP()
+    inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(inbox, 1, request)
+    fake.add(sent, 2, mail(approver, marker, "", reply_to=str(request["Message-ID"])))
+    fake.folders[sent][2].update({
+        "structure": b"(" + PLAIN + PLAIN.replace(b'"PLAIN"', b'"HTML"') + b' "ALTERNATIVE")',
+        "1": b"OK",
+        "2.MIME": b"Content-Type: text/html; charset=utf-8\r\n\r\n",
+        "2": "<p>还需核对</p><blockquote>旧引文中的同意</blockquote>".encode(),
+    })
+    judged = []
+
+    def judge(text):
+        judged.append(text)
+        return ApprovalDecision.APPROVE if text == "OK" else ApprovalDecision.CONDITIONAL
+
+    result = poll_once(config, lambda *_: None, factory=fake.factory, approval_judge=judge)
+    assert result.delivered and not result.approved
+    assert judged == ["OK", "还需核对"]
+
+
+@pytest.mark.parametrize("second_decision", [ApprovalDecision.APPROVE, ApprovalDecision.REJECT])
+def test_poll_verifies_reply_sender_and_requires_all_approver_replies(config, second_decision):
+    fake = FakeIMAP()
+    inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    request_id = str(request["Message-ID"])
+    fake.add(inbox, 1, request)
+    fake.add(sent, 2, mail(config["MAIL_USER"], marker, "非审批人回复", reply_to=request_id))
+    fake.add(sent, 3, mail(approver, marker, "OK", reply_to=request_id))
+    fake.add(sent, 4, mail(approver, marker, "后续回复", references=request_id))
+    judged = []
+
+    def judge(text):
+        judged.append(text)
+        return {"OK": ApprovalDecision.APPROVE, "后续回复": second_decision}[text]
+
+    result = poll_once(config, lambda *_: None, factory=fake.factory, approval_judge=judge)
+    assert result.approved is (second_decision is ApprovalDecision.APPROVE)
+    assert judged == ["OK", "后续回复"]
+    assert not fake.fetched(sent, 2, "HEADER")
 
 
 def test_related_text_resources_are_not_fetched(config):
@@ -337,6 +450,78 @@ def test_run_polling_picks_up_mail_at_next_minute(config):
     run_polling(config, process, stop, factory=fake.factory, clock=lambda: now, wait=wait)
     assert calls == [(60, "合成正文")]
     assert fake.calls.count(("EXAMINE", f'"{inbox}"')) == 2
+
+
+@pytest.mark.parametrize("reply_in_inbox", [False, True], ids=["sent-only", "self-reply"])
+def test_run_polling_reports_late_approval(config, reply_in_inbox):
+    fake = FakeIMAP()
+    inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
+    if reply_in_inbox:
+        config["MAIL_APPROVER"] = config["MAIL_USER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    fake.add(inbox, 1, request)
+    calls = []
+    results = []
+    stop = Event()
+    now = 0.0
+
+    def on_result(result):
+        results.append((now, result))
+        if len(results) == 2:
+            stop.set()
+
+    def wait(seconds):
+        nonlocal now
+        assert seconds == 60 and len(results) == 1
+        now += seconds
+        reply = mail(approver, f"Re: {marker}", "可以", reply_to=str(request["Message-ID"]))
+        fake.add(sent, 2, reply)
+        if reply_in_inbox:
+            fake.add(inbox, 3, reply)
+        return False
+
+    run_polling(config, lambda *args: calls.append(args), stop, factory=fake.factory,
+                clock=lambda: now, wait=wait, on_result=on_result,
+                approval_judge=lambda _: ApprovalDecision.APPROVE)
+
+    assert [(tick, result.total, result.matched, result.delivered, result.approved)
+            for tick, result in results] == [
+        (0, 1, 1, True, False), (60, 2 if reply_in_inbox else 1, 1, False, True),
+    ]
+    [(body, approved, _)] = calls
+    assert (body, approved) == ("合成申请", False)
+    if reply_in_inbox:
+        assert fake.fetched(inbox, 3, SUMMARY)
+        assert not fake.fetched(inbox, 3, "HEADER")
+
+
+def test_history_finds_related_alternative_root_by_mime_content_id(config, tmp_path):
+    fake = FakeIMAP()
+    inbox = config["MAIL_FOLDER"]
+    fake.add(inbox, 1, mail(config["MAIL_USER"], config["MAIL_HISTORY_SUBJECT"], "合成申请"))
+    fake.folders[inbox][1].update({
+        "structure": (
+            b"(" + PLAIN + b"(" + PLAIN + PLAIN.replace(b'"PLAIN"', b'"HTML"')
+            + b' "ALTERNATIVE") "RELATED" ("START" "<fixture-root>"))'
+        ),
+        "1.MIME": b"Content-ID: <fixture-resource>\r\n\r\n",
+        "2.MIME": b"Content-ID: <fixture-root>\r\n\r\n",
+        "2.1.MIME": b"Content-Type: text/plain; charset=utf-8\r\n\r\n",
+        "2.1": "合成正文".encode(),
+        "2.2.MIME": b"Content-Type: text/html; charset=utf-8\r\n\r\n",
+        "2.2": "<p>合成正文</p>".encode(),
+    })
+
+    assert export_history(config, date(2000, 1, 1), date(2000, 2, 1),
+                          factory=fake.factory) == (1, 0)
+    [output] = tmp_path.glob("mail-history-*/samples.json")
+    [application] = json.loads(output.read_text())
+    assert application["body"] == ["合成正文", "<p>合成正文</p>"]
+    assert fake.fetched(inbox, 1, "1.MIME")
+    assert fake.fetched(inbox, 1, "2.MIME")
+    assert not fake.fetched(inbox, 1, "1")
+    assert not fake.fetched(inbox, 1, "2")
 
 
 def test_history_writes_only_matching_text_and_linked_replies(config, tmp_path):

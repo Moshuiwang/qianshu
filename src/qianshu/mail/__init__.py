@@ -9,13 +9,14 @@ import stat
 from collections.abc import Callable, Mapping
 from contextlib import closing
 from dataclasses import dataclass
+from enum import Enum
 from hashlib import sha256
 from pathlib import Path
 from threading import Event
 from time import monotonic
 
 from .imap import SUMMARY, MailError, ReadOnlyMailbox, connect
-from .message import body_parts, explicit_approval, headers, is_reply, message_id, request_text, sender
+from .message import authored_reply, body_parts, headers, is_reply, message_id, request_text, sender
 
 _LOG = logging.getLogger(__name__)
 _PACKAGE_SOURCE_DIR = Path(__file__).resolve().parents[2]
@@ -27,6 +28,16 @@ class PollResult:
     matched: int
     delivered: bool = False
     approved: bool = False
+
+
+class ApprovalDecision(Enum):
+    APPROVE = "同意"
+    REJECT = "不同意"
+    CONDITIONAL = "带条件"
+    UNCERTAIN = "不确定"
+
+
+ApprovalJudge = Callable[[str], ApprovalDecision]
 
 
 def _private_dir(config: Mapping[str, str]) -> Path:
@@ -68,8 +79,21 @@ def _sent_folder(config: Mapping[str, str]) -> str:
     return folder
 
 
-def _approval(mailbox: ReadOnlyMailbox, folder: str, request_id: str | None, approver: str) -> bool:
-    if request_id is None:
+def _reply_approved(parts: tuple[tuple[str, str], ...], judge: ApprovalJudge) -> bool:
+    texts = dict.fromkeys(authored_reply(kind, content) for kind, content in parts)
+    if not texts or None in texts or "" in texts:
+        return False
+    try:
+        return all(judge(text) is ApprovalDecision.APPROVE for text in texts if text is not None)
+    except Exception:
+        return False
+
+
+def _approval(
+    mailbox: ReadOnlyMailbox, folder: str, request_id: str | None, approver: str,
+    judge: ApprovalJudge | None,
+) -> bool:
+    if request_id is None or judge is None:
         return False
     mailbox.select(folder)
     decisions = []
@@ -77,7 +101,7 @@ def _approval(mailbox: ReadOnlyMailbox, folder: str, request_id: str | None, app
         summary = headers(mailbox.section(uid, SUMMARY))
         if sender(summary).casefold() == approver and is_reply(summary, request_id):
             raw_headers = mailbox.section(uid, "HEADER")
-            decisions.append(explicit_approval(body_parts(mailbox, uid, raw_headers)))
+            decisions.append(_reply_approved(body_parts(mailbox, uid, raw_headers), judge))
     return bool(decisions) and all(decisions)
 
 
@@ -99,6 +123,7 @@ def poll_once(
     process: Callable[[str, bool, str], None],
     *,
     factory: Callable = imaplib.IMAP4_SSL,
+    approval_judge: ApprovalJudge | None = None,
 ) -> PollResult:
     """处理单封 X7 邮件。回调接收正文、当前审批结果和去重指纹。"""
     marker = config.get("MAIL_TEST_MARKER", "")
@@ -109,6 +134,7 @@ def poll_once(
     sent = _sent_folder(config)
 
     with connect(config, factory) as mailbox:
+        scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"], inbox, marker)
         total = mailbox.select(inbox)
         matches = []
         for uid in mailbox.marked(marker, approver):
@@ -116,14 +142,10 @@ def poll_once(
             summary = headers(raw)
             subjects = summary.get_all("Subject", [])
             if sender(summary).casefold() == approver and len(subjects) == 1 and marker in str(subjects[0]):
-                matches.append((uid, raw, message_id(summary)))
-        if len(matches) != 1:
-            _LOG.info("mail_poll total=%d matched=%d delivered=0", total, len(matches))
-            return PollResult(total, len(matches))
-
-        uid, raw, request_id = matches[0]
-        scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"], inbox, marker)
-        fingerprint = _fingerprint(scope, str(uid), raw)
+                matches.append((uid, summary, _fingerprint(scope, str(uid), raw)))
+        if not matches:
+            _LOG.info("mail_poll total=%d matched=0 delivered=0", total)
+            return PollResult(total, 0)
         try:
             with closing(_open_ledger(config)) as ledger:
                 ledger.execute(
@@ -131,14 +153,30 @@ def poll_once(
                     "scope TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, delivered INTEGER NOT NULL)"
                 )
                 with ledger:
-                    ledger.execute(
-                        "INSERT OR IGNORE INTO delivery VALUES (?, ?, 0)", (scope, fingerprint)
-                    )
-                with ledger:
                     ledger.execute("BEGIN IMMEDIATE")
-                    stored, delivered = ledger.execute(
+                    binding = ledger.execute(
                         "SELECT fingerprint, delivered FROM delivery WHERE scope = ?", (scope,)
                     ).fetchone()
+                    if binding is not None:
+                        stored, _ = binding
+                        bound_id = next((message_id(summary) for _, summary, fingerprint in matches
+                                         if fingerprint == stored), None)
+                        if bound_id is not None:
+                            matches = [match for match in matches
+                                       if match[2] == stored or not is_reply(match[1], bound_id)]
+                    if len(matches) != 1:
+                        _LOG.info("mail_poll total=%d matched=%d delivered=0", total, len(matches))
+                        return PollResult(total, len(matches))
+
+                    uid, summary, fingerprint = matches[0]
+                    if binding is None:
+                        ledger.execute("INSERT INTO delivery VALUES (?, ?, 0)", (scope, fingerprint))
+                        ledger.commit()  # 交接失败时保留绑定，下一轮只能重试同一封邮件。
+                        ledger.execute("BEGIN IMMEDIATE")
+                        binding = ledger.execute(
+                            "SELECT fingerprint, delivered FROM delivery WHERE scope = ?", (scope,)
+                        ).fetchone()
+                    stored, delivered = binding
                     if stored != fingerprint:
                         raise MailError("测试标记已绑定另一封邮件。")
                     body = ""
@@ -147,7 +185,7 @@ def poll_once(
                         body = request_text(body_parts(mailbox, uid, raw_headers))
                         if not body:
                             raise MailError("测试邮件没有可处理的正文。")
-                    approved = _approval(mailbox, sent, request_id, approver)
+                    approved = _approval(mailbox, sent, message_id(summary), approver, approval_judge)
                     if not delivered:
                         try:
                             process(body, approved, fingerprint)
@@ -169,15 +207,20 @@ def run_polling(
     factory: Callable = imaplib.IMAP4_SSL,
     clock: Callable[[], float] = monotonic,
     wait: Callable[[float], bool] | None = None,
+    approval_judge: ApprovalJudge | None = None,
+    on_result: Callable[[PollResult], None] | None = None,
 ) -> None:
     """立即轮询，每轮结束后等待 60 秒。wait 超时返回 False，收到停止信号返回 True。"""
     if wait is None:
         wait = stop.wait
     while not stop.is_set():
         try:
-            poll_once(config, process, factory=factory)
+            result = poll_once(config, process, factory=factory, approval_judge=approval_judge)
         except MailError:
             _LOG.warning("mail_poll_failed count=1")
+        else:
+            if on_result is not None:
+                on_result(result)
         deadline = clock() + 60
         while not stop.is_set():
             remaining = deadline - clock()
