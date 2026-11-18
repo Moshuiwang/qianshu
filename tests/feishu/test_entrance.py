@@ -160,6 +160,44 @@ def test_failed_notice_is_retried_once_after_restart(tmp_path, settings, window,
     assert fake.events == [("reply", message.message_id, "概念验证期不处理")]
 
 
+def test_pending_notice_merges_active_retry_with_live_and_history(tmp_path, settings, window, source):
+    fake = FakeTransport()
+    message = replace(source, sender_id="<非白名单占位>")
+    fake.offline = [message]
+    attempts = []
+    retry_started, release_retry, completed = Event(), Event(), Event()
+    state = State(tmp_path / "private.sqlite", settings)
+    complete_notice = state.complete_notice
+
+    def reply(message_id, text, *, deadline):
+        attempts.append(message_id)
+        if len(attempts) == 1:
+            raise OSError("合成 REST 网络中断")
+        retry_started.set()
+        assert release_retry.wait(3)
+
+    def complete(message_id):
+        complete_notice(message_id)
+        completed.set()
+
+    fake.reply = reply
+    state.complete_notice = complete
+    entrance = Entrance(settings, window, state, fake,
+                        lambda app: pytest.fail("意外进入业务处理"), clock=lambda: 150)
+    try:
+        entrance.inject_message(message).result(timeout=2)
+        assert retry_started.wait(2)
+        entrance.inject_message(message).result(timeout=2)
+        entrance.recover().result(timeout=2)
+        assert attempts == [message.message_id, message.message_id]
+        release_retry.set()
+        assert completed.wait(2)
+        assert state.message_status(message.message_id) == "done"
+    finally:
+        release_retry.set()
+        entrance.close()
+
+
 def test_notice_is_sent_while_business_is_blocked(tmp_path, settings, window, source):
     fake = FakeTransport()
     started, release = Event(), Event()

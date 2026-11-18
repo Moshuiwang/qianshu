@@ -9,7 +9,7 @@ import unicodedata
 from collections.abc import Callable, Iterable
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
-from threading import Lock
+from threading import Condition, Thread
 from typing import Protocol
 
 from .cards import Report, result_card
@@ -17,6 +17,8 @@ from .settings import Settings, Window
 from .state import State
 
 _NOTICE = "概念验证期不处理"
+_NOTICE_BUDGET = 3
+_NOTICE_RETRY_DELAY = 0.5
 _LOG = logging.getLogger(__name__)
 
 
@@ -107,8 +109,12 @@ class Entrance:
         self.process = process
         self.clock = clock
         self._pending = set()
-        self._lock = Lock()
+        self._condition = Condition()
+        self._retry_at: dict[str, float] = {}
+        self._retry_thread: Thread | None = None
+        self._closed = False
         self._receipts = ThreadPoolExecutor(max_workers=8, thread_name_prefix="feishu-receipt")
+        self._reactions = ThreadPoolExecutor(max_workers=8, thread_name_prefix="feishu-reaction")
         self._work = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feishu-work")
         self._history = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feishu-history")
 
@@ -120,45 +126,122 @@ class Entrance:
 
     def inject_message(self, message: Message) -> Future | None:
         """进程内注入，使用离线 Transport 时整个处理链无需 TCP。"""
-        deadline = time.monotonic() + 3
+        deadline = time.monotonic() + _NOTICE_BUDGET
         if self._in_scope(message) and message.bot_mention_keys:
             return self._receipts.submit(self._receive, message, deadline)
         return None
 
     def _receive(self, message: Message, deadline: float) -> Future | None:
-        with self._lock:
-            if message.message_id in self._pending:
-                return None
-            self._pending.add(message.message_id)
+        message_id = message.message_id
+        if not self._claim_pending(message_id):
+            return None
         work = None
+        retry = False
         try:
             if not self.window.contains(self.clock()):
                 return None
-            status = self.state.message_status(message.message_id)
+            status = self.state.message_status(message_id)
             if status == "done":
                 return None
             text = self._approved_text(message) if status is None else None
             if text is None:
-                if status is None and not self.state.claim_message(message.message_id, "notice_pending"):
+                if status is None and not self.state.claim_message(message_id, "notice_pending"):
                     return None
-                if time.monotonic() < deadline:
-                    self.transport.reply(message.message_id, _NOTICE, deadline=deadline)
-                    self.state.complete_notice(message.message_id)
+                retry = not self._send_notice(message_id, deadline)
                 return None
 
-            self.transport.react(message.message_id)
-            work = self._work.submit(self._handle_once, message, text)
-            work.add_done_callback(lambda _: self._release(message.message_id))
+            work = self._dispatch_after_reaction(message, text)
         except Exception:
             _LOG.error("feishu_receipt_failed")
         finally:
             if work is None:
-                self._release(message.message_id)
+                self._release(message_id, retry=retry)
         return work
 
-    def _release(self, message_id: str) -> None:
-        with self._lock:
+    def _claim_pending(self, message_id: str) -> bool:
+        with self._condition:
+            if self._closed or message_id in self._pending:
+                return False
+            self._pending.add(message_id)
+            return True
+
+    def _dispatch_after_reaction(self, message: Message, text: str) -> Future:
+        finished = Future()
+
+        def finish() -> None:
+            self._release(message.message_id)
+            finished.set_result(None)
+
+        def dispatch(reaction: Future) -> None:
+            if not reaction.cancelled() and reaction.exception() is None:
+                work = self._work.submit(self._handle_once, message, text)
+                work.add_done_callback(lambda _: finish())
+                return
+            if not reaction.cancelled():
+                _LOG.error("feishu_receipt_failed")
+            finish()
+
+        finished.set_running_or_notify_cancel()
+        reaction = self._reactions.submit(self.transport.react, message.message_id)
+        reaction.add_done_callback(dispatch)
+        return finished
+
+    def _send_notice(self, message_id: str, deadline: float) -> bool:
+        with self._condition:
+            if self._closed or time.monotonic() >= deadline or not self.window.contains(self.clock()):
+                return False
+        try:
+            self.transport.reply(message_id, _NOTICE, deadline=deadline)
+            self.state.complete_notice(message_id)
+        except Exception:
+            _LOG.error("feishu_receipt_failed")
+            return False
+        return True
+
+    def _release(self, message_id: str, *, retry: bool = False) -> None:
+        with self._condition:
             self._pending.discard(message_id)
+            if retry and not self._closed and self.window.contains(self.clock()):
+                self._retry_at[message_id] = time.monotonic() + _NOTICE_RETRY_DELAY
+                if self._retry_thread is None:
+                    self._retry_thread = Thread(target=self._schedule_retries, name="feishu-retry")
+                    self._retry_thread.start()
+            self._condition.notify()
+
+    def _schedule_retries(self) -> None:
+        with self._condition:
+            while not self._closed:
+                remaining = self.window.end.timestamp() - self.clock()
+                if remaining <= 0:
+                    self._retry_at.clear()
+                    return
+                if not self._retry_at:
+                    self._condition.wait(remaining)
+                    continue
+                message_id = min(self._retry_at, key=self._retry_at.__getitem__)
+                delay = self._retry_at[message_id] - time.monotonic()
+                if delay > 0:
+                    self._condition.wait(min(delay, remaining))
+                    continue
+                if message_id in self._pending:
+                    self._retry_at[message_id] = time.monotonic() + _NOTICE_RETRY_DELAY
+                    continue
+                # 与实时和补漏共用占用状态，入队前即合并同一条消息的发送尝试。
+                del self._retry_at[message_id]
+                self._pending.add(message_id)
+                deadline = time.monotonic() + _NOTICE_BUDGET
+                self._receipts.submit(self._retry_notice, message_id, deadline)
+
+    def _retry_notice(self, message_id: str, deadline: float) -> None:
+        retry = False
+        try:
+            if self.window.contains(self.clock()) and self.state.message_status(message_id) == "notice_pending":
+                retry = not self._send_notice(message_id, deadline)
+        except Exception:
+            _LOG.error("feishu_receipt_failed")
+            retry = True
+        finally:
+            self._release(message_id, retry=retry)
 
     def _handle_once(self, message: Message, text: str) -> None:
         try:
@@ -200,11 +283,18 @@ class Entrance:
                     if not self.window.contains(self.clock()):
                         break
                     if self._in_scope(message) and message.bot_mention_keys:
-                        self._receive(message, time.monotonic() + 3)
+                        self._receive(message, time.monotonic() + _NOTICE_BUDGET)
         except Exception:
             _LOG.error("feishu_history_failed")
 
     def close(self) -> None:
+        with self._condition:
+            self._closed = True
+            self._retry_at.clear()
+            self._condition.notify()
+        if self._retry_thread is not None:
+            self._retry_thread.join()
         self._history.shutdown(cancel_futures=True)
         self._receipts.shutdown(cancel_futures=True)
+        self._reactions.shutdown(cancel_futures=True)
         self._work.shutdown(cancel_futures=True)

@@ -23,7 +23,11 @@ from lark_oapi.api.im.v1 import (
     GetChatMembersRequest, GetMessageResourceRequest, ListMessageRequest,
     ReplyMessageRequest, ReplyMessageRequestBody,
 )
-from lark_oapi.core.token.manager import TokenManager
+from lark_oapi.core.http import Transport as SDKTransport
+from lark_oapi.core.token import (
+    AccessTokenResponse, CreateSelfTenantTokenRequest, CreateSelfTenantTokenRequestBuilder,
+    CreateTokenRequestBody, CreateTokenRequestBodyBuilder, TokenManager,
+)
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse,
 )
@@ -36,6 +40,10 @@ from .state import State
 
 _LOG = logging.getLogger(__name__)
 _HTTP_TIMEOUT = 2
+
+
+class _EndpointUnavailable(ws.ServerException):
+    """取址暂时失败，可以在窗口内重试。"""
 
 
 def _checked(response):
@@ -75,19 +83,12 @@ class _Transport:
         _checked(self.im.message_reaction.create(request.build()))
 
     def reply(self, message_id: str, text: str, *, deadline: float) -> None:
-        self._require_window()
-        if time.monotonic() >= deadline:
-            raise TimeoutError
-        token = TokenManager.get_self_tenant_token(self.im.message.config)
-        if not token:
-            raise RuntimeError("飞书未返回租户令牌。")
         body = ReplyMessageRequestBody.builder().msg_type("text").content(
             json.dumps({"text": text}, ensure_ascii=False),
         ).uuid(
             str(uuid5(NAMESPACE_OID, message_id)),
         ).build()
         request = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
-        option = lark.RequestOption.builder().tenant_access_token(token).build()
 
         async def send():
             self._require_window()
@@ -95,9 +96,39 @@ class _Transport:
             if remaining <= 0:
                 raise TimeoutError
             async with asyncio.timeout(remaining):
+                token = await self._reply_token()
+                self._require_window()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
+                option = lark.RequestOption.builder().tenant_access_token(token).build()
                 _checked(await self.im.message.areply(request, option))
 
         asyncio.run(send())
+
+    async def _reply_token(self) -> str:
+        # 复用 SDK 1.8 的令牌缓存和请求模型，用可取消的异步传输处理缓存未命中。
+        config = self.im.message.config
+        cache_key = f"self_tenant_token:{config.app_id}"
+        token = TokenManager.cache.get(cache_key)
+        if token:
+            return token
+        # 该版本的构建器默认共用模型实例，给并发请求各自传入新实例。
+        body = (
+            CreateTokenRequestBodyBuilder(CreateTokenRequestBody())
+            .app_id(config.app_id).app_secret(config.app_secret).build()
+        )
+        request = (
+            CreateSelfTenantTokenRequestBuilder(CreateSelfTenantTokenRequest()).request_body(body).build()
+        )
+        raw = await SDKTransport.aexecute(config, request)
+        if raw.status_code != HTTPStatus.OK:
+            raise RuntimeError("飞书租户令牌请求失败。")
+        response = _checked(lark.JSON.unmarshal(raw.content.decode(), AccessTokenResponse))
+        if not response.tenant_access_token or type(response.expire) is not int or response.expire <= 0:
+            raise RuntimeError("飞书未返回有效租户令牌。")
+        token = response.tenant_access_token
+        TokenManager.cache.set(cache_key, token, int(time.time() + response.expire - 600))
+        return token
 
     async def is_member(self, operator_id: str) -> bool:
         seen_pages = set()
@@ -234,14 +265,21 @@ class _Connection(ws.Client):
         headers = {"locale": "zh", ws.USER_AGENT: self._user_agent}
         body = {"AppID": self._app_id, "AppSecret": self._app_secret}
         limit = min(_HTTP_TIMEOUT, self.service._remaining())
-        async with asyncio.timeout(limit):
-            async with httpx.AsyncClient(timeout=httpx.Timeout(limit, connect=limit)) as client:
-                response = await client.post(self._domain + ws.GEN_ENDPOINT_URI, headers=headers, json=body)
+        try:
+            async with asyncio.timeout(limit):
+                async with httpx.AsyncClient(timeout=httpx.Timeout(limit, connect=limit)) as client:
+                    response = await client.post(self._domain + ws.GEN_ENDPOINT_URI, headers=headers, json=body)
+        except (TimeoutError, httpx.TransportError):
+            raise _EndpointUnavailable(0, "飞书长连接地址暂不可用。") from None
+        if response.status_code in (HTTPStatus.REQUEST_TIMEOUT, HTTPStatus.TOO_MANY_REQUESTS) or (
+            500 <= response.status_code < 600
+        ):
+            raise _EndpointUnavailable(response.status_code, "飞书长连接地址暂不可用。")
         if response.status_code != HTTPStatus.OK:
-            raise ws.ServerException(response.status_code, "飞书长连接地址请求失败。")
+            raise ws.ClientException(response.status_code, "飞书长连接地址请求失败。")
         endpoint = ws.JSON.unmarshal(response.text, ws.EndpointResp)
         if endpoint.code in (ws.SYSTEM_BUSY, ws.INTERNAL_ERROR):
-            raise ws.ServerException(endpoint.code, "飞书长连接地址暂不可用。")
+            raise _EndpointUnavailable(endpoint.code, "飞书长连接地址暂不可用。")
         if endpoint.code != ws.OK:
             raise ws.ClientException(endpoint.code, "飞书长连接地址请求被拒绝。")
         if endpoint.data.ClientConfig is not None:
@@ -469,7 +507,17 @@ class FeishuService:
     async def _serve(self) -> None:
         try:
             async with asyncio.timeout(self._remaining()):
-                await self._client._connect()
+                delay = 0.25
+                while self._remaining() > 0:
+                    try:
+                        await self._client._connect()
+                    except _EndpointUnavailable:
+                        await asyncio.sleep(min(delay, max(0, self._remaining())))
+                        delay = min(2, delay * 2)
+                    else:
+                        break
+                if self._remaining() <= 0:
+                    return
                 ping = asyncio.create_task(self._client._ping_loop())
                 try:
                     await asyncio.sleep(max(0, self._remaining()))
