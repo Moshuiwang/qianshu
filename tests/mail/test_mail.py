@@ -3,15 +3,17 @@ import json
 import logging
 import stat
 from collections import deque
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from email import policy
 from email.message import EmailMessage
 from functools import partial
 from threading import Event, enumerate as running_threads
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+from qianshu import __main__ as entry, validate
 from qianshu.mail import ApprovalDecision, _private_dir, poll_once, run_polling
 from qianshu.mail.history import export_history, main
 from qianshu.mail.imap import SUMMARY, MailError, ReadOnlyMailbox, connect
@@ -919,3 +921,214 @@ def test_history_cli_exports_with_config_and_prints_only_counts(config, monkeypa
     assert main() == 0
     assert capsys.readouterr().out == "申请 1 封，关联回复 0 封。\n"
     assert len(list(tmp_path.glob("mail-history-*/samples.json"))) == 1
+
+
+@pytest.fixture
+def resident(config, tmp_path, monkeypatch):
+    tmp_path.chmod(0o700)
+    config.pop("MAIL_PORT")
+    config.update({
+        key: uuid4().hex for key in (
+            "FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID",
+            "FEISHU_BOT_OPEN_ID", "FEISHU_ALLOWED_SENDER_IDS", "ANTHROPIC_API_KEY",
+        )
+    })
+    config["FEISHU_APPROVED_FINGERPRINT"] = uuid4().hex + uuid4().hex
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    env = tmp_path / ".env"
+
+    def argv(*, enabled=True, seconds=120):
+        env.write_text("".join(f"{key}={value}\n" for key, value in config.items()), encoding="utf-8")
+        now = datetime.now(UTC)
+        return [
+            "--env-file", str(env), "--state", str(tmp_path / "service.sqlite"),
+            "--window-start", (now - timedelta(seconds=1)).isoformat(),
+            "--window-end", (now + timedelta(seconds=seconds)).isoformat(),
+            *(["--mail"] if enabled else []),
+        ]
+
+    rig = SimpleNamespace(
+        argv=argv, config=config, run=lambda: None, model_reply="[]",
+        models=[], validations=[], cards={}, requests=[], unexpected_polls=[],
+    )
+
+    def configure_model(_):
+        def complete(*, system, user):
+            rig.models.append(user)
+            return rig.model_reply
+
+        return complete
+
+    def validate_batch(policies, *, today):
+        rig.validations.append(policies)
+        return original_validate(policies, today=today)
+
+    def create(request, _option):
+        body = request.request_body
+        assert request.receive_id_type == "chat_id"
+        assert body.receive_id == config["FEISHU_CHAT_ID"]
+        assert body.msg_type == "interactive"
+        card = json.loads(body.content)
+        rig.requests.append(body.uuid)
+        rig.cards.setdefault(body.uuid, card)
+        if getattr(rig, "unconfirmed", 0):
+            rig.unconfirmed -= 1
+            raise TimeoutError
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id=uuid4().hex))
+
+    class Service:
+        def __init__(self, settings, window, _state, _processor):
+            async def token():
+                return uuid4().hex
+
+            self.transport = SimpleNamespace(
+                settings=settings, im=SimpleNamespace(message=SimpleNamespace(create=create)),
+                _require_window=lambda: None, _tenant_token=token,
+                react=None, reply=None, download=None,
+            )
+            self.entrance = SimpleNamespace()
+            rig.resume = self.entrance
+
+        def run(self):
+            rig.run()
+
+    original_validate = validate.validate_batch
+    monkeypatch.setattr(validate, "validate_batch", validate_batch)
+    monkeypatch.setattr(entry, "configured_model", configure_model)
+    monkeypatch.setattr(entry, "FeishuService", Service)
+
+    def unexpected_poll(*args, **kwargs):
+        rig.unexpected_polls.append(True)
+
+    monkeypatch.setattr(entry.mail, "run_polling", unexpected_poll)
+    return rig
+
+
+def test_resident_mail_disabled(resident):
+    started = []
+    resident.run = lambda: started.append(True)
+    assert entry.main(resident.argv(enabled=False)) == 0
+    assert started == [True]
+    assert not resident.unexpected_polls and not resident.models and not resident.cards
+
+
+@pytest.mark.parametrize("key", ("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD", "MAIL_APPROVER", "MAIL_TEST_MARKER"))
+def test_resident_mail_requires_private_config(resident, key, capsys, monkeypatch):
+    monkeypatch.setenv(key, resident.config.pop(key))
+
+    def unexpected_service(*args, **kwargs):
+        pytest.fail("配置不全时启动了飞书服务。")
+
+    monkeypatch.setattr(entry, "FeishuService", unexpected_service)
+    assert entry.main(resident.argv()) == 1
+    assert capsys.readouterr().err == "邮件轮询配置缺失或不可读，请检查 .env。\n"
+
+
+@pytest.mark.parametrize("qualified", (True, False))
+def test_resident_mail_read_only_handoff(resident, monkeypatch, capsys, qualified):
+    config = resident.config
+    fake = FakeIMAP()
+    body = "合成占位正文，仅核对邮件内容未进入卡片及日志。"
+    fake.add("INBOX", 1, mail(config["MAIL_APPROVER"], "合成普通主题", "合成占位正文甲"))
+    wrong_sender = f"{uuid4().hex}@{config['MAIL_HOST']}"
+    fake.add("INBOX", 2, mail(wrong_sender, config["MAIL_TEST_MARKER"], "合成占位正文乙"))
+    if qualified:
+        fake.add("INBOX", 3, mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], body))
+        resident.model_reply = json.dumps([{"company": {"value": None, "evidence": [body]}}])
+        resident.unconfirmed = 2
+    results = []
+    done = Event()
+
+    def poll(config, process, *, stop, wait, approval_judge, on_result):
+        assert config["MAIL_PORT"] == "993"
+        assert approval_judge is None
+
+        def handoff(text, approved, digest):
+            process(text, approved, digest)
+            process(text, approved, digest)
+
+        def finished(result):
+            results.append(result)
+            on_result(result)
+            done.set()
+
+        run_polling(config, handoff, stop, factory=fake.factory, wait=wait,
+                    approval_judge=approval_judge, on_result=finished)
+
+    monkeypatch.setattr(entry.mail, "run_polling", poll)
+    resident.run = lambda: done.wait(5)
+    assert entry.main(resident.argv()) == 0
+    assert results == [entry.mail.PollResult(3 if qualified else 2, int(qualified), qualified, False)]
+    assert len(resident.cards) == len(resident.validations) == len(resident.models) == int(qualified)
+    for command, *args in fake.calls:
+        assert command in {"LIST", "EXAMINE", "SEARCH", "FETCH", "SHUTDOWN"}
+        if command == "FETCH":
+            query = args[-1]
+            assert query == "(BODYSTRUCTURE)" or query.startswith("(BODY.PEEK[") and query.endswith("])")
+    assert fake.flags["INBOX"] == set()
+    assert not any(fake.fetched("INBOX", uid, "TEXT") for uid in (1, 2))
+    if qualified:
+        assert body in resident.models[0]
+        assert fake.fetched("INBOX", 3, "TEXT")
+        card, = resident.cards.values()
+        assert [row["text"]["content"] for row in card["elements"]] == [
+            "来源\n邮件", "邮件审批\n不确定，交人工",
+            "处理状态\n解析完成，共 1 条政策。通过校验 0 条，需人工核对 1 条。",
+        ]
+        assert len(resident.requests) == 3
+        assert len(set(resident.requests)) == 1
+    captured = capsys.readouterr()
+    output = captured.out + captured.err + json.dumps(resident.cards, ensure_ascii=False)
+    assert f"total={3 if qualified else 2} matched={int(qualified)}" in output
+    for value in (body, wrong_sender, config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], config["MAIL_PASSWORD"]):
+        assert value not in output
+
+
+def test_resident_mail_retries_unexpected_poll_error(resident, monkeypatch, capsys):
+    poll_stops = []
+    delays = []
+    done = Event()
+    failure_text = "合成占位异常详情"
+
+    class FastRetry(Event):
+        def wait(self, timeout=None):
+            if timeout == 60:
+                delays.append(timeout)
+                return self.is_set()
+            return super().wait(timeout)
+
+    def poll(_config, _process, *, stop, **kwargs):
+        poll_stops.append(stop)
+        if len(poll_stops) == 1:
+            raise ValueError(failure_text)
+        done.set()
+        stop.wait(5)
+
+    monkeypatch.setattr(entry, "Event", FastRetry)
+    monkeypatch.setattr(entry.mail, "run_polling", poll)
+    resident.run = lambda: done.wait(5)
+    assert entry.main(resident.argv()) == 0
+    assert delays == [60]
+    assert len(poll_stops) == 2 and poll_stops[0] is poll_stops[1]
+    assert poll_stops[0].is_set()
+    captured = capsys.readouterr()
+    assert "mail_poll_failed count=1 category=ValueError" in captured.err
+    assert failure_text not in captured.err
+
+
+def test_resident_mail_window_stops_even_while_feishu_is_running(resident, monkeypatch):
+    finished = Event()
+    observed = []
+
+    def poll(_config, process, *, stop, **kwargs):
+        observed.append(stop.wait(5))
+        with pytest.raises(RuntimeError, match="验收窗口已关闭"):
+            process("合成逾期正文", False, uuid4().hex)
+        finished.set()
+
+    monkeypatch.setattr(entry.mail, "run_polling", poll)
+    resident.run = lambda: observed.append(finished.wait(5))
+    assert entry.main(resident.argv(seconds=1)) == 0
+    assert observed == [True, True]
+    assert not resident.models and not resident.cards
