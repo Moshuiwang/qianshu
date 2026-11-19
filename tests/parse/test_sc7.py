@@ -12,7 +12,8 @@ COMPANIES_FILE = Path(__file__).parent / "fixtures" / "companies.tsv"
 ONCE_HINT = "是否只触发一次按默认填否"
 REPEAT_HINT = "多买多送按默认填是"
 MULTIPLIER_HINT = "生效倍数按默认填 1"
-ATTACHMENTS_HINT = "审批件由人工处理"
+ATTACHMENTS_HINT = "审批件按默认留空"
+POLICY_TYPE_HINT = "政策类型按用户标签判定"
 
 
 def field(value, *quotes):
@@ -119,14 +120,72 @@ def test_g152_values_follow_policy_text_even_when_model_omits_the_statements(nam
 
 
 @pytest.mark.parametrize("attachment", ["", "审批件附件：占位审批截图.png"])
-def test_approval_attachments_remain_for_manual_handling(attachment):
+def test_approval_attachments_default_to_confirmed_empty(attachment):
     draft, = parse(f"占位说明。\n{attachment}", {
         "approval_attachments": field(["占位审批截图.png"], attachment),
     })
-    assert draft.approval_attachments.value is None
-    assert draft.approval_attachments.uncertainty is not None
-    assert draft.approval_attachments.uncertainty.candidates == []
+    assert draft.approval_attachments.value == []
+    assert draft.approval_attachments.uncertainty is None
+    assert draft.approval_attachments.evidence == []
     assert ATTACHMENTS_HINT in draft.hints
+
+
+@pytest.mark.parametrize(("tags", "statement", "expected"), [
+    (["占位标签甲"], "用户标签：占位标签甲", "定向政策"),
+    ([], "用户标签：无", "公开政策"),
+    (None, "用户标签：待确认", None),
+])
+def test_policy_type_follows_confirmed_user_tags(tags, statement, expected):
+    draft, = parse(statement, {"user_tags": field(tags, statement)})
+    result = draft.policy_type
+    assert result.value == expected
+    assert (result.uncertainty is None) == (expected is not None)
+    assert (POLICY_TYPE_HINT in draft.hints) == (expected is not None)
+
+
+@pytest.mark.parametrize(("statement", "model_type"), [
+    ("政策类型：公开", {}),
+    ("申请类型：公开政策", {}),
+    ("本次申请为公开政策", {}),
+    ("本次申请为公开政策并面向占位用户", {}),
+    ("本条政策为公开政策（占位范围说明）", {}),
+    ("占位公司公开政策申请：", {}),
+    ("政策类型：公开政策", {"policy_type": field("公开政策", "政策类型：公开政策")}),
+    ("占位说明", {"policy_type": field("公开")}),
+    ("占位说明", {"policy_type": {"candidates": [field("公开政策")]}}),
+])
+def test_policy_type_conflict_reports_the_tag_rule_and_claim(statement, model_type):
+    tag_line = "用户标签：占位标签甲"
+    draft, = parse(f"{tag_line}。\n{statement}", {
+        "user_tags": field(["占位标签甲"], tag_line), **model_type,
+    })
+    assert draft.policy_type.value is None
+    derived, conflicting = draft.policy_type.uncertainty.candidates
+    assert derived.value == "定向政策"
+    assert [quote.text for quote in derived.evidence] == [tag_line]
+    assert conflicting.value == "公开政策"
+    assert [quote.text for quote in conflicting.evidence] == (
+        [statement] if statement != "占位说明" else []
+    )
+    assert POLICY_TYPE_HINT not in draft.hints
+
+
+def test_unrelated_reference_url_is_left_for_the_create_stage():
+    url = "https://reference.example.invalid/placeholder"
+    statement = f"参考链接：{url}"
+    draft, = parse(statement, {"approval_url": field(url, statement)})
+    assert draft.approval_url.value is None
+    assert draft.approval_url.uncertainty is None
+
+
+def test_conflicting_archive_urls_remain_uncertain():
+    urls = [f"https://archive.example.invalid/{suffix}" for suffix in ("first", "second")]
+    statements = [f"存档链接：{url}" for url in urls]
+    draft, = parse("。\n".join(statements), {
+        "approval_url": {"candidates": [field(url, statement) for url, statement in zip(urls, statements, strict=True)]},
+    })
+    assert draft.approval_url.value is None
+    assert [item.value for item in draft.approval_url.uncertainty.candidates] == urls
 
 
 def test_g152_conflicts_are_limited_to_applicable_policy_and_shared_text():
@@ -143,18 +202,20 @@ def test_g152_conflicts_are_limited_to_applicable_policy_and_shared_text():
     assert [quote.text for quote in second.repeat_bonus.evidence] == ["本批统一允许多买多赠"]
 
 
-def test_g152_defaults_are_blocked_when_policy_boundary_is_uncertain():
-    drafts = parse("赠送30天。", *[{"gift_days": field(30, "赠送30天")}] * 2)
+def test_field_defaults_are_blocked_when_policy_boundary_is_uncertain():
+    tag_line = "用户标签：占位标签甲"
+    reply = {"user_tags": field(["占位标签甲"], tag_line)}
+    drafts = parse(f"{tag_line}。", reply, reply)
     for draft in drafts:
-        for name in ("policy_name", "trigger_once", "repeat_bonus", "effective_multiplier", "approval_attachments"):
+        for name in ("policy_name", "trigger_once", "repeat_bonus", "effective_multiplier",
+                     "approval_attachments", "policy_type"):
             result = getattr(draft, name)
             assert result.value is None
-            assert result.uncertainty is not None
-        assert {ONCE_HINT, REPEAT_HINT, MULTIPLIER_HINT}.isdisjoint(draft.hints)
-        assert ATTACHMENTS_HINT in draft.hints
+            assert result.uncertainty.reason == "段落边界无法确定，需人工确认"
+        assert {ONCE_HINT, REPEAT_HINT, MULTIPLIER_HINT, ATTACHMENTS_HINT, POLICY_TYPE_HINT}.isdisjoint(draft.hints)
 
 
-def test_synthetic_policy_resolves_all_fields_except_type_archive_and_attachments():
+def test_synthetic_policy_resolves_all_fields_and_defers_archive_url():
     heading = "1.占位星光包用户（赞比亚）"
     interval = "2099.2.1-2099.3.31"
     tag = "占位标签甲"
@@ -174,7 +235,10 @@ def test_synthetic_policy_resolves_all_fields_except_type_archive_and_attachment
         "recharge_days": field(30, "充1个月"),
         "gift_days": field(30, "赠送1个月"),
     })
-    assert set(draft.uncertain_fields()) == {"policy_type", "approval_url", "approval_attachments"}
+    assert draft.uncertain_fields() == []
+    assert draft.policy_type.value == "定向政策"
+    assert draft.approval_url.value is None
+    assert draft.approval_attachments.value == []
     assert draft.policy_name.value == tag
     assert draft.company.value == "占位公司甲"
     assert draft.packages.value == [PackageRow(current_package="占位星光", gift_package="占位星光_copy")]
@@ -189,4 +253,4 @@ def test_synthetic_policy_resolves_all_fields_except_type_archive_and_attachment
     assert draft.trigger_once.value == "否"
     assert draft.repeat_bonus.value == "是"
     assert draft.effective_multiplier.value == 1
-    assert {ONCE_HINT, REPEAT_HINT, MULTIPLIER_HINT, ATTACHMENTS_HINT} <= set(draft.to_dict()["hints"])
+    assert {ONCE_HINT, REPEAT_HINT, MULTIPLIER_HINT, ATTACHMENTS_HINT, POLICY_TYPE_HINT} <= set(draft.to_dict()["hints"])

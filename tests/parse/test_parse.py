@@ -10,15 +10,18 @@ from qianshu.parse import ParseError, parse_application as parse_with_config
 from qianshu.parse.scope import PolicyReference, country_matches, policy_scopes, read_countries
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FIRST_UNCERTAIN_FIELDS = {"policy_name", "effective_multiplier", "approval_attachments", "company", "policy_type", "packages"}
-G152_HINTS = {"是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1", "审批件由人工处理"}
+FIRST_UNCERTAIN_FIELDS = {"policy_name", "effective_multiplier", "company", "packages"}
+FIELD_RULE_HINTS = {
+    "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1",
+    "审批件按默认留空", "政策类型按用户标签判定",
+}
 MUTEX_NO_HINT = "申请要求不维护互斥组，需人工确认"
 BOUNDARY_HINT = "段落边界无法确定，需人工确认"
 parse_application = partial(parse_with_config, companies_file=FIXTURES / "companies.tsv")
 
 
 def mutex_hints(draft):
-    return [hint for hint in draft.hints if hint not in G152_HINTS]
+    return [hint for hint in draft.hints if hint not in FIELD_RULE_HINTS]
 
 
 def assert_mutex_no(draft):
@@ -54,8 +57,8 @@ def test_six_synthetic_policies_match_manual_expectations(application, recorded_
         assert draft.user_tags.value == [f"占位标签{suffix}"]
         assert draft.start_date.value == "2099-01-10"
         assert draft.end_date.value == "2099-02-15"
-        assert draft.policy_type.value is None
-        assert not draft.policy_type.evidence
+        assert draft.policy_type.value == "定向政策"
+        assert draft.policy_type.evidence == draft.user_tags.evidence
         assert draft.benefit_type.value == "赠送时长"
         assert draft.maintain_mutual_exclusion_group.value == "是"
         assert mutex_hints(draft) == ["互斥组按默认填是"]
@@ -63,7 +66,7 @@ def test_six_synthetic_policies_match_manual_expectations(application, recorded_
         assert draft.approval_url.value == "https://archive.example.invalid/batch"
         assert draft.trigger_once.value == "否"
         assert draft.repeat_bonus.value == "是"
-        assert draft.approval_attachments.value is None
+        assert draft.approval_attachments.value == []
         if suffix != "甲":
             assert draft.policy_name.value == f"占位标签{suffix}"
             assert draft.policy_name.evidence == draft.user_tags.evidence
@@ -85,7 +88,7 @@ def test_six_synthetic_policies_match_manual_expectations(application, recorded_
     assert [quote.text for quote in first.policy_name.evidence] == ["优惠政策名称：占位政策甲"]
     assert [quote.text for quote in first.repeat_bonus.evidence] == ["多买多送：是"]
     assert [quote.text for quote in first.effective_multiplier.evidence] == ["生效倍数：2"]
-    assert first.approval_attachments.uncertainty.candidates == []
+    assert first.approval_attachments.uncertainty is None
 
 
 @pytest.mark.parametrize("model_behavior", ["marks_missing", "replays_old_date", "copies_start_date", "copies_tag_expiry"])
@@ -927,8 +930,6 @@ def test_omitting_a_company_from_the_reply_does_not_share_its_policy():
     ("gift_days", 30, "无需赠送30天", "赠送30天"),
     ("gift_days", 30, "无需（占位说明，待确认）赠送30天", "赠送30天"),
     ("gift_days", 30, "不送30天", "送30天"),
-    ("approval_url", "https://archive.example.invalid/batch", "参考链接：https://archive.example.invalid/batch",
-     "参考链接：https://archive.example.invalid/batch"),
     ("packages", [{"current_package": "占位包甲", "gift_package": None}],
      "当前占位包甲；当前占位包乙，无赠送包", "当前占位包甲；当前占位包乙，无赠送包"),
     ("packages", [{"current_package": "占位包甲", "gift_package": None}],
