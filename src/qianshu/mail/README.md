@@ -2,8 +2,20 @@
 
 ## X7 单封试跑
 
-常驻进程可每 60 秒调一次 `qianshu.mail.poll_once(config, process)`，也可调用
-`run_polling(config, process, stop)`，由 `threading.Event` 控制结束。连接参数
+常驻入口 `python -m qianshu` 在指定 `--mail` 时启用收信轮询，与飞书长连接共用验收窗口和汇报群。
+通过 `--env-file` 指定私有 `.env`，默认读取当前目录的 `.env`。
+`MAIL_HOST`、`MAIL_USER`、`MAIL_PASSWORD`、`MAIL_APPROVER`、`MAIL_TEST_MARKER` 缺任一项时启动失败。
+`MAIL_PORT` 可选，默认 993。常驻入口也从同一配置文件读取可选的
+`MAIL_FOLDER`、`MAIL_SENT_FOLDER` 和 `MAIL_PRIVATE_DIR`。
+
+轮询线程启动即检查一次，每轮结束后等待 60 秒。验收窗口结束或常驻服务退出时发出停止信号，
+阻止下一轮轮询和新的汇报发送。在途 I/O 仍受原有超时约束。同一邮件指纹在汇报状态库中只登记一张卡片，
+发送重试沿用同一飞书请求 UUID。邮件正文复用群申请的解析和校验，卡片只展示来源、审批结论、
+处理状态和计数。常驻入口当前传入 `approval_judge=None`，审批显示「不确定，交人工」。
+真实 X7 验收仍按 Trace 合同执行，须先接入经审核的审批判断器并通过就绪自检。
+
+库调用方可自行使用 `qianshu.mail.poll_once(config, process)`，也可调用
+`run_polling(config, process, stop)`，由 `threading.Event` 控制结束。库调用的连接参数
 `MAIL_HOST`、`MAIL_PORT`、`MAIL_USER`、`MAIL_PASSWORD` 和可选的 `MAIL_FOLDER`
 沿用 `load_config`。调用方在配置映射中提供 `MAIL_APPROVER`（产品负责人邮箱）
 和 `MAIL_TEST_MARKER`（本次验收生成的一次性随机标记，
