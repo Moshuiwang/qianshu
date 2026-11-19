@@ -23,7 +23,16 @@ __all__ = ["ModelError", "ParseError", "parse_application"]
 
 _FIELD_NAMES = {field.name for field in fields(PolicyDraft)}
 _G152_FIELDS = {"policy_name", "trigger_once", "repeat_bonus", "effective_multiplier", "approval_attachments"}
-_ATTACHMENTS_HINT = "审批件由人工处理"
+_ATTACHMENTS_HINT = "审批件按默认留空"
+_POLICY_TYPE_HINT = "政策类型按用户标签判定"
+_POLICY_TYPE_STATEMENT = re.compile(
+    r"(?:(?:本条|本|该条|该)?(?:政策|申请)类型\s*(?:[:：=]|为|是)\s*|"
+    r"(?:(?:本次|本条|本|该条|该)(?:申请|活动|政策)?|这)\s*(?:均为|为|是|属于|定为)\s*|"
+    r"(?:均为|为|是)\s*)?"
+    r"(定向(?:政策)?|公开(?:政策)?)(?:\s*[（(][^）)]*[）)])?(?:\s*(?:并|且|适用|面向).+)?"
+)
+_POLICY_TYPE_HEADING = re.compile(r"[^：:，,。；;]{0,60}?(定向|公开)政策申请\s*[:：]")
+_POLICY_TYPE_ALIASES = {"定向": "定向政策", "公开": "公开政策"}
 _POLICY_NAME_LABEL = r"(?:优惠)?政策(?:名称|名)"
 _POLICY_NAME_SEPARATOR = r"\s*(?:[:：=]|为|是)\s*"
 _POLICY_NAME_MENTION = re.compile(rf"^{_POLICY_NAME_LABEL}|{_POLICY_NAME_LABEL}{_POLICY_NAME_SEPARATOR}")
@@ -96,6 +105,7 @@ _ARCHIVE_LABEL = re.compile(
     r"(?:存档|归档)(?:文档(?:链接)?|链接|网址|地址)?"
     r"\s*(?:见|为|在)?\s*[:：]?\s*(?:\[[^\]\r\n]+\]\()?$"
 )
+_WEB_LINK = re.compile(r"https?://[^\s，。；！？、)）】」]+")
 _NO_GIFT_PACKAGE = re.compile(
     r"(?<![非并])无赠送(?:节目)?包|(?:不赠送|没有赠送)(?:节目)?包|赠送(?:节目)?包\s*[:：=]\s*无"
 )
@@ -141,7 +151,10 @@ class ParsedPolicyDraft(PolicyDraft):
             hints.append("多买多送按默认填是")
         if self.effective_multiplier.value == 1 and not self.effective_multiplier.evidence:
             hints.append("生效倍数按默认填 1")
-        hints.append(_ATTACHMENTS_HINT)
+        if self.approval_attachments.value == [] and self.approval_attachments.uncertainty is None:
+            hints.append(_ATTACHMENTS_HINT)
+        if self.policy_type.value is not None and self.policy_type.uncertainty is None:
+            hints.append(_POLICY_TYPE_HINT)
         return hints
 
     def to_dict(self) -> dict[str, object]:
@@ -226,11 +239,14 @@ def parse_application(
             name: _draft_field(
                 name, raw=policy.get(name, {}), body=body, scope=scope, options=options.get(name, {}),
             )
-            for name in sorted(_FIELD_NAMES - {_MUTEX, "company"} - _G152_FIELDS)
+            for name in sorted(_FIELD_NAMES - {_MUTEX, "company", "policy_type"} - _G152_FIELDS)
         }
         for name in sorted(_G152_FIELDS):
             _validate_field_shape(policy.get(name, {}))
         draft_fields.update(_g152_fields(body, scope, draft_fields["user_tags"]))
+        draft_fields["policy_type"] = _policy_type(
+            policy.get("policy_type", {}), body, scope, draft_fields["user_tags"], options["policy_type"],
+        )
         draft_fields["company"] = _company(body, scope, countries, companies)
         raw_mutex = policy.get(_MUTEX, {})
         _validate_field_shape(raw_mutex)
@@ -418,7 +434,6 @@ def _validate_field_shape(raw: dict) -> None:
 
 
 def _g152_fields(body: str, scope: Scope, tags: DraftField[list[str]]) -> dict[str, DraftField]:
-    result = {"approval_attachments": DraftField(uncertainty=Uncertainty(reason=_ATTACHMENTS_HINT))}
     if scope.boundary_uncertain:
         return {name: DraftField(uncertainty=Uncertainty(reason=_BOUNDARY_HINT)) for name in _G152_FIELDS}
 
@@ -454,13 +469,62 @@ def _g152_fields(body: str, scope: Scope, tags: DraftField[list[str]]) -> dict[s
     else:
         policy_name = DraftField(value=tags.value[0], evidence=tags.evidence)
 
-    result.update(
-        policy_name=policy_name,
-        trigger_once=_g152_value(statements, _ONCE_MENTION, {"否": _ONCE_NO}, "否"),
-        repeat_bonus=_g152_value(statements, _REPEAT_MENTION, {"是": _REPEAT_YES, "否": _REPEAT_NO}, "是"),
-        effective_multiplier=_g152_value(statements, _MULTIPLIER_MENTION, {1: _MULTIPLIER_ONE}, 1),
-    )
-    return result
+    return {
+        "policy_name": policy_name,
+        "trigger_once": _g152_value(statements, _ONCE_MENTION, {"否": _ONCE_NO}, "否"),
+        "repeat_bonus": _g152_value(statements, _REPEAT_MENTION, {"是": _REPEAT_YES, "否": _REPEAT_NO}, "是"),
+        "effective_multiplier": _g152_value(statements, _MULTIPLIER_MENTION, {1: _MULTIPLIER_ONE}, 1),
+        "approval_attachments": DraftField(value=[]),
+    }
+
+
+def _policy_type(
+    raw: dict, body: str, scope: Scope, tags: DraftField[list[str]], options: dict[str, str],
+) -> DraftField[str]:
+    _validate_field_shape(raw)
+    if scope.boundary_uncertain:
+        return DraftField(uncertainty=Uncertainty(reason=_BOUNDARY_HINT))
+    if tags.uncertainty is not None or tags.value is None:
+        return DraftField(uncertainty=Uncertainty(reason="用户标签尚未确定，无法判定政策类型。"))
+
+    expected = "定向政策" if tags.value else "公开政策"
+    claims: dict[str, list[SourceExcerpt]] = {}
+    for item in [raw, *raw.get("candidates", [])]:
+        value = item.get("value")
+        if not _text(value):
+            continue
+        value = options.get(value, _POLICY_TYPE_ALIASES.get(value, value))
+        evidence, _ = _evidence(body, scope, item.get("evidence", []))
+        terms = {value, *(term for term, option in (options | _POLICY_TYPE_ALIASES).items() if option == value)}
+        known = claims.setdefault(value, [])
+        known.extend(
+            excerpt for excerpt in evidence if excerpt not in known and any(term in excerpt.text for term in terms)
+        )
+
+    for left, right in scope.spans():
+        for start, end in clause_spans(body[left:right], punctuation="。；;，,！!？?\r\n"):
+            raw_clause = body[left + start:left + end]
+            clause = raw_clause.strip()
+            statement = without_list_prefix(without_batch_intro(without_list_prefix(clause))).strip()
+            if match := (
+                _POLICY_TYPE_STATEMENT.fullmatch(statement.removesuffix("."))
+                or _POLICY_TYPE_HEADING.fullmatch(statement)
+            ):
+                value = _POLICY_TYPE_ALIASES.get(match[1], match[1])
+                excerpt = SourceExcerpt(text=clause, start=left + start + len(raw_clause) - len(raw_clause.lstrip()))
+                known = claims.setdefault(value, [])
+                if excerpt not in known:
+                    known.append(excerpt)
+
+    conflicts = [
+        Candidate(value=value, evidence=evidence) for value, evidence in claims.items() if value != expected
+    ]
+    if conflicts:
+        return DraftField(uncertainty=Uncertainty(
+            reason="申请或模型给出的政策类型与用户标签判定冲突。",
+            candidates=[Candidate(value=expected, evidence=tags.evidence), *conflicts],
+        ))
+    return DraftField(value=expected, evidence=claims.get(expected) or tags.evidence)
 
 
 def _g152_value(
@@ -611,6 +675,11 @@ def _draft_field(
         candidate = Candidate(value=value, evidence=value_evidence)
         if candidate not in candidates:
             candidates.insert(0, candidate)
+    if (
+        name == "approval_url" and not scope.boundary_uncertain and not candidates
+        and not any(_archive_links(body[left:right]) for left, right in scope.spans())
+    ):
+        return DraftField()
     return DraftField(evidence=evidence, uncertainty=Uncertainty(reason=reason, candidates=candidates))
 
 
@@ -679,12 +748,7 @@ def _supports_value(
     if name == "user_scope":
         return any(value in excerpt for excerpt in excerpts)
     if name == "approval_url":
-        return any(
-            _ARCHIVE_LABEL.search(excerpt[:match.start()])
-            for excerpt in excerpts
-            for match in re.finditer(r"https?://[^\s，。；！？、)）】」]+", excerpt)
-            if match[0] == value
-        )
+        return any(value in _archive_links(excerpt) for excerpt in excerpts)
     if name == "user_tags":
         return all(any(item in excerpt for excerpt in excerpts) for item in value)
     if name in _DAYS_ACTION:
@@ -692,6 +756,10 @@ def _supports_value(
     if name == "packages":
         return _supports_packages(value, excerpts, body, scope)
     return True
+
+
+def _archive_links(text: str) -> list[str]:
+    return [match[0] for match in _WEB_LINK.finditer(text) if _ARCHIVE_LABEL.search(text[:match.start()])]
 
 
 def _supports_packages(rows: list[PackageRow], excerpts: list[str], body: str, scope: Scope) -> bool:

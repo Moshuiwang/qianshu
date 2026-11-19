@@ -8,7 +8,10 @@ from qianshu.parse import parse_application
 from qianshu.parse.scope import _preamble_policy_field
 
 MONTH_HINT = "充值 / 赠送天数按 1 月 = 30 天换算"
-G152_HINTS = {"是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1", "审批件由人工处理"}
+FIELD_RULE_HINTS = {
+    "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1",
+    "审批件按默认留空", "政策类型按用户标签判定",
+}
 COMPANIES_FILE = Path(__file__).parent / "fixtures" / "companies.tsv"
 INTERVAL = "2099.2.1-2099.3.31"
 
@@ -293,10 +296,10 @@ def test_six_numbered_policies_share_dates_and_keep_their_own_packages(local_day
         if local_days:
             assert draft.recharge_days.value == draft.gift_days.value == 60
             assert {"recharge_days", "gift_days"}.isdisjoint(draft.uncertain_fields())
-            assert [hint for hint in draft.hints if hint not in G152_HINTS] == ["互斥组按默认填是", MONTH_HINT]
+            assert [hint for hint in draft.hints if hint not in FIELD_RULE_HINTS] == ["互斥组按默认填是", MONTH_HINT]
         else:
             assert_uncertain(draft, "recharge_days", "gift_days")
-            assert [hint for hint in draft.hints if hint not in G152_HINTS] == ["互斥组按默认填是"]
+            assert [hint for hint in draft.hints if hint not in FIELD_RULE_HINTS] == ["互斥组按默认填是"]
         assert draft.company.value == "占位公司甲"
         assert draft.company.uncertainty is None
         assert [item.text for item in draft.company.evidence] == [title]
@@ -603,4 +606,4 @@ def test_repository_company_example_is_not_a_mapping(monkeypatch, tmp_path):
         "赞比亚占位申请", model=lambda **_: '[{"company":{"evidence":["赞比亚"]}}]', rules_dir=rules_dir,
     )
     assert_uncertain(draft, "company")
-    assert [hint for hint in draft.hints if hint not in G152_HINTS] == ["互斥组按默认填是", "公司对照表缺失或无效"]
+    assert [hint for hint in draft.hints if hint not in FIELD_RULE_HINTS] == ["互斥组按默认填是", "公司对照表缺失或无效"]

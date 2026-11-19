@@ -29,7 +29,6 @@ PARSE_FIXTURES = ROOT / "tests" / "parse" / "fixtures"
 COMPANIES_FIXTURE = PARSE_FIXTURES / "companies.tsv"
 SECRET = "合成占位凭据-仅用于测试"
 
-# 待群卡片同意的场景用合成附件确认模拟人工补齐，其他字段仍由真实解析和校验确定。
 _CHILD_SETUP = """
 import os
 import sys
@@ -40,26 +39,11 @@ def prohibit_network(event, args):
         os._exit(91)
 
 sys.addaudithook(prohibit_network)
-from dataclasses import replace
 from functools import partial
 from pathlib import Path
-from qianshu import parse, pipeline
-from qianshu.draft import DraftField
+from qianshu import pipeline
 
 pipeline.Pipeline = partial(pipeline.Pipeline, companies_file=Path(os.environ["QIANSHU_TEST_COMPANIES"]))
-if os.environ.get("QIANSHU_TEST_CONFIRMED") == "1":
-    parse_original = parse.parse_application
-
-    def parse_confirmed(*args, **kwargs):
-        return [
-            replace(draft, approval_attachments=DraftField(value=[]))
-            if (draft.approval_attachments.uncertainty
-                and draft.approval_attachments.uncertainty.reason == "审批件由人工处理")
-            else draft
-            for draft in parse_original(*args, **kwargs)
-        ]
-
-    parse.parse_application = parse_confirmed
 """
 
 
@@ -92,7 +76,7 @@ def single_policy():
     return body, [reply]
 
 
-def _run(tmp_path, body, model_reply, *, confirmed=False, tag_dates=None, approved_body=None):
+def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None):
     now = datetime.now(UTC)
     placeholder = {name: f"<合成占位-{name}>" for name in ("app", "bot", "chat", "sender", "message")}
     mention = "@_user_1"
@@ -129,7 +113,7 @@ def _run(tmp_path, body, model_reply, *, confirmed=False, tag_dates=None, approv
     run = subprocess.run(
         cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=45,
         env={**os.environ, "PYTHONPATH": os.pathsep.join((str(tmp_path), str(ROOT / "src"))),
-             "QIANSHU_TEST_CONFIRMED": str(int(confirmed)), "QIANSHU_TEST_COMPANIES": str(COMPANIES_FIXTURE)},
+             "QIANSHU_TEST_COMPANIES": str(COMPANIES_FIXTURE)},
     )
     assert run.returncode == 0, run.stderr
     assert SECRET not in run.stdout + run.stderr
@@ -150,7 +134,7 @@ def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path
     body = body.replace("占位休眠用户", scope)
     model[0]["user_scope"] = {"value": scope, "evidence": [f"用户范围：{scope}"]}
     cards = _run(
-        tmp_path, body, model, confirmed=True,
+        tmp_path, body, model,
         tag_dates={"占位标签甲": "2099-02-15"},
     )
     content = _contents(cards)
@@ -164,7 +148,10 @@ def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path
     assert any("是否需要维护互斥组\n值　是\n原文出处　无原文摘录" in row for row in fields)
     assert "政策 1 · 公司\n值　占位公司甲\n原文出处　「 赞比亚占位申请。」" in content
     assert '政策 1 · 节目包\n值　[{"当前节目包": "占位甲", "赠送节目包": "占位甲_copy"}]\n原文出处　「占位甲包用户」' in content
-    for hint in ("互斥组按默认填是", "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1"):
+    for hint in (
+        "互斥组按默认填是", "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1",
+        "审批件按默认留空", "政策类型按用户标签判定",
+    ):
         assert f"政策 1 · 自动调整\n{hint}" in content
     assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
 
@@ -173,7 +160,7 @@ def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy)
     body, model = single_policy
     body += "\n是否需要维护互斥组：否"
     cards = _run(
-        tmp_path, body, model, confirmed=True,
+        tmp_path, body, model,
         tag_dates={"占位标签甲": "2099-02-15"},
     )
     content = "\n".join(_contents(cards))
@@ -192,14 +179,23 @@ def test_command_blocks_uncovered_heading_when_drafts_outnumber_segments(tmp_pat
     assert "未校验" in content
 
 
-def test_command_reports_manual_attachments_in_production_parser(tmp_path, single_policy):
+@pytest.mark.parametrize("missing_scope", [False, True])
+def test_command_defers_missing_approval_url_but_still_checks_other_fields(tmp_path, single_policy, missing_scope):
     body, model = single_policy
+    body = body.rsplit("\n", 1)[0]
+    del model[0]["approval_url"]
+    if missing_scope:
+        del model[0]["user_scope"]
     cards = _run(tmp_path, body, model, tag_dates={"占位标签甲": "2099-02-15"})
     content = _contents(cards)
-    assert "政策 1 · 提醒项\n审批件由人工处理" in content
-    assert "政策 1 · 审批件附件 · 待确认\n审批件由人工处理" in content
-    assert "政策 1 · 处理状态\n停在校验，需人工确认或请申请人补充。" in content
-    assert not any("需追问 · 审批件附件" in line for line in content)
+    assert "政策 1 · 任务审批链接\n建单时填写" in content
+    assert "政策 1 · 审批件附件\n值　[]\n原文出处　无原文摘录" in content
+    assert not any("需追问 · 任务审批链接" in line for line in content)
+    if missing_scope:
+        assert "政策 1 · 处理状态\n停在校验，需人工确认或请申请人补充。" in content
+        assert any("需追问 · 用户范围" in line for line in content)
+    else:
+        assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
 
 
 @pytest.mark.parametrize(("missing", "numbered"), [
@@ -229,7 +225,7 @@ def test_command_checks_coverage_before_validation(tmp_path, single_policy, miss
         tag_dates[f"占位标签{suffix}"] = "2099-02-15"
     body = intro + "\n".join(segments)
     assert _suspected_policy_count(body) == (6 if numbered else 0)
-    cards = _run(tmp_path, body, policies, confirmed=True, tag_dates=tag_dates)
+    cards = _run(tmp_path, body, policies, tag_dates=tag_dates)
     content = "\n".join(_contents(cards))
     assert "段落边界未确认" not in content
     if missing is None:
@@ -257,7 +253,7 @@ def test_command_checks_coverage_before_validation(tmp_path, single_policy, miss
 ])
 def test_command_checks_untitled_paragraph_signals(tmp_path, single_policy, paragraph, explicit):
     body, model = single_policy
-    cards = _run(tmp_path, body.rstrip() + "\n" + paragraph, model, confirmed=True,
+    cards = _run(tmp_path, body.rstrip() + "\n" + paragraph, model,
                  tag_dates={"占位标签甲": "2099-02-15"})
     content = "\n".join(_contents(cards))
     if explicit:
@@ -282,7 +278,7 @@ def test_command_stops_when_an_indented_line_starts_another_policy(tmp_path, sin
     body = body.rstrip() + "\n" + paragraph
     assert "标签名称" not in body
     content = "\n".join(_contents(_run(
-        tmp_path, body, model, confirmed=True,
+        tmp_path, body, model,
         tag_dates={"占位标签甲": "2099-02-15"},
     )))
     status = "解析不完整，需人工确认"
@@ -301,7 +297,7 @@ def test_command_stops_when_a_heading_continues_with_another_policy(tmp_path, si
     ).replace("充30天送30天，充一送一", "充一送一")
     model = [{name: model[0][name] for name in ("company", "recharge_days", "gift_days")}]
     content = "\n".join(_contents(_run(
-        tmp_path, body, model, confirmed=True,
+        tmp_path, body, model,
         tag_dates={"占位标签甲": "2099-02-15"},
     )))
     assert "<font color='red'>处理状态\n解析不完整，需人工确认</font>" in content
@@ -770,7 +766,7 @@ def test_history_keeps_scanning_if_resume_fails(caplog):
 
 def test_command_shows_validation_questions(tmp_path, single_policy):
     body, model = single_policy
-    cards = _run(tmp_path, body, model, confirmed=True)
+    cards = _run(tmp_path, body, model)
     content = "\n".join(_contents(cards))
     assert "需追问 · 结束日期\n标签最晚结束日期尚未确认，请申请人补充。" in content
     assert "停在校验，需人工确认或请申请人补充。" in content
@@ -791,7 +787,7 @@ def test_command_preserves_long_evidence(tmp_path, single_policy):
     body = body.replace("占位休眠用户", scope)
     model[0]["user_scope"] = {"value": scope, "evidence": [f"用户范围：{scope}"]}
     cards = _run(
-        tmp_path, body, model, confirmed=True,
+        tmp_path, body, model,
         tag_dates={"占位标签甲": "2099-02-15"},
     )
     assert len(cards) > 2
