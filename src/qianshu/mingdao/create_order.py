@@ -209,6 +209,12 @@ def receipt(value):
     return isinstance(value, str) and bool(value.strip())
 
 
+def single_option(items, error):
+    require(len(items) == 1 and isinstance(option := items[0], dict)
+            and receipt(option.get("key")) and receipt(option.get("value")), error)
+    return option["key"], option["value"]
+
+
 def notice_recipients(config):
     rows = config.get("notice_recipients") if isinstance(config, dict) else None
     require(isinstance(rows, list) and bool(rows) and all(
@@ -403,13 +409,22 @@ class Official:
         return raw
 
     def record(self, raw):
-        record_id = raw["_id"]
-        name = raw[self.config["search"]["name_control"]]
-        state = raw[self.config["status_control"]]
-        require(uuid_record(record_id) and receipt(name) and type(state) in (int, str),
-                "官方记录标识或状态未确认")
-        return Record(record_id, name, self.config["status_map"][str(state)],
-                      utc(raw["_updatedAt"], platform=True), state)
+        error = "官方记录标识或状态未确认"
+        record_id = raw.get("_id")
+        name = raw.get(self.config["search"]["name_control"])
+        state = raw.get(self.config["status_control"])
+        require(uuid_record(record_id) and receipt(name), error)
+        status_map = self.config["status_map"]
+        if isinstance(state, list):
+            state, label = single_option(state, error)
+            by_key, by_label = status_map.get(state), status_map.get(label)
+            require(by_key is None or by_label is None or by_key == by_label, error)
+            status = by_key if by_key is not None else by_label
+        else:
+            require(type(state) in (int, str), error)
+            status = status_map.get(str(state))
+        require(status is not None, error)
+        return Record(record_id, name, status, utc(raw["_updatedAt"], platform=True), state)
 
     def _query(self, action, name):
         spec = self.config[action]
@@ -574,6 +589,9 @@ def encode_cell(value, spec):
         return compact(result)
     items = unpack_array(value)
     if kind in _SELECT:
+        if kind != 10 and items and isinstance(items[0], dict):
+            key, _ = single_option(items, "选项单元格格式无效")
+            items = [key]
         require(all(receipt(item) for item in items) and (kind == 10 or len(items) <= 1),
                 "选项单元格格式无效")
     elif kind == 29:

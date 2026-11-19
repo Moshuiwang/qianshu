@@ -65,8 +65,9 @@ def case(tmp_path):
             child["price"]: "3.00",
         }],
         "approval_url": "https://placeholder.invalid/approval",
-        "company": "合成公司", "maintain_mutual_exclusion_group": order.compact([ids["option"]]),
+        "company": "合成公司", "maintain_mutual_exclusion_group": [{"key": ids["option"], "value": "占位选项"}],
         "country": "合成国家", "member": [{"accountId": str(uuid4()), "name": "占位成员"}],
+        "status": [{"key": ids["new_status"], "value": "新建（占位部门）"}],
         "generated": "合成旧值",
     }
     values = {"policy_name": "【测试】合成单", "start_date": "2026-12-01", "end_date": "2026-12-31",
@@ -75,9 +76,11 @@ def case(tmp_path):
               "packages": [{"current_package": "合成当前包", "gift_package": "合成赠送包"}]}
     endpoint = {"host": order._CREATE_HOST, "method": "POST", "path": order._CREATE_PATH}
     rows_path = f"/v3/app/worksheets/{ids['worksheetId']}/rows"
-    statuses = {index: order.compact([ids[key]]) for index, key in enumerate(
+    statuses = {index: ids[key] for index, key in enumerate(
         ("new_status", "pending_status", "configuring_status", "configured_status"), start=1,
     )}
+    status_names = dict(enumerate(("新建", "待审批", "待配置", "配置完成"), start=1))
+    status_labels = {index: f"{name}（占位部门）" for index, name in status_names.items()}
 
     config = {
         "configurator": {"id": str(uuid4()), "label": "合成负责人"},
@@ -92,7 +95,8 @@ def case(tmp_path):
             "origin": "https://placeholder.invalid", "token_key": "PLACEHOLDER_OFFICIAL_TOKEN",
             "app_id_key": "PLACEHOLDER_OFFICIAL_APP",
             "status_control": control["status"],
-            "status_map": dict(zip(statuses.values(), ("新建", "待审批", "待配置", "配置完成"))),
+            "status_map": {key: name for index, name in status_names.items()
+                           for key in (statuses[index], status_labels[index])},
             "read": {"path": rows_path + "/{record_id}", "missing_status": 404,
                      "missing_key": ["error_code"], "missing_value": 12345},
             "search": {"path": rows_path + "/list", "name_control": control["policy_name"],
@@ -114,7 +118,8 @@ def case(tmp_path):
     private = tmp_path / ".private"
     private.mkdir(mode=0o700)
     return SimpleNamespace(
-        ids=ids, control=control, child=child, values=values, config=config, evidence=evidence, statuses=statuses,
+        ids=ids, control=control, child=child, values=values, config=config, evidence=evidence,
+        statuses=statuses, status_labels=status_labels,
         cells={control[key]: value for key, value in template.items()}, private=private, window=window,
         session_token="placeholder-sensitive-" + uuid4().hex,
         official_token="placeholder-sensitive-" + uuid4().hex,
@@ -137,6 +142,7 @@ def add_notice_recipients(case):
 def test_assemble_values_and_legacy_cells(case):
     case.cells.update({"_id": case.ids["template"], "_owner": {}, "_createdBy": {},
                        "_createdAt": "", "_updatedAt": "", str(uuid4()): "占位自动计算值"})
+    case.cells[case.control["maintain_mutual_exclusion_group"]] = order.compact([case.ids["option"]])
     controls, summary = assemble(case)
     fields = {row["controlId"]: row["value"] for row in controls}
     assert fields.keys() == case.config["fields"].keys()
@@ -243,12 +249,15 @@ class Platform:
         self.timeouts = []
         self.template = {**case.cells, "_id": case.ids["template"], "_createdBy": {}, "_owner": {}}
 
+    def status_cell(self, status):
+        return [{"key": self.case.statuses[status], "value": self.case.status_labels[status]}]
+
     def record(self, record_id, status, cells):
         return {
             **cells, "_id": record_id,
             self.case.control["policy_name"]: cells.get(self.case.control["policy_name"],
                                                        self.case.values["policy_name"]),
-            self.case.control["status"]: self.case.statuses[status],
+            self.case.control["status"]: self.status_cell(status),
             "_createdAt": "2026-11-20 08:00:00", "_updatedAt": "2026-11-20 08:00:01",
             "_createdBy": {}, "_owner": {},
         }
@@ -261,9 +270,9 @@ class Platform:
                 "_createdAt": f"2026-11-20 08:00:{index % 60:02d}",
                 "logData": [{
                     "id": self.case.control["status"], "name": "政策状态",
-                    "type": 11, "editType": 1, "oldValue": "", "oldText": "",
-                    "newValue": self.case.statuses[state],
-                    "newText": self.case.config["official"]["status_map"][self.case.statuses[state]],
+                    "type": 11, "editType": 1,
+                    "oldValue": self.case.status_labels[self.states[index - 1]] if index else "", "oldText": "",
+                    "newValue": self.case.status_labels[state], "newText": "",
                     "isDeleted": False,
                 }],
             },
@@ -381,6 +390,9 @@ class Platform:
                 assert all(payload[key] == value for key, value in case.config["create"]["identifiers"].items())
                 raw_cells = {cell["controlId"]: cell["value"] for cell in payload["receiveControls"]}
                 platform.created_cells = raw_cells.copy()
+                mutual_exclusion = case.control["maintain_mutual_exclusion_group"]
+                key, = json.loads(raw_cells[mutual_exclusion])
+                raw_cells[mutual_exclusion] = [{"key": key, "value": "占位选项"}]
                 if platform.mismatch:
                     raw_cells[case.control["gift_days"]] = "9"
                     del raw_cells[case.control["start_date"]]
@@ -699,24 +711,24 @@ def test_d15_verification(case, platform, condition, deleted, verified):
             change.update(oldValue=None, oldText=None)
         if condition in ("old_configuring_only", "old_pending_only"):
             old_state = 3 if condition == "old_configuring_only" else 2
-            old_value = case.statuses[old_state]
+            old_value = case.status_labels[old_state]
             change.update(oldValue=old_value, oldText=case.config["official"]["status_map"][old_value])
         if condition == "old_configuring_without_text":
-            change.update(oldValue=case.statuses[3], oldText="")
+            change.update(oldValue=case.status_labels[3], oldText="")
         if condition == "old_unknown_without_text":
             change.update(oldValue="占位未知状态键", oldText="")
         if condition == "new_configuring_with_new_text":
-            change.update(newValue=case.statuses[3], newText="新建")
+            change.update(newValue=case.status_labels[3], newText="新建")
         if condition == "old_conflicting_allowed_states":
-            change.update(oldValue=case.statuses[2], oldText="新建")
+            change.update(oldValue=case.status_labels[2], oldText="新建")
         if condition == "null_status_text":
             change["newText"] = None
         if condition == "null_status_value":
-            change["newValue"] = None
+            change.update(newValue=None, newText="新建")
         if condition == "empty_new_fields":
             change.update(newValue=None, newText="")
         if condition == "blank_status":
-            change["newText"] = ""
+            change.update(newValue=case.statuses[1], newText="")
         if condition == "unknown_status":
             change["newText"] = "占位未知状态"
         if condition == "deleted_status":
@@ -732,7 +744,7 @@ def test_d15_verification(case, platform, condition, deleted, verified):
     def modify_after_history(row):
         if platform.actions[-2] == "history":
             if condition == "pending_before_delete":
-                row[case.control["status"]] = case.statuses[2]
+                row[case.control["status"]] = platform.status_cell(2)
             else:
                 row["_updatedAt"] = "2026-11-20 08:00:02"
 
@@ -803,7 +815,8 @@ def test_invalid_log_page_limit(case, limit):
         order.Official(case.config["official"], case.official_token, case.ids["official_app"], None)
 
 
-@pytest.mark.parametrize("mode", ["stable", "pending_during_wait", "timestamp_changes", "never_stable", "late_read"])
+@pytest.mark.parametrize("mode", ["stable", "pending_during_wait", "timestamp_changes", "option_key_changes",
+                                  "never_stable", "late_read"])
 def test_deletion_waits_for_stable_status_and_timestamp(case, platform, mode):
     now, pauses = [0], []
 
@@ -813,9 +826,13 @@ def test_deletion_waits_for_stable_status_and_timestamp(case, platform, mode):
 
     def update(row):
         if mode == "pending_during_wait" and now[0] >= 5:
-            row[case.control["status"]] = case.statuses[2]
+            row[case.control["status"]] = platform.status_cell(2)
         if mode == "timestamp_changes" and now[0] >= 5:
             row["_updatedAt"] = "2026-11-20 08:00:02"
+        if mode == "option_key_changes":
+            row[case.control["status"]] = platform.status_cell(1)
+            if now[0] == 5:
+                row[case.control["status"]][0]["key"] = "占位备用选项键"
         if mode == "never_stable":
             row["_updatedAt"] = f"2026-11-20 08:00:{now[0] % 60:02d}"
         if mode == "late_read" and now[0] >= 5:
@@ -830,7 +847,7 @@ def test_deletion_waits_for_stable_status_and_timestamp(case, platform, mode):
         assert pauses == [5] * (24 if mode == "never_stable" else 1)
         assert "history" not in platform.actions and "delete" not in platform.actions
         assert "delete_attempt" not in events(case)
-        assert platform.rows[case.ids["created"]][case.control["status"]] == case.statuses[1]
+        assert platform.rows[case.ids["created"]][case.control["status"]] == platform.status_cell(1)
         assert any("需人工核对" in notice and "<at " in notice for notice in approvals.notices)
     elif mode == "pending_during_wait":
         with pytest.raises(order.Stop, match="删除前状态须为新建"):
@@ -839,7 +856,8 @@ def test_deletion_waits_for_stable_status_and_timestamp(case, platform, mode):
         assert "history" not in platform.actions and "delete" not in platform.actions
     else:
         assert run()
-        assert pauses == ([5] if mode == "stable" else [5, 5])
+        expected_reads = {"stable": 1, "timestamp_changes": 2, "option_key_changes": 3}
+        assert pauses == [5] * expected_reads[mode]
         assert platform.actions.count("read") == len(pauses) + 3
 
 
@@ -847,6 +865,51 @@ def test_official_record_interprets_naive_updated_at_as_utc_plus_eight(case, pla
     api = order.Official(case.config["official"], case.official_token, case.ids["official_app"], None)
     row = platform.record(case.ids["created"], 1, {})
     assert api.record(row).updated_at == datetime(2026, 11, 20, 0, 0, 1, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("mapped", ["both", "key", "value", "neither", "conflict"])
+def test_official_record_single_option_status_mapping(case, platform, mapped):
+    config = case.config["official"]
+    key, label = case.statuses[1], case.status_labels[1]
+    config["status_map"] = {entry: "新建" for entry in {
+        "both": (key, label), "key": (key,), "value": (label,), "neither": (), "conflict": (key,),
+    }[mapped]}
+    if mapped == "conflict":
+        config["status_map"][label] = "待审批"
+    api = order.Official(config, case.official_token, case.ids["official_app"], None)
+    row = platform.record(case.ids["created"], 1, {})
+    if mapped in ("neither", "conflict"):
+        with pytest.raises(order.Stop, match="官方记录标识或状态未确认"):
+            api.record(row)
+    else:
+        record = api.record(row)
+        assert (record.status, record.platform_status) == ("新建", key)
+
+
+@pytest.mark.parametrize("state", [
+    [], [{"key": "占位选项键", "value": "占位显示文本"}] * 2, ["占位选项键"],
+    [{}], [{"key": "占位选项键"}], [{"value": "占位显示文本"}],
+    [{"key": "", "value": "占位显示文本"}], [{"key": "占位选项键", "value": ""}],
+    [{"key": 1, "value": "占位显示文本"}], [{"key": "占位选项键", "value": None}],
+    {"key": "占位选项键", "value": "占位显示文本"}, True, None, 1.0,
+])
+def test_official_record_rejects_invalid_status_shape(case, platform, state):
+    api = order.Official(case.config["official"], case.official_token, case.ids["official_app"], None)
+    row = platform.record(case.ids["created"], 1, {})
+    row[case.control["status"]] = state
+    with pytest.raises(order.Stop, match="官方记录标识或状态未确认"):
+        api.record(row)
+
+
+@pytest.mark.parametrize("state", [1, '["placeholder_option_key"]'])
+def test_official_record_legacy_status(case, platform, state):
+    config = case.config["official"]
+    config["status_map"] = {str(state): "新建"}
+    api = order.Official(config, case.official_token, case.ids["official_app"], None)
+    row = platform.record(case.ids["created"], 1, {})
+    row[case.control["status"]] = state
+    record = api.record(row)
+    assert (record.status, record.platform_status) == ("新建", state)
 
 
 @pytest.mark.parametrize("read_number", [1, 2, 3])
@@ -893,6 +956,18 @@ def test_readback_report_counts_and_modes(case, platform):
     assert report["可能由工作流回填"] == [{"字段名": "赠送天数", "类型": 6}]
     assert any("一致 11 / 不一致 1 / 缺失 1 / 跳过 1" in text for text in approvals.notices)
     assert all(file.stat().st_mode & 0o777 == 0o600 for file in case.private.iterdir())
+
+
+@pytest.mark.parametrize("kind", [9, 11])
+@pytest.mark.parametrize("same_key", [True, False])
+def test_readback_compares_single_option_by_key(case, kind, same_key):
+    control = case.control["maintain_mutual_exclusion_group"]
+    case.config["fields"][control]["type"] = kind
+    expected = [{"controlId": control, "value": order.compact([case.ids["option"]])}]
+    key = case.ids["option"] if same_key else "占位其他选项键"
+    raw = {control: [{"key": key, "value": "占位显示文本"}]}
+    _, counts = order.compare(expected, raw, case.config)
+    assert counts == {"一致" if same_key else "不一致": 1}
 
 
 def test_trace_lock_blocks_crash_and_allows_proven_no_send(case):
