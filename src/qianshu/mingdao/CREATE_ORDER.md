@@ -48,11 +48,13 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `official.search`、`official.tags` | 各含 `path`、`name_control`、`view_ids`。路径为 `/v3/app/worksheets/placeholder_worksheet/rows/list`，两个查询使用各自的表和名称字段 controlId。视图列表形如 `["placeholder_view"]`，每张表至少登记一个视图。政策同名检查须登记覆盖所有政策记录的全部视图 |
 | `official.page_size`、`official.page_limit` | 每页条数与每视图页数上限，正整数，默认分别为 50、20。查询逐个视图从第 1 页开始，用携带 `viewId` 的官方列表 POST 和名称等值筛选。每个视图读到短页才视为读完，任一页失败或满页达到上限均停止。按返回行的名称精确比对，政策同名检查合计须为 0。每个标签读完全部视图后，按记录 `_id` 忽略大小写去重，须恰好匹配 1 条，否则停止。写入保留首次匹配的记录 ID 原始大小写 |
 | `official.read` | `path` 为政策表的 `/v3/app/worksheets/placeholder_worksheet/rows/{record_id}`。模板、建单回读和删前回读使用同一详情解析，取平铺的 controlId 字段及系统键 `_id`。用 `missing_status`、`missing_key`、`missing_value` 登记经平台确认的记录不存在信号，例如在私有登记中填写实际错误码的取值路径 `["error_code"]` |
-| `official.status_control`、`official.status_map` | 政策状态字段的 controlId，如 `placeholder_status_control`。状态映射以平台原始状态的字符串为键，值为产品文档所列状态。回读和日志用同一个状态控件 |
+| `official.status_control`、`official.status_map` | 政策状态字段的 controlId，如 `placeholder_status_control`。键须同时登记选项 key 与平台显示文本（日志里存的是显示文本），值为产品文档所列状态。官方读记录的政策状态形如 `[{"key": "placeholder_new_option", "value": "新建（占位部门）"}]`。回读至少须命中一项映射，两项均命中时结果须相同。回读和日志用同一个状态控件 |
 | `official.logs` | `path` 为政策记录读取路径加 `/logs`。请求显式取第 1 页、每页 50 条。可用 `page_limit` 设置更严格的停止阈值，须为 1～50 的整数，默认 50，日志条数达到阈值即停止 |
-| `official.delete` | `path` 与政策记录读取一致，`method` 为 `DELETE`。固定 JSON 请求体含 `triggerWorkflow: false` 和 `permanent: false`。若平台支持按状态条件删除，`condition` 登记其请求键，传入即时回读的原始状态。仅当守望者确认平台不支持条件校验时登记 `condition: null` |
+| `official.delete` | `path` 与政策记录读取一致，`method` 为 `DELETE`。固定 JSON 请求体含 `triggerWorkflow: false` 和 `permanent: false`。若平台支持按状态条件删除，`condition` 登记其请求键，传入即时回读的状态选项 key。旧版整数或字符串回读传入原始值。仅当守望者确认平台不支持条件校验时登记 `condition: null` |
 
 取值路径用 JSON 数组，例如 `["占位外层", "占位字段"]`；空数组取当前位置。读取源须在放行前确认真实响应形态。单选、下拉及多选使用选项键；关联和成员分别写成含 `sid` 或 `accountId` 的对象数组。若官方读接口的对象标识键不同，可为对应控件登记 `relation_id_key` 或 `member_id_key`。节目包当前包和赠送包按行与草稿完全一致时，照抄整行的可写控件。子表写成二维数组 JSON 字符串，各内层单元格含 `controlId`、`value`。
+
+单选写入形如 `["placeholder_option"]`，官方读记录形如 `[{"key": "placeholder_option", "value": "占位显示文本"}]`，按 `key` 核对写入与回读是否一致。
 
 ## 回读、停止与台账
 
