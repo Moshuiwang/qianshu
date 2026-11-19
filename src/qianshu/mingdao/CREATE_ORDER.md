@@ -8,7 +8,7 @@ X5 的入口只处理一条经登记的「【测试】」草稿。机器人在�
 python -m qianshu.mingdao.create_order --config .private/占位配置.json --registration 占位登记号 .private/占位草稿.json
 ```
 
-在本 Trace 独占的运行目录执行。固定使用该目录下权限为 `0700` 的 `.private/`，运行之间保留整个目录及其资格锁。配置、草稿、登录态和授权登记使用 `0600`。会话取自登录检查脚本生成的 `.private/mingdao-state.json`。飞书沿用 #8 的私有配置，默认读当前目录的 `.env`，也可用 `--env-file` 指定私有文件。官方接口令牌也从该文件取值，配置只登记键名。两个令牌进入请求头，台账、摘要、报告和错误信息均不记录令牌。
+在本 Trace 独占的运行目录执行。固定使用该目录下权限为 `0700` 的 `.private/`，运行之间保留整个目录及其资格锁。配置、草稿、登录态和授权登记使用 `0600`。会话取自登录检查脚本生成的 `.private/mingdao-state.json`。飞书沿用 #8 的私有配置，默认读当前目录的 `.env`，也可用 `--env-file` 指定私有文件。官方接口个人令牌和应用 ID 也从该文件取值，配置只登记键名。官方请求使用 `Authorization: Bearer <占位个人令牌>` 和 `HAP-Appid: <占位应用标识>`。台账、摘要、报告和错误信息均不记录这些值或网页会话令牌。
 
 ## 授权登记
 
@@ -41,14 +41,14 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `fields.<控件>.draft_values` | 枚举、关系等字段把草稿值映射到平台类型。键为草稿值的紧凑 JSON 字符串，例如文本值的键为 `"\"占位选项\""`，值形如 `["占位选项键"]`。字段比较时仅用该映射核对模板 |
 | `fields.<子表控件>` | `children` 以子控件 ID 为键，各含 `type`；`current`、`gift` 各含 `control`、`name_path`，用于从模板原始单元格读精确包名。可用 `row_metadata` 指定子行的非控件元数据键 |
 | `readback_skip` | 经实测确认由工作流回填的控件 ID 列表，初次用空数组。可变字段和审批链接必须比对 |
-| `official.origin`、`official.token_key` | 官方 HTTPS 源和私有环境文件中的令牌键名 |
-| `official.record` | 记录的 `id`、`name`、`status`、`revision`、`cells` 的取值路径；如单元格与元数据平铺，可用 `metadata` 排除明确的非控件键 |
-| `official.status_map` | 以平台原始状态的字符串为键，值为产品文档所列状态 |
-| `official.read`、`search`、`tags`、`logs`、`delete` | 每项含 `path`、`success_key`、`success_value`、`data`。读取和删除指向政策表的 `/占位前缀/占位表标识/rows/{record_id}`，日志在该路径后加 `/logs`。删除登记 `method: "DELETE"`，入口固定传 `permanent=false` |
-| `official.search`、`official.tags` | 配置各自表的 `/占位前缀/占位表标识/rows`，及 `name_param`、`name`、`id`、`rows`、`has_more`；可通过 `params` 提供必要的固定读取参数。同名预检须覆盖政策表，勿加视图或状态范围 |
-| `official.read` | 用 `missing_status`、`missing_key`、`missing_value` 登记经平台确认的记录不存在信号 |
-| `official.logs` | `rows`、`has_more`、`complete` 及单条日志的 `id`、`revision`、`before`、`after`、`time` 的取值路径 |
-| `official.delete.condition` | 官方接口的条件校验请求键；`condition_value` 可为 `revision`（默认）或 `status`。仅当守望者确认平台不支持时登记为 `null` |
+| `official.origin`、`official.token_key`、`official.app_id_key` | 官方 HTTPS 源及私有环境文件中的个人令牌、应用 ID 键名，例如 `https://placeholder.invalid`、`PLACEHOLDER_HAP_TOKEN`、`PLACEHOLDER_HAP_APP_ID` |
+| `official.search`、`official.tags` | 各含 `path`、`name_control`、`view_ids`。路径为 `/v3/app/worksheets/placeholder_worksheet/rows/list`，两个查询使用各自的表和名称字段 controlId。视图列表形如 `["placeholder_view"]`，每张表至少登记一个视图。政策同名检查须登记覆盖所有政策记录的全部视图 |
+| `official.page_size`、`official.page_limit` | 每页条数与每视图页数上限，正整数，默认分别为 50、20。查询逐个视图从第 1 页开始，用携带 `viewId` 的官方列表 POST 和名称等值筛选。每个视图读到短页才视为读完，任一页失败或满页达到上限均停止。按返回行的名称精确比对，同名检查合计须为 0，标签查询须恰好匹配 1 条 |
+| `official.read` | `path` 为政策表的 `/v3/app/worksheets/placeholder_worksheet/rows/{record_id}`。用 `missing_status`、`missing_key`、`missing_value` 登记经平台确认的记录不存在信号，例如在私有登记中填写实际错误码的取值路径 `["error_code"]` |
+| `official.status_control`、`official.status_map` | 政策状态字段的 controlId，如 `placeholder_status_control`。状态映射以平台原始状态的字符串为键，值为产品文档所列状态。回读和日志用同一个状态控件 |
+| `official.record_metadata` | 可选，额外排除的非组装控件或元数据键。平台固定元数据 `_id`、`_createdAt`、`_updatedAt`、`_createdBy`、`_owner` 已由入口排除 |
+| `official.logs` | `path` 为政策记录读取路径加 `/logs`。可用 `page_limit` 登记核实过的日志单页条数上限，默认 50，读到上限即停止 |
+| `official.delete` | `path` 与政策记录读取一致，`method` 为 `DELETE`。固定 JSON 请求体含 `triggerWorkflow: false` 和 `permanent: false`。若平台支持按状态条件删除，`condition` 登记其请求键，传入即时回读的原始状态。仅当守望者确认平台不支持条件校验时登记 `condition: null` |
 
 取值路径用 JSON 数组，例如 `["占位外层", "占位字段"]`；空数组取当前位置。读取源须在放行前确认真实响应形态。单选、下拉及多选使用选项键；关联和成员分别写成含 `sid` 或 `accountId` 的对象数组。若官方读接口的对象标识键不同，可为对应控件登记 `relation_id_key` 或 `member_id_key`。节目包当前包和赠送包按行与草稿完全一致时，照抄整行的可写控件。子表写成二维数组 JSON 字符串，各内层单元格含 `controlId`、`value`。
 
@@ -56,6 +56,8 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 
 - `trial-orders.jsonl` 和 `trace-12-create.lock` 沿用 Trace 既有名称。台账排他加锁、追加并同步落盘。曾发出或无法证明未发出的建单永久占用该 Trace 资格。仅在台账持久记录确未交给传输时，才可凭另一份当次授权重新登记。原登记号始终不可再用。
 - `create-fields-*.json` 仅存字段名、类型、来源及值的 12 位 SHA-256 前缀。`create-preflight-*.json` 记需要人工处理的组装停止原因。`create-readback-*.json` 仅存字段名和比对结果。各文件以 `0600` 一次性写入；群内回读汇报只给计数。
-- 建单结果未知时，台账追加 `create_unknown`，只按名称用官方接口回读供人工对账。记录匹配也不能恢复清理资格。
-- D15 需要同一 UUID 从建单版本 0 连续到当前版本的完整历史，且前后状态衔接、时刻单调、末尾状态及版本与即时回读一致。无时区平台日志按 UTC+8 解释再转 UTC。只有平台响应明确完整且没有后续页才接受。`待审批` 可出现在历史里；任何一次进入 `待配置` 或后续状态即停止。删前、删后均在群里 @ 配置负责人。平台返回已登记的不存在信号，才写入 `delete_verified`。
+- 发送前复核登录态摘要、审批认领和连接代次。在同步边界内核对共用截止时间，至少剩余 10 秒才交给传输。截止前余量不足或交接前关闭审批，台账记录 `aborted_before_write`。
+- 建单与官方接口的连接超时为 10 秒、读响应超时为 30 秒，均由代码常量控制。建单响应必须完整收到声明的正文或分块结束标记，再解析 JSON。建单结果未知时，台账追加 `create_unknown`，只按名称用官方接口回读供人工对账。记录匹配也不能恢复清理资格。
+- 逐字段比对后，以 5 秒为间隔回读，连续两次的政策状态和 `_updatedAt` 一致才继续 D15。稳定等待上限为 120 秒，临近上限会缩短回读超时，超过上限的回读结果作废。无法在限时内确认稳定时停止删除，群内 @ 配置负责人并交人工处理。
+- D15 要求日志接口明确成功，所有日志可解析，且恰好包含一条创建日志。政策状态的每项改动以配置的 controlId 匹配，`newText` 只允许「新建」或「待审批」。日志条数达到单页上限、出现续页迹象或无法确认读全时停止。无时区的日志及更新时间按 UTC+8 解释。删除前立即再核对名称、记录 ID、当前「新建」状态和已核对过的更新时间。删除前后在群里 @ 配置负责人，仅凭官方回读的已登记不存在信号追加 `delete_verified`。
 - 退出码 `0` 表示回读全部通过且删除已核验。`1` 表示停止、回读差异或流程未确认，以私有报告和台账为准。`2` 表示调用参数格式无效。

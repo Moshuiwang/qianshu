@@ -45,6 +45,7 @@ _HTTP_TIMEOUT = 2
 _CALLBACK_BUDGET = 3
 _CALLBACK_RESPONSE_MARGIN = 0.5
 _CALLBACK_TIMEOUT_NOTICE = "处理超时，请重新点击"
+_CREATE_SEND_MARGIN = 10
 
 
 class ApprovalClosed(RuntimeError):
@@ -483,6 +484,7 @@ class FeishuService:
         self.settings, self.window, self.clock = settings, window, clock
         self._lock = Lock()
         self._origin = None
+        self._approval_generation = 0
         self._approval_disconnected = Event()
         self._approval_disconnected.set()
         self._connected_at: float | None = None
@@ -508,15 +510,17 @@ class FeishuService:
             self._connected_at = self.clock()
             self._state.close_approvals()
             self._origin = origin
+            self._approval_generation += 1
             self._approval_disconnected.clear()
         _LOG.info("feishu_connected")
         if self.entrance is not None:
             self.entrance.recover()
 
-    def _disconnected(self) -> None:
-        # 断线先标记。即使建单的发送临界区仍在检查同名记录，也能看到断线。
-        self._approval_disconnected.set()
+    def _disconnected(self, stop=None) -> None:
         with self._lock:
+            self._approval_disconnected.set()
+            if stop is not None and self.window.contains(self.clock()):
+                stop.set()
             was_connected = self._origin is not None
             self._origin = None
             self._connected_at = None
@@ -529,14 +533,14 @@ class FeishuService:
         if not record_id.strip():
             raise ValueError("缺少台账记录标识。")
         with self._lock:
-            origin = self._origin
+            origin, generation = self._origin, self._approval_generation
             if origin is None or origin.close_code is not None or not self.window.contains(self.clock()):
                 raise RuntimeError("审批长连接不可用。")
         approval_id = token_urlsafe(32)
         message_id = self.transport.send_card(approval_card(summary, approval_id, record_id))
         with self._lock:
             if (
-                self._origin is not origin or origin.close_code is not None
+                self._origin is not origin or generation != self._approval_generation or origin.close_code is not None
                 or not self.window.contains(self.clock())
             ):
                 raise RuntimeError("发送审批卡片期间审批已关闭。")
@@ -551,7 +555,7 @@ class FeishuService:
     def approval_status(self, approval_id: str, record_id: str) -> str:
         with self._lock:
             status = self._state.approval_status(approval_id, record_id)
-            if status in ("pending", "approve") and not self.approval_connection_ready():
+            if status in ("pending", "approve", "claimed") and not self.approval_connection_ready():
                 self._state.close_approvals()
                 return "closed"
             return status
@@ -560,23 +564,32 @@ class FeishuService:
         with self._lock:
             self._state.close_create_approval(approval_id, record_id)
 
-    def send_first_create(self, approval_id, record_id, before_send, send):
-        """在关闭审批的同步边界内持久记录尝试，再交付已经预连的请求。"""
+    def send_first_create(self, approval_id, record_id, prepare, record_attempt, send):
+        """认领后查询，查询期间可以关闭审批。随后串行记录尝试与交接。"""
+        def check(expires):
+            now = self.clock()
+            if (self._approval_disconnected.is_set() or origin is not self._origin
+                    or generation != self._approval_generation or origin.close_code is not None
+                    or not self.window.contains(now)
+                    or min(expires, self.window.end.timestamp()) - now < _CREATE_SEND_MARGIN):
+                raise ApprovalClosed("建单审批已关闭")
+
+        def dispatch(expires):
+            check(expires)
+            record_attempt()
+            send(lambda: check(expires))
+
         with self._lock:
-            origin = self._origin
+            if not self.approval_connection_ready():
+                return False
+            origin, generation = self._origin, self._approval_generation
+            expires = self._state.claim_create(approval_id, record_id)
+            if expires is None:
+                return False
+            check(expires)
 
-            def check(expires):
-                now = self.clock()
-                if (self._approval_disconnected.is_set() or origin is None or origin.close_code is not None
-                        or not self.window.contains(now) or now >= expires):
-                    raise ApprovalClosed("建单审批已关闭")
-
-            def dispatch(expires):
-                check(expires)
-                before_send()
-                check(expires)
-                send()
-
+        prepare()
+        with self._lock:
             return self._state.dispatch_create(approval_id, record_id, dispatch)
 
     async def _record_action(
@@ -777,16 +790,15 @@ class FeishuService:
             except Exception:
                 _LOG.error("feishu_create_listener_failed")
             finally:
-                if self.window.contains(self.clock()):
-                    stop.set()
-                self._disconnected()
+                self._disconnected(stop)
 
         listener = ws.loop.create_task(listen())
         worker = ws.loop.create_task(asyncio.to_thread(work, stop))
         try:
             return ws.loop.run_until_complete(worker)
         except KeyboardInterrupt:
-            stop.set()
+            with self._lock:
+                stop.set()
             ws.loop.run_until_complete(asyncio.gather(worker, return_exceptions=True))
             raise
         finally:

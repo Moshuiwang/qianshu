@@ -200,7 +200,7 @@ class State:
         with self._write(deadline=deadline, before_commit=before_commit) as db:
             db.execute("""
                 UPDATE feishu_approvals SET status = 'closed'
-                WHERE scope = ? AND status IN ('pending', 'approve')
+                WHERE scope = ? AND status IN ('pending', 'approve', 'claimed')
             """, (self.scope,))
 
     def approval_status(self, approval_id: str, record_id: str) -> str:
@@ -216,8 +216,17 @@ class State:
             db.execute("""
                 UPDATE feishu_approvals SET status = 'closed'
                 WHERE scope = ? AND approval_id = ? AND record_id = ?
-                  AND status IN ('pending', 'approve')
+                  AND status IN ('pending', 'approve', 'claimed')
             """, (self.scope, approval_id, record_id))
+
+    def claim_create(self, approval_id, record_id):
+        with self._write() as db:
+            row = db.execute("""
+                UPDATE feishu_approvals SET status = 'claimed'
+                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'approve'
+                RETURNING expires
+            """, (self.scope, approval_id, record_id)).fetchone()
+            return row[0] if row is not None else None
 
     def dispatch_create(self, approval_id, record_id, dispatch):
         # 关闭或认领同一卡片的其他进程与传输交接串行。
@@ -225,7 +234,7 @@ class State:
         with self._write() as db:
             row = db.execute("""
                 UPDATE feishu_approvals SET status = 'used'
-                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'approve'
+                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'claimed'
                 RETURNING expires
             """, (self.scope, approval_id, record_id)).fetchone()
             if row is None:

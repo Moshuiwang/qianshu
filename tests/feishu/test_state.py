@@ -2,6 +2,8 @@ import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 
+import pytest
+
 from qianshu.feishu import State
 
 
@@ -80,3 +82,31 @@ def test_callback_claims_survive_restart_and_import_prior_decisions(tmp_path, se
         assert not reopened.claim_callback(current)
     finally:
         reopened.close()
+
+
+@pytest.mark.parametrize("close_at", ["before_click", "before_claim", "after_claim", "after_dispatch"])
+def test_closed_approval_cannot_grant_or_reuse_create_claim(tmp_path, settings, close_at):
+    state = State(tmp_path / "private.sqlite", settings)
+    approval, card, record, event = ("<审批占位>", "<卡片占位>", "<记录占位>", "<回调占位>")
+    sent = []
+    try:
+        state.bind(approval, card, record, 200)
+        if close_at == "before_click":
+            state.close_approvals()
+        assert state.claim_callback(event)
+        assert state.decide(approval, card, record, "approve", event, "<点击人占位>", lambda: 150) == (
+            close_at != "before_click"
+        )
+        if close_at == "before_claim":
+            state.close_create_approval(approval, record)
+        expected_claim = 200 if close_at in ("after_claim", "after_dispatch") else None
+        assert state.claim_create(approval, record) == expected_claim
+        assert state.claim_create(approval, record) is None
+        if close_at == "after_claim":
+            state.close_approvals()
+        assert state.dispatch_create(approval, record, sent.append) == (close_at == "after_dispatch")
+        state.close_approvals()
+        assert not state.dispatch_create(approval, record, sent.append)
+        assert sent == ([200] if close_at == "after_dispatch" else [])
+    finally:
+        state.close()

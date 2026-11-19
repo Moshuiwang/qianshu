@@ -34,6 +34,11 @@ _NEW = "新建"
 _PENDING = "待审批"
 _PLATFORM_TZ = timezone(timedelta(hours=8))
 _LIMIT = 8 * 1024 * 1024
+_CONNECT_TIMEOUT = 10
+_READ_TIMEOUT = 30
+_STABILITY_INTERVAL = 5
+_STABILITY_TIMEOUT = 120
+_OFFICIAL_METADATA = frozenset({"_id", "_createdAt", "_updatedAt", "_createdBy", "_owner"})
 _CREATE_HOST = "www.mingdao.com"
 _CREATE_PATH = "/api/Worksheet/AddWorksheetRow"
 _EVIDENCE = (
@@ -262,7 +267,7 @@ class Record:
     record_id: str
     name: str
     status: str
-    revision: int
+    updated_at: datetime
     platform_status: str | int
 
 
@@ -271,48 +276,64 @@ _NO_CELL = object()
 
 
 class Official:
-    """REST 取值路径、查询字段和状态映射由私有登记冻结。"""
+    """明道云 v3 官方接口。读取、日志和删除绑定到建单目标表。"""
 
-    def __init__(self, config, token, client):
-        self.config, self._token, self.client = config, token, client
+    def __init__(self, config, token, app_id, client):
+        require(secret_safe(token) and secret_safe(app_id), "官方接口鉴权配置无效")
+        self.config, self.client = config, client
+        self._headers = {"Authorization": "Bearer " + token, "HAP-Appid": app_id}
         self.origin = https_origin(config["origin"])
         for action in ("read", "search", "tags", "logs", "delete"):
-            spec = config[action]
-            path = spec["path"]
+            path = config[action]["path"]
             bound = action in ("read", "logs", "delete")
             require(path.count("{record_id}") == int(bound)
                     and valid_path(path.replace("{record_id}", "placeholder")), "官方接口路径无效")
-            if action in ("search", "tags"):
-                require(receipt(spec["name_param"]) and isinstance(spec.get("params", {}), dict)
-                        and spec["name_param"] not in spec.get("params", {}), "官方查询配置无效")
-        require(config["read"]["path"].endswith("/rows/{record_id}")
-                and config["search"]["path"] + "/{record_id}" == config["read"]["path"]
-                and config["tags"]["path"].endswith("/rows")
+        list_path = r"/v3/app/worksheets/[A-Za-z0-9_-]+/rows/list"
+        for action in ("search", "tags"):
+            spec = config[action]
+            views = spec["view_ids"]
+            require(re.fullmatch(list_path, spec["path"]) is not None
+                    and receipt(spec["name_control"])
+                    and isinstance(views, list) and bool(views)
+                    and all(receipt(view) for view in views) and len(set(views)) == len(views),
+                    "官方查询配置无效")
+        read_path = config["search"]["path"].removesuffix("/list") + "/{record_id}"
+        require(config["read"]["path"] == read_path
                 and config["tags"]["path"] != config["search"]["path"]
-                and config["logs"]["path"] == config["read"]["path"] + "/logs"
-                and config["delete"]["path"] == config["read"]["path"]
+                and config["logs"]["path"] == read_path + "/logs"
+                and config["delete"]["path"] == read_path
                 and config["delete"]["method"] == "DELETE", "官方记录、日志或删除入口未绑定同一张表")
+        self.page_size = config.get("page_size", 50)
+        self.page_limit = config.get("page_limit", 20)
+        self.log_page_limit = config["logs"].get("page_limit", 50)
+        require(all(type(limit) is int and limit > 0
+                    for limit in (self.page_size, self.page_limit, self.log_page_limit)),
+                "官方分页上限配置无效")
+        require(receipt(config["status_control"])
+                and config["status_control"] not in _OFFICIAL_METADATA
+                and config["search"]["name_control"] not in _OFFICIAL_METADATA
+                and config["status_control"] != config["search"]["name_control"], "官方记录字段配置无效")
         deletion = config["delete"]
         condition = deletion["condition"]
-        require(condition is None or (receipt(condition) and condition != "permanent"
-                and deletion.get("condition_value", "revision") in ("revision", "status")),
-                "官方删除条件配置无效")
-        miss_status = config["read"]["missing_status"]
+        require((condition is None or (receipt(condition) and condition not in ("permanent", "triggerWorkflow")))
+                and deletion.get("condition_value", "status") == "status", "官方删除条件配置无效")
+        read = config["read"]
+        miss_status = read["missing_status"]
         require(type(miss_status) is int and (200 <= miss_status < 300 or miss_status in (404, 410))
-                and config["read"]["missing_key"] and config["read"]["missing_value"] is not None
-                and (config["read"]["missing_key"], config["read"]["missing_value"])
-                != (config["read"]["success_key"], config["read"]["success_value"]),
+                and isinstance(read["missing_key"], list) and bool(read["missing_key"])
+                and read["missing_key"] != ["success"] and read["missing_value"] is not None,
                 "记录不存在信号配置无效")
 
-    def _request(self, action, record_id="", *, params=None, body=None):
+    def _request(self, action, record_id="", *, body=None, timeout=None):
         require(not record_id or uuid_record(record_id), "记录编号格式无效")
         spec = self.config[action]
         url = self.origin + spec["path"].replace("{record_id}", record_id)
-        method = "DELETE" if action == "delete" else "GET"
+        method = {"delete": "DELETE", "search": "POST", "tags": "POST"}.get(action, "GET")
+        options = {} if timeout is None else {"timeout": timeout}
         failed = False
         try:
-            with self.client.stream(method, url, params=params, json=body, follow_redirects=False,
-                                    headers={"Authorization": "Bearer " + self._token}) as response:
+            with self.client.stream(method, url, json=body, follow_redirects=False,
+                                    headers=self._headers, **options) as response:
                 buffer = bytearray()
                 for chunk in response.iter_bytes():
                     buffer.extend(chunk)
@@ -328,85 +349,102 @@ class Official:
                 marker = at(payload, spec["missing_key"])
             except (KeyError, TypeError, IndexError):
                 marker = None
-            if type(marker) is type(spec["missing_value"]) and marker == spec["missing_value"]:
+            if (isinstance(payload, dict) and payload.get("success") is False
+                    and type(marker) is type(spec["missing_value"]) and marker == spec["missing_value"]):
                 return _MISSING
-        require(200 <= status < 300, "官方接口请求失败")
-        marker = at(payload, spec["success_key"])
-        expected = spec["success_value"]
-        require(type(marker) is type(expected) and marker == expected, "官方接口结果未确认")
-        return at(payload, spec["data"])
+        require(200 <= status < 300 and isinstance(payload, dict) and payload.get("success") is True,
+                "官方接口结果未确认")
+        return payload.get("data")
 
-    def read(self, record_id):
-        return self._request("read", record_id)
+    def read(self, record_id, *, budget=None):
+        timeout = None if budget is None else httpx.Timeout(
+            min(_READ_TIMEOUT, budget), connect=min(_CONNECT_TIMEOUT, budget),
+        )
+        return self._request("read", record_id, timeout=timeout)
 
     def cells(self, raw):
-        spec = self.config["record"]
-        values = at(raw, spec["cells"])
-        require(isinstance(values, dict), "官方记录字段未确认")
-        excluded = spec.get("metadata", [])
-        require(isinstance(excluded, list) and all(receipt(key) for key in excluded),
-                "官方记录元数据配置无效")
-        return {key: value for key, value in values.items() if key not in excluded}
+        require(isinstance(raw, dict), "官方记录字段未确认")
+        metadata = self.config.get("record_metadata", [])
+        require(isinstance(metadata, list) and all(receipt(key) for key in metadata), "官方记录元数据配置无效")
+        return {key: value for key, value in raw.items() if key not in _OFFICIAL_METADATA and key not in metadata}
 
     def record(self, raw):
-        spec = self.config["record"]
-        record_id, name, state, revision = (at(raw, spec[key]) for key in ("id", "name", "status", "revision"))
-        require(uuid_record(record_id) and receipt(name) and type(state) in (int, str)
-                and type(revision) is int and revision >= 0, "官方记录标识、状态或版本未确认")
-        return Record(record_id, name, self.config["status_map"][str(state)], revision, state)
+        record_id = raw["_id"]
+        name = raw[self.config["search"]["name_control"]]
+        state = raw[self.config["status_control"]]
+        require(uuid_record(record_id) and receipt(name) and type(state) in (int, str),
+                "官方记录标识或状态未确认")
+        return Record(record_id, name, self.config["status_map"][str(state)],
+                      utc(raw["_updatedAt"], platform=True), state)
 
     def _query(self, action, name):
         spec = self.config[action]
-        params = {**spec.get("params", {}), spec["name_param"]: name}
-        result = self._request(action, params=params)
-        rows = at(result, spec["rows"])
-        require(at(result, spec["has_more"]) is False and isinstance(rows, list), "官方查询结果不完整")
-        named = [(at(row, spec["name"]), row) for row in rows]
-        require(all(receipt(candidate) for candidate, _ in named), "官方查询返回无效名称")
-        return [row for candidate, row in named if candidate == name]
+        control = spec["name_control"]
+        condition = {"type": "condition", "field": control, "operator": "eq", "value": name}
+        matches = []
+        for view in spec["view_ids"]:
+            for page in range(1, self.page_limit + 1):
+                result = self._request(action, body={
+                    "viewId": view, "pageSize": self.page_size, "pageIndex": page,
+                    "filter": {"type": "group", "logic": "AND", "children": [condition]},
+                })
+                rows = result["rows"]
+                require(isinstance(rows, list) and len(rows) <= self.page_size, "官方查询结果不完整")
+                for row in rows:
+                    require(isinstance(row, dict) and receipt(row.get(control)), "官方查询返回无效名称")
+                    if row[control] == name:
+                        matches.append(row)
+                if len(rows) < self.page_size:
+                    break
+            else:
+                raise Stop("官方查询超过分页上限，需人工")
+        return matches
 
     def find(self, name):
-        spec = self.config["search"]
-        ids = [at(row, spec["id"]) for row in self._query("search", name)]
+        ids = [row["_id"] for row in self._query("search", name)]
         require(all(uuid_record(item) for item in ids), "名称查询记录编号未确认")
         return ids
 
     def tag(self, name):
-        spec = self.config["tags"]
         rows = self._query("tags", name)
         require(len(rows) == 1, "用户标签查询未获得唯一同名记录，需人工")
-        record_id = at(rows[0], spec["id"])
+        record_id = rows[0]["_id"]
         require(uuid_record(record_id), "用户标签记录编号未确认")
         return record_id
 
     def history(self, current):
-        spec = self.config["logs"]
         result = self._request("logs", current.record_id)
-        rows = at(result, spec["rows"])
-        require(at(result, spec["has_more"]) is False and at(result, spec["complete"]) is True
-                and isinstance(rows, list) and bool(rows), "状态历史不能证明完整")
-        last_state, last_time = None, None
-        for expected_revision, row in enumerate(rows):
-            revision = at(row, spec["revision"])
-            before, after = at(row, spec["before"]), at(row, spec["after"])
-            before = None if before is None else self.config["status_map"][str(before)]
-            after = self.config["status_map"][str(after)]
-            changed_at = utc(at(row, spec["time"]), platform=True)
-            require(at(row, spec["id"]) == current.record_id and type(revision) is int
-                    and revision == expected_revision and before == last_state
-                    and (last_time is None or changed_at >= last_time), "状态历史不能证明完整")
-            require(after in (_NEW, _PENDING) and (expected_revision or after == _NEW),
-                    "状态历史曾进入待配置或后续状态")
-            last_state, last_time = after, changed_at
-        require(current.revision == len(rows) - 1 and current.status == last_state,
-                "状态历史与当前记录不一致")
+        require(isinstance(result, dict) and result.keys() == {"logs"}
+                and isinstance(rows := result["logs"], list)
+                and 0 < len(rows) < self.log_page_limit, "状态历史不能证明完整")
+        creations = 0
+        for row in rows:
+            require(isinstance(row, dict) and isinstance(row.get("operator"), dict)
+                    and isinstance(content := row.get("content"), dict), "状态历史日志结构无效")
+            kind = content.get("type")
+            changes = content.get("logData")
+            require(type(kind) is int and kind in (1, 2)
+                    and isinstance(changes, list), "状态历史日志结构无效")
+            utc(content.get("_createdAt"), platform=True)
+            creations += kind == 1
+            for change in changes:
+                require(isinstance(change, dict) and receipt(change.get("id"))
+                        and all(isinstance(change.get(key), str)
+                                for key in ("name", "oldValue", "oldText", "newValue", "newText"))
+                        and all(type(change.get(key)) is int for key in ("type", "editType"))
+                        and type(change.get("isDeleted")) is bool, "状态历史字段改动结构无效")
+                if change["id"] == self.config["status_control"]:
+                    require(not change["isDeleted"] and change["newText"] in (_NEW, _PENDING),
+                            "状态历史包含待配置、后续状态或未确认的状态")
+        require(creations == 1, "状态历史未见唯一创建日志")
+        require(current.status == _NEW, "删除前状态须为新建")
 
     def delete(self, current):
-        spec = self.config["delete"]
-        condition = spec["condition"]
-        value = current.revision if spec.get("condition_value", "revision") == "revision" else current.platform_status
-        self._request("delete", current.record_id, params={"permanent": "false"},
-                      body={condition: value} if condition is not None else None)
+        condition = self.config["delete"]["condition"]
+        body = {"triggerWorkflow": False, "permanent": False}
+        if condition is not None:
+            body[condition] = current.platform_status
+        self._request("delete", current.record_id, body=body)
 
 
 def draft_values(draft):
@@ -651,6 +689,44 @@ def compare(expected, raw_cells, config):
     return results, Counter(row["结果"] for row in results)
 
 
+class CreateResponse(http.client.HTTPResponse):
+    """建单回执只接受完整的 HTTP 分块终止符。"""
+
+    def _read_and_discard_trailer(self):
+        remaining = _LIMIT
+        while remaining > 0:
+            line = self.fp.readline(remaining + 1)
+            require(len(line) <= remaining and line.endswith(b"\r\n"), "建单分块响应不完整")
+            if line == b"\r\n":
+                return
+            remaining -= len(line)
+        raise Stop("建单分块响应不完整")
+
+    def _get_chunk_left(self):
+        if self.chunk_left == 0:
+            require(self._safe_read(2) == b"\r\n", "建单分块响应不完整")
+            self.chunk_left = None
+        return super()._get_chunk_left()
+
+
+def read_create_response(response):
+    lengths = response.headers.get_all("Content-Length", [])
+    encodings = response.headers.get_all("Transfer-Encoding", [])
+    require(200 <= response.status < 300, "建单响应未确认")
+    if encodings:
+        require(len(encodings) == 1 and encodings[0].lower() == "chunked", "建单响应消息定界无效")
+        require(response.chunked and not lengths, "建单响应消息定界无效")
+        raw = response.read(_LIMIT + 1)
+        require(len(raw) <= _LIMIT and response.isclosed(), "建单分块响应不完整")
+        return raw
+    require(len(lengths) == 1 and re.fullmatch(r"[0-9]+", lengths[0]), "建单响应长度未确认")
+    expected = int(lengths[0])
+    require(expected <= _LIMIT, "建单响应超出限制")
+    raw = response.read(expected)
+    require(len(raw) == expected, "建单响应长度未确认")
+    return raw
+
+
 class CreateRequest:
     """单跳、预建连，只有一个不可撤销的请求交付点。"""
 
@@ -672,7 +748,9 @@ class CreateRequest:
     @contextmanager
     def prepare(self, body):
         require(not self.started and len(body) <= _LIMIT, "建单请求已尝试或正文过长")
-        connection = self.connect(self.endpoint["host"], timeout=5, context=ssl.create_default_context())
+        connection = self.connect(self.endpoint["host"], timeout=_CONNECT_TIMEOUT,
+                                  context=ssl.create_default_context())
+        connection.response_class = CreateResponse
         connection.set_debuglevel(0)
         try:
             connection.connect()
@@ -683,15 +761,16 @@ class CreateRequest:
             connection.putheader("Content-Type", "application/json; charset=utf-8")
             connection.putheader("Content-Length", str(len(body)))
 
-            def send():
+            def send(check_approval):
                 require(not self.started and connection.sock is not None, "建单传输不可用")
+                check_approval()
                 self.started = True
                 connection.endheaders(body)
 
             def record_id():
+                connection.sock.settimeout(_READ_TIMEOUT)
                 response = connection.getresponse()
-                raw = response.read(_LIMIT + 1)
-                require(200 <= response.status < 300 and len(raw) <= _LIMIT, "建单响应未确认")
+                raw = read_create_response(response)
                 record_id = at(decode(raw), self.spec["response_id"])
                 require(uuid_record(record_id), "建单记录编号未确认")
                 return record_id
@@ -726,23 +805,37 @@ def abandon(ledger, feishu, approval_id, binding, announce, reason):
     announce(f"未建单（{reason}）")
 
 
-def delete_test(api, ledger, record_id, evidence, announce, stop):
-    def current():
-        raw = api.read(record_id)
+def delete_test(api, ledger, record_id, evidence, announce, stop, readback, *, pause, monotonic):
+    def checked_record(raw):
         require(raw is not _MISSING, "删除前记录不存在")
         result = api.record(raw)
-        require((result.record_id, result.name, result.status) == (record_id, ledger.name, _NEW),
-                "删除前名称、记录编号或状态回读不符")
+        require((result.record_id, result.name) == (record_id, ledger.name), "删除前名称或记录编号回读不符")
+        require(result.status in (_NEW, _PENDING), "删除前回读出现待配置、后续状态或未确认的状态")
         return result
 
     try:
         ledger.registered(record_id)
         require_cleanup_notice(evidence)
         announce("开始核验 D15 删除条件")
-        earlier = current()
+        deadline = monotonic() + _STABILITY_TIMEOUT
+        earlier = checked_record(readback)
+        unstable = "政策状态或更新时间未在 120 秒内稳定"
+        while True:
+            require(monotonic() + _STABILITY_INTERVAL <= deadline, unstable)
+            stop_if_interrupted(stop)
+            pause(_STABILITY_INTERVAL)
+            stop_if_interrupted(stop)
+            budget = deadline - monotonic()
+            require(budget > 0, unstable)
+            raw = api.read(record_id, budget=budget)
+            require(monotonic() <= deadline, unstable)
+            observed = checked_record(raw)
+            if observed == earlier:
+                break
+            earlier = observed
         api.history(earlier)
         ledger.append("delete_attempt", record_id)
-        latest = current()
+        latest = checked_record(api.read(record_id))
         require(latest == earlier, "状态历史与最新回读不一致")
         stop_if_interrupted(stop)
         api.delete(latest)
@@ -760,7 +853,7 @@ def delete_test(api, ledger, record_id, evidence, announce, stop):
 
 
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
-              contact, login_check, stop, *, clock=time.time, pause=time.sleep):
+              contact, login_check, stop, *, clock=time.time, pause=time.sleep, monotonic=time.monotonic):
     def announce(text):
         feishu.transport.announce(f"{ledger.name} · {text}\n{contact}")
 
@@ -768,12 +861,18 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
     binding = "create:" + registration_hash
     approval_id = None
 
-    def before_send():
+    def prepare():
         stop_if_interrupted(stop)
         require(not api.find(ledger.name), "已存在同名记录，需人工")
-        login_check()
+
+    def record_attempt():
         stop_if_interrupted(stop)
         ledger.append("create_attempt")
+
+    def check_before_transport(check_approval):
+        login_check()
+        stop_if_interrupted(stop)
+        check_approval()
 
     try:
         while not feishu.approval_connection_ready():
@@ -789,11 +888,11 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         if status != "approve":
             raise Stop("群卡片已驳回" if status == "reject" else "审批到期或断线")
         with create.prepare(payload) as (transmit, read_id):
-            def send():
-                stop_if_interrupted(stop)
-                transmit()
+            def send(check_approval):
+                transmit(lambda: check_before_transport(check_approval))
 
-            require(feishu.send_first_create(approval_id, binding, before_send, send), "建单审批已关闭")
+            require(feishu.send_first_create(approval_id, binding, prepare, record_attempt, send),
+                    "建单审批已关闭")
             record_id = read_id()
         ledger.append("created", record_id)
     except (Exception, KeyboardInterrupt) as error:
@@ -817,7 +916,7 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
     try:
         stop_if_interrupted(stop)
         raw = api.read(record_id)
-        require(raw is not _MISSING and api.record(raw).record_id == record_id, "建单回读记录未确认")
+        require(isinstance(raw, dict) and raw.get("_id") == record_id, "建单回读记录未确认")
         observed = api.cells(raw)
         rows, counts = compare(controls, observed, config)
         exclusive(ledger.directory / f"create-readback-{registration_hash}.json", rows)
@@ -830,7 +929,7 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         if isinstance(error, KeyboardInterrupt):
             raise
         raise Stop("官方回读未获确认") from None
-    delete_test(api, ledger, record_id, evidence, announce, stop)
+    delete_test(api, ledger, record_id, evidence, announce, stop, raw, pause=pause, monotonic=monotonic)
     return not (counts["不一致"] or counts["缺失"])
 
 
@@ -859,15 +958,22 @@ def run(args, directory, *, clock=time.time):
     token = extract_token(decode(login_data), config["create"]["session_cookie"])
     with args.env_file.open(encoding="utf-8-sig") as stream:
         secrets = dotenv_values(stream=stream, interpolate=False)
-    official_key = config["official"]["token_key"]
-    require(isinstance(official_key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", official_key),
-            "官方令牌配置键无效")
-    official_token = secrets.get(official_key)
-    require(secret_safe(official_token), "官方接口令牌缺失或格式无效")
+    official = config["official"]
+
+    def official_setting(key):
+        name = official[key]
+        require(isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name),
+                "官方接口环境配置键无效")
+        value = secrets.get(name)
+        require(secret_safe(value), "官方接口鉴权配置无效")
+        return value
+
+    official_token = official_setting("token_key")
+    official_app_id = official_setting("app_id_key")
     contact = mention(config["configurator"]["id"], config["configurator"]["label"])
     summary = card_summary(values, default_mutual_exclusion=default_mutual_exclusion)
     tracked = [summary, contact, args.registration, *(spec["label"] for spec in config["fields"].values())]
-    require(not any(secret in item for item in tracked for secret in (token, official_token)),
+    require(not any(secret in item for item in tracked for secret in (token, official_token, official_app_id)),
             "展示字段与凭据冲突")
 
     def login_check():
@@ -878,19 +984,22 @@ def run(args, directory, *, clock=time.time):
 
     create = CreateRequest(config["create"], evidence, token)
     worksheet = config["create"]["identifiers"]["worksheetId"]
-    require(config["official"]["search"]["path"].split("/")[-2:-1] == [worksheet],
+    require(official["search"]["path"] == f"/v3/app/worksheets/{worksheet}/rows/list",
             "官方读写与建单目标表不一致")
+    require(config["fields"].get(official["search"]["name_control"], {}).get("draft") == "policy_name",
+            "同名查询字段与建单政策名称不一致")
     settings = load_settings(args.env_file)
     with ledger_open(directory, args.registration, values["policy_name"]) as ledger:
         ledger.check_available()
-        with httpx.Client(timeout=5, follow_redirects=False, trust_env=False) as client:
-            api = Official(config["official"], official_token, client)
+        timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
+        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+            api = Official(official, official_token, official_app_id, client)
             template_id = config["template"]["row_id"]
             require(uuid_record(template_id), "模板记录编号须为 UUID")
             template = api.read(template_id)
-            require(template is not _MISSING and api.record(template).record_id == template_id,
+            require(isinstance(template, dict) and template.get("_id") == template_id,
                     "模板记录回读未确认")
-            require(not (set(config["official"]["record"].get("metadata", [])) & config["fields"].keys()),
+            require(not ((_OFFICIAL_METADATA | set(official.get("record_metadata", []))) & config["fields"].keys()),
                     "官方记录元数据与控件配置重叠")
             cells = api.cells(template)
             registration_hash = digest(args.registration.encode())
