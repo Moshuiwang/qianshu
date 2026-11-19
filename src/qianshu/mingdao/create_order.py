@@ -42,12 +42,14 @@ _OFFICIAL_METADATA = frozenset({"_id", "_createdAt", "_updatedAt", "_createdBy",
 _CREATE_HOST = "www.mingdao.com"
 _CREATE_PATH = "/api/Worksheet/AddWorksheetRow"
 _EVIDENCE = (
-    "owner_approval", "readiness_confirmation", "approver_notice", "configurator_notice",
+    "owner_approval", "readiness_confirmation",
     "trace_decision", "comparison_report", "same_country_count_evidence", "owner_login_confirmation",
 )
 _VARIABLE = (
-    "policy_name", "start_date", "end_date", "recharge_days", "gift_days", "user_tags", "packages",
+    "policy_name", "start_date", "end_date", "recharge_days", "gift_days",
 )
+_TEMPLATE_CHECKS = ("user_tags", "packages", "approval_url", "company", "maintain_mutual_exclusion_group")
+_LOG_PAGE_SIZE = 50
 _DRAFT_FIELDS = {field.name for field in fields(PolicyDraft)}
 _SELECT = {9, 10, 11}
 _ARRAY = _SELECT | {26, 29, 34}
@@ -207,16 +209,38 @@ def receipt(value):
     return isinstance(value, str) and bool(value.strip())
 
 
-def require_cleanup_notice(evidence):
-    require(all(receipt(evidence.get(key)) for key in ("approver_notice", "configurator_notice")),
-            "清理前通知留痕缺失")
-    require(evidence["approver_notice"] != evidence["configurator_notice"], "清理通知须留存两份回执")
+def notice_recipients(config):
+    rows = config.get("notice_recipients") if isinstance(config, dict) else None
+    require(isinstance(rows, list) and bool(rows) and all(
+        isinstance(row, dict) and row.keys() == {"key", "label"}
+        and receipt(row["key"]) and receipt(row["label"]) for row in rows
+    ), "通知名单配置无效")
+    recipients = {row["key"]: row["label"] for row in rows}
+    require(len(recipients) == len(rows), "通知名单配置无效")
+    return recipients
 
 
-def preflight(evidence, config_data, draft_data, login_data, clock):
+def notice_summary(recipients, notices):
+    return [{"通知对象": label, "已回执": isinstance(notices, dict) and receipt(notices.get(key))}
+            for key, label in recipients.items()]
+
+
+def require_cleanup_notice(recipients, notices):
+    require(isinstance(notices, dict), "通知回执登记无效")
+    missing = [key for key in recipients if not receipt(notices.get(key))]
+    require(not missing, "通知回执缺失：" + compact(missing))
+    require(not (notices.keys() - recipients.keys()), "通知回执含未登记对象")
+    require(len({value.strip() for value in notices.values()}) == len(recipients), "通知回执重复")
+
+
+def no_log_continuation(result):
+    return result.get("flag", False) is False and result.get("lastMark") in (None, "")
+
+
+def preflight(evidence, recipients, config_data, draft_data, login_data, clock):
     require(evidence.get("is_test") is True, "登记须明确授权测试单")
     require(all(receipt(evidence.get(key)) for key in _EVIDENCE), "当次前置留痕不完整")
-    require_cleanup_notice(evidence)
+    require_cleanup_notice(recipients, evidence.get("notices", {}))
     reviews = evidence.get("two_reviews")
     require(isinstance(reviews, dict)
             and all(receipt(reviews.get(key)) for key in ("internal", "external"))
@@ -305,9 +329,10 @@ class Official:
                 and config["delete"]["method"] == "DELETE", "官方记录、日志或删除入口未绑定同一张表")
         self.page_size = config.get("page_size", 50)
         self.page_limit = config.get("page_limit", 20)
-        self.log_page_limit = config["logs"].get("page_limit", 50)
+        self.log_page_limit = config["logs"].get("page_limit", _LOG_PAGE_SIZE)
         require(all(type(limit) is int and limit > 0
-                    for limit in (self.page_size, self.page_limit, self.log_page_limit)),
+                    for limit in (self.page_size, self.page_limit, self.log_page_limit))
+                and self.log_page_limit <= _LOG_PAGE_SIZE,
                 "官方分页上限配置无效")
         require(receipt(config["status_control"])
                 and config["status_control"] not in _OFFICIAL_METADATA
@@ -324,7 +349,7 @@ class Official:
                 and read["missing_key"] != ["success"] and read["missing_value"] is not None,
                 "记录不存在信号配置无效")
 
-    def _request(self, action, record_id="", *, body=None, timeout=None):
+    def _request(self, action, record_id="", *, body=None, params=None, timeout=None):
         require(not record_id or uuid_record(record_id), "记录编号格式无效")
         spec = self.config[action]
         url = self.origin + spec["path"].replace("{record_id}", record_id)
@@ -332,7 +357,7 @@ class Official:
         options = {} if timeout is None else {"timeout": timeout}
         failed = False
         try:
-            with self.client.stream(method, url, json=body, follow_redirects=False,
+            with self.client.stream(method, url, json=body, params=params, follow_redirects=False,
                                     headers=self._headers, **options) as response:
                 buffer = bytearray()
                 for chunk in response.iter_bytes():
@@ -354,6 +379,8 @@ class Official:
                 return _MISSING
         require(200 <= status < 300 and isinstance(payload, dict) and payload.get("success") is True,
                 "官方接口结果未确认")
+        if action == "logs":
+            require(no_log_continuation(payload), "状态历史不能证明完整")
         return payload.get("data")
 
     def read(self, record_id, *, budget=None):
@@ -362,11 +389,10 @@ class Official:
         )
         return self._request("read", record_id, timeout=timeout)
 
-    def cells(self, raw):
-        require(isinstance(raw, dict), "官方记录字段未确认")
-        metadata = self.config.get("record_metadata", [])
-        require(isinstance(metadata, list) and all(receipt(key) for key in metadata), "官方记录元数据配置无效")
-        return {key: value for key, value in raw.items() if key not in _OFFICIAL_METADATA and key not in metadata}
+    def detail(self, raw, record_id):
+        require(isinstance(raw, dict) and uuid_record(raw.get("_id")) and raw["_id"] == record_id,
+                "官方详情记录编号未确认")
+        return raw
 
     def record(self, raw):
         record_id = raw["_id"]
@@ -406,38 +432,36 @@ class Official:
         return ids
 
     def tag(self, name):
-        rows = self._query("tags", name)
-        require(len(rows) == 1, "用户标签查询未获得唯一同名记录，需人工")
-        record_id = rows[0]["_id"]
-        require(uuid_record(record_id), "用户标签记录编号未确认")
-        return record_id
+        ids = [row.get("_id") for row in self._query("tags", name)]
+        require(all(uuid_record(record_id) for record_id in ids), "用户标签记录编号未确认")
+        unique_ids = {record_id.lower() for record_id in ids}
+        require(len(unique_ids) == 1, "用户标签查询未获得唯一同名记录，需人工")
+        return next(iter(unique_ids))
 
     def history(self, current):
-        result = self._request("logs", current.record_id)
-        require(isinstance(result, dict) and result.keys() == {"logs"}
-                and isinstance(rows := result["logs"], list)
+        result = self._request("logs", current.record_id, params={"pageIndex": 1, "pageSize": _LOG_PAGE_SIZE})
+        require(isinstance(result, dict) and result.keys() <= {"logs", "flag", "lastMark"}
+                and no_log_continuation(result) and isinstance(rows := result.get("logs"), list)
                 and 0 < len(rows) < self.log_page_limit, "状态历史不能证明完整")
-        creations = 0
         for row in rows:
             require(isinstance(row, dict) and isinstance(row.get("operator"), dict)
                     and isinstance(content := row.get("content"), dict), "状态历史日志结构无效")
             kind = content.get("type")
             changes = content.get("logData")
-            require(type(kind) is int and kind in (1, 2)
+            require(type(kind) is int
                     and isinstance(changes, list), "状态历史日志结构无效")
             utc(content.get("_createdAt"), platform=True)
-            creations += kind == 1
             for change in changes:
                 require(isinstance(change, dict) and receipt(change.get("id"))
-                        and all(isinstance(change.get(key), str)
-                                for key in ("name", "oldValue", "oldText", "newValue", "newText"))
+                        and isinstance(change.get("name"), str)
+                        and all(key in change and (change[key] is None or isinstance(change[key], str))
+                                for key in ("oldValue", "oldText", "newValue", "newText"))
                         and all(type(change.get(key)) is int for key in ("type", "editType"))
                         and type(change.get("isDeleted")) is bool, "状态历史字段改动结构无效")
                 if change["id"] == self.config["status_control"]:
-                    require(not change["isDeleted"] and change["newText"] in (_NEW, _PENDING),
+                    require(not change["isDeleted"] and isinstance(change["newValue"], str)
+                            and change["newText"] in (_NEW, _PENDING),
                             "状态历史包含待配置、后续状态或未确认的状态")
-        require(creations == 1, "状态历史未见唯一创建日志")
-        require(current.status == _NEW, "删除前状态须为新建")
 
     def delete(self, current):
         condition = self.config["delete"]["condition"]
@@ -455,7 +479,7 @@ def draft_values(draft):
         require(field.get("uncertainty") is None, f"草稿字段 {key} 待确认，需人工")
         if field["value"] is not None:
             values[key] = field["value"]
-    require(all(key in values for key in _VARIABLE), "草稿缺少可变字段")
+    require(all(key in values for key in (*_VARIABLE, "user_tags", "packages")), "草稿缺少必填字段")
     name = values["policy_name"]
     require(receipt(name) and len(name) > len(_PREFIX) and not any(c in name for c in "\r\n<>"),
             "草稿政策名称格式无效")
@@ -588,7 +612,8 @@ def cell_schema(fields_config, skip):
             "字段类型或回读跳过配置无效")
     draft_controls = {}
     for control, spec in fields_config.items():
-        require(receipt(control) and receipt(spec["label"]) and type(spec["type"]) is int and spec["type"] > 0,
+        require(receipt(control) and control not in _OFFICIAL_METADATA
+                and receipt(spec["label"]) and type(spec["type"]) is int and spec["type"] > 0,
                 "字段类型配置无效")
         if spec["type"] == 34:
             children = spec["children"]
@@ -603,13 +628,12 @@ def cell_schema(fields_config, skip):
         if key is not None:
             require(key in _DRAFT_FIELDS and key not in draft_controls, "草稿与模板字段映射不唯一")
             draft_controls[key] = control
-    require(set(_VARIABLE) | {"approval_url", "company", "maintain_mutual_exclusion_group"}
-            <= draft_controls.keys(), "草稿与模板字段映射不全")
-    require(all(draft_controls[key] not in skip for key in (*_VARIABLE, "approval_url")),
+    require(set(_VARIABLE + _TEMPLATE_CHECKS) <= draft_controls.keys(), "草稿与模板字段映射不全")
+    require(all(draft_controls[key] not in skip for key in (*_VARIABLE, "approval_url", "user_tags", "packages")),
             "不可跳过建单关键字段的回读")
     expected_types = {"user_tags": {29}, "packages": {34}}
     require(all(fields_config[draft_controls[key]]["type"] not in _ARRAY
-                for key in (*_VARIABLE[:5], "approval_url")), "草稿标量字段的控件类型无效")
+                for key in (*_VARIABLE, "approval_url")), "草稿标量字段的控件类型无效")
     require(all(fields_config[draft_controls[key]]["type"] in kinds
                 for key, kinds in expected_types.items()), "关键字段的控件类型无效")
     return draft_controls
@@ -627,43 +651,74 @@ def draft_cell(value, spec):
     return encode_cell(value, spec)
 
 
+def fixed_cells(config, schema, draft_controls):
+    fixed = config.get("fixed")
+    official = config["official"]
+    status_control = official["status_control"]
+    protected = {draft_controls[key] for key in (*_VARIABLE, "approval_url")}
+    require(isinstance(fixed, dict) and status_control in fixed and fixed.keys() <= schema.keys()
+            and not (fixed.keys() & protected), "固定字段配置无效")
+    require(schema[status_control]["type"] in _SELECT, "固定政策状态配置无效")
+    encoded = {control: encode_cell(value, schema[control]) for control, value in fixed.items()}
+    state = unpack_array(encoded[status_control])
+    status_map = official["status_map"]
+    require(len(state) == 1 and status_map.get(encoded[status_control], status_map.get(state[0])) == _NEW,
+            "固定政策状态须为新建")
+    applicant = config.get("applicant_control")
+    require(receipt(applicant) and applicant in encoded and schema[applicant]["type"] == 26
+            and len(unpack_array(encoded[applicant])) == 1, "固定申请人须为单个成员")
+    return encoded
+
+
 def assemble(values, template_cells, config, resolve_tag, *, is_test):
     schema = config["fields"]
     draft_controls = cell_schema(schema, config["readback_skip"])
     require(is_test is True, "正式单不得照抄任务审批链接，需人工")
-    require(isinstance(template_cells, dict) and template_cells.keys() == schema.keys(),
-            "模板字段不全或存在未配置类型的字段")
+    fixed = fixed_cells(config, schema, draft_controls)
+    require(isinstance(template_cells, dict) and schema.keys() - fixed.keys() <= template_cells.keys(),
+            "模板字段不全")
     approval_link = template_cells[draft_controls["approval_url"]]
     require(receipt(approval_link) and urlsplit(approval_link).scheme in ("http", "https")
             and bool(urlsplit(approval_link).hostname), "模板任务审批链接缺失或无效")
     country = config["template"]["country"]
     country_control = country["control"]
     require(encode_cell(country["value"], schema[country_control])
-            == encode_cell(template_cells[country_control], schema[country_control]),
+            == encode_cell(template_cells.get(country_control), schema[country_control]),
             "模板国家与登记不一致")
     require(encode_cell(country["value"], schema[country_control]) not in ("", "[]")
-            and country_control not in (draft_controls[key] for key in _VARIABLE),
+            and country_control not in (draft_controls[key] for key in _VARIABLE)
+            and (country_control not in fixed
+                 or fixed[country_control] == encode_cell(country["value"], schema[country_control])),
             "模板国家绑定无效")
 
     package_control = draft_controls["packages"]
-    require(package_names(subtable_rows(template_cells[package_control]), schema[package_control])
-            == values["packages"], "节目包与模板不同，需人工")
-    for key in values.keys() - set(_VARIABLE):
+    if package_control not in fixed:
+        require(package_names(subtable_rows(template_cells[package_control]), schema[package_control])
+                == values["packages"], "节目包与模板不同，需人工")
+    for key in values.keys() - set((*_VARIABLE, "packages", "user_tags")):
         control = draft_controls.get(key)
         require(control is not None, f"草稿字段 {key} 无法核对模板，需人工")
+        if control in fixed:
+            continue
         spec = schema[control]
         require(equivalent(draft_cell(values[key], spec), encode_cell(template_cells[control], spec), spec),
                 f"字段 {spec['label']} 与模板不同，需人工")
+    tag_control = draft_controls["user_tags"]
+    if tag_control not in fixed:
+        spec = schema[tag_control]
+        requested = encode_cell([resolve_tag(tag) for tag in values["user_tags"]], spec)
+        require(equivalent(requested, encode_cell(template_cells[tag_control], spec), spec),
+                "用户标签与模板不同，需人工")
 
     controls, summary = [], []
     for control, spec in schema.items():
         key = spec.get("draft")
-        from_draft = key in _VARIABLE and key != "packages"
-        source = "草稿" if from_draft else "模板"
-        value = values[key] if from_draft else template_cells[control]
-        if key == "user_tags":
-            value = [resolve_tag(tag) for tag in value]
-        encoded = encode_cell(value, spec)
+        if control in fixed:
+            source, encoded = "固定值", fixed[control]
+        elif key in _VARIABLE:
+            source, encoded = "草稿", encode_cell(values[key], spec)
+        else:
+            source, encoded = "模板", encode_cell(template_cells[control], spec)
         controls.append({"controlId": control, "type": spec["type"], "value": encoded})
         summary.append({"字段名": spec["label"], "类型": spec["type"], "来源": source,
                         "值指纹": digest(encoded.encode())[:12]})
@@ -671,7 +726,7 @@ def assemble(values, template_cells, config, resolve_tag, *, is_test):
 
 
 def compare(expected, raw_cells, config):
-    results = []
+    results, differences = [], []
     for control in expected:
         key = control["controlId"]
         field = config["fields"][key]
@@ -686,7 +741,9 @@ def compare(expected, raw_cells, config):
                 matches = False
             result = "一致" if matches else "不一致"
         results.append({"字段名": field["label"], "结果": result})
-    return results, Counter(row["结果"] for row in results)
+        if result == "不一致":
+            differences.append({"字段名": field["label"], "类型": field["type"]})
+    return {"字段比对": results, "可能由工作流回填": differences}, Counter(row["结果"] for row in results)
 
 
 class CreateResponse(http.client.HTTPResponse):
@@ -805,17 +862,17 @@ def abandon(ledger, feishu, approval_id, binding, announce, reason):
     announce(f"未建单（{reason}）")
 
 
-def delete_test(api, ledger, record_id, evidence, announce, stop, readback, *, pause, monotonic):
+def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, readback, *, pause, monotonic):
     def checked_record(raw):
         require(raw is not _MISSING, "删除前记录不存在")
-        result = api.record(raw)
+        result = api.record(api.detail(raw, record_id))
         require((result.record_id, result.name) == (record_id, ledger.name), "删除前名称或记录编号回读不符")
-        require(result.status in (_NEW, _PENDING), "删除前回读出现待配置、后续状态或未确认的状态")
+        require(result.status == _NEW, "删除前状态须为新建")
         return result
 
     try:
         ledger.registered(record_id)
-        require_cleanup_notice(evidence)
+        require_cleanup_notice(recipients, evidence.get("notices", {}))
         announce("开始核验 D15 删除条件")
         deadline = monotonic() + _STABILITY_TIMEOUT
         earlier = checked_record(readback)
@@ -916,10 +973,9 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
     try:
         stop_if_interrupted(stop)
         raw = api.read(record_id)
-        require(isinstance(raw, dict) and raw.get("_id") == record_id, "建单回读记录未确认")
-        observed = api.cells(raw)
-        rows, counts = compare(controls, observed, config)
-        exclusive(ledger.directory / f"create-readback-{registration_hash}.json", rows)
+        observed = api.detail(raw, record_id)
+        report, counts = compare(controls, observed, config)
+        exclusive(ledger.directory / f"create-readback-{registration_hash}.json", report)
         ledger.append("readback_compared", record_id, counts=dict(counts))
         announce(f"官方回读 一致 {counts['一致']} / 不一致 {counts['不一致']} / "
                  f"缺失 {counts['缺失']} / 跳过 {counts['跳过']}")
@@ -929,7 +985,8 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         if isinstance(error, KeyboardInterrupt):
             raise
         raise Stop("官方回读未获确认") from None
-    delete_test(api, ledger, record_id, evidence, announce, stop, raw, pause=pause, monotonic=monotonic)
+    delete_test(api, ledger, record_id, notice_recipients(config), evidence, announce, stop, raw,
+                pause=pause, monotonic=monotonic)
     return not (counts["不一致"] or counts["缺失"])
 
 
@@ -948,7 +1005,19 @@ def run(args, directory, *, clock=time.time):
     login_data = private_bytes(login_path)
     config = decode(config_data)
     evidence = decode(private_bytes(directory / "create-authorizations.json"))[args.registration]
-    window = preflight(evidence, config_data, draft_data, login_data, clock)
+    recipients = notice_recipients(config)
+    notices = notice_summary(recipients, evidence.get("notices"))
+    registration_hash = digest(args.registration.encode())
+
+    def write_preflight_failure(error):
+        exclusive(directory / f"create-preflight-{registration_hash}-{time.time_ns()}.json",
+                  {"结果": "未建单", "原因": str(error), "通知回执": notices})
+
+    try:
+        window = preflight(evidence, recipients, config_data, draft_data, login_data, clock)
+    except Stop as error:
+        write_preflight_failure(error)
+        raise
     values = draft_values(decode(draft_data))
     mutex = "maintain_mutual_exclusion_group"
     default_mutual_exclusion = mutex not in values
@@ -996,24 +1065,18 @@ def run(args, directory, *, clock=time.time):
             api = Official(official, official_token, official_app_id, client)
             template_id = config["template"]["row_id"]
             require(uuid_record(template_id), "模板记录编号须为 UUID")
-            template = api.read(template_id)
-            require(isinstance(template, dict) and template.get("_id") == template_id,
-                    "模板记录回读未确认")
-            require(not ((_OFFICIAL_METADATA | set(official.get("record_metadata", []))) & config["fields"].keys()),
-                    "官方记录元数据与控件配置重叠")
-            cells = api.cells(template)
-            registration_hash = digest(args.registration.encode())
+            cells = api.detail(api.read(template_id), template_id)
             try:
                 controls, fields_summary = assemble(values, cells, config, api.tag, is_test=evidence["is_test"])
             except Stop as error:
-                exclusive(directory / f"create-preflight-{registration_hash}-{time.time_ns()}.json",
-                          {"结果": "未建单", "原因": str(error)})
+                write_preflight_failure(error)
                 raise
             payload = create.payload(controls)
             require(window.contains(clock()), "验收窗口已关闭")
             ledger.reserve()
             try:
-                exclusive(directory / f"create-fields-{registration_hash}.json", fields_summary)
+                exclusive(directory / f"create-fields-{registration_hash}.json",
+                          {"字段": fields_summary, "通知回执": notices})
                 service = FeishuService(settings, window, directory / "create-approvals.sqlite",
                                         process=None, clock=clock)
             except (Exception, KeyboardInterrupt):

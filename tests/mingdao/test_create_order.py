@@ -3,6 +3,7 @@ import json
 import logging
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+from email.message import Message
 from functools import partial
 from io import BytesIO
 from threading import Event, Thread, current_thread
@@ -23,7 +24,8 @@ def case(tmp_path):
     ids = {key: str(uuid4()) for key in (
         "template", "created", "tag", "option", "member", "package", "gift_package",
         "worksheetId", "appId", "viewId", "projectId", "tag_sheet", "registration",
-        "additional_view", "tag_view", "tag_name", "status", "official_app",
+        "additional_view", "tag_view", "tag_name", "official_app",
+        "new_status", "pending_status", "configuring_status", "configured_status",
     )}
     fields = {}
     control = {}
@@ -50,12 +52,13 @@ def case(tmp_path):
     field("maintain_mutual_exclusion_group", 11, "互斥组",
           draft_values={order.compact("是"): [ids["option"]], order.compact("否"): [str(uuid4())]})
     field("country", 2, "国家")
-    field("member", 26, "成员")
+    field("member", 26, "申请人")
+    field("status", 11, "政策状态")
     field("generated", 2, "回填字段")
 
     template = {
         "policy_name": "合成模板", "start_date": "2026-11-21", "end_date": "2026-12-01",
-        "recharge_days": "1", "gift_days": "2", "user_tags": [],
+        "recharge_days": "1", "gift_days": "2", "user_tags": [{"rowid": ids["tag"]}],
         "packages": [{
             child["current"]: [{"rowid": ids["package"], "name": "合成当前包"}],
             child["gift"]: [{"rowid": ids["gift_package"], "name": "合成赠送包"}],
@@ -63,7 +66,7 @@ def case(tmp_path):
         }],
         "approval_url": "https://placeholder.invalid/approval",
         "company": "合成公司", "maintain_mutual_exclusion_group": order.compact([ids["option"]]),
-        "country": "合成国家", "member": [{"accountId": ids["member"], "name": "合成人员"}],
+        "country": "合成国家", "member": [{"accountId": str(uuid4()), "name": "占位成员"}],
         "generated": "合成旧值",
     }
     values = {"policy_name": "【测试】合成单", "start_date": "2026-12-01", "end_date": "2026-12-31",
@@ -72,18 +75,24 @@ def case(tmp_path):
               "packages": [{"current_package": "合成当前包", "gift_package": "合成赠送包"}]}
     endpoint = {"host": order._CREATE_HOST, "method": "POST", "path": order._CREATE_PATH}
     rows_path = f"/v3/app/worksheets/{ids['worksheetId']}/rows"
+    statuses = {index: order.compact([ids[key]]) for index, key in enumerate(
+        ("new_status", "pending_status", "configuring_status", "configured_status"), start=1,
+    )}
 
     config = {
         "configurator": {"id": str(uuid4()), "label": "合成负责人"},
+        "notice_recipients": [{"key": "placeholder_owner", "label": "占位通知对象甲"}],
         "fields": fields, "readback_skip": [control["generated"]],
+        "applicant_control": control["member"],
+        "fixed": {control["status"]: [ids["new_status"]], control["member"]: [ids["member"]]},
         "template": {"row_id": ids["template"], "country": {"control": control["country"], "value": "合成国家"}},
         "create": {"endpoint": endpoint.copy(), "session_cookie": "placeholder_session", "response_id": ["id"],
                    "identifiers": {key: ids[key] for key in ("worksheetId", "appId", "viewId", "projectId")}},
         "official": {
             "origin": "https://placeholder.invalid", "token_key": "PLACEHOLDER_OFFICIAL_TOKEN",
             "app_id_key": "PLACEHOLDER_OFFICIAL_APP",
-            "status_control": ids["status"], "record_metadata": [ids["status"]],
-            "status_map": {"1": "新建", "2": "待审批", "3": "待配置", "4": "配置完成"},
+            "status_control": control["status"],
+            "status_map": dict(zip(statuses.values(), ("新建", "待审批", "待配置", "配置完成"))),
             "read": {"path": rows_path + "/{record_id}", "missing_status": 404,
                      "missing_key": ["error_code"], "missing_value": 12345},
             "search": {"path": rows_path + "/list", "name_control": control["policy_name"],
@@ -98,12 +107,13 @@ def case(tmp_path):
     window = Window(now - timedelta(minutes=1), now + timedelta(minutes=1))
     evidence = {key: f"占位回执 {index}" for index, key in enumerate(order._EVIDENCE)}
     evidence.update(is_test=True, create_endpoint=endpoint.copy(),
+                    notices={"placeholder_owner": "占位免通知回执"},
                     window={"start": window.start.isoformat(), "end": window.end.isoformat()},
                     two_reviews={"internal": "占位内审", "external": "占位外审"})
     private = tmp_path / ".private"
     private.mkdir(mode=0o700)
     return SimpleNamespace(
-        ids=ids, control=control, child=child, values=values, config=config, evidence=evidence,
+        ids=ids, control=control, child=child, values=values, config=config, evidence=evidence, statuses=statuses,
         cells={control[key]: value for key, value in template.items()}, private=private, window=window,
         session_token="placeholder-sensitive-" + uuid4().hex,
         official_token="placeholder-sensitive-" + uuid4().hex,
@@ -114,16 +124,26 @@ def assemble(case):
     return order.assemble(case.values, case.cells, case.config, lambda _: case.ids["tag"], is_test=True)
 
 
+def add_notice_recipients(case):
+    for suffix, label in (("b", "占位通知对象乙"), ("c", "占位通知对象丙")):
+        key = f"placeholder_{suffix}"
+        case.config["notice_recipients"].append({"key": key, "label": label})
+        case.evidence["notices"][key] = f"占位回执 {suffix}"
+
+
 def test_assemble_values_and_legacy_cells(case):
+    case.cells.update({"_id": case.ids["template"], "_owner": {}, "_createdBy": {},
+                       "_createdAt": "", "_updatedAt": "", str(uuid4()): "占位自动计算值"})
     controls, summary = assemble(case)
     fields = {row["controlId"]: row["value"] for row in controls}
-    assert fields.keys() == case.cells.keys()
+    assert fields.keys() == case.config["fields"].keys()
     assert all(isinstance(value, str) for value in fields.values())
     for key in ("policy_name", "start_date", "end_date", "recharge_days", "gift_days"):
         assert fields[case.control[key]] == str(case.values[key])
     assert json.loads(fields[case.control["user_tags"]]) == [{"sid": case.ids["tag"]}]
     assert json.loads(fields[case.control["maintain_mutual_exclusion_group"]]) == [case.ids["option"]]
     assert json.loads(fields[case.control["member"]]) == [{"accountId": case.ids["member"]}]
+    assert json.loads(fields[case.control["status"]]) == [case.ids["new_status"]]
     assert json.loads(fields[case.control["packages"]]) == [[
         {"controlId": case.child["current"], "value": order.compact([{"sid": case.ids["package"]}])},
         {"controlId": case.child["gift"], "value": order.compact([{"sid": case.ids["gift_package"]}])},
@@ -131,7 +151,8 @@ def test_assemble_values_and_legacy_cells(case):
     ]]
     for key in ("approval_url", "company", "country", "generated"):
         assert fields[case.control[key]] == case.cells[case.control[key]]
-    assert [row["来源"] for row in summary].count("草稿") == 6
+    assert [row["来源"] for row in summary].count("草稿") == 5
+    assert [row["来源"] for row in summary].count("固定值") == 2
     assert all(row.keys() == {"字段名", "类型", "来源", "值指纹"}
                and len(row["值指纹"]) == 12 for row in summary)
     assert order.encode_cell([case.ids["option"]], {"type": 9}) == order.compact([case.ids["option"]])
@@ -139,7 +160,7 @@ def test_assemble_values_and_legacy_cells(case):
 
 @pytest.mark.parametrize(("failure", "reason"), [
     ("conflict", "互斥组"), ("package", "节目包与模板不同"), ("missing", "模板字段不全"),
-    ("type", "未配置类型"), ("formal", "正式单不得照抄任务审批链接"),
+    ("formal", "正式单不得照抄任务审批链接"),
 ])
 def test_assembly_stops(case, failure, reason):
     if failure == "conflict":
@@ -148,12 +169,47 @@ def test_assembly_stops(case, failure, reason):
         case.values["packages"][0]["gift_package"] = "合成替换包"
     if failure == "missing":
         del case.cells[case.control["country"]]
-    if failure == "type":
-        del case.config["fields"][case.control["generated"]]
-        case.config["readback_skip"] = []
     with pytest.raises(order.Stop, match=reason):
         order.assemble(case.values, case.cells, case.config, lambda _: pytest.fail("提前查标签"),
                        is_test=failure != "formal")
+
+
+@pytest.mark.parametrize("field", ["policy_name", "start_date", "end_date", "recharge_days",
+                                   "gift_days", "approval_url", "unknown"])
+def test_fixed_fields_reject_overlaps_and_unconfigured_controls(case, field):
+    case.config["fixed"][case.control.get(field, str(uuid4()))] = "占位固定值"
+    with pytest.raises(order.Stop, match="固定字段配置无效"):
+        assemble(case)
+
+
+def test_fixed_field_can_replace_conflicting_or_missing_template_value(case):
+    country = case.control["country"]
+    company = case.control["company"]
+    del case.cells[company]
+    case.config["fixed"][company] = "占位固定公司"
+    assert "company" in case.values
+    controls, _ = assemble(case)
+    assert {row["controlId"]: row["value"] for row in controls}[company] == "占位固定公司"
+    case.config["fixed"][country] = "占位其他国家"
+    with pytest.raises(order.Stop, match="模板国家绑定无效"):
+        assemble(case)
+
+
+@pytest.mark.parametrize(("field", "reason"), [("status", "固定字段配置无效"), ("member", "固定申请人")])
+def test_fixed_fields_require_new_status_and_applicant(case, field, reason):
+    del case.config["fixed"][case.control[field]]
+    with pytest.raises(order.Stop, match=reason):
+        assemble(case)
+    if field == "status":
+        case.config["fixed"][case.control["status"]] = [case.ids["pending_status"]]
+        with pytest.raises(order.Stop, match="固定政策状态须为新建"):
+            assemble(case)
+
+
+def test_template_tag_must_match_resolved_draft_tag(case):
+    case.cells[case.control["user_tags"]] = [{"rowid": str(uuid4())}]
+    with pytest.raises(order.Stop, match="用户标签与模板不同"):
+        assemble(case)
 
 
 class Platform:
@@ -165,6 +221,7 @@ class Platform:
         self.actions = []
         self.states = [1, 2, 1]
         self.log_effect = lambda logs: {"logs": logs}
+        self.log_envelope = {}
         self.logs_success = True
         self.delete_effect = "missing"
         self.create_effect = "ok"
@@ -183,7 +240,7 @@ class Platform:
             **cells, "_id": record_id,
             self.case.control["policy_name"]: cells.get(self.case.control["policy_name"],
                                                        self.case.values["policy_name"]),
-            self.case.ids["status"]: status,
+            self.case.control["status"]: self.case.statuses[status],
             "_createdAt": "2026-11-20 08:00:00", "_updatedAt": "2026-11-20 08:00:01",
             "_createdBy": {}, "_owner": {},
         }
@@ -195,9 +252,10 @@ class Platform:
                 "type": 1 if index == 0 else 2,
                 "_createdAt": f"2026-11-20 08:00:{index % 60:02d}",
                 "logData": [{
-                    "id": self.case.ids["status"], "name": "政策状态",
+                    "id": self.case.control["status"], "name": "政策状态",
                     "type": 11, "editType": 1, "oldValue": "", "oldText": "",
-                    "newValue": str(state), "newText": self.case.config["official"]["status_map"][str(state)],
+                    "newValue": str(state),
+                    "newText": self.case.config["official"]["status_map"][self.case.statuses[state]],
                     "isDeleted": False,
                 }],
             },
@@ -209,9 +267,12 @@ class Platform:
         assert request.headers["Authorization"] == "Bearer " + case.official_token
         assert request.headers["HAP-Appid"] == case.ids["official_app"]
         assert request.url.host == "placeholder.invalid"
-        assert not request.url.params
         self.timeouts.append(request.extensions["timeout"])
         path = request.url.path
+        if path == spec["logs"]["path"].replace("{record_id}", case.ids["created"]):
+            assert dict(request.url.params) == {"pageIndex": "1", "pageSize": "50"}
+        else:
+            assert not request.url.params
         if path in (spec["search"]["path"], spec["tags"]["path"]):
             action = "search" if path == spec["search"]["path"] else "tags"
             self.actions.append("search" if action == "search" else "tag")
@@ -232,7 +293,8 @@ class Platform:
                 if self.same_name:
                     rows.append(self.record(str(uuid4()), 1, {}))
             else:
-                rows = [{"_id": case.ids["tag"], control: name}] * self.tag_count
+                ids = [case.ids["tag"], *(str(uuid4()) for _ in range(self.tag_count - 1))]
+                rows = [{"_id": tag_id, control: name} for tag_id in ids[:self.tag_count]]
             page_rows = self.query_pages.get((view, page), rows)
             if page_rows is None:
                 return httpx.Response(503, json={"success": False})
@@ -241,7 +303,7 @@ class Platform:
         if path == spec["logs"]["path"].replace("{record_id}", record_id):
             self.actions.append("history")
             assert request.method == "GET"
-            return self.response(self.log_effect(self.logs()), success=self.logs_success)
+            return self.response(self.log_effect(self.logs()), success=self.logs_success, **self.log_envelope)
         if path == spec["read"]["path"].replace("{record_id}", case.ids["template"]):
             self.actions.append("template")
             assert request.method == "GET"
@@ -258,7 +320,7 @@ class Platform:
         assert request.method == "DELETE"
         body = {"triggerWorkflow": False, "permanent": False}
         if spec["delete"]["condition"] is not None:
-            body[spec["delete"]["condition"]] = self.states[-1]
+            body[spec["delete"]["condition"]] = case.statuses[self.states[-1]]
         assert json.loads(request.content) == body
         if self.delete_effect == "interrupted":
             raise KeyboardInterrupt
@@ -267,8 +329,8 @@ class Platform:
         return self.response(None)
 
     @staticmethod
-    def response(data, *, success=True):
-        return httpx.Response(200, json={"success": success, "error_code": 0, "data": data})
+    def response(data, *, success=True, **envelope):
+        return httpx.Response(200, json={"success": success, "error_code": 0, "data": data, **envelope})
 
     def connection(self, host, **kwargs):
         platform = self
@@ -332,7 +394,9 @@ class Platform:
                     top = f"{len(body):x}".encode()
                     endings = {"chunk_ok": b"0\r\nTrailer: value\r\n\r\n",
                                "chunk_missing_end": b"", "chunk_short_trailer": b"0\r\n"}
-                    body = top + b"\r\n" + body + b"\r\n" + endings[effect]
+                    endings["chunk_bad_crlf"] = endings["chunk_ok"]
+                    separator = b"xx" if effect == "chunk_bad_crlf" else b"\r\n"
+                    body = top + b"\r\n" + body + separator + endings[effect]
                 else:
                     size = len(body) + (3 if effect == "short_length" else 0)
                     headers = f"Content-Length: {size}".encode()
@@ -388,7 +452,7 @@ def test_duplicate_check_reads_every_page_of_every_view(case, platform, mode):
     assert ("aborted_before_write" in events(case)) == (mode != "zero_matches")
 
 
-@pytest.mark.parametrize("mode", ["later_exact", "duplicate", "later_page_failed"])
+@pytest.mark.parametrize("mode", ["later_exact", "duplicate", "later_page_failed", "overlapping_views"])
 def test_tag_query_requires_unique_exact_name_across_pages(case, platform, mode):
     config = case.config["official"]
     config["page_size"] = 2
@@ -397,17 +461,23 @@ def test_tag_query_requires_unique_exact_name_across_pages(case, platform, mode)
     near_match = {"_id": str(uuid4()), control: name + "（占位后缀）"}
     exact = {"_id": case.ids["tag"], control: name}
     platform.query_pages = {
-        (view, 1): [near_match, exact if mode == "duplicate" else near_match],
+        (view, 1): [near_match, {"_id": str(uuid4()), control: name} if mode == "duplicate" else near_match],
         (view, 2): None if mode == "later_page_failed" else [exact],
     }
+    expected_queries = [("tags", view, 1), ("tags", view, 2)]
+    if mode == "overlapping_views":
+        extra = case.ids["additional_view"]
+        config["tags"]["view_ids"].append(extra)
+        platform.query_pages[(extra, 1)] = [exact]
+        expected_queries.append(("tags", extra, 1))
     with httpx.Client(transport=httpx.MockTransport(platform.official)) as client:
         api = order.Official(config, case.official_token, case.ids["official_app"], client)
-        if mode == "later_exact":
+        if mode in ("later_exact", "overlapping_views"):
             assert api.tag(name) == case.ids["tag"]
         else:
             with pytest.raises(order.Stop):
                 api.tag(name)
-    assert platform.queries == [("tags", view, 1), ("tags", view, 2)]
+    assert platform.queries == expected_queries
 
 
 def test_search_requires_configured_view(case):
@@ -509,7 +579,7 @@ def test_does_not_create_without_current_approval_or_unique_name(case, platform,
 
 
 @pytest.mark.parametrize("effect", ["timeout", "read_timeout", "bad_json", "redirect", "interrupted", "short_length",
-                                     "chunk_missing_end", "chunk_short_trailer"])
+                                     "chunk_missing_end", "chunk_short_trailer", "chunk_bad_crlf"])
 def test_create_unknown_freezes_and_secrets_stay_out(case, platform, effect, capsys, caplog):
     caplog.set_level(logging.DEBUG)
     approvals = Approvals(platform)
@@ -553,13 +623,21 @@ def test_exact_endpoint_matches_authorization(case, platform):
     ("malformed_change", False, False),
     ("bad_log_time", False, False),
     ("bad_operator", False, False),
-    ("no_creation", False, False),
-    ("two_creations", False, False),
+    ("no_type_one", True, True),
+    ("manual_edit", True, True),
+    ("null_old_fields", True, True),
+    ("null_status_text", False, False),
+    ("null_status_value", False, False),
+    ("flag_true", False, False),
+    ("envelope_flag_true", False, False),
+    ("last_mark", False, False),
+    ("flag_false", True, True),
     ("configured_then_new", False, False),
     ("blank_status", False, False),
     ("unknown_status", False, False),
     ("deleted_status", False, False),
     ("current_pending", False, False),
+    ("pending_before_delete", False, False),
     ("49_logs", True, True),
     ("50_logs", False, False),
     ("lower_log_limit", False, False),
@@ -585,10 +663,18 @@ def test_d15_verification(case, platform, condition, deleted, verified):
             content["_createdAt"] = "占位无效时刻"
         if condition == "bad_operator":
             logs[0]["operator"] = None
-        if condition == "no_creation":
+        if condition == "no_type_one":
             content["type"] = 2
-        if condition == "two_creations":
-            logs[-1]["content"]["type"] = 1
+        if condition == "manual_edit":
+            manual_change = dict(change, id=case.control["company"], name="占位字段",
+                                 oldValue=None, oldText=None, newValue=None, newText=None)
+            logs.append({"operator": {}, "content": dict(content, logData=[manual_change])})
+        if condition == "null_old_fields":
+            change.update(oldValue=None, oldText=None)
+        if condition == "null_status_text":
+            change["newText"] = None
+        if condition == "null_status_value":
+            change["newValue"] = None
         if condition == "blank_status":
             change["newText"] = ""
         if condition == "unknown_status":
@@ -599,11 +685,16 @@ def test_d15_verification(case, platform, condition, deleted, verified):
             logs = []
         if condition == "undetermined_completeness":
             return {"logs": logs, "more": True}
-        return {"logs": list(reversed(logs))}
+        markers = {"flag_true": {"flag": True}, "last_mark": {"lastMark": "占位续页标记"},
+                   "flag_false": {"flag": False, "lastMark": ""}}
+        return {"logs": list(reversed(logs)), **markers.get(condition, {})}
 
     def modify_after_history(row):
         if platform.actions[-2] == "history":
-            row["_updatedAt"] = "2026-11-20 08:00:02"
+            if condition == "pending_before_delete":
+                row[case.control["status"]] = case.statuses[2]
+            else:
+                row["_updatedAt"] = "2026-11-20 08:00:02"
 
     platform.log_effect = edit_logs
     platform.logs_success = condition != "logs_failed"
@@ -617,23 +708,33 @@ def test_d15_verification(case, platform, condition, deleted, verified):
         platform.states = [1] * int(condition[:2])
     if condition == "lower_log_limit":
         case.config["official"]["logs"]["page_limit"] = 3
+    if condition == "envelope_flag_true":
+        platform.log_envelope = {"flag": True}
     if condition == "default_delete_body":
         case.config["official"]["delete"]["condition"] = None
     if condition == "missing_notice":
-        del case.evidence["configurator_notice"]
-    if condition == "changed_before_delete":
+        add_notice_recipients(case)
+        platform.before_handoff = lambda: case.evidence["notices"].pop("placeholder_b")
+    if condition in ("changed_before_delete", "pending_before_delete"):
         platform.before_read = modify_after_history
     if deleted and not verified:
         platform.delete_effect = condition
     if verified:
         assert run_case(case, platform, approvals)
     else:
-        with pytest.raises((order.Stop, KeyboardInterrupt)):
+        message = {"missing_notice": "通知回执缺失",
+                   "current_pending": "删除前状态须为新建",
+                   "pending_before_delete": "删除前状态须为新建"}.get(condition)
+        with pytest.raises((order.Stop, KeyboardInterrupt), match=message):
             run_case(case, platform, approvals)
         assert "delete_unconfirmed" in events(case)
         assert any("需人工核对" in notice and "<at " in notice for notice in approvals.notices)
     assert ("delete" in platform.actions) == deleted
     assert ("delete_verified" in events(case)) == verified
+    if condition == "missing_notice":
+        assert "history" not in platform.actions
+        assert any('通知回执缺失：["placeholder_b"]' in notice for notice in approvals.notices)
+        assert all("占位回执" not in notice for notice in approvals.notices)
     assert any("删除已核验" in notice for notice in approvals.notices) == verified
     if deleted:
         idx = platform.actions.index("delete")
@@ -641,7 +742,14 @@ def test_d15_verification(case, platform, condition, deleted, verified):
     assert all("<at " in notice for notice in approvals.notices)
 
 
-@pytest.mark.parametrize("mode", ["stable", "status_changes", "timestamp_changes", "never_stable", "late_read"])
+@pytest.mark.parametrize("limit", [0, 51, True])
+def test_invalid_log_page_limit(case, limit):
+    case.config["official"]["logs"]["page_limit"] = limit
+    with pytest.raises(order.Stop, match="官方分页上限配置无效"):
+        order.Official(case.config["official"], case.official_token, case.ids["official_app"], None)
+
+
+@pytest.mark.parametrize("mode", ["stable", "pending_during_wait", "timestamp_changes", "never_stable", "late_read"])
 def test_deletion_waits_for_stable_status_and_timestamp(case, platform, mode):
     now, pauses = [0], []
 
@@ -650,10 +758,8 @@ def test_deletion_waits_for_stable_status_and_timestamp(case, platform, mode):
         now[0] += seconds
 
     def update(row):
-        if mode == "status_changes" and now[0] == 0:
-            row[case.ids["status"]] = 2
-        if mode == "status_changes" and now[0] >= 5:
-            row[case.ids["status"]] = 1
+        if mode == "pending_during_wait" and now[0] >= 5:
+            row[case.control["status"]] = case.statuses[2]
         if mode == "timestamp_changes" and now[0] >= 5:
             row["_updatedAt"] = "2026-11-20 08:00:02"
         if mode == "never_stable":
@@ -670,8 +776,13 @@ def test_deletion_waits_for_stable_status_and_timestamp(case, platform, mode):
         assert pauses == [5] * (24 if mode == "never_stable" else 1)
         assert "history" not in platform.actions and "delete" not in platform.actions
         assert "delete_attempt" not in events(case)
-        assert platform.rows[case.ids["created"]][case.ids["status"]] == 1
+        assert platform.rows[case.ids["created"]][case.control["status"]] == case.statuses[1]
         assert any("需人工核对" in notice and "<at " in notice for notice in approvals.notices)
+    elif mode == "pending_during_wait":
+        with pytest.raises(order.Stop, match="删除前状态须为新建"):
+            run()
+        assert pauses == [5]
+        assert "history" not in platform.actions and "delete" not in platform.actions
     else:
         assert run()
         assert pauses == ([5] if mode == "stable" else [5, 5])
@@ -684,6 +795,19 @@ def test_official_record_interprets_naive_updated_at_as_utc_plus_eight(case, pla
     assert api.record(row).updated_at == datetime(2026, 11, 20, 0, 0, 1, tzinfo=UTC)
 
 
+@pytest.mark.parametrize("read_number", [1, 2, 3])
+def test_created_detail_with_mismatched_id_stops_cleanup(case, platform, read_number):
+    def replace_id(row):
+        if platform.actions.count("read") == read_number:
+            row["_id"] = case.ids["template"]
+
+    platform.before_read = replace_id
+    reason = "官方回读未获确认" if read_number == 1 else "官方详情记录编号未确认"
+    with pytest.raises(order.Stop, match=reason):
+        run_case(case, platform, Approvals(platform))
+    assert "delete" not in platform.actions
+
+
 @pytest.mark.parametrize("effect", ["ok", "chunk_ok"])
 def test_complete_create_response_is_accepted(case, platform, effect):
     platform.create_effect = effect
@@ -692,17 +816,28 @@ def test_complete_create_response_is_accepted(case, platform, effect):
     assert "created" in events(case)
 
 
+def test_chunked_response_requires_closed_stream():
+    headers = Message()
+    headers["Transfer-Encoding"] = "chunked"
+    response = SimpleNamespace(headers=headers, status=200, chunked=True,
+                               read=lambda _: b'{"id":"placeholder"}', isclosed=lambda: False)
+    with pytest.raises(order.Stop, match="建单分块响应不完整"):
+        order.read_create_response(response)
+
+
 def test_readback_report_counts_and_modes(case, platform):
     platform.mismatch = True
     approvals = Approvals(platform)
     assert not run_case(case, platform, approvals)
     assert events(case)[-1] == "delete_verified"
     path, = case.private.glob("create-readback-*.json")
-    rows = json.loads(path.read_text())
+    report = json.loads(path.read_text())
+    rows = report["字段比对"]
     assert all(row.keys() == {"字段名", "结果"} for row in rows)
-    assert len(rows) == len(case.cells)
+    assert len(rows) == len(case.config["fields"])
     assert sorted(row["结果"] for row in rows if row["结果"] != "一致") == ["不一致", "缺失", "跳过"]
-    assert any("一致 10 / 不一致 1 / 缺失 1 / 跳过 1" in text for text in approvals.notices)
+    assert report["可能由工作流回填"] == [{"字段名": "赠送天数", "类型": 6}]
+    assert any("一致 11 / 不一致 1 / 缺失 1 / 跳过 1" in text for text in approvals.notices)
     assert all(file.stat().st_mode & 0o777 == 0o600 for file in case.private.iterdir())
 
 
@@ -861,7 +996,9 @@ def test_disconnect_waits_until_transport_handoff(case, platform, live_approval)
 
 @pytest.mark.parametrize("mode", [
     "success", "missing_review", "digest_changed", "template_conflict", "delete_interrupted",
-    "login_changed_after_approval",
+    "login_changed_after_approval", "three_recipients", "missing_notice", "duplicate_receipt",
+    "unexpected_notice", "empty_recipients", "duplicate_recipient", "malformed_recipient",
+    "template_mismatched_id",
 ])
 def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys):
     private = case.private
@@ -869,6 +1006,22 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     draft_path = private / "draft.json"
     login_path = private / "mingdao-state.json"
     env_file = private / "env"
+    if mode in ("three_recipients", "missing_notice", "duplicate_receipt"):
+        add_notice_recipients(case)
+    if mode == "empty_recipients":
+        case.config["notice_recipients"].clear()
+    if mode == "duplicate_recipient":
+        case.config["notice_recipients"].extend(case.config["notice_recipients"][:1])
+    if mode == "malformed_recipient":
+        case.config["notice_recipients"][0]["key"] = []
+    if mode == "missing_notice":
+        del case.evidence["notices"]["placeholder_b"]
+    if mode == "duplicate_receipt":
+        case.evidence["notices"]["placeholder_b"] = " " + case.evidence["notices"]["placeholder_owner"]
+    if mode == "unexpected_notice":
+        case.evidence["notices"]["placeholder_unlisted"] = "占位未列回执"
+    if mode == "template_mismatched_id":
+        platform.template["_id"] = case.ids["created"]
     order.exclusive(config_path, case.config)
     draft = deepcopy(case.values)
     if mode == "template_conflict":
@@ -912,15 +1065,37 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     monkeypatch.setattr(order, "CreateRequest", partial(order.CreateRequest, connect=platform.connection))
     monkeypatch.setattr(httpx, "Client", partial(httpx.Client, transport=httpx.MockTransport(platform.official)))
 
-    success = mode == "success"
+    success = mode in ("success", "three_recipients")
     assert order.main(["--config", str(config_path), "--registration", case.ids["registration"],
                        "--env-file", str(env_file), str(draft_path)]) == (0 if success else 1)
     captured = capsys.readouterr()
     assert ("D15 删除已核验" in captured.out) == success
-    assert platform.create_count == int(mode in ("success", "delete_interrupted"))
+    assert platform.create_count == int(success or mode == "delete_interrupted")
+    notice_errors = {
+        "missing_notice": '通知回执缺失：["placeholder_b"]',
+        "duplicate_receipt": "通知回执重复",
+        "unexpected_notice": "通知回执含未登记对象",
+        "empty_recipients": "通知名单配置无效",
+        "duplicate_recipient": "通知名单配置无效",
+        "malformed_recipient": "通知名单配置无效",
+    }
+    if mode in notice_errors:
+        assert captured.err == f"已停止：{notice_errors[mode]}\n"
+        assert not platform.actions
+    if mode == "missing_notice":
+        path, = private.glob("create-preflight-*.json")
+        assert json.loads(path.read_text())["通知回执"] == [
+            {"通知对象": "占位通知对象甲", "已回执": True},
+            {"通知对象": "占位通知对象乙", "已回执": False},
+            {"通知对象": "占位通知对象丙", "已回执": True},
+        ]
+        assert "占位免通知回执" not in path.read_text()
     if mode == "login_changed_after_approval":
         assert "aborted_before_write" in events(case)
         assert any("建单登录状态已变化" in notice for notice in approvals.notices)
+    if mode == "template_mismatched_id":
+        assert "官方详情记录编号未确认" in captured.err
+        assert platform.actions == ["template"]
     assert all(timeout["connect"] == 10 and timeout["read"] == 30
                for timeout in platform.timeouts if isinstance(timeout, dict))
     if mode == "template_conflict":
@@ -932,9 +1107,14 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         assert "delete_verified" not in events(case)
     if success:
         summary_path, = private.glob("create-fields-*.json")
-        fields = json.loads(summary_path.read_text())
-        assert len(fields) == len(case.cells)
+        material = json.loads(summary_path.read_text())
+        assert len(material["字段"]) == len(case.config["fields"])
+        assert material["通知回执"] == [
+            {"通知对象": row["label"], "已回执": True} for row in case.config["notice_recipients"]
+        ]
         assert "合成模板" not in summary_path.read_text()
         assert summary_path.stat().st_mode & 0o777 == 0o600
+        assert all(value not in summary_path.read_text() for value in case.evidence["notices"].values())
+    assert all(value not in captured.out + captured.err for value in case.evidence["notices"].values())
     for token in (case.session_token, case.official_token, case.ids["official_app"]):
         assert token not in captured.out + captured.err
