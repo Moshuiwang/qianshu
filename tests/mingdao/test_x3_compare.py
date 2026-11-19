@@ -1,5 +1,6 @@
 import json
 from collections import Counter
+from secrets import token_hex
 from stat import S_IMODE
 from types import SimpleNamespace
 from uuid import uuid4
@@ -77,11 +78,15 @@ def sample(tmp_path, monkeypatch):
                     {ids["current"]: [{"name": "placeholder_b"}], ids["gift"]: ""},
                     {ids["current"]: '[{"name":"placeholder a"}]', ids["gift"]: "Placeholder Gift"},
                 ]
-            data = {"rows": rows, "total": len(rows)}
+            data = {
+                "rows": [{"_id": token_hex(12), "rowId": str(uuid4()), **row} for row in rows],
+                "total": len(rows),
+            }
         else:
             assert not request.url.params
             data = {
-                "_id": row_id, ids["policy_name"]: f" 占位政策 {index} ",
+                "_id": token_hex(12), "rowId": row_id.upper(),
+                ids["policy_name"]: f" 占位政策 {index} ",
                 ids["gift_days"]: "30.00", ids["start_date"]: "2099-02-04T23:30:00-05:00",
                 ids["trigger_once"]: [{"key": ids["option"], "value": "占位否"}],
                 ids["approval_attachments"]: ["占位附件"],
@@ -171,7 +176,6 @@ def test_reader_has_no_method_parameter(sample):
     {"rows": [], "total": 1},
     {"rows": [], "total": False},
     {"rows": [], "total": "0"},
-    {"rows": [{}] * 50, "total": 50},
     {"rows": {}, "total": 0},
     {"rows": [None], "total": 1},
     {"rows": [{}], "total": 1},
@@ -191,6 +195,21 @@ def test_relations_fail_only_the_affected_record(sample, bad_data):
     assert report["字段汇总"][0]["一致率"] == 5 / 6
 
 
+def test_relations_stop_at_page_limit_with_valid_names(sample):
+    def full_page(_):
+        rows = [
+            {"_id": token_hex(12), "rowId": str(uuid4()), sample.ids["tag_name"]: f"占位标签 {index}"}
+            for index in range(50)
+        ]
+        return httpx.Response(200, json={"success": True, "data": {"rows": rows, "total": 50}})
+
+    sample.failures[3, sample.ids["user_tags"]] = full_page
+    assert sample.run() == 1
+    failed, = [row for row in _read(sample)["记录"] if row["读取"] == "读取失败"]
+    assert failed["草稿序号"] == 3
+    assert len(sample.requests) == 17
+
+
 @pytest.mark.parametrize("failure", ["identity", "http", "redirect", "shape", "control", "json", "overflow", "timeout"])
 def test_detail_failure_isolated_and_redirects_not_followed(sample, failure, capsys):
     def fail(data):
@@ -205,7 +224,7 @@ def test_detail_failure_isolated_and_redirects_not_followed(sample, failure, cap
         if failure == "overflow":
             return httpx.Response(200, text='{"success":true,"data":1e999}')
         if failure == "identity":
-            data["_id"] = str(uuid4())
+            data["rowId"] = sample.row_ids[0]
         if failure == "shape":
             data = []
         if failure == "control":

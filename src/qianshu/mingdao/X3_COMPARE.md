@@ -16,7 +16,7 @@ python -m qianshu.mingdao.x3_compare \
 
 ## 私有配置
 
-以下结构中的标识均为占位。把六条 `rowId` 替换为详情响应 `_id` 使用的 UUID 写法。草稿序号从 1 开始，六个序号和六个 UUID 各出现一次。支持按任意顺序登记配对。
+以下结构中的标识均为占位。为六条记录填写各自的 `rowId`（UUID）。草稿序号从 1 开始，六个序号和六个 UUID 各出现一次。支持按任意顺序登记配对。
 
 ```json
 {
@@ -77,7 +77,7 @@ python -m qianshu.mingdao.x3_compare \
 
 ## 读取与报告
 
-- 每条记录先请求一次 `GET /v3/app/worksheets/{worksheet_id}/rows/{rowId}`。详情须返回 `success: true` 与平铺的 `data`，其 `_id` 必须与请求 UUID 一致。非关联控件须存在，空值可显式返回。
+- 每条记录先请求一次 `GET /v3/app/worksheets/{worksheet_id}/rows/{rowId}`。详情须返回 `success: true` 与平铺的 `data`，其中 `data.rowId` 须为 UUID，并与请求中的 `rowId` 忽略大小写后相同。非关联控件须存在，空值可显式返回。
 - 用户标签和节目包各使用相应控件的 `GET …/rows/{rowId}/relations/{controlId}?pageIndex=1&pageSize=50`。接口须明确成功，`data.rows` 为对象数组，且整数 `data.total` 等于行数并小于 50。
 - 任一请求失败、响应结构不符或详情身份不匹配，则该记录记「读取失败」，跳过该记录剩余请求并继续下一条。重定向按读取失败处理。
 - 草稿缺值或带不确定标记时记「草稿不确定」。草稿确定且人工缺值时记「人工为空」。关联两边均为明确的空数组时记「一致」。双方有值但无法归一化时记「无法比较」，可比较值按相等与否分别记「一致」或「不一致」。

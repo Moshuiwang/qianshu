@@ -19,9 +19,8 @@ from dotenv import dotenv_values
 
 from qianshu.draft import PolicyDraft
 from qianshu.mingdao.create_order import (
-    Arguments, Official, Stop, at, bad_constant, https_origin, package_names,
-    private_bytes, receipt, require, secret_safe, subtable_rows, unique_object,
-    unpack_array, uuid_record,
+    Arguments, Official, Stop, at, bad_constant, https_origin, private_bytes,
+    receipt, require, secret_safe, unique_object, unpack_array, uuid_record,
 )
 
 _RECORDS = 6
@@ -126,7 +125,6 @@ class Reader:
 
     def detail(self, row_id):
         raw = self._get(row_id)
-        # create_order 的详情检查只检查响应类型、官方 _id 和请求 UUID。
         return Official.detail(self, raw, row_id)
 
     def relations(self, row_id, control):
@@ -142,6 +140,18 @@ def _name(value):
     return value.strip().casefold().replace(" ", "_")
 
 
+def _package_name(row, mapping):
+    value = row[mapping["control"]]
+    if _empty(value) or value == "[]":
+        return None
+    path = mapping["name_path"]
+    if path and isinstance(value, str):
+        value = _decode(value)
+    name = at(value, path)
+    require(receipt(name), "节目包名称无效")
+    return name
+
+
 def _manual(reader, record, specs):
     detail = reader.detail(record)
     values = {}
@@ -153,7 +163,11 @@ def _manual(reader, record, specs):
             if kind == "user_tags":
                 value = [at(row, relation["name_path"]) for row in rows]
             else:
-                value = package_names(subtable_rows(rows), relation)
+                value = [
+                    {"current_package": _package_name(row, relation["current"]),
+                     "gift_package": _package_name(row, relation["gift"])}
+                    for row in rows
+                ]
             # 官方关联数据缺失名称时无法确认本条读取结果。
             _normalize(value, spec)
         else:
