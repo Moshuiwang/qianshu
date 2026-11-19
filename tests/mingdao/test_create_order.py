@@ -887,7 +887,10 @@ def test_official_record_single_option_status_mapping(case, platform, mapped):
 
 
 @pytest.mark.parametrize("state", [
-    [], [{"key": "占位选项键", "value": "占位显示文本"}] * 2, ["占位选项键"],
+    [],
+    pytest.param(lambda platform: platform.status_cell(1) * 2, id="duplicate-new"),
+    pytest.param(lambda platform: platform.status_cell(1) + platform.status_cell(3), id="new-and-configuring"),
+    ["占位选项键"],
     [{}], [{"key": "占位选项键"}], [{"value": "占位显示文本"}],
     [{"key": "", "value": "占位显示文本"}], [{"key": "占位选项键", "value": ""}],
     [{"key": 1, "value": "占位显示文本"}], [{"key": "占位选项键", "value": None}],
@@ -896,7 +899,7 @@ def test_official_record_single_option_status_mapping(case, platform, mapped):
 def test_official_record_rejects_invalid_status_shape(case, platform, state):
     api = order.Official(case.config["official"], case.official_token, case.ids["official_app"], None)
     row = platform.record(case.ids["created"], 1, {})
-    row[case.control["status"]] = state
+    row[case.control["status"]] = state(platform) if callable(state) else state
     with pytest.raises(order.Stop, match="官方记录标识或状态未确认"):
         api.record(row)
 
