@@ -26,7 +26,7 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `two_reviews.internal`、`two_reviews.external` | 同一冻结候选的两份独立私有审核回执 |
 | `trace_decision`、`comparison_report`、`same_country_count_evidence` | 当次放行、拟写字段比对材料、同国家生效政策只读计数的私有证据 |
 
-草稿使用 `PolicyDraft.to_dict()` 的字段结构，每项为含 `value` 的对象。只传一条。名称以「【测试】」开头，起止日期用 `YYYY-MM-DD`，充值和赠送天数是非负整数，标签值是精确名称列表，节目包每行给出 `current_package` 和 `gift_package`（无赠送包时用 `null`）。草稿的待确认项应交人工。未给定的互斥组按 R7 核对模板为「是」，在审批卡片注明默认值。采用模板值的字段须与草稿中的确定值一致，任务审批链接采用模板值。
+草稿使用 `PolicyDraft.to_dict()` 的字段结构，每项为含 `value` 的对象。只传一条。名称以「【测试】」开头，起止日期用 `YYYY-MM-DD`，充值和赠送天数是非负整数，标签值是确定的名称列表，节目包每行给出 `current_package` 和 `gift_package`（无赠送包时用 `null`）。草稿的待确认项应交人工。未给定的互斥组按 R7 核对模板为「是」，在审批卡片注明默认值。采用模板值的字段须与草稿中的确定值一致，任务审批链接采用模板值。
 
 ## 配置项
 
@@ -39,14 +39,15 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `notice_recipients` | 非空列表，每项含唯一的稳定标识 `key`、显示名 `label` 和角色 `role`。建单预检和删除前逐人核对。正常通知的名单须至少覆盖一名审批人（`approver`）和一名配置人（`configurator`）。G173 免除当次 X5 测试单的事前通知，授权登记须有有效的 `notice_waiver`，私有名单仅登记产品负责人（`owner`），例如 `[{"key": "placeholder_owner", "label": "占位通知对象", "role": "owner"}]` |
 | `template.row_id` | 同国家模板记录的 `rowId`，须为 UUID |
 | `template.country` | 国家字段的 `control` 及预期原始 `value`。国家控件须避开从草稿写入的字段 |
-| `fields` | 以控件 ID 为键，每项登记 `label`、数值 `type`。私有配置按 11 月 18 日 UTC 录制的 X5 建单请求登记全部 55 个字段，写入仅限这些字段。五个可变标量字段（政策名称、起止日期、充值与赠送天数）从草稿填写。用户标签按草稿逐个查询官方列表，保留查得的 `rowId` 原始大小写并编为关联字段写入。0.1.0 只建定向政策测试单，草稿无用户标签或不同标签名查得同一记录 ID 时停止并交人工。节目包按草稿逐行挑选并照抄匹配的模板行，任务审批链接、公司、互斥组及其他确定的草稿值也须映射到 `draft`。除固定字段和用户标签外，配置字段须在模板中存在。模板的系统字段、自动计算字段及其他未配置的键均跳过 |
+| `fields` | 以控件 ID 为键，每项登记 `label`、数值 `type`。私有配置按 11 月 18 日 UTC 录制的 X5 建单请求登记全部 55 个字段，写入仅限这些字段。五个可变标量字段（政策名称、起止日期、充值与赠送天数）从草稿填写。用户标签和节目包从模板各自的官方关联行挑选。0.1.0 只建定向政策测试单，草稿无用户标签时停止并交人工。节目包按草稿逐行挑选并照抄匹配的模板行，任务审批链接、公司、互斥组及其他确定的草稿值也须映射到 `draft`。除固定字段外，配置字段须在模板中存在。模板的系统字段、自动计算字段及其他未配置的键均跳过 |
 | `fixed`、`applicant_control` | `fixed` 的键须恰好是 `official.status_control` 与 `applicant_control`，分别登记「新建」选项键与登录账号成员 ID，例如 `{"placeholder_status_control": ["placeholder_new_option"], "placeholder_applicant_control": ["placeholder_member"]}`。两个控件均须在 `fields` 内，且须避开五个可变标量字段和任务审批链接 |
 | `fields.<控件>.draft_values` | 枚举、关系等字段把草稿值映射到平台类型。键为草稿值的紧凑 JSON 字符串，例如文本值的键为 `"\"占位选项\""`，值形如 `["占位选项键"]`。字段比较时仅用该映射核对模板 |
-| `fields.<子表控件>` | `children` 以子控件 ID 为键，各含 `type`；`current`、`gift` 各含 `control`、`name_path`，用于从模板原始单元格读取包名。可用 `row_metadata` 指定子行的非控件元数据键 |
+| `fields.<子表控件>` | `children` 以子控件 ID 为键，各含 `type`。`current`、`gift` 各含在 `children` 中登记的 `control` 及 `name_path`，用于从对应关联行的子格读取包名。子表关联行按 `children` 白名单取值。其他子表单元格解析可用 `row_metadata` 指定非控件元数据键 |
 | `readback_skip` | 经实测确认由工作流回填的控件 ID 列表，初次用空数组。可变字段和审批链接必须比对 |
 | `official.origin`、`official.token_key`、`official.app_id_key` | 官方 HTTPS 源及私有环境文件中的个人令牌、应用 ID 键名，例如 `https://placeholder.invalid`、`PLACEHOLDER_HAP_TOKEN`、`PLACEHOLDER_HAP_APP_ID` |
-| `official.search`、`official.tags` | 各含 `path`、`name_control`、`view_ids`。路径为 `/v3/app/worksheets/placeholder_worksheet/rows/list`，两个查询使用各自的表和名称字段 controlId。视图列表形如 `["placeholder_view"]`，每张表至少登记一个视图。政策同名检查须登记覆盖所有政策记录的全部视图 |
-| `official.page_size`、`official.page_limit` | 每页条数与每视图页数上限，正整数，默认分别为 50、20。查询逐个视图从第 1 页开始，用携带 `viewId` 的官方列表 POST 和名称等值筛选。每个视图读到短页才视为读完，任一页失败或满页达到上限均停止。每行须有 UUID 格式的 `rowId`。名称精确匹配后按 `rowId` 忽略大小写去重。政策同名检查合计须为 0。每个标签须恰好匹配 1 条，否则停止。标签写入保留首次匹配的 `rowId` 原始大小写 |
+| `official.search` | 含 `path`、`name_control`、`view_ids`。路径为 `/v3/app/worksheets/placeholder_worksheet/rows/list`，名称字段为政策名称的 controlId。视图列表形如 `["placeholder_view"]`，须登记覆盖所有政策记录的全部视图 |
+| `official.tag_relation.name_keys` | 登记 1～2 个不同的候选标签名键，例如 `["placeholder_tag_title_control", "placeholder_tag_alias"]`，用于从模板用户标签的关联行取名称 |
+| `official.page_size`、`official.page_limit` | 每页条数与每视图页数上限，正整数，默认分别为 50、20。查询逐个视图从第 1 页开始，用携带 `viewId` 的官方列表 POST 和名称等值筛选。每个视图读到短页才视为读完，任一页失败或满页达到上限均停止。每行须有 UUID 格式的 `rowId`。名称精确匹配后按 `rowId` 忽略大小写去重。政策同名检查合计须为 0。 |
 | `official.read` | `path` 为政策表的 `/v3/app/worksheets/placeholder_worksheet/rows/{record_id}`。详情、日志和删除路径中的 `{record_id}` 均传入 `rowId`。模板、建单回读和删前回读使用同一详情解析，取平铺的 controlId 字段并按 UUID 格式核验 `rowId`，比较忽略大小写。详情或列表缺少有效 `rowId` 即停止，`_id` 仅是系统元数据。记录不存在信号须同时满足私有配置登记的 HTTP 状态、响应 `success: false`、指定路径的值及类型。用 `missing_status`、`missing_key`、`missing_value` 登记，例如错误码的取值路径为 `["error_code"]` |
 | `official.status_control`、`official.status_map` | 政策状态字段的 controlId，如 `placeholder_status_control`。键须同时登记选项 key 与平台显示文本（日志里存的是显示文本），值为产品文档所列状态。官方读记录的政策状态形如 `[{"key": "placeholder_new_option", "value": "新建（占位部门）"}]`。回读至少须命中一项映射，两项均命中时结果须相同。回读和日志用同一个状态控件 |
 | `official.logs` | `path` 为政策记录读取路径加 `/logs`。请求显式取第 1 页、每页 50 条。可用 `page_limit` 设置更严格的停止阈值，须为 1～50 的整数，默认 50，日志条数达到阈值即停止 |
@@ -54,7 +55,11 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 
 取值路径用 JSON 数组，例如 `["占位外层", "占位字段"]`；空数组取当前位置。读取源须在放行前确认真实响应形态。单选、下拉及多选使用选项键；关联和成员分别写成含 `sid` 或 `accountId` 的对象数组。若官方读接口的对象标识键不同，可为对应控件登记 `relation_id_key` 或 `member_id_key`。
 
-比较节目包名时去掉首尾空白、忽略大小写，连续的空格和下划线统一按一个下划线比较。例如草稿 `PLACEHOLDER Basic` 可匹配模板 `PLACEHOLDER_Basic`。草稿每行的当前包和赠送包须同时且唯一匹配一条模板行，空赠送包须与空赠送包匹配。任一行无匹配或有多条匹配，按「节目包与模板不同，需人工」停止。按草稿顺序写入匹配行的全部可写控件，使用模板原值。子表写成二维数组 JSON 字符串，各内层单元格含 `controlId`、`value`。
+节目包与用户标签的模板详情格仅含整数计数。读取关联行时，在模板官方详情路径后追加 `/relations/{字段控件 ID}`，通过 GET 显式请求 `pageIndex=1&pageSize=50`。仅接受 `success: true`、列表 `data.rows`、与返回行数相等且小于 50 的整数 `data.total`。每行须有 UUID 格式的 `rowId`，对应模板格的整数须等于 `total`，否则在发布群审批卡前停止。
+
+比较节目包和用户标签名称时去掉首尾空白、忽略大小写，连续的空格和下划线统一按一个下划线比较。例如草稿 `PLACEHOLDER Basic` 可匹配模板 `PLACEHOLDER_Basic`。草稿每行的当前包和赠送包须同时且唯一匹配一条模板行，空赠送包须与空赠送包匹配。任一行无匹配或有多条匹配，按「节目包与模板不同，需人工」停止。按草稿顺序写入匹配行，只取 `children` 登记的子控件。关联行缺失任一已登记子控件时停止。关联对象数组写成仅含 `sid` 的 JSON 数组，字符串原样写入，空数组写成 `[]`。子表写成二维数组 JSON 字符串，各内层单元格含 `controlId`、`value`。
+
+草稿每个用户标签须唯一匹配一条模板关联行，任一候选名称键命中即匹配。缺失或歧义按「用户标签与模板不同，需人工」停止。同一 `rowId`（忽略大小写）被两个草稿标签命中时停止。按草稿顺序写入匹配行的 `rowId`，保留原始大小写。「按名称查任意标签」不在本版（#38）。
 
 单选写入形如 `["placeholder_option"]`，官方读记录形如 `[{"key": "placeholder_option", "value": "占位显示文本"}]`，按 `key` 核对写入与回读是否一致。
 
