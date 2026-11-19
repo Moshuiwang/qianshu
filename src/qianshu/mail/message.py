@@ -38,9 +38,11 @@ def sender(message: EmailMessage) -> str:
 
 def message_id(message: EmailMessage) -> str | None:
     fields = message.get_all("Message-ID", [])
-    if len(fields) == 1 and _MESSAGE_ID.fullmatch(str(fields[0])):
-        return str(fields[0])
-    return None
+    if len(fields) != 1:
+        return None
+    # Python 3.12.3 展开冒号后的折行时会保留续行开头的空格或制表符。
+    value = str(fields[0]).lstrip(" \t")
+    return value if _MESSAGE_ID.fullmatch(value) else None
 
 
 def is_reply(message: EmailMessage, request_id: str) -> bool:

@@ -15,7 +15,7 @@ import pytest
 from qianshu.mail import ApprovalDecision, _private_dir, poll_once, run_polling
 from qianshu.mail.history import export_history, main
 from qianshu.mail.imap import SUMMARY, MailError, ReadOnlyMailbox, connect
-from qianshu.mail.message import authored_reply
+from qianshu.mail.message import authored_reply, headers, message_id
 
 
 PLAIN = b'("TEXT" "PLAIN" NIL NIL NIL "8BIT" 20 1)'
@@ -143,6 +143,20 @@ def mail(address, subject, body, *, reply_to=None, references=None):
         message["References"] = references
     message.set_content(body)
     return message
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        (b"Message-ID:\r\n <fixture@sample.invalid>", "<fixture@sample.invalid>"),
+        (b"Message-ID:\r\n\t<fixture@sample.invalid>", "<fixture@sample.invalid>"),
+        (b"Message-ID: <fixture@\r\n sample.invalid>", None),
+        (b"Message-ID: <fixture@sample.invalid> <other@sample.invalid>", None),
+        (b"Message-ID: <fixture@sample.invalid>\r\nMessage-ID: <other@sample.invalid>", None),
+    ],
+)
+def test_message_id_accepts_leading_fold_only(raw, expected):
+    assert message_id(headers(raw + b"\r\n\r\n")) == expected
 
 
 def test_private_dir_allows_unrelated_git_ancestor(tmp_path):
