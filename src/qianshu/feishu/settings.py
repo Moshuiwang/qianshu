@@ -10,9 +10,7 @@ from dotenv import dotenv_values
 
 from qianshu.config import ConfigError, load_config
 
-_EXTRA_KEYS = (
-    "FEISHU_BOT_OPEN_ID", "FEISHU_ALLOWED_SENDER_IDS", "FEISHU_APPROVED_FINGERPRINT",
-)
+_REQUIRED_EXTRA_KEYS = ("FEISHU_BOT_OPEN_ID", "FEISHU_ALLOWED_SENDER_IDS")
 
 
 @dataclass(frozen=True, repr=False)
@@ -22,7 +20,7 @@ class Settings:
     chat_id: str
     bot_open_id: str
     allowed_senders: frozenset[str]
-    approved_fingerprint: str
+    approved_fingerprint: str = ""
     tenant_key: str | None = None
     callback_max_age: float = 30
 
@@ -36,7 +34,10 @@ class Settings:
             or self.callback_max_age <= 0
             or not self.allowed_senders
             or any(not value.strip() for value in self.allowed_senders)
-            or not re.fullmatch(r"[a-f0-9]{64}", self.approved_fingerprint)
+            or (
+                self.approved_fingerprint != ""
+                and not re.fullmatch(r"[a-f0-9]{64}", self.approved_fingerprint)
+            )
         ):
             raise ConfigError("飞书入口配置缺失或格式无效。")
 
@@ -49,10 +50,11 @@ def load_settings(env_file: Path = Path(".env")) -> Settings:
             extra = dotenv_values(stream=stream, interpolate=False)
     except (OSError, UnicodeError):
         raise ConfigError("无法读取飞书入口配置。") from None
-    missing = [key for key in _EXTRA_KEYS if not (extra.get(key) or "").strip()]
+    missing = [key for key in _REQUIRED_EXTRA_KEYS if not (extra.get(key) or "").strip()]
     if missing:
         raise ConfigError(f"缺少配置，请在 .env 中填写：{'、'.join(missing)}")
-    bot, senders, fingerprint = (extra[key].strip() for key in _EXTRA_KEYS)
+    bot, senders = (extra[key].strip() for key in _REQUIRED_EXTRA_KEYS)
+    fingerprint = (extra.get("FEISHU_APPROVED_FINGERPRINT") or "").strip().lower()
     try:
         max_age = float(extra.get("FEISHU_CALLBACK_MAX_AGE_SECONDS", "30"))
     except (TypeError, ValueError):
@@ -63,7 +65,7 @@ def load_settings(env_file: Path = Path(".env")) -> Settings:
     return Settings(
         base["FEISHU_APP_ID"], base["FEISHU_APP_SECRET"], base["FEISHU_CHAT_ID"],
         bot, frozenset(value.strip() for value in senders.split(",") if value.strip()),
-        fingerprint.lower(), tenant_key=tenant_key.strip() or None,
+        fingerprint, tenant_key=tenant_key.strip() or None,
         callback_max_age=max_age,
     )
 

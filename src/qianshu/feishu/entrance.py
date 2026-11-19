@@ -255,7 +255,10 @@ class Entrance:
             return None
         try:
             text, attachments = _application_body(message)
-            if not attachments and text.strip() and fingerprint(text) == self.settings.approved_fingerprint:
+            approved_fingerprint = self.settings.approved_fingerprint
+            if not attachments and text.strip() and (
+                not approved_fingerprint or fingerprint(text) == approved_fingerprint
+            ):
                 return text
         except (AttributeError, ValueError, TypeError, KeyError):
             pass
