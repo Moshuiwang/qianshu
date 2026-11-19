@@ -1,0 +1,67 @@
+[
+  {
+    "company": {"value": "占位公司甲", "evidence": ["① 占位公司甲"]},
+    "policy_type": {"value": "定向政策", "evidence": ["均为定向政策"]},
+    "benefit_type": {"value": "充一送一", "evidence": ["充一送一"]},
+    "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+    "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+    "user_tags": {"value": ["占位标签甲"], "evidence": ["用户标签：占位标签甲"]},
+    "approval_url": {"value": "https://archive.example.invalid/batch", "evidence": ["本批存档文档：https://archive.example.invalid/batch"]},
+    "policy_name": {"value": "占位政策甲", "evidence": ["优惠政策名称：占位政策甲"]},
+    "maintain_mutual_exclusion_group": {"value": null, "evidence": []},
+    "trigger_once": {"value": "否", "evidence": ["只触发一次：否"]},
+    "cancel_on_downgrade": {"value": "否", "evidence": ["不限制升降包"]},
+    "recharge_days": {"value": 30, "evidence": ["充30天"]},
+    "gift_days": {"value": 30, "evidence": ["送30天"]},
+    "repeat_bonus": {"value": "是", "evidence": ["多买多送：是"]},
+    "effective_multiplier": {"value": 2, "evidence": ["生效倍数：2"]},
+    "packages": {"value": [{"current_package": "占位包甲", "gift_package": "占位包甲_copy"}, {"current_package": "占位包乙", "gift_package": null}], "evidence": ["当前占位包甲，送该包的附属包", "当前占位包乙，无赠送包"]},
+    "user_scope": {"value": "占位休眠用户", "evidence": ["用户范围：占位休眠用户"]},
+    "approval_attachments": {"value": ["占位截图.png"], "evidence": ["审批件附件：占位截图.png"]}
+  },
+  {
+    "company": {"value": "占位公司乙", "evidence": ["② 占位公司乙"]},
+    "policy_type": {"value": "定向政策", "evidence": ["均为定向政策"]},
+    "benefit_type": {"value": "买一赠一", "evidence": ["② 占位公司乙，买一赠一"]},
+    "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+    "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+    "user_tags": {"value": ["占位标签乙"], "evidence": ["用户标签：占位标签乙"]},
+    "approval_url": {"value": "https://archive.example.invalid/batch", "evidence": ["本批存档文档：https://archive.example.invalid/batch"]}
+  },
+  {
+    "company": {"value": "占位公司丙", "evidence": ["③ 占位公司丙"]},
+    "policy_type": {"value": "定向政策", "evidence": ["均为定向政策"]},
+    "benefit_type": {"value": "买一赠一", "evidence": ["③ 占位公司丙，买一赠一"]},
+    "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+    "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+    "user_tags": {"value": ["占位标签丙"], "evidence": ["用户标签：占位标签丙"]},
+    "approval_url": {"value": "https://archive.example.invalid/batch", "evidence": ["本批存档文档：https://archive.example.invalid/batch"]}
+  },
+  {
+    "company": {"value": "占位公司丁", "evidence": ["④ 占位公司丁"]},
+    "policy_type": {"value": "定向政策", "evidence": ["均为定向政策"]},
+    "benefit_type": {"value": "买一赠一", "evidence": ["④ 占位公司丁，买一赠一"]},
+    "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+    "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+    "user_tags": {"value": ["占位标签丁"], "evidence": ["用户标签：占位标签丁"]},
+    "approval_url": {"value": "https://archive.example.invalid/batch", "evidence": ["本批存档文档：https://archive.example.invalid/batch"]}
+  },
+  {
+    "company": {"value": "占位公司戊", "evidence": ["⑤ 占位公司戊"]},
+    "policy_type": {"value": "定向政策", "evidence": ["均为定向政策"]},
+    "benefit_type": {"value": "买一赠一", "evidence": ["⑤ 占位公司戊，买一赠一"]},
+    "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+    "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+    "user_tags": {"value": ["占位标签戊"], "evidence": ["用户标签：占位标签戊"]},
+    "approval_url": {"value": "https://archive.example.invalid/batch", "evidence": ["本批存档文档：https://archive.example.invalid/batch"]}
+  },
+  {
+    "company": {"value": "占位公司己", "evidence": ["⑥ 占位公司己"]},
+    "policy_type": {"value": "定向政策", "evidence": ["均为定向政策"]},
+    "benefit_type": {"value": "买一赠一", "evidence": ["⑥ 占位公司己，买一赠一"]},
+    "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+    "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+    "user_tags": {"value": ["占位标签己"], "evidence": ["用户标签：占位标签己"]},
+    "approval_url": {"value": "https://archive.example.invalid/batch", "evidence": ["本批存档文档：https://archive.example.invalid/batch"]}
+  }
+]
