@@ -25,6 +25,8 @@ uv run --frozen --extra mingdao-check python -m qianshu.mingdao.rehearsal \
 
 ## 拦截与证据
 
+文档路径还可配置为 `/app/<应用>/newrecord/<工作表>/<视图>`（末尾斜杠可选）或 `/app/<应用>/<工作表>/<视图>/row/<记录>`，标识段只允许 ASCII 字母、数字、下划线和连字符，放行仍要求 GET 文档请求的路径与配置逐字相等。
+
 X2、X3 和整合入口复用 `qianshu.mingdao.readonly.readonly_context`。第一层在创建任何页面前安装 `context.route`，默认拒绝，覆盖弹窗的首个请求。在线阶段只放行同时匹配配置源和路径的视图文档 GET，以及匹配静态资源类型、路径和源的 GET。重定向在首跳截断。带预取或预渲染标记的 `Sec-Purpose` 或 `Purpose` 请求直接中止。上下文禁用 Service Worker 注册和下载，所有 WebSocket 都在握手前关闭并记录。
 
 X2 读齐五个基线行数后，在线预载「新建」视图。页面就绪后调用 `context.set_offline(True)`，且禁止路由通过 `route.fetch` 转发，此后才打开表单并填写。离线期间 Playwright 上报的网络尝试记为 `offline_attempt`，路由和脚本的拒绝仍另记 `blocked`。同一请求可以产生一条尝试记录和一条拒绝记录。联网取数型控件可能无法在离线状态加载，观察缺口记入报告。演练结束后受控关闭演练上下文里的页面及弹窗，销毁该上下文，再使用同一登录状态文件、同一拦截规则创建新的联网上下文，独立回读五个视图。

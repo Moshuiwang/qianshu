@@ -62,11 +62,18 @@ class ReadOnlyPolicy:
         object.__setattr__(self, "app_origin", _origin_setting(self.app_origin))
         object.__setattr__(self, "document_paths", tuple(self.document_paths))
         object.__setattr__(self, "static_origins", tuple(map(_origin_setting, self.static_origins)))
+        segment = r"[A-Za-z0-9_-]+"
+        document_pattern = re.compile(
+            rf"/app/{segment}/(?:"
+            rf"{segment}(?:/{segment})?"
+            rf"|newrecord/{segment}/{segment}/?"
+            rf"|{segment}/{segment}/row/{segment}"
+            r")"
+        )
         if not self.document_paths or any(
-            not re.fullmatch(r"/app/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+(?:/[A-Za-z0-9_-]+)?", path)
-            for path in self.document_paths
+            not document_pattern.fullmatch(path) for path in self.document_paths
         ):
-            raise ValueError("文档路径须为应用下的工作表或视图路径")
+            raise ValueError("文档路径须为应用下的工作表、视图、新建记录页或记录详情页路径")
 
     def classify(self, method: str, url: str, resource: str) -> tuple[bool, str]:
         try:
