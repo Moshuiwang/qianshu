@@ -13,7 +13,7 @@ from contextvars import ContextVar
 from http import HTTPStatus
 from pathlib import Path
 from secrets import token_urlsafe
-from threading import Lock
+from threading import Event, Lock
 from urllib.parse import parse_qs, urlparse
 from uuid import NAMESPACE_OID, uuid5
 
@@ -45,6 +45,11 @@ _HTTP_TIMEOUT = 2
 _CALLBACK_BUDGET = 3
 _CALLBACK_RESPONSE_MARGIN = 0.5
 _CALLBACK_TIMEOUT_NOTICE = "处理超时，请重新点击"
+_CREATE_SEND_MARGIN = 10
+
+
+class ApprovalClosed(RuntimeError):
+    """审批无法再用于建单。"""
 
 
 class _EndpointUnavailable(ws.ServerException):
@@ -176,6 +181,14 @@ class _Transport:
         if not response.data or not response.data.message_id:
             raise RuntimeError("飞书未返回卡片消息标识。")
         return response.data.message_id
+
+    def announce(self, text: str) -> None:
+        # 到期关闭和 D15 的读回结果也须发往同一汇报群。
+        body = CreateMessageRequestBody.builder().receive_id(self.settings.chat_id).msg_type(
+            "text",
+        ).content(json.dumps({"text": text}, ensure_ascii=False)).build()
+        request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+        _checked(self.im.message.create(request))
 
     async def notify_callback_timeout(self) -> None:
         async with asyncio.timeout(_HTTP_TIMEOUT):
@@ -422,7 +435,7 @@ class _Connection(ws.Client):
         )
 
     def _receive(self, data) -> None:
-        if not self._from_current_app(data) or not data.event:
+        if self.service.entrance is None or not self._from_current_app(data) or not data.event:
             return
         message, sender = data.event.message, data.event.sender
         if (
@@ -462,7 +475,7 @@ class FeishuService:
 
     def __init__(
         self, settings: Settings, window: Window, state_path: Path,
-        process: Callable[[Application], Report], *, clock: Callable[[], float] = time.time,
+        process: Callable[[Application], Report] | None, *, clock: Callable[[], float] = time.time,
         membership_check: Callable[[str], Awaitable[bool]] | None = None,
         callback_response_margin: float = _CALLBACK_RESPONSE_MARGIN,
     ):
@@ -471,6 +484,9 @@ class FeishuService:
         self.settings, self.window, self.clock = settings, window, clock
         self._lock = Lock()
         self._origin = None
+        self._approval_generation = 0
+        self._approval_disconnected = Event()
+        self._approval_disconnected.set()
         self._connected_at: float | None = None
         self._membership_check = membership_check
         self._callback_response_margin = callback_response_margin
@@ -483,7 +499,10 @@ class FeishuService:
         logging.getLogger("Lark").disabled = True
         logging.getLogger("httpx").disabled = True
         self.transport = _Transport(settings, window, clock)
-        self.entrance = Entrance(settings, window, self._state, self.transport, process, clock=clock)
+        self.entrance = (
+            Entrance(settings, window, self._state, self.transport, process, clock=clock)
+            if process is not None else None
+        )
         self._client = _Connection(self)
 
     def _connected(self, origin) -> None:
@@ -491,11 +510,17 @@ class FeishuService:
             self._connected_at = self.clock()
             self._state.close_approvals()
             self._origin = origin
+            self._approval_generation += 1
+            self._approval_disconnected.clear()
         _LOG.info("feishu_connected")
-        self.entrance.recover()
+        if self.entrance is not None:
+            self.entrance.recover()
 
-    def _disconnected(self) -> None:
+    def _disconnected(self, stop=None) -> None:
         with self._lock:
+            self._approval_disconnected.set()
+            if stop is not None and self.window.contains(self.clock()):
+                stop.set()
             was_connected = self._origin is not None
             self._origin = None
             self._connected_at = None
@@ -508,19 +533,64 @@ class FeishuService:
         if not record_id.strip():
             raise ValueError("缺少台账记录标识。")
         with self._lock:
-            origin = self._origin
+            origin, generation = self._origin, self._approval_generation
             if origin is None or origin.close_code is not None or not self.window.contains(self.clock()):
                 raise RuntimeError("审批长连接不可用。")
         approval_id = token_urlsafe(32)
         message_id = self.transport.send_card(approval_card(summary, approval_id, record_id))
         with self._lock:
             if (
-                self._origin is not origin or origin.close_code is not None
+                self._origin is not origin or generation != self._approval_generation or origin.close_code is not None
                 or not self.window.contains(self.clock())
             ):
                 raise RuntimeError("发送审批卡片期间审批已关闭。")
             self._state.bind(approval_id, message_id, record_id, self.window.end.timestamp())
         return approval_id
+
+    def approval_connection_ready(self) -> bool:
+        origin = self._origin
+        return (not self._approval_disconnected.is_set() and origin is not None
+                and origin.close_code is None and self.window.contains(self.clock()))
+
+    def approval_status(self, approval_id: str, record_id: str) -> str:
+        with self._lock:
+            status = self._state.approval_status(approval_id, record_id)
+            if status in ("pending", "approve", "claimed") and not self.approval_connection_ready():
+                self._state.close_approvals()
+                return "closed"
+            return status
+
+    def close_create_approval(self, approval_id: str, record_id: str) -> None:
+        with self._lock:
+            self._state.close_create_approval(approval_id, record_id)
+
+    def send_first_create(self, approval_id, record_id, prepare, record_attempt, send):
+        """认领后查询，查询期间可以关闭审批。随后串行记录尝试与交接。"""
+        def check(expires):
+            now = self.clock()
+            if (self._approval_disconnected.is_set() or origin is not self._origin
+                    or generation != self._approval_generation or origin.close_code is not None
+                    or not self.window.contains(now)
+                    or min(expires, self.window.end.timestamp()) - now < _CREATE_SEND_MARGIN):
+                raise ApprovalClosed("建单审批已关闭")
+
+        def dispatch(expires):
+            check(expires)
+            record_attempt()
+            send(lambda: check(expires))
+
+        with self._lock:
+            if not self.approval_connection_ready():
+                return False
+            origin, generation = self._origin, self._approval_generation
+            expires = self._state.claim_create(approval_id, record_id)
+            if expires is None:
+                return False
+            check(expires)
+
+        prepare()
+        with self._lock:
+            return self._state.dispatch_create(approval_id, record_id, dispatch)
 
     async def _record_action(
         self, data: P2CardActionTrigger, origin, deadline: float,
@@ -705,6 +775,36 @@ class FeishuService:
                 ws.loop.run_until_complete(self._stop())
             finally:
                 try:
-                    self.entrance.close()
+                    if self.entrance is not None:
+                        self.entrance.close()
                 finally:
                     self._state.close()
+
+    def run_create(self, work):
+        """审批监听在 SDK 事件循环运行，阻塞业务在工作线程运行。"""
+        stop = Event()
+
+        async def listen():
+            try:
+                await self._serve()
+            except Exception:
+                _LOG.error("feishu_create_listener_failed")
+            finally:
+                self._disconnected(stop)
+
+        listener = ws.loop.create_task(listen())
+        worker = ws.loop.create_task(asyncio.to_thread(work, stop))
+        try:
+            return ws.loop.run_until_complete(worker)
+        except KeyboardInterrupt:
+            with self._lock:
+                stop.set()
+            ws.loop.run_until_complete(asyncio.gather(worker, return_exceptions=True))
+            raise
+        finally:
+            listener.cancel()
+            try:
+                ws.loop.run_until_complete(asyncio.gather(listener, return_exceptions=True))
+                ws.loop.run_until_complete(self._stop())
+            finally:
+                self._state.close()

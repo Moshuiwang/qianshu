@@ -200,5 +200,44 @@ class State:
         with self._write(deadline=deadline, before_commit=before_commit) as db:
             db.execute("""
                 UPDATE feishu_approvals SET status = 'closed'
-                WHERE scope = ? AND status IN ('pending', 'approve')
+                WHERE scope = ? AND status IN ('pending', 'approve', 'claimed')
             """, (self.scope,))
+
+    def approval_status(self, approval_id: str, record_id: str) -> str:
+        with self.connection() as db:
+            row = db.execute("""
+                SELECT status FROM feishu_approvals
+                WHERE scope = ? AND approval_id = ? AND record_id = ?
+            """, (self.scope, approval_id, record_id)).fetchone()
+            return row[0] if row else "closed"
+
+    def close_create_approval(self, approval_id: str, record_id: str) -> None:
+        with self._write() as db:
+            db.execute("""
+                UPDATE feishu_approvals SET status = 'closed'
+                WHERE scope = ? AND approval_id = ? AND record_id = ?
+                  AND status IN ('pending', 'approve', 'claimed')
+            """, (self.scope, approval_id, record_id))
+
+    def claim_create(self, approval_id, record_id):
+        with self._write() as db:
+            row = db.execute("""
+                UPDATE feishu_approvals SET status = 'claimed'
+                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'approve'
+                RETURNING expires
+            """, (self.scope, approval_id, record_id)).fetchone()
+            return row[0] if row is not None else None
+
+    def dispatch_create(self, approval_id, record_id, dispatch):
+        # 关闭或认领同一卡片的其他进程与传输交接串行。
+        # 即使这里回滚，入口也会依据已落盘的尝试记录冻结 Trace 资格。
+        with self._write() as db:
+            row = db.execute("""
+                UPDATE feishu_approvals SET status = 'used'
+                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'claimed'
+                RETURNING expires
+            """, (self.scope, approval_id, record_id)).fetchone()
+            if row is None:
+                return False
+            dispatch(row[0])
+            return True
