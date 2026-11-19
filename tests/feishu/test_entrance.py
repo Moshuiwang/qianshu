@@ -7,6 +7,7 @@ from threading import Event
 
 import pytest
 
+from qianshu.config import ConfigError
 from qianshu.feishu import Entrance, Message, Report, State, fingerprint, load_settings
 
 
@@ -88,13 +89,49 @@ def test_reaction_precedes_dispatch_and_duplicate_is_not_processed(tmp_path, set
     assert [kind for kind, *_ in fake.events] == ["reaction", "card"]
 
 
+@pytest.mark.parametrize("check_fingerprint", [True, False], ids=["configured", "empty"])
+def test_different_body_requires_matching_fingerprint_only_when_configured(
+    tmp_path, settings, window, source, check_fingerprint,
+):
+    if not check_fingerprint:
+        settings = replace(settings, approved_fingerprint="")
+    body = " 合成的不同正文　ＡＢＣ\n"
+    message = replace(source, content=json.dumps({"text": f"@_user_1{body}"}))
+    fake = FakeTransport()
+    processed = []
+
+    def process(application):
+        processed.append(application.text)
+        return Report("合成来源")
+
+    entrance = Entrance(settings, window, State(tmp_path / "private.sqlite", settings), fake,
+                        process, clock=lambda: 150)
+    try:
+        work = entrance.inject_message(message).result(timeout=2)
+        if check_fingerprint:
+            assert work is None
+        else:
+            work.result(timeout=2)
+    finally:
+        entrance.close()
+    if check_fingerprint:
+        assert processed == []
+        assert fake.events == [("reply", message.message_id, "概念验证期不处理")]
+    else:
+        assert processed == [body]
+        assert [kind for kind, *_ in fake.events] == ["reaction", "card"]
+
+
+@pytest.mark.parametrize("check_fingerprint", [True, False], ids=["configured", "empty"])
 @pytest.mark.parametrize("change", [
     {"sender_id": "<非白名单占位>"},
     {"content": '{"text":"合成样例 ABC"}'},
-    {"content": '{"text":"@_user_1 合成样例 ABC 附加文本"}'},
+    {"content": '{"text":"@_user_1  "}'},
     {"kind": "image", "content": '{"image_key":"<合成图片>"}'},
-], ids=["sender", "explicit-mention", "fingerprint", "image"])
-def test_ineligible_messages_only_receive_notice(tmp_path, settings, window, source, change):
+], ids=["sender", "explicit-mention", "blank-body", "image"])
+def test_ineligible_messages_only_receive_notice(tmp_path, settings, window, source, change, check_fingerprint):
+    if not check_fingerprint:
+        settings = replace(settings, approved_fingerprint="")
     fake = FakeTransport()
     entrance = Entrance(settings, window, State(tmp_path / "private.sqlite", settings), fake,
                         lambda app: pytest.fail("意外进入业务处理"), clock=lambda: 150)
@@ -108,10 +145,13 @@ def test_ineligible_messages_only_receive_notice(tmp_path, settings, window, sou
     assert fake.events == [("reply", source.message_id, "概念验证期不处理")]
 
 
+@pytest.mark.parametrize("check_fingerprint", [True, False], ids=["configured", "empty"])
 @pytest.mark.parametrize("attachment", [
     {"tag": "img", "image_key": "<图片占位>"}, {"tag": "file", "file_key": "<文件占位>"},
 ])
-def test_attachments_are_refused_before_download(tmp_path, settings, window, source, attachment):
+def test_attachments_are_refused_before_download(tmp_path, settings, window, source, attachment, check_fingerprint):
+    if not check_fingerprint:
+        settings = replace(settings, approved_fingerprint="")
     fake = FakeTransport()
     post = replace(source, kind="post", content=json.dumps({
         "title": "",
@@ -256,15 +296,29 @@ def test_existing_message_claims_remain_deduplicated(tmp_path, settings, source)
     assert not state.claim_message(source.message_id)
 
 
-def test_config_reads_from_dotenv(tmp_path, settings):
+@pytest.mark.parametrize("fingerprint_value", [
+    "uppercase", "", None, "a" * 63, "g" * 64,
+], ids=["uppercase", "empty", "omitted", "wrong-length", "non-hex"])
+def test_config_reads_from_dotenv(tmp_path, settings, fingerprint_value):
+    if fingerprint_value == "uppercase":
+        fingerprint_value = settings.approved_fingerprint.upper()
+    fingerprint_line = (
+        "" if fingerprint_value is None else f"FEISHU_APPROVED_FINGERPRINT={fingerprint_value}\n"
+    )
     path = tmp_path / ".env"
     path.write_text(
         f"FEISHU_APP_ID={settings.app_id}\nFEISHU_APP_SECRET={settings.app_secret}\n"
         f"FEISHU_CHAT_ID={settings.chat_id}\nFEISHU_BOT_OPEN_ID={settings.bot_open_id}\n"
         f"FEISHU_ALLOWED_SENDER_IDS={','.join(settings.allowed_senders)}\n"
-        f"FEISHU_APPROVED_FINGERPRINT={settings.approved_fingerprint}\n",
+        + fingerprint_line,
         encoding="utf-8",
     )
+    if not fingerprint_value:
+        settings = replace(settings, approved_fingerprint="")
+    elif fingerprint_value.lower() != settings.approved_fingerprint:
+        with pytest.raises(ConfigError, match="配置缺失或格式无效"):
+            load_settings(path)
+        return
     assert load_settings(path) == settings
     tenant = "<租户配置占位>"
     with path.open("a", encoding="utf-8") as stream:
