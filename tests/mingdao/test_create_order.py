@@ -97,7 +97,7 @@ def case(tmp_path):
             "status_control": control["status"],
             "status_map": {key: name for index, name in status_names.items()
                            for key in (statuses[index], status_labels[index])},
-            "read": {"path": rows_path + "/{record_id}", "missing_status": 404,
+            "read": {"path": rows_path + "/{record_id}", "missing_status": 200,
                      "missing_key": ["error_code"], "missing_value": 12345},
             "search": {"path": rows_path + "/list", "name_control": control["policy_name"],
                        "view_ids": [ids["viewId"]]},
@@ -140,8 +140,8 @@ def add_notice_recipients(case):
 
 
 def test_assemble_values_and_legacy_cells(case):
-    case.cells.update({"_id": case.ids["template"], "_owner": {}, "_createdBy": {},
-                       "_createdAt": "", "_updatedAt": "", str(uuid4()): "占位自动计算值"})
+    case.cells.update(record_identity(case.ids["template"]), _owner={}, _createdBy={})
+    case.cells.update({"_createdAt": "", "_updatedAt": "", str(uuid4()): "占位自动计算值"})
     case.cells[case.control["maintain_mutual_exclusion_group"]] = order.compact([case.ids["option"]])
     controls, summary = assemble(case)
     fields = {row["controlId"]: row["value"] for row in controls}
@@ -165,6 +165,59 @@ def test_assemble_values_and_legacy_cells(case):
     assert all(row.keys() == {"字段名", "类型", "来源", "值指纹"}
                and len(row["值指纹"]) == 12 for row in summary)
     assert order.encode_cell([case.ids["option"]], {"type": 9}) == order.compact([case.ids["option"]])
+
+
+@pytest.mark.parametrize(("draft_name", "template_name"), [
+    ("PLACEHOLDER Basic", "PLACEHOLDER_Basic"),
+    ("PLACEHOLDER classic", "PLACEHOLDER_Classic"),
+    ("  placeholder  _  basic  ", "PLACEHOLDER_Basic"),
+])
+def test_packages_select_only_third_template_row(case, draft_name, template_name):
+    control = case.control["packages"]
+    current, gift, price = (case.child[key] for key in ("current", "gift", "price"))
+    spec = case.config["fields"][control]
+    spec["children"][current] = {"type": 2}
+    spec["current"]["name_path"] = []
+    gift_cell = [{"rowid": case.ids["gift_package"], "name": "PLACEHOLDER_Gift"}]
+    other_gift = [{"rowid": str(uuid4()), "name": "PLACEHOLDER_Other"}]
+    case.cells[control] = [
+        {current: f"占位包{index}", gift: gift_cell, price: str(index)} for index in range(1, 7)
+    ]
+    case.cells[control][0].update({current: template_name, gift: other_gift})
+    case.cells[control][2][current] = template_name
+    case.cells[control][1][gift] = []
+    case.values["packages"] = [{"current_package": draft_name, "gift_package": "placeholder gift"}]
+
+    controls, _ = assemble(case)
+    fields = {row["controlId"]: row["value"] for row in controls}
+    selected = [
+        {"controlId": current, "value": template_name},
+        {"controlId": gift, "value": order.compact([{"sid": case.ids["gift_package"]}])},
+        {"controlId": price, "value": "3"},
+    ]
+    assert json.loads(fields[control]) == [selected]
+
+    case.values["packages"].insert(0, {"current_package": "占位包2", "gift_package": None})
+    controls, _ = assemble(case)
+    fields = {row["controlId"]: row["value"] for row in controls}
+    assert json.loads(fields[control]) == [[
+        {"controlId": current, "value": "占位包2"},
+        {"controlId": gift, "value": "[]"},
+        {"controlId": price, "value": "2"},
+    ], selected]
+
+
+def test_packages_stop_on_duplicate_normalized_pair(case):
+    control, current = case.control["packages"], case.child["current"]
+    first, = case.cells[control]
+    first[current][0]["name"] = "PLACEHOLDER_Basic"
+    second = deepcopy(first)
+    second[current][0]["name"] = "placeholder basic"
+    second[case.child["price"]] = "6"
+    case.cells[control].append(second)
+    case.values["packages"][0]["current_package"] = "Placeholder Basic"
+    with pytest.raises(order.Stop, match="节目包与模板不同，需人工"):
+        assemble(case)
 
 
 @pytest.mark.parametrize(("failure", "reason"), [
@@ -225,6 +278,10 @@ def test_draft_tags_can_be_resolved_without_template_tags(case):
     }
 
 
+def record_identity(row_id):
+    return {"_id": uuid4().hex[:24], "rowId": row_id}
+
+
 class Platform:
     def __init__(self, case):
         self.case = case
@@ -245,16 +302,17 @@ class Platform:
         self.before_read = lambda row: None
         self.before_handoff = lambda: None
         self.query_pages = {}
+        self.after_delete_query_pages = {}
         self.queries = []
         self.timeouts = []
-        self.template = {**case.cells, "_id": case.ids["template"], "_createdBy": {}, "_owner": {}}
+        self.template = {**case.cells, **record_identity(case.ids["template"]), "_createdBy": {}, "_owner": {}}
 
     def status_cell(self, status):
         return [{"key": self.case.statuses[status], "value": self.case.status_labels[status]}]
 
     def record(self, record_id, status, cells):
         return {
-            **cells, "_id": record_id,
+            **cells, **record_identity(record_id),
             self.case.control["policy_name"]: cells.get(self.case.control["policy_name"],
                                                        self.case.values["policy_name"]),
             self.case.control["status"]: self.status_cell(status),
@@ -315,8 +373,9 @@ class Platform:
                     rows.append(self.record(str(uuid4()), 1, {}))
             else:
                 ids = [case.ids["tag"], *(str(uuid4()) for _ in range(self.tag_count - 1))]
-                rows = [{"_id": tag_id, control: name} for tag_id in ids[:self.tag_count]]
-            page_rows = self.query_pages.get((view, page), rows)
+                rows = [{**record_identity(tag_id), control: name} for tag_id in ids[:self.tag_count]]
+            pages = self.after_delete_query_pages if "delete" in self.actions else self.query_pages
+            page_rows = pages.get((view, page), rows)
             if page_rows is None:
                 return httpx.Response(503, json={"success": False})
             return self.response({"rows": page_rows})
@@ -333,8 +392,8 @@ class Platform:
         if request.method == "GET":
             self.actions.append("read")
             if record_id not in self.rows:
-                code = 99999 if self.delete_effect == "wrong_missing" else 12345
-                return httpx.Response(404, json={"success": False, "error_code": code})
+                code = 99999 if self.delete_effect == "wrong_missing" else spec["read"]["missing_value"]
+                return httpx.Response(200, json={"success": False, "error_code": code})
             self.before_read(self.rows[record_id])
             return self.response(self.rows[record_id])
         self.actions.append("delete")
@@ -459,8 +518,8 @@ def test_duplicate_check_reads_every_page_of_every_view(case, platform, mode):
     official["page_size"] = 2
     control = official["search"]["name_control"]
     name = case.values["policy_name"]
-    near_match = {"_id": str(uuid4()), control: name + "（占位后缀）"}
-    exact_match = {"_id": str(uuid4()), control: name}
+    near_match = {**record_identity(str(uuid4())), control: name + "（占位后缀）"}
+    exact_match = {**record_identity(str(uuid4())), control: name}
     platform.query_pages = {
         (view, 1): [near_match, near_match],
         (view, 2): [],
@@ -470,9 +529,11 @@ def test_duplicate_check_reads_every_page_of_every_view(case, platform, mode):
     if mode == "page_limit":
         official["page_limit"] = 2
         platform.query_pages[(extra, 2)] = [near_match, near_match]
+    if mode == "zero_matches":
+        platform.after_delete_query_pages = platform.query_pages.copy()
     assert run_case(case, platform, Approvals(platform)) == (mode == "zero_matches")
-    assert platform.queries == [("search", view, 1), ("search", view, 2),
-                                ("search", extra, 1), ("search", extra, 2)]
+    expected = [("search", view, 1), ("search", view, 2), ("search", extra, 1), ("search", extra, 2)]
+    assert platform.queries == expected * (2 if mode == "zero_matches" else 1)
     assert platform.create_count == int(mode == "zero_matches")
     assert ("aborted_before_write" in events(case)) == (mode != "zero_matches")
 
@@ -483,18 +544,19 @@ def test_tag_query_requires_unique_exact_name_across_pages(case, platform, mode)
     config["page_size"] = 2
     view, control = config["tags"]["view_ids"][0], config["tags"]["name_control"]
     name = case.values["user_tags"][0]
-    near_match = {"_id": str(uuid4()), control: name + "（占位后缀）"}
+    near_match = {**record_identity(str(uuid4())), control: name + "（占位后缀）"}
     tag_id = "A" + case.ids["tag"][1:]
-    exact = {"_id": tag_id, control: name}
+    exact = {**record_identity(tag_id), control: name}
+    duplicate = {**record_identity(str(uuid4())), control: name}
     platform.query_pages = {
-        (view, 1): [near_match, {"_id": str(uuid4()), control: name} if mode == "duplicate" else near_match],
+        (view, 1): [near_match, duplicate if mode == "duplicate" else near_match],
         (view, 2): None if mode == "later_page_failed" else [exact],
     }
     expected_queries = [("tags", view, 1), ("tags", view, 2)]
     if mode == "overlapping_views":
         extra = case.ids["additional_view"]
         config["tags"]["view_ids"].append(extra)
-        platform.query_pages[(extra, 1)] = [dict(exact, _id=tag_id.lower())]
+        platform.query_pages[(extra, 1)] = [{**record_identity(tag_id.lower()), control: name}]
         expected_queries.append(("tags", extra, 1))
     with httpx.Client(transport=httpx.MockTransport(platform.official)) as client:
         api = order.Official(config, case.official_token, case.ids["official_app"], client)
@@ -504,6 +566,22 @@ def test_tag_query_requires_unique_exact_name_across_pages(case, platform, mode)
             with pytest.raises(order.Stop):
                 api.tag(name)
     assert platform.queries == expected_queries
+
+
+@pytest.mark.parametrize(("action", "method"), [("search", "find"), ("tags", "tag")])
+@pytest.mark.parametrize("invalid_row_id", [None, "占位无效编号"])
+def test_list_requires_valid_row_id(case, platform, action, method, invalid_row_id):
+    config = case.config["official"]
+    name = case.values["policy_name"] if action == "search" else case.values["user_tags"][0]
+    spec = config[action]
+    row = {"_id": str(uuid4()), spec["name_control"]: name}
+    if invalid_row_id is not None:
+        row["rowId"] = invalid_row_id
+    platform.query_pages[(spec["view_ids"][0], 1)] = [row]
+    with httpx.Client(transport=httpx.MockTransport(platform.official)) as client:
+        api = order.Official(config, case.official_token, case.ids["official_app"], client)
+        with pytest.raises(order.Stop, match="官方查询记录编号未确认"):
+            getattr(api, method)(name)
 
 
 def test_search_requires_configured_view(case):
@@ -517,7 +595,7 @@ def test_search_stops_at_default_page_limit(case, platform):
     config = case.config["official"]
     config["page_size"] = 1
     view = config["search"]["view_ids"][0]
-    filler = {"_id": str(uuid4()), config["search"]["name_control"]: "占位近似名称"}
+    filler = {**record_identity(str(uuid4())), config["search"]["name_control"]: "占位近似名称"}
     platform.query_pages = {(view, page): [filler] for page in range(1, 22)}
     with httpx.Client(transport=httpx.MockTransport(platform.official)) as client:
         api = order.Official(config, case.official_token, case.ids["official_app"], client)
@@ -808,6 +886,47 @@ def test_d15_verification(case, platform, condition, deleted, verified):
     assert all("<at " in notice for notice in approvals.notices)
 
 
+@pytest.mark.parametrize("mode", ["both_confirmed", "name_remains", "detail_still_exists", "name_page_failed"])
+def test_delete_verification_requires_missing_signal_and_no_exact_name(case, platform, mode):
+    config = case.config["official"]
+    view, extra = (case.ids[key] for key in ("viewId", "additional_view"))
+    config["search"]["view_ids"].append(extra)
+    config["page_size"] = 1
+    control = config["search"]["name_control"]
+    name = case.values["policy_name"]
+    near_match = {**record_identity(str(uuid4())), control: name + "（占位后缀）"}
+    exact_match = {**record_identity(str(uuid4())), control: name}
+    platform.after_delete_query_pages = {
+        (view, 1): [near_match], (view, 2): [],
+        (extra, 1): [near_match], (extra, 2): [], (extra, 3): [],
+    }
+    expected_search = [("search", view, 1), ("search", view, 2),
+                       ("search", extra, 1), ("search", extra, 2)]
+    if mode == "name_remains":
+        platform.after_delete_query_pages[(extra, 2)] = [exact_match]
+        expected_search.append(("search", extra, 3))
+    if mode == "detail_still_exists":
+        platform.delete_effect = "still_exists"
+    if mode == "name_page_failed":
+        platform.after_delete_query_pages[(extra, 2)] = None
+
+    approvals = Approvals(platform)
+    if mode == "both_confirmed":
+        assert run_case(case, platform, approvals)
+        assert events(case)[-1] == "delete_verified"
+    else:
+        reason = {"name_remains": "删除后仍有同名记录",
+                  "detail_still_exists": "删除后未收到登记的记录不存在信号",
+                  "name_page_failed": "官方接口结果未确认"}[mode]
+        with pytest.raises(order.Stop, match=reason):
+            run_case(case, platform, approvals)
+        assert events(case)[-1] == "delete_unconfirmed"
+        assert "delete_verified" not in events(case)
+        assert any("删除未获确认" in notice and "<at " in notice for notice in approvals.notices)
+    assert platform.actions.count("delete") == 1
+    assert platform.queries == [("search", view, 1), ("search", extra, 1), *expected_search]
+
+
 @pytest.mark.parametrize("limit", [0, 51, True])
 def test_invalid_log_page_limit(case, limit):
     case.config["official"]["logs"]["page_limit"] = limit
@@ -916,16 +1035,33 @@ def test_official_record_legacy_status(case, platform, state):
 
 
 @pytest.mark.parametrize("read_number", [1, 2, 3])
-def test_created_detail_with_mismatched_id_stops_cleanup(case, platform, read_number):
+@pytest.mark.parametrize("mode", ["mismatched", "invalid", "missing"])
+def test_created_detail_without_matching_row_id_stops_cleanup(case, platform, read_number, mode):
     def replace_id(row):
         if platform.actions.count("read") == read_number:
-            row["_id"] = case.ids["template"]
+            row["_id"] = case.ids["created"]
+            if mode == "missing":
+                del row["rowId"]
+            else:
+                row["rowId"] = case.ids["template"] if mode == "mismatched" else "占位无效编号"
 
     platform.before_read = replace_id
     reason = "官方回读未获确认" if read_number == 1 else "官方详情记录编号未确认"
     with pytest.raises(order.Stop, match=reason):
         run_case(case, platform, Approvals(platform))
     assert "delete" not in platform.actions
+
+
+def test_created_row_id_case_can_vary_between_reads(case, platform):
+    case.ids["created"] = "a" + case.ids["created"][1:]
+
+    def change_case(row):
+        row["rowId"] = (case.ids["created"].upper() if platform.actions.count("read") % 2
+                        else case.ids["created"])
+
+    platform.before_read = change_case
+    assert run_case(case, platform, Approvals(platform))
+    assert events(case)[-1] == "delete_verified"
 
 
 @pytest.mark.parametrize("effect", ["ok", "chunk_ok"])
@@ -971,6 +1107,16 @@ def test_readback_compares_single_option_by_key(case, kind, same_key):
     raw = {control: [{"key": key, "value": "占位显示文本"}]}
     _, counts = order.compare(expected, raw, case.config)
     assert counts == {"一致" if same_key else "不一致": 1}
+
+
+@pytest.mark.parametrize("same_id", [True, False])
+def test_tag_readback_compares_uuid_without_case(case, same_id):
+    control = case.control["user_tags"]
+    tag_id = "A" + case.ids["tag"][1:]
+    expected = [{"controlId": control, "value": order.compact([{"sid": tag_id}])}]
+    raw = {control: [{"rowid": tag_id.lower() if same_id else str(uuid4())}]}
+    _, counts = order.compare(expected, raw, case.config)
+    assert counts == {"一致" if same_id else "不一致": 1}
 
 
 def test_trace_lock_blocks_crash_and_allows_proven_no_send(case):
@@ -1133,7 +1279,7 @@ def test_disconnect_waits_until_transport_handoff(case, platform, live_approval)
     "missing_approver", "missing_configurator", "waiver_with_configurator", "empty_waiver",
     "waiver_without_receipt",
     "unexpected_notice", "empty_recipients", "duplicate_recipient", "malformed_recipient",
-    "template_mismatched_id",
+    "template_mismatched_id", "template_only_legacy_id",
 ])
 def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys):
     private = case.private
@@ -1168,7 +1314,9 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     if mode == "unexpected_notice":
         case.evidence["notices"]["placeholder_unlisted"] = "占位未列回执"
     if mode == "template_mismatched_id":
-        platform.template["_id"] = case.ids["created"]
+        platform.template["rowId"] = case.ids["created"]
+    if mode == "template_only_legacy_id":
+        platform.template["_id"] = platform.template.pop("rowId")
     if mode in ("draft_tag", "draft_tag_missing", "draft_tag_ambiguous"):
         platform.template[case.control["user_tags"]] = [{"rowid": str(uuid4()), "name": "占位标签甲"}]
         case.values["user_tags"] = ["占位标签乙"]
@@ -1254,7 +1402,7 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     if mode == "login_changed_after_approval":
         assert "aborted_before_write" in events(case)
         assert any("建单登录状态已变化" in notice for notice in approvals.notices)
-    if mode == "template_mismatched_id":
+    if mode in ("template_mismatched_id", "template_only_legacy_id"):
         assert "官方详情记录编号未确认" in captured.err
         assert platform.actions == ["template"]
     if mode == "draft_tag":

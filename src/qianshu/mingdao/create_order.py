@@ -13,7 +13,7 @@ import sys
 import time
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -38,7 +38,7 @@ _CONNECT_TIMEOUT = 10
 _READ_TIMEOUT = 30
 _STABILITY_INTERVAL = 5
 _STABILITY_TIMEOUT = 120
-_OFFICIAL_METADATA = frozenset({"_id", "_createdAt", "_updatedAt", "_createdBy", "_owner"})
+_OFFICIAL_METADATA = frozenset({"_id", "rowId", "_createdAt", "_updatedAt", "_createdBy", "_owner"})
 _CREATE_HOST = "www.mingdao.com"
 _CREATE_PATH = "/api/Worksheet/AddWorksheetRow"
 _EVIDENCE = (
@@ -188,7 +188,8 @@ class Ledger:
         require(sum(row["event"] == "create_attempt" for row in rows) == 1
                 and uuid_record(record_id) and self.name.startswith(_PREFIX) and len(created) == 1
                 and created[0]["is_test"] is True and created[0]["name"] == self.name
-                and created[0]["record_id"] == record_id
+                and uuid_record(created[0]["record_id"])
+                and created[0]["record_id"].lower() == record_id.lower()
                 and not any(row["event"] in {"create_unknown", "delete_attempt", "delete_verified"}
                             for row in rows), "建单台账不符或已尝试清理")
 
@@ -364,7 +365,8 @@ class Official:
                 "记录不存在信号配置无效")
 
     def _request(self, action, record_id="", *, body=None, params=None, timeout=None):
-        require(not record_id or uuid_record(record_id), "记录编号格式无效")
+        if action in ("read", "logs", "delete"):
+            require(uuid_record(record_id), "记录编号格式无效")
         spec = self.config[action]
         url = self.origin + spec["path"].replace("{record_id}", record_id)
         method = {"delete": "DELETE", "search": "POST", "tags": "POST"}.get(action, "GET")
@@ -404,13 +406,14 @@ class Official:
         return self._request("read", record_id, timeout=timeout)
 
     def detail(self, raw, record_id):
-        require(isinstance(raw, dict) and uuid_record(raw.get("_id")) and raw["_id"] == record_id,
+        require(uuid_record(record_id) and isinstance(raw, dict) and uuid_record(raw.get("rowId"))
+                and raw["rowId"].lower() == record_id.lower(),
                 "官方详情记录编号未确认")
         return raw
 
     def record(self, raw):
         error = "官方记录标识或状态未确认"
-        record_id = raw.get("_id")
+        record_id = raw.get("rowId")
         name = raw.get(self.config["search"]["name_control"])
         state = raw.get(self.config["status_control"])
         require(uuid_record(record_id) and receipt(name), error)
@@ -430,7 +433,7 @@ class Official:
         spec = self.config[action]
         control = spec["name_control"]
         condition = {"type": "condition", "field": control, "operator": "eq", "value": name}
-        matches = []
+        matches = {}
         for view in spec["view_ids"]:
             for page in range(1, self.page_limit + 1):
                 result = self._request(action, body={
@@ -441,24 +444,22 @@ class Official:
                 require(isinstance(rows, list) and len(rows) <= self.page_size, "官方查询结果不完整")
                 for row in rows:
                     require(isinstance(row, dict) and receipt(row.get(control)), "官方查询返回无效名称")
+                    record_id = row.get("rowId")
+                    require(uuid_record(record_id), "官方查询记录编号未确认")
                     if row[control] == name:
-                        matches.append(row)
+                        matches.setdefault(record_id.lower(), record_id)
                 if len(rows) < self.page_size:
                     break
             else:
                 raise Stop("官方查询超过分页上限，需人工")
-        return matches
+        return list(matches.values())
 
     def find(self, name):
-        ids = [row["_id"] for row in self._query("search", name)]
-        require(all(uuid_record(item) for item in ids), "名称查询记录编号未确认")
-        return ids
+        return self._query("search", name)
 
     def tag(self, name):
-        ids = [row.get("_id") for row in self._query("tags", name)]
-        require(all(uuid_record(record_id) for record_id in ids), "用户标签记录编号未确认")
-        unique_ids = {record_id.lower() for record_id in ids}
-        require(len(unique_ids) == 1, "用户标签查询未获得唯一同名记录，需人工")
+        ids = self._query("tags", name)
+        require(len(ids) == 1, "用户标签查询未获得唯一同名记录，需人工")
         return ids[0]
 
     def history(self, current):
@@ -617,6 +618,10 @@ def equivalent(left, right, spec):
         except ValueError:
             return False
     if kind in (10, 26, 29):
+        if spec.get("draft") == "user_tags":
+            expected, observed = ([item["sid"] for item in decode(value)] for value in (left, right))
+            return (all(uuid_record(record_id) for record_id in expected + observed)
+                    and sorted(map(str.lower, expected)) == sorted(map(str.lower, observed)))
         return sorted(map(compact, decode(left))) == sorted(map(compact, decode(right)))
     if kind == 34:
         expected, observed = subtable_rows(left), subtable_rows(right)
@@ -628,7 +633,14 @@ def equivalent(left, right, spec):
     return left == right
 
 
-def package_names(rows, spec):
+def normalize_package_name(value):
+    if value is None:
+        return None
+    require(receipt(value), "节目包与模板不同，需人工")
+    return re.sub(r"[ _]+", "_", value.strip().casefold())
+
+
+def select_package_rows(value, spec, packages):
     def name(row, mapping):
         value = row[mapping["control"]]
         if value is None or value == "" or value == [] or value == "[]":
@@ -636,10 +648,21 @@ def package_names(rows, spec):
         path = mapping["name_path"]
         if path and isinstance(value, str):
             value = decode(value)
-        return at(value, path)
+        return normalize_package_name(at(value, path))
 
-    return [{"current_package": name(row, spec["current"]), "gift_package": name(row, spec["gift"])}
-            for row in rows]
+    by_names = {}
+    for row in subtable_rows(value, metadata=spec.get("row_metadata", [])):
+        names = name(row, spec["current"]), name(row, spec["gift"])
+        by_names.setdefault(names, []).append(row)
+
+    selected = []
+    for package in packages:
+        names = (normalize_package_name(package["current_package"]),
+                 normalize_package_name(package["gift_package"]))
+        matches = by_names.get(names, [])
+        require(len(matches) == 1, "节目包与模板不同，需人工")
+        selected.append(matches[0])
+    return selected
 
 
 def cell_schema(fields_config, skip):
@@ -732,8 +755,7 @@ def assemble(values, template_cells, config, resolve_tag, *, is_test):
             "模板国家绑定无效")
 
     package_control = draft_controls["packages"]
-    require(package_names(subtable_rows(template_cells[package_control]), schema[package_control])
-            == values["packages"], "节目包与模板不同，需人工")
+    package_rows = select_package_rows(template_cells[package_control], schema[package_control], values["packages"])
     for key in values.keys() - set((*_VARIABLE, "packages", "user_tags")):
         control = draft_controls.get(key)
         require(control is not None, f"草稿字段 {key} 无法核对模板，需人工")
@@ -753,6 +775,8 @@ def assemble(values, template_cells, config, resolve_tag, *, is_test):
             source, encoded = "固定值", fixed[control]
         elif control == tag_control:
             source, encoded = "草稿", encode_cell(tag_ids, spec)
+        elif control == package_control:
+            source, encoded = "模板", encode_cell(package_rows, spec)
         elif key in _VARIABLE:
             source, encoded = "草稿", encode_cell(values[key], spec)
         else:
@@ -904,9 +928,10 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
     def checked_record(raw):
         require(raw is not _MISSING, "删除前记录不存在")
         result = api.record(api.detail(raw, record_id))
-        require((result.record_id, result.name) == (record_id, ledger.name), "删除前名称或记录编号回读不符")
+        require(result.name == ledger.name, "删除前名称或记录编号回读不符")
         require(result.status == _NEW, "删除前状态须为新建")
-        return result
+        # 详情已核对身份，后续请求沿用台账中的大小写。
+        return replace(result, record_id=record_id)
 
     try:
         ledger.registered(record_id)
@@ -934,7 +959,10 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
         require(latest == earlier, "状态历史与最新回读不一致")
         stop_if_interrupted(stop)
         api.delete(latest)
-        require(api.read(record_id) is _MISSING, "删除后未收到登记的记录不存在信号")
+        missing = api.read(record_id) is _MISSING
+        same_name = api.find(ledger.name)
+        require(missing, "删除后未收到登记的记录不存在信号")
+        require(not same_name, "删除后仍有同名记录")
         stop_if_interrupted(stop)
     except (Exception, KeyboardInterrupt) as error:
         ledger.append("delete_unconfirmed", record_id)
@@ -944,7 +972,7 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
             raise
         raise Stop(reason) from None
     ledger.append("delete_verified", record_id)
-    announce("删除已核验，官方接口回读记录不存在")
+    announce("删除已核验，官方接口回读记录不存在且未查到同名记录")
 
 
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
