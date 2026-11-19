@@ -7,12 +7,14 @@ import logging
 import os
 import re
 import sqlite3
+import stat
 import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager, nullcontext
 from datetime import date, datetime
+from functools import partial
 from hashlib import sha256
 from pathlib import Path
 from threading import Event, Thread, Timer
@@ -26,9 +28,10 @@ from . import mail
 from .config import Config, ConfigError, load_config
 from .feishu import Entrance, FeishuService, Message, Report, Settings, State, Window, load_settings
 from .feishu.cards import CardLine, DetailPage, detail_pages, interrupted_report_card, result_card
-from .feishu.entrance import Application, Attachment, Transport
+from .feishu.entrance import Application, Attachment, Transport, fingerprint
 from .feishu.sdk import _Transport
 from .logs import setup_logging
+from .parse import _DEFAULT_COMPANIES_FILE
 from .parse.model import configured_model
 from .pipeline import Pipeline
 
@@ -50,6 +53,8 @@ _MAIL_PREFIX = "mail:"
 _MAIL_REQUIRED = ("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD", "MAIL_APPROVER", "MAIL_TEST_MARKER")
 _MAIL_EXTRA = ("MAIL_APPROVER", "MAIL_TEST_MARKER", "MAIL_SENT_FOLDER", "MAIL_PRIVATE_DIR")
 _MAIL_CONFIG_ERROR = "邮件轮询配置缺失或不可读，请检查 .env。"
+_COMPANIES_FILE_ERROR = "公司对照表文件缺失或不可读，请检查 --companies-file。"
+_RAW_OUTPUT_DIR_ERROR = "原始回复目录须为可访问的 0700 目录，请检查 --raw-output-dir。"
 _SendReport = Callable[[dict, str, bool, Callable[[], None]], None]
 
 
@@ -382,7 +387,9 @@ def _inject(
         return fixture["model_reply"]
 
     transport = _OfflineTransport()
-    pipeline = Pipeline(model=model, tag_dates=tag_dates, sensitive_values=sensitive_values)
+    pipeline = Pipeline(
+        model=model, tag_dates=tag_dates, sensitive_values=sensitive_values, companies_file=args.companies_file,
+    )
     with tempfile.TemporaryDirectory(prefix="qianshu-inject-") as directory:
         state = State(Path(directory) / "state.sqlite", settings)
         try:
@@ -481,6 +488,53 @@ def _mail_worker(
         deadline.cancel()
 
 
+def _check_companies_file(path: Path) -> None:
+    try:
+        if not path.is_file():
+            raise OSError
+        path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        raise ConfigError(_COMPANIES_FILE_ERROR) from None
+
+
+@contextmanager
+def _raw_output_directory(path: Path) -> Iterator[int]:
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    except OSError:
+        raise ConfigError(_RAW_OUTPUT_DIR_ERROR) from None
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) != 0o700:
+            raise ConfigError(_RAW_OUTPUT_DIR_ERROR)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _save_raw_reply(path: Path, application: Application, reply: str) -> None:
+    try:
+        with _raw_output_directory(path) as directory:
+            digest = fingerprint(application.text)
+            timestamp = time.time_ns()
+            while True:
+                name = f"{timestamp}-{digest}.txt"
+                try:
+                    fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
+                    break
+                except FileExistsError:
+                    timestamp += 1
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
+                    os.fchmod(output.fileno(), 0o600)
+                    output.write(reply)
+            except (OSError, UnicodeError):
+                os.unlink(name, dir_fd=directory)
+                raise
+    except (ConfigError, OSError, UnicodeError):
+        _LOG.warning("原始模型回复保存失败。")
+        raise
+
+
 def _serve(
     args: argparse.Namespace, settings: Settings, window: Window, tag_dates: dict[str, date],
     sensitive_values: tuple[str, ...], config: Config, *, mail_config: Config | None = None,
@@ -497,7 +551,11 @@ def _serve(
             raise RuntimeError("验收窗口已关闭。")
         return model(system=system, user=user)
 
-    pipeline = Pipeline(model=complete, tag_dates=tag_dates, sensitive_values=sensitive_values)
+    pipeline = Pipeline(
+        model=complete, tag_dates=tag_dates, sensitive_values=sensitive_values,
+        companies_file=args.companies_file,
+        on_reply=partial(_save_raw_reply, args.raw_output_dir) if args.raw_output_dir is not None else None,
+    )
 
     def send(card: dict, request_id: str, _notice: bool, check_attempt: Callable[[], None]) -> None:
         _send_report_card(service.transport, card, request_id, check_attempt)
@@ -565,13 +623,25 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--inject", type=Path, help="离线注入文件，卡片以 JSON 行输出")
     parser.add_argument("--mail", action="store_true", help="在验收窗口内启用只读邮件轮询")
     parser.add_argument("--tag-dates", type=Path, help="私有 JSON 对象，标签名称映射到已确认的结束日期")
+    parser.add_argument("--companies-file", type=Path,
+                        help="公司对照表路径，常驻服务默认 .private/companies.tsv。")
+    parser.add_argument("--raw-output-dir", type=Path, help="常驻服务保存原始模型回复的现有 0700 目录。")
     args = parser.parse_args(argv)
     if args.inject is None and args.state is None:
         parser.error("常驻服务须指定 --state。")
     if args.mail and args.inject is not None:
         parser.error("--mail 仅用于常驻服务。")
+    if args.raw_output_dir is not None and args.inject is not None:
+        parser.error("--raw-output-dir 仅用于常驻服务。")
 
     try:
+        if args.inject is None:
+            if args.companies_file is None:
+                args.companies_file = _DEFAULT_COMPANIES_FILE
+            _check_companies_file(args.companies_file)
+            if args.raw_output_dir is not None:
+                with _raw_output_directory(args.raw_output_dir):
+                    pass
         config = load_config(env_file=args.env_file)
         mail_config = _load_mail_config(config, args.env_file) if args.mail else None
         setup_logging(config if mail_config is None else {**config, **mail_config})

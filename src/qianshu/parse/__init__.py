@@ -660,6 +660,8 @@ def _draft_field(
 
     if scope.boundary_uncertain:
         reason = _BOUNDARY_HINT
+    elif name == "user_scope" and value is not None and value_evidence:
+        return DraftField(value=value, evidence=value_evidence)
     elif proposed:
         reason = "申请存在待确认的候选值。"
     elif value is None:
@@ -684,6 +686,8 @@ def _draft_field(
 
 
 def _value(name: str, value: object) -> object:
+    if name == "user_scope":
+        return (value.strip() or None) if isinstance(value, str) else None
     if name == "cancel_on_downgrade":
         return value if value in ("是", "否") else None
     if name in {"recharge_days", "gift_days"}:
