@@ -38,7 +38,7 @@ def sender(message: EmailMessage) -> str:
 
 def message_id(message: EmailMessage) -> str | None:
     fields = message.get_all("Message-ID", [])
-    if len(fields) != 1:
+    if len(fields) != 1 or fields[0].defects:
         return None
     # Python 3.12.3 展开冒号后的折行时会保留续行开头的空格或制表符。
     value = str(fields[0]).lstrip(" \t")

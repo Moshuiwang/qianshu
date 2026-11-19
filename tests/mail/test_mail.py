@@ -97,7 +97,7 @@ class FakeIMAP:
             return "OK", [b"1 (UID " + uid.encode() + b" BODYSTRUCTURE " + msg["structure"] + b")"]
         assert query.startswith("(BODY.PEEK[") and query.endswith("])")
         section = query[len("(BODY.PEEK["):-2]
-        if section == SUMMARY:
+        if section == SUMMARY and section not in msg:
             summary = EmailMessage()
             for field in ("From", "Subject", "Message-ID", "In-Reply-To", "References"):
                 if field in msg["message"]:
@@ -364,6 +364,37 @@ def test_poll_rejects_ambiguous_marker_and_prevents_rebinding(config):
     fake.folders[inbox][2] = second
     del fake.folders[inbox][1]
     assert poll_once(config, lambda *_: None, factory=fake.factory).delivered
+
+
+@pytest.mark.parametrize("separator", [b", ", b""], ids=["comma-separated", "adjacent"])
+def test_poll_delivers_request_without_approval_for_defective_message_id(config, separator):
+    fake = FakeIMAP()
+    inbox, sent = config["MAIL_FOLDER"], config["MAIL_SENT_FOLDER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    request = mail(approver, marker, "合成申请")
+    request_id = str(request["Message-ID"])
+    fake.add(inbox, 1, request)
+    # 直接提供 IMAP 原始摘要，避免邮件库重新序列化时丢掉解析缺陷。
+    fake.folders[inbox][1][SUMMARY] = (
+        f"From: {approver}\r\nSubject: {marker}\r\nMessage-ID:\r\n {request_id}".encode()
+        + separator + b"<other@sample.invalid>\r\n\r\n"
+    )
+    fake.add(sent, 2, mail(approver, "合成回复", "同意", reply_to=request_id))
+    calls = []
+    judged = []
+
+    def judge(text):
+        judged.append(text)
+        return ApprovalDecision.APPROVE
+
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory,
+                       approval_judge=judge)
+
+    assert (result.total, result.matched, result.delivered, result.approved) == (1, 1, True, False)
+    [(body, approved, _)] = calls
+    assert (body, approved) == ("合成申请", False)
+    assert not judged
+    assert not fake.fetched(sent, 2, SUMMARY)
 
 
 @pytest.mark.parametrize("reply_header", ["reply_to", "references"])
