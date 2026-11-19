@@ -91,6 +91,24 @@ def test_six_synthetic_policies_match_manual_expectations(application, recorded_
     assert first.approval_attachments.uncertainty is None
 
 
+@pytest.mark.parametrize(("value", "quotes", "expected"), [
+    ("占位休眠用户召回", ["用户范围：占位休眠用户"], "占位休眠用户召回"),
+    ("占位休眠用户召回", ["占位虚构摘录", "用户范围：占位休眠用户"], "占位休眠用户召回"),
+    ("占位休眠用户召回", [], None),
+    ("占位休眠用户召回", ["占位虚构摘录"], None),
+    (" ", ["用户范围：占位休眠用户"], None),
+])
+def test_user_scope_accepts_summary_with_verified_source(application, recorded_reply, value, quotes, expected):
+    reply = json.loads(recorded_reply)
+    reply[0]["user_scope"] = {"value": value, "evidence": quotes}
+    first, *_ = parse_application(application, model=lambda **_: json.dumps(reply))
+    assert first.user_scope.value == expected
+    assert (first.user_scope.uncertainty is None) == (expected is not None)
+    assert [item.text for item in first.user_scope.evidence] == [
+        quote for quote in quotes if quote == "用户范围：占位休眠用户"
+    ]
+
+
 @pytest.mark.parametrize("model_behavior", ["marks_missing", "replays_old_date", "copies_start_date", "copies_tag_expiry"])
 def test_deleted_end_date_is_uncertain(application, recorded_reply, model_behavior):
     tag_expiry = "标签到期日 2099-02-15"

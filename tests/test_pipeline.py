@@ -3,6 +3,7 @@
 import json
 import os
 import sqlite3
+import stat
 import subprocess
 import sys
 from contextlib import closing
@@ -15,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 from lark_oapi.core.http import Transport as SDKTransport
 
+import qianshu.__main__ as service_entry
 from qianshu import parse, validate
 from qianshu.__main__ import _EntranceTransport, _processor, _send_report_card
 from qianshu.draft import DraftField, PackageRow, PolicyDraft, SourceExcerpt
@@ -39,11 +41,6 @@ def prohibit_network(event, args):
         os._exit(91)
 
 sys.addaudithook(prohibit_network)
-from functools import partial
-from pathlib import Path
-from qianshu import pipeline
-
-pipeline.Pipeline = partial(pipeline.Pipeline, companies_file=Path(os.environ["QIANSHU_TEST_COMPANIES"]))
 """
 
 
@@ -106,14 +103,14 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None):
         sys.executable, "-m", "qianshu", "--inject", str(injection), "--env-file", str(dotenv),
         "--window-start", (now - timedelta(minutes=1)).isoformat(),
         "--window-end", (now + timedelta(minutes=1)).isoformat(),
+        "--companies-file", str(COMPANIES_FIXTURE),
     ]
     if tag_dates is not None:
         dates_file = _write_json(tmp_path / "tag-dates.json", tag_dates)
         cmd.extend(("--tag-dates", str(dates_file)))
     run = subprocess.run(
         cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=45,
-        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(tmp_path), str(ROOT / "src"))),
-             "QIANSHU_TEST_COMPANIES": str(COMPANIES_FIXTURE)},
+        env={**os.environ, "PYTHONPATH": os.pathsep.join((str(tmp_path), str(ROOT / "src")))},
     )
     assert run.returncode == 0, run.stderr
     assert SECRET not in run.stdout + run.stderr
@@ -126,6 +123,123 @@ def _contents(cards):
         for card in cards
         for item in card["elements"]
     ]
+
+
+def _resident_args(tmp_path):
+    now = datetime.now(UTC)
+    return [
+        "--state", str(tmp_path / "state.sqlite"),
+        "--window-start", (now - timedelta(minutes=1)).isoformat(),
+        "--window-end", (now + timedelta(minutes=1)).isoformat(),
+    ]
+
+
+@pytest.mark.parametrize("companies_type", ["default-missing", "explicit-missing", "directory", "unreadable"])
+def test_resident_rejects_missing_or_unreadable_company_file(tmp_path, monkeypatch, capsys, companies_type):
+    monkeypatch.chdir(tmp_path)
+    args = _resident_args(tmp_path)
+    if companies_type != "default-missing":
+        path = tmp_path / "占位对照表.tsv"
+        args.extend(("--companies-file", str(path)))
+        if companies_type == "directory":
+            path.mkdir()
+        elif companies_type == "unreadable":
+            path.write_text("占位内容", encoding="utf-8")
+
+            def unreadable(*args, **kwargs):
+                raise PermissionError("占位底层错误")
+
+            monkeypatch.setattr(Path, "read_text", unreadable)
+    monkeypatch.setattr(service_entry, "load_config", lambda **_: pytest.fail("对照表检查应先于服务配置读取"))
+
+    assert service_entry.main(args) == 1
+    assert capsys.readouterr() == ("", "公司对照表文件缺失或不可读，请检查 --companies-file。\n")
+
+
+@pytest.mark.parametrize("directory_type", ["missing", "file", "public"])
+def test_resident_rejects_invalid_raw_reply_directory(tmp_path, monkeypatch, capsys, directory_type):
+    path = tmp_path / "占位回复目录"
+    if directory_type == "file":
+        path.touch()
+    elif directory_type == "public":
+        path.mkdir(mode=0o755)
+        path.chmod(0o755)
+    monkeypatch.setattr(service_entry, "load_config", lambda **_: pytest.fail("目录检查应先于服务配置读取"))
+    args = [
+        *_resident_args(tmp_path), "--companies-file", str(COMPANIES_FIXTURE),
+        "--raw-output-dir", str(path), "--env-file", str(tmp_path / ".env"),
+    ]
+
+    assert service_entry.main(args) == 1
+    assert capsys.readouterr() == ("", "原始回复目录须为可访问的 0700 目录，请检查 --raw-output-dir。\n")
+
+
+@pytest.mark.parametrize("save_raw", [False, True], ids=["disabled", "enabled"])
+def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
+    tmp_path, single_policy, monkeypatch, capsys, caplog, save_raw,
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "rules").symlink_to(ROOT / "rules", target_is_directory=True)
+    body, model = single_policy
+    marker = "占位原始回复标记"
+    replies = [
+        f'  {json.dumps(model, ensure_ascii=False)}\r\n',
+        f"\r\n{marker}\r\n",
+    ]
+    args = [*_resident_args(tmp_path), "--env-file", str(tmp_path / ".env")]
+    if save_raw:
+        companies_file = tmp_path / "占位对照表.tsv"
+        args.extend(("--companies-file", str(companies_file)))
+    else:
+        companies_file = tmp_path / ".private" / "companies.tsv"
+        companies_file.parent.mkdir()
+    companies_file.write_text("赞比亚\t占位常驻公司\n", encoding="utf-8")
+    output = tmp_path / "占位回复目录"
+    output.mkdir(mode=0o700)
+    if save_raw:
+        args.extend(("--raw-output-dir", str(output)))
+
+    settings = SimpleNamespace(
+        app_id="<占位应用>", tenant_key="<占位租户>", chat_id="<占位群>",
+        bot_open_id="<占位机器人>", allowed_senders=("<占位申请人>",), approved_fingerprint=fingerprint(body),
+    )
+    cards = []
+    pending = iter(replies)
+
+    def fake_service(settings, window, state_path, processor):
+        def run():
+            for index in range(len(replies)):
+                message = Message(f"<占位消息-{index}>", settings.chat_id, "<占位申请人>", 0, "text", "")
+                processor(Application(message, body, ()))
+
+        return SimpleNamespace(run=run, entrance=SimpleNamespace(), transport=SimpleNamespace(
+            react=None, reply=None, download=None,
+        ))
+
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(service_entry, "load_settings", lambda _: settings)
+    monkeypatch.setattr(service_entry, "setup_logging", lambda _: None)
+    monkeypatch.setattr(service_entry, "configured_model", lambda _: lambda **kwargs: next(pending))
+    monkeypatch.setattr(service_entry, "FeishuService", fake_service)
+    monkeypatch.setattr(service_entry, "_send_report_card", lambda _, card, *args: cards.append(card))
+    monkeypatch.setattr(service_entry.time, "time_ns", lambda: 1_900_000_000_000_000_000)
+
+    assert service_entry.main(args) == 0
+    contents = "\n".join(_contents(cards))
+    assert "公司\n值　占位常驻公司" in contents
+    assert "解析不完整，需人工确认" in contents
+    captured = capsys.readouterr()
+    assert marker not in contents + captured.out + captured.err + caplog.text
+    files = sorted(output.iterdir())
+    if save_raw:
+        assert len(files) == len(replies)
+        for index, (file, reply) in enumerate(zip(files, replies, strict=True)):
+            assert file.name == f"{1_900_000_000_000_000_000 + index}-{fingerprint(body)}.txt"
+            assert stat.S_IMODE(file.stat().st_mode) == 0o600
+            assert file.read_bytes() == reply.encode("utf-8")
+    else:
+        assert not files
 
 
 def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path, single_policy):

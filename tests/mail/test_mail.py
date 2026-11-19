@@ -937,12 +937,15 @@ def resident(config, tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     env = tmp_path / ".env"
+    companies = tmp_path / "companies.tsv"
+    companies.write_text("赞比亚\t占位公司\n", encoding="utf-8")
 
     def argv(*, enabled=True, seconds=120):
         env.write_text("".join(f"{key}={value}\n" for key, value in config.items()), encoding="utf-8")
         now = datetime.now(UTC)
         return [
             "--env-file", str(env), "--state", str(tmp_path / "service.sqlite"),
+            "--companies-file", str(companies),
             "--window-start", (now - timedelta(seconds=1)).isoformat(),
             "--window-end", (now + timedelta(seconds=seconds)).isoformat(),
             *(["--mail"] if enabled else []),

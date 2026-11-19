@@ -6,6 +6,7 @@ from bisect import bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime
+from functools import partial
 from pathlib import Path
 
 from . import parse, validate
@@ -296,11 +297,13 @@ class Pipeline:
         today: Callable[[], date] = _utc_today,
         sensitive_values: Iterable[str] = (),
         companies_file: Path | None = None,
+        on_reply: Callable[[Application, str], None] | None = None,
     ) -> None:
         self.model = model
         self.tag_dates = tag_dates
         self.today = today
         self.companies_file = companies_file
+        self._on_reply = on_reply
         values = sorted({
             literal for value in sensitive_values if value
             for literal in (value, json.dumps(value, ensure_ascii=False)[1:-1])
@@ -329,7 +332,8 @@ class Pipeline:
             parse_failed = False
             try:
                 options = {} if self.companies_file is None else {"companies_file": self.companies_file}
-                drafts = parse.parse_application(body, model=self.model, **options)
+                on_reply = None if self._on_reply is None else partial(self._on_reply, application)
+                drafts = parse.parse_application(body, model=self.model, on_reply=on_reply, **options)
             except Exception:
                 if len(starts) == 1 and not uncertain and not suspected:
                     raise
