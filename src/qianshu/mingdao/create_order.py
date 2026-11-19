@@ -451,6 +451,9 @@ class Official:
         require(isinstance(result, dict) and result.keys() <= {"logs", "flag", "lastMark"}
                 and no_log_continuation(result) and isinstance(rows := result.get("logs"), list)
                 and 0 < len(rows) < self.log_page_limit, "状态历史不能证明完整")
+        status_map = self.config["status_map"]
+        allowed = (_NEW, _PENDING)
+        invalid_status = "状态历史包含待配置、后续状态或未确认的状态"
         for row in rows:
             require(isinstance(row, dict) and isinstance(row.get("operator"), dict)
                     and isinstance(content := row.get("content"), dict), "状态历史日志结构无效")
@@ -467,10 +470,15 @@ class Official:
                         and all(type(change.get(key)) is int for key in ("type", "editType"))
                         and type(change.get("isDeleted")) is bool, "状态历史字段改动结构无效")
                 if change["id"] == self.config["status_control"]:
-                    require(not change["isDeleted"] and isinstance(change["newValue"], str)
-                            and change["newText"] in (_NEW, _PENDING)
-                            and change["oldText"] in (None, "", _NEW, _PENDING),
-                            "状态历史包含待配置、后续状态或未确认的状态")
+                    require(not change["isDeleted"] and (change["newValue"] or change["newText"]),
+                            invalid_status)
+                    for value, label in ((change["oldValue"], change["oldText"]),
+                                         (change["newValue"], change["newText"])):
+                        if value:
+                            mapped = status_map.get(value)
+                            require(mapped in allowed and (not label or mapped == label), invalid_status)
+                        elif label:
+                            require(label in allowed, invalid_status)
 
     def delete(self, current):
         condition = self.config["delete"]["condition"]
@@ -501,6 +509,7 @@ def draft_values(draft):
     tags = values["user_tags"]
     require(isinstance(tags, list) and all(receipt(tag) for tag in tags) and len(set(tags)) == len(tags),
             "草稿用户标签格式无效")
+    require(bool(tags), "用户标签为空，需人工")
     packages = values["packages"]
     require(isinstance(packages, list) and bool(packages) and all(
         isinstance(row, dict) and set(row) == {"current_package", "gift_package"}
@@ -716,6 +725,8 @@ def assemble(values, template_cells, config, resolve_tag, *, is_test):
         require(equivalent(draft_cell(values[key], spec), encode_cell(template_cells[control], spec), spec),
                 f"字段 {spec['label']} 与模板不同，需人工")
     tag_ids = [resolve_tag(tag) for tag in values["user_tags"]]
+    require(len({record_id.lower() for record_id in tag_ids}) == len(tag_ids),
+            "不同用户标签对应同一条记录，需人工")
 
     controls, summary = [], []
     for control, spec in schema.items():

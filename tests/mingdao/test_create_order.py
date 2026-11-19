@@ -262,7 +262,7 @@ class Platform:
                 "logData": [{
                     "id": self.case.control["status"], "name": "政策状态",
                     "type": 11, "editType": 1, "oldValue": "", "oldText": "",
-                    "newValue": str(state),
+                    "newValue": self.case.statuses[state],
                     "newText": self.case.config["official"]["status_map"][self.case.statuses[state]],
                     "isDeleted": False,
                 }],
@@ -287,7 +287,11 @@ class Platform:
             query = json.loads(request.content)
             view, page = query["viewId"], query["pageIndex"]
             control = spec[action]["name_control"]
-            name = case.values["policy_name"] if action == "search" else case.values["user_tags"][0]
+            name = query["filter"]["children"][0]["value"]
+            if action == "search":
+                assert name == case.values["policy_name"]
+            else:
+                assert name in case.values["user_tags"]
             assert request.method == "POST"
             assert view in spec[action]["view_ids"] and page > 0
             assert query == {"viewId": view, "pageSize": spec.get("page_size", 50), "pageIndex": page,
@@ -635,17 +639,23 @@ def test_exact_endpoint_matches_authorization(case, platform):
     ("bad_operator", False, False),
     ("no_type_one", True, True),
     ("manual_edit", True, True),
+    ("empty_old_fields", True, True),
     ("null_old_fields", True, True),
-    ("null_status_text", False, False),
-    ("null_status_value", False, False),
+    ("null_status_text", True, True),
+    ("null_status_value", True, True),
+    ("empty_new_fields", False, False),
     ("flag_true", False, False),
     ("envelope_flag_true", False, False),
     ("last_mark", False, False),
     ("flag_false", True, True),
     ("configured_then_new", False, False),
     ("old_configuring_only", False, False),
+    ("old_configuring_without_text", False, False),
+    ("old_unknown_without_text", False, False),
+    ("new_configuring_with_new_text", False, False),
+    ("old_conflicting_allowed_states", False, False),
     ("old_pending_only", True, True),
-    ("blank_status", False, False),
+    ("blank_status", True, True),
     ("unknown_status", False, False),
     ("deleted_status", False, False),
     ("current_pending", False, False),
@@ -683,16 +693,28 @@ def test_d15_verification(case, platform, condition, deleted, verified):
             manual_change = dict(change, id=case.control["company"], name="占位字段",
                                  oldValue=None, oldText=None, newValue=None, newText=None)
             logs.append({"operator": {}, "content": dict(content, logData=[manual_change])})
+        if condition == "empty_old_fields":
+            change.update(oldValue="", oldText=None)
         if condition == "null_old_fields":
             change.update(oldValue=None, oldText=None)
         if condition in ("old_configuring_only", "old_pending_only"):
             old_state = 3 if condition == "old_configuring_only" else 2
             old_value = case.statuses[old_state]
             change.update(oldValue=old_value, oldText=case.config["official"]["status_map"][old_value])
+        if condition == "old_configuring_without_text":
+            change.update(oldValue=case.statuses[3], oldText="")
+        if condition == "old_unknown_without_text":
+            change.update(oldValue="占位未知状态键", oldText="")
+        if condition == "new_configuring_with_new_text":
+            change.update(newValue=case.statuses[3], newText="新建")
+        if condition == "old_conflicting_allowed_states":
+            change.update(oldValue=case.statuses[2], oldText="新建")
         if condition == "null_status_text":
             change["newText"] = None
         if condition == "null_status_value":
             change["newValue"] = None
+        if condition == "empty_new_fields":
+            change.update(newValue=None, newText="")
         if condition == "blank_status":
             change["newText"] = ""
         if condition == "unknown_status":
@@ -750,6 +772,10 @@ def test_d15_verification(case, platform, condition, deleted, verified):
                    "old_configuring_only": "状态历史包含待配置",
                    "current_pending": "删除前状态须为新建",
                    "pending_before_delete": "删除前状态须为新建"}.get(condition)
+        if condition in ("old_configuring_without_text", "old_unknown_without_text",
+                         "new_configuring_with_new_text", "old_conflicting_allowed_states",
+                         "empty_new_fields"):
+            message = "状态历史包含待配置"
         with pytest.raises((order.Stop, KeyboardInterrupt), match=message):
             run_case(case, platform, approvals)
         assert "delete_unconfirmed" in events(case)
@@ -1024,7 +1050,7 @@ def test_disconnect_waits_until_transport_handoff(case, platform, live_approval)
 
 @pytest.mark.parametrize("mode", [
     "success", "missing_review", "digest_changed", "template_conflict", "delete_interrupted",
-    "draft_tag", "draft_tag_missing", "draft_tag_ambiguous",
+    "draft_tag", "draft_tag_missing", "draft_tag_ambiguous", "draft_tag_duplicate_id", "draft_tag_empty",
     "login_changed_after_approval", "normal_notice", "missing_notice", "duplicate_receipt",
     "missing_approver", "missing_configurator", "waiver_with_configurator", "empty_waiver",
     "waiver_without_receipt",
@@ -1070,6 +1096,10 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         case.values["user_tags"] = ["占位标签乙"]
         case.ids["tag"] = "A" + case.ids["tag"][1:]
         platform.tag_count = {"draft_tag": 1, "draft_tag_missing": 0, "draft_tag_ambiguous": 2}[mode]
+    if mode == "draft_tag_duplicate_id":
+        case.values["user_tags"] = ["占位标签甲", "占位标签乙"]
+    if mode == "draft_tag_empty":
+        case.values["user_tags"] = []
     order.exclusive(config_path, case.config)
     draft = deepcopy(case.values)
     if mode == "template_conflict":
@@ -1154,6 +1184,12 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     if mode in ("draft_tag_missing", "draft_tag_ambiguous"):
         assert "用户标签查询未获得唯一同名记录" in captured.err
         assert platform.actions == ["template", "tag"]
+    if mode == "draft_tag_duplicate_id":
+        assert "不同用户标签对应同一条记录，需人工" in captured.err
+        assert platform.actions == ["template", "tag", "tag"]
+    if mode == "draft_tag_empty":
+        assert "用户标签为空，需人工" in captured.err
+        assert not platform.actions
     assert all(timeout["connect"] == 10 and timeout["read"] == 30
                for timeout in platform.timeouts if isinstance(timeout, dict))
     if mode == "template_conflict":
