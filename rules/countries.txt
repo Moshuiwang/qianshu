@@ -1,0 +1,17 @@
+赞比亚	Zambia	ZM
+肯尼亚	Kenya	KE
+乌干达	Uganda	UG
+坦桑尼亚	Tanzania	TZ
+卢旺达	Rwanda	RW
+布隆迪	Burundi	BI
+尼日利亚	Nigeria	NG
+加纳	Ghana	GH
+南非	South Africa	ZA
+莫桑比克	Mozambique	MZ
+马拉维	Malawi	MW
+刚果（金）	Democratic Republic of the Congo	DR Congo	DRC	CD
+刚果（布）	Congo-Brazzaville	CG
+喀麦隆	Cameroon	CM
+科特迪瓦	Côte d’Ivoire	Ivory Coast	CI
+塞内加尔	Senegal	SN
+马达加斯加	Madagascar	MG
