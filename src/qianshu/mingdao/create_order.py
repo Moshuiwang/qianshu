@@ -46,7 +46,7 @@ _EVIDENCE = (
     "trace_decision", "comparison_report", "same_country_count_evidence", "owner_login_confirmation",
 )
 _VARIABLE = (
-    "policy_name", "start_date", "end_date", "recharge_days", "gift_days",
+    "policy_name", "start_date", "end_date", "recharge_days", "gift_days", "user_scope",
 )
 _TEMPLATE_CHECKS = ("user_tags", "packages", "approval_url", "company", "maintain_mutual_exclusion_group")
 _LOG_PAGE_SIZE = 50
@@ -522,6 +522,7 @@ def draft_values(draft):
         if field["value"] is not None:
             values[key] = field["value"]
     require(all(key in values for key in (*_VARIABLE, "user_tags", "packages")), "草稿缺少必填字段")
+    require(receipt(values["user_scope"]), "草稿用户范围格式无效，需人工")
     name = values["policy_name"]
     require(receipt(name) and len(name) > len(_PREFIX) and not any(c in name for c in "\r\n<>"),
             "草稿政策名称格式无效")
@@ -541,6 +542,8 @@ def draft_values(draft):
         and receipt(row["current_package"]) and (row["gift_package"] is None or receipt(row["gift_package"]))
         for row in packages
     ), "草稿节目包格式无效")
+    require(len({draft_package_names(row) for row in packages}) == len(packages),
+            "节目包行重复，需人工")
     return values
 
 
@@ -627,10 +630,6 @@ def equivalent(left, right, spec):
         except ValueError:
             return False
     if kind in (10, 26, 29):
-        if spec.get("draft") == "user_tags":
-            expected, observed = ([item["sid"] for item in decode(value)] for value in (left, right))
-            return (all(uuid_record(record_id) for record_id in expected + observed)
-                    and sorted(map(str.lower, expected)) == sorted(map(str.lower, observed)))
         return sorted(map(compact, decode(left))) == sorted(map(compact, decode(right)))
     if kind == 34:
         expected, observed = subtable_rows(left), subtable_rows(right)
@@ -646,8 +645,12 @@ def normalize_template_name(value):
     return None if value is None else re.sub(r"[ _]+", "_", value.strip().casefold())
 
 
-def select_package_rows(rows, spec, packages):
-    def name(row, mapping):
+def draft_package_names(row):
+    return normalize_template_name(row["current_package"]), normalize_template_name(row["gift_package"])
+
+
+def relation_package_names(row, spec):
+    def name(mapping):
         value = row[mapping["control"]]
         if value is None or value == "" or value == [] or value == "[]":
             return None
@@ -661,18 +664,20 @@ def select_package_rows(rows, spec, packages):
         require(receipt(value), "节目包与模板不同，需人工")
         return normalize_template_name(value)
 
+    return name(spec["current"]), name(spec["gift"])
+
+
+def select_package_rows(rows, spec, packages):
     by_names = {}
     children = spec["children"]
     for row in rows:
         require(children.keys() <= row.keys(), "节目包关联行缺少已登记的子控件，需人工")
-        names = name(row, spec["current"]), name(row, spec["gift"])
+        names = relation_package_names(row, spec)
         by_names.setdefault(names, []).append(row)
 
     selected = []
     for package in packages:
-        names = (normalize_template_name(package["current_package"]),
-                 normalize_template_name(package["gift_package"]))
-        matches = by_names.get(names, [])
+        matches = by_names.get(draft_package_names(package), [])
         require(len(matches) == 1, "节目包与模板不同，需人工")
         row = matches[0]
         selected.append([
@@ -835,14 +840,40 @@ def assemble(values, template_cells, config, read_relations, *, is_test):
     return controls, summary
 
 
-def compare(expected, raw_cells, config):
+def compare_relation(control, count, field, read_relations, packages):
+    try:
+        rows = read_relations(control["controlId"])
+    except Stop:
+        return "无法核对"
+    if type(count) is not int or count != len(rows):
+        return "不一致"
+    if field["draft"] == "user_tags":
+        matches = {row["rowId"].lower() for row in rows} == {
+            item["sid"].lower() for item in decode(control["value"])
+        }
+    else:
+        # 写入的节目包行按草稿顺序从模板挑选，关联对象在写入值中只保留 sid。
+        try:
+            matches = len(rows) == len(packages) and all(
+                relation_package_names(row, field) == draft_package_names(package)
+                for row, package in zip(rows, packages)
+            )
+        except (Stop, KeyError):
+            matches = False
+    return "一致" if matches else "不一致"
+
+
+def compare(expected, raw_cells, config, *, read_relations, packages):
     results, differences = [], []
     for control in expected:
         key = control["controlId"]
         field = config["fields"][key]
+        actual = raw_cells.get(key, _NO_CELL)
         if key in config["readback_skip"]:
             result = "跳过"
-        elif (actual := raw_cells.get(key, _NO_CELL)) is _NO_CELL:
+        elif field.get("draft") in ("user_tags", "packages"):
+            result = compare_relation(control, actual, field, read_relations, packages)
+        elif actual is _NO_CELL:
             result = "缺失"
         else:
             try:
@@ -1024,7 +1055,7 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
 
 
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
-              contact, login_check, stop, *, clock=time.time, pause=time.sleep, monotonic=time.monotonic):
+              contact, login_check, stop, *, packages, clock=time.time, pause=time.sleep, monotonic=time.monotonic):
     def announce(text):
         feishu.transport.announce(f"{ledger.name} · {text}\n{contact}")
 
@@ -1088,11 +1119,12 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         stop_if_interrupted(stop)
         raw = api.read(record_id)
         observed = api.detail(raw, record_id)
-        report, counts = compare(controls, observed, config)
+        report, counts = compare(controls, observed, config,
+                                 read_relations=lambda control: api.relations(record_id, control), packages=packages)
         exclusive(ledger.directory / f"create-readback-{registration_hash}.json", report)
         ledger.append("readback_compared", record_id, counts=dict(counts))
         announce(f"官方回读 一致 {counts['一致']} / 不一致 {counts['不一致']} / "
-                 f"缺失 {counts['缺失']} / 跳过 {counts['跳过']}")
+                 f"缺失 {counts['缺失']} / 跳过 {counts['跳过']} / 无法核对 {counts['无法核对']}")
     except (Exception, KeyboardInterrupt) as error:
         ledger.append("readback_unconfirmed", record_id)
         announce("官方回读未获确认，已停止，需人工核对")
@@ -1101,7 +1133,7 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         raise Stop("官方回读未获确认") from None
     delete_test(api, ledger, record_id, notice_recipients(config), evidence, announce, stop, raw,
                 pause=pause, monotonic=monotonic)
-    return not (counts["不一致"] or counts["缺失"])
+    return not (counts["不一致"] or counts["缺失"] or counts["无法核对"])
 
 
 class Arguments(argparse.ArgumentParser):
@@ -1201,7 +1233,7 @@ def run(args, directory, *, clock=time.time):
                 raise
             return service.run_create(lambda stop: run_order(
                 ledger, api, create, service, window, payload, summary, controls, config, evidence,
-                contact, login_check, stop, clock=clock,
+                contact, login_check, stop, packages=values["packages"], clock=clock,
             ))
 
 

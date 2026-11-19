@@ -42,6 +42,7 @@ def case(tmp_path):
     field("end_date", 15, "结束日期")
     field("recharge_days", 6, "充值天数")
     field("gift_days", 6, "赠送天数")
+    field("user_scope", 2, "用户范围")
     field("user_tags", 29, "用户标签")
     field("packages", 34, "节目包", children={
         child["current"]: {"type": 29}, child["gift"]: {"type": 29}, child["price"]: {"type": 6},
@@ -58,7 +59,8 @@ def case(tmp_path):
 
     template = {
         "policy_name": "合成模板", "start_date": "2026-11-21", "end_date": "2026-12-01",
-        "recharge_days": "1", "gift_days": "2", "user_tags": 1, "packages": 1,
+        "recharge_days": "1", "gift_days": "2", "user_scope": "占位模板用户范围",
+        "user_tags": 1, "packages": 1,
         "approval_url": "https://placeholder.invalid/approval",
         "company": "合成公司", "maintain_mutual_exclusion_group": [{"key": ids["option"], "value": "占位选项"}],
         "country": "合成国家", "member": [{"accountId": str(uuid4()), "name": "占位成员"}],
@@ -75,7 +77,8 @@ def case(tmp_path):
         control["user_tags"]: [{**record_identity(ids["tag"]), "_owner": {}, ids["tag_name"]: "合成标签"}],
     }
     values = {"policy_name": "【测试】合成单", "start_date": "2026-12-01", "end_date": "2026-12-31",
-              "recharge_days": 30, "gift_days": 31, "company": "合成公司", "user_tags": ["合成标签"],
+              "recharge_days": 30, "gift_days": 31, "user_scope": "占位草稿用户范围",
+              "company": "合成公司", "user_tags": ["合成标签"],
               "maintain_mutual_exclusion_group": "是",
               "packages": [{"current_package": "合成当前包", "gift_package": "合成赠送包"}]}
     endpoint = {"host": order._CREATE_HOST, "method": "POST", "path": order._CREATE_PATH}
@@ -164,11 +167,22 @@ def test_assemble_values_and_legacy_cells(case):
     ]]
     for key in ("approval_url", "company", "country", "generated"):
         assert fields[case.control[key]] == case.cells[case.control[key]]
-    assert [row["来源"] for row in summary].count("草稿") == 6
+    assert [row["来源"] for row in summary].count("草稿") == 7
     assert [row["来源"] for row in summary].count("固定值") == 2
     assert all(row.keys() == {"字段名", "类型", "来源", "值指纹"}
                and len(row["值指纹"]) == 12 for row in summary)
     assert order.encode_cell([case.ids["option"]], {"type": 9}) == order.compact([case.ids["option"]])
+
+
+def test_user_scope_is_written_from_draft_and_cannot_skip_readback(case):
+    control = case.control["user_scope"]
+    controls, summary = assemble(case)
+    field, = (value for value in controls if value["controlId"] == control)
+    assert field["value"] == case.values["user_scope"] != case.cells[control]
+    assert next(row for row in summary if row["字段名"] == "用户范围")["来源"] == "草稿"
+    case.config["readback_skip"].append(control)
+    with pytest.raises(order.Stop, match="不可跳过建单关键字段的回读"):
+        assemble(case)
 
 
 @pytest.mark.parametrize(("draft_name", "template_name"), [
@@ -320,6 +334,8 @@ class Platform:
         self.case = case
         self.relations = deepcopy(case.relations)
         self.relation_response = lambda rows: self.response({"rows": rows, "total": len(rows)})
+        self.created_relations = {}
+        self.created_relation_response = lambda _, rows: self.relation_response(rows)
         self.same_name = False
         self.rows = {}
         self.actions = []
@@ -379,12 +395,17 @@ class Platform:
         self.timeouts.append(request.extensions["timeout"])
         path = request.url.path
         template_path = spec["read"]["path"].replace("{record_id}", case.ids["template"])
-        for control, rows in self.relations.items():
-            if path == f"{template_path}/relations/{control}":
+        record_id = case.ids["created"]
+        created_path = spec["read"]["path"].replace("{record_id}", record_id)
+        for control in self.relations:
+            if path in (f"{template_path}/relations/{control}", f"{created_path}/relations/{control}"):
                 assert request.method == "GET" and not request.content
                 assert dict(request.url.params) == {"pageIndex": "1", "pageSize": "50"}
-                self.actions.append("relations:" + control)
-                return self.relation_response(rows)
+                if path.startswith(template_path + "/"):
+                    self.actions.append("relations:" + control)
+                    return self.relation_response(self.relations[control])
+                self.actions.append("created_relations:" + control)
+                return self.created_relation_response(control, self.created_relations[control])
         if path == spec["logs"]["path"].replace("{record_id}", case.ids["created"]):
             assert dict(request.url.params) == {"pageIndex": "1", "pageSize": "50"}
         else:
@@ -411,7 +432,6 @@ class Platform:
             if page_rows is None:
                 return httpx.Response(503, json={"success": False})
             return self.response({"rows": page_rows})
-        record_id = case.ids["created"]
         if path == spec["logs"]["path"].replace("{record_id}", record_id):
             self.actions.append("history")
             assert request.method == "GET"
@@ -420,7 +440,7 @@ class Platform:
             self.actions.append("template")
             assert request.method == "GET"
             return self.response(self.template)
-        assert path == spec["read"]["path"].replace("{record_id}", record_id)
+        assert path == created_path
         if request.method == "GET":
             self.actions.append("read")
             if record_id not in self.rows:
@@ -481,6 +501,14 @@ class Platform:
                 assert all(payload[key] == value for key, value in case.config["create"]["identifiers"].items())
                 raw_cells = {cell["controlId"]: cell["value"] for cell in payload["receiveControls"]}
                 platform.created_cells = raw_cells.copy()
+                packages = case.control["packages"]
+                tags = case.control["user_tags"]
+                platform.created_relations[packages] = deepcopy(platform.relations[packages])
+                platform.created_relations[tags] = [
+                    record_identity(tag["sid"].lower()) for tag in json.loads(raw_cells[tags])
+                ]
+                for control in (packages, tags):
+                    raw_cells[control] = len(json.loads(raw_cells[control]))
                 mutual_exclusion = case.control["maintain_mutual_exclusion_group"]
                 key, = json.loads(raw_cells[mutual_exclusion])
                 raw_cells[mutual_exclusion] = [{"key": key, "value": "占位选项"}]
@@ -696,7 +724,8 @@ def run_case(case, platform, approvals, *, clock=order.time.time, stop=None, pau
                 ledger, api, create, approvals, case.window, create.payload(controls),
                 order.card_summary(case.values), controls, case.config, case.evidence,
                 '<at user_id="placeholder">占位</at>', lambda: None, stop or Event(),
-                clock=clock, pause=pause or (lambda _: None), monotonic=monotonic or (lambda: 0),
+                packages=case.values["packages"], clock=clock, pause=pause or (lambda _: None),
+                monotonic=monotonic or (lambda: 0),
             )
 
 
@@ -1129,8 +1158,67 @@ def test_readback_report_counts_and_modes(case, platform):
     assert len(rows) == len(case.config["fields"])
     assert sorted(row["结果"] for row in rows if row["结果"] != "一致") == ["不一致", "缺失", "跳过"]
     assert report["可能由工作流回填"] == [{"字段名": "赠送天数", "类型": 6}]
-    assert any("一致 11 / 不一致 1 / 缺失 1 / 跳过 1" in text for text in approvals.notices)
+    assert any("一致 12 / 不一致 1 / 缺失 1 / 跳过 1 / 无法核对 0" in text for text in approvals.notices)
     assert all(file.stat().st_mode & 0o777 == 0o600 for file in case.private.iterdir())
+
+
+@pytest.mark.parametrize(("mode", "field", "result"), [
+    ("success", "packages", "一致"),
+    ("wrong_tag_id", "user_tags", "不一致"),
+    ("wrong_package_name", "packages", "不一致"),
+    ("wrong_gift_name", "packages", "不一致"),
+    ("wrong_package_row_count", "packages", "不一致"),
+    ("request_failed", "user_tags", "无法核对"),
+    ("incomplete_relations", "packages", "无法核对"),
+    ("wrong_detail_count", "packages", "不一致"),
+    ("wrong_detail_count", "user_tags", "不一致"),
+    ("wrong_scope", "user_scope", "不一致"),
+])
+def test_created_record_readback_uses_relations(case, platform, mode, field, result):
+    control = case.control[field]
+    packages = case.control["packages"]
+    package = platform.relations[packages][0]
+    package[case.child["current"]][0]["name"] = "  PLACEHOLDER__Basic  "
+    case.relations[packages][0] = deepcopy(package)
+    case.values["packages"][0]["current_package"] = "placeholder basic"
+
+    def relations(key, rows):
+        if key == control:
+            if mode == "request_failed":
+                return httpx.Response(503, json={"success": False})
+            if mode == "incomplete_relations":
+                return platform.response({"rows": rows, "total": len(rows) + 1})
+            if mode == "wrong_tag_id":
+                rows = [record_identity(str(uuid4()))]
+            if mode in ("wrong_package_name", "wrong_gift_name"):
+                child = case.child["current" if mode == "wrong_package_name" else "gift"]
+                rows[0][child][0]["name"] = "占位其他节目包"
+            if mode == "wrong_package_row_count":
+                rows = []
+        return platform.relation_response(rows)
+
+    def before_read(row):
+        if mode == "wrong_detail_count":
+            row[control] += 1
+        if mode == "wrong_package_row_count":
+            row[control] = 0
+        if mode == "wrong_scope":
+            row[control] = case.cells[control]
+
+    platform.created_relation_response = relations
+    platform.before_read = before_read
+    approvals = Approvals(platform)
+    assert run_case(case, platform, approvals) == (mode == "success")
+    assert events(case)[-1] == "delete_verified"
+    assert platform.actions.count("created_relations:" + packages) == 1
+    assert platform.actions.count("created_relations:" + case.control["user_tags"]) == 1
+    assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
+    path, = case.private.glob("create-readback-*.json")
+    results = {row["字段名"]: row["结果"] for row in json.loads(path.read_text())["字段比对"]}
+    assert results["用户标签"] == (result if field == "user_tags" else "一致")
+    assert results["节目包"] == (result if field == "packages" else "一致")
+    assert results["用户范围"] == (result if field == "user_scope" else "一致")
+    assert any(f"无法核对 {int(result == '无法核对')}" in text for text in approvals.notices)
 
 
 @pytest.mark.parametrize("kind", [9, 11])
@@ -1141,7 +1229,7 @@ def test_readback_compares_single_option_by_key(case, kind, same_key):
     expected = [{"controlId": control, "value": order.compact([case.ids["option"]])}]
     key = case.ids["option"] if same_key else "占位其他选项键"
     raw = {control: [{"key": key, "value": "占位显示文本"}]}
-    _, counts = order.compare(expected, raw, case.config)
+    _, counts = order.compare(expected, raw, case.config, read_relations=case.relations.__getitem__, packages=[])
     assert counts == {"一致" if same_key else "不一致": 1}
 
 
@@ -1150,8 +1238,8 @@ def test_tag_readback_compares_uuid_without_case(case, same_id):
     control = case.control["user_tags"]
     tag_id = "A" + case.ids["tag"][1:]
     expected = [{"controlId": control, "value": order.compact([{"sid": tag_id}])}]
-    raw = {control: [{"rowid": tag_id.lower() if same_id else str(uuid4())}]}
-    _, counts = order.compare(expected, raw, case.config)
+    rows = {control: [record_identity(tag_id.lower() if same_id else str(uuid4()))]}
+    _, counts = order.compare(expected, {control: 1}, case.config, read_relations=rows.__getitem__, packages=[])
     assert counts == {"一致" if same_id else "不一致": 1}
 
 
@@ -1317,6 +1405,7 @@ def test_disconnect_waits_until_transport_handoff(case, platform, live_approval)
     "waiver_without_receipt",
     "unexpected_notice", "empty_recipients", "duplicate_recipient", "malformed_recipient",
     "template_mismatched_id", "template_only_legacy_id",
+    "missing_user_scope", "duplicate_draft_package",
 ])
 def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys):
     private = case.private
@@ -1382,6 +1471,13 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     draft = deepcopy(case.values)
     if mode == "template_conflict":
         draft["maintain_mutual_exclusion_group"] = "否"
+    if mode == "missing_user_scope":
+        del draft["user_scope"]
+    if mode == "duplicate_draft_package":
+        draft["packages"] = [
+            {"current_package": "PLACEHOLDER__Basic", "gift_package": "PLACEHOLDER_Gift"},
+            {"current_package": " placeholder basic ", "gift_package": "placeholder gift"},
+        ]
     order.exclusive(draft_path, {key: {"value": value} for key, value in draft.items()})
     order.exclusive(login_path, {"cookies": [{
         "name": case.config["create"]["session_cookie"], "value": case.session_token,
@@ -1479,6 +1575,10 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         assert platform.actions == template_relations[:2]
     if mode == "draft_tag_empty":
         assert "用户标签为空，需人工" in captured.err
+        assert not platform.actions
+    if mode in ("missing_user_scope", "duplicate_draft_package"):
+        reason = "草稿缺少必填字段" if mode == "missing_user_scope" else "节目包行重复，需人工"
+        assert f"已停止：{reason}\n" == captured.err
         assert not platform.actions
     assert all(timeout["connect"] == 10 and timeout["read"] == 30
                for timeout in platform.timeouts if isinstance(timeout, dict))
