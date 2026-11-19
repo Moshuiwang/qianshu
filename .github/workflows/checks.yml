@@ -52,9 +52,15 @@ jobs:
           python3 -m venv "$RUNNER_TEMP/bootstrap"
           "$RUNNER_TEMP/bootstrap/bin/pip" install uv==0.12.1
           echo "$RUNNER_TEMP/bootstrap/bin" >> "$GITHUB_PATH"
+      - name: Install managed Python
+        if: steps.level.outputs.level == 'full' && hashFiles('pyproject.toml') != ''
+        run: uv python install "$(cat .python-version)"
+      - name: Print Python version
+        if: steps.level.outputs.level == 'full' && hashFiles('pyproject.toml') != ''
+        run: uv run --frozen --python "$(cat .python-version)" --managed-python python -VV
       - name: Run tests
         if: steps.level.outputs.level == 'full' && hashFiles('pyproject.toml') != ''
-        run: uv run --frozen python -m pytest -q
+        run: uv run --frozen --python "$(cat .python-version)" --managed-python python -m pytest -q
       - name: No code yet
         if: steps.level.outputs.level == 'full' && hashFiles('pyproject.toml') == ''
         run: echo "仓库还没有 pyproject.toml，暂无代码检查。"
