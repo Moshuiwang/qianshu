@@ -5,23 +5,27 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Iterator
-from contextlib import closing, contextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import closing, contextmanager, nullcontext
 from datetime import date, datetime
 from hashlib import sha256
 from pathlib import Path
+from threading import Event, Thread, Timer
 from uuid import NAMESPACE_OID, uuid5
 
+from dotenv import dotenv_values
 from lark_oapi import RequestOption
 from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
 
+from . import mail
 from .config import Config, ConfigError, load_config
 from .feishu import Entrance, FeishuService, Message, Report, Settings, State, Window, load_settings
-from .feishu.cards import DetailPage, interrupted_report_card, result_card
+from .feishu.cards import CardLine, DetailPage, detail_pages, interrupted_report_card, result_card
 from .feishu.entrance import Application, Attachment, Transport
 from .feishu.sdk import _Transport
 from .logs import setup_logging
@@ -42,6 +46,10 @@ def _tag_dates(path: Path | None) -> dict[str, date]:
 _REPORT_HANDLED = DetailPage("")
 _LOG = logging.getLogger(__name__)
 _REPORT_RETRY_SECONDS = 55 * 60
+_MAIL_PREFIX = "mail:"
+_MAIL_REQUIRED = ("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD", "MAIL_APPROVER", "MAIL_TEST_MARKER")
+_MAIL_EXTRA = ("MAIL_APPROVER", "MAIL_TEST_MARKER", "MAIL_SENT_FOLDER", "MAIL_PRIVATE_DIR")
+_MAIL_CONFIG_ERROR = "邮件轮询配置缺失或不可读，请检查 .env。"
 _SendReport = Callable[[dict, str, bool, Callable[[], None]], None]
 
 
@@ -97,11 +105,18 @@ class _ReportProcessor:
         *,
         scope: str = "",
         clock: Callable[[], float] = time.time,
+        mail_stop: Event | None = None,
+        mail_scope: str | None = None,
     ) -> None:
         self.pipeline, self.send, self.window, self.clock = pipeline, send, window, clock
         self.state_path = state_path
+        self.mail_stop = mail_stop
         binding = [scope, window.start.isoformat(), window.end.isoformat()]
         self.binding = sha256(json.dumps(binding).encode()).hexdigest()
+        self.mail_binding = (
+            sha256(json.dumps([*binding, mail_scope]).encode()).hexdigest()
+            if mail_scope is not None else None
+        )
         if state_path.is_symlink():
             raise ValueError("汇报状态文件须为权限 0600 的私有文件。")
         state_path.touch(mode=0o600, exist_ok=True)
@@ -160,12 +175,23 @@ class _ReportProcessor:
     def _payload(digest: str, suffix: int | str, card: dict) -> tuple[str, dict]:
         return str(uuid5(NAMESPACE_OID, f"qianshu-report:{digest}:{suffix}")), card
 
-    def _try_send(self, payload: tuple[str, dict], first_attempt: float, *, notice: bool = False) -> bool:
+    def _active(self, digest: str, now: float) -> bool:
+        return self.window.contains(now) and (
+            not digest.startswith(_MAIL_PREFIX)
+            or (self.mail_stop is not None and not self.mail_stop.is_set())
+        )
+
+    def _binding(self, digest: str) -> str | None:
+        return self.mail_binding if digest.startswith(_MAIL_PREFIX) else self.binding
+
+    def _try_send(
+        self, digest: str, payload: tuple[str, dict], first_attempt: float, *, notice: bool = False,
+    ) -> bool:
         request_id, card = payload
 
         def check_attempt() -> None:
             now = self.clock()
-            if not self.window.contains(now) or now - first_attempt > _REPORT_RETRY_SECONDS:
+            if not self._active(digest, now) or now - first_attempt > _REPORT_RETRY_SECONDS:
                 raise RuntimeError("汇报自动发送期限已结束。")
 
         try:
@@ -203,7 +229,7 @@ class _ReportProcessor:
                     db.execute("UPDATE reports SET notice_first_attempt = ? WHERE digest = ?",
                                (self.clock(), digest))
                     continue
-                confirmed = self._try_send(json.loads(report["notice"]), first_attempt, notice=True)
+                confirmed = self._try_send(digest, json.loads(report["notice"]), first_attempt, notice=True)
                 db.execute("""
                     UPDATE reports SET notice_confirmed = ?, stop_notice_failures = ? WHERE digest = ?
                 """, (int(confirmed), int(not confirmed), digest))
@@ -212,13 +238,13 @@ class _ReportProcessor:
                 return
 
     def _deliver(self, digest: str) -> None:
-        while self.window.contains(self.clock()):
+        while self._active(digest, self.clock()):
             with self._write() as db:
                 report = db.execute("""
                     SELECT sent_pages, total_pages, pages, notice, notice_confirmed,
                            page_first_attempt, notice_first_attempt FROM reports
                     WHERE digest = ? AND binding = ? AND pages IS NOT NULL
-                """, (digest, self.binding)).fetchone()
+                """, (digest, self._binding(digest))).fetchone()
                 if report is None or self._stop_stale(db, digest, report):
                     return
                 first_attempt = report["page_first_attempt"]
@@ -229,7 +255,7 @@ class _ReportProcessor:
                     continue
                 number, total = report["sent_pages"] + 1, report["total_pages"]
                 payload = json.loads(report["pages"])[number - 1]
-                if self._try_send(payload, first_attempt) or self._try_send(payload, first_attempt):
+                if self._try_send(digest, payload, first_attempt) or self._try_send(digest, payload, first_attempt):
                     db.execute("""
                         UPDATE reports SET sent_pages = ?, page_first_attempt = NULL,
                             pages = CASE WHEN total_pages = ? THEN NULL ELSE pages END,
@@ -239,6 +265,8 @@ class _ReportProcessor:
                     continue
                 if self._stop_stale(db, digest, report):
                     return
+                if digest.startswith(_MAIL_PREFIX):
+                    break
                 prepare_notice = report["notice"] is None and self.window.contains(self.clock())
                 if prepare_notice:
                     notice = self._payload(digest, "stopped", interrupted_report_card(number, total))
@@ -257,35 +285,44 @@ class _ReportProcessor:
                 WHERE pages IS NOT NULL AND expires_at <= ?
             """, (self.clock(),))
 
-    def resume(self) -> None:
+    def resume(self, *, mail_only: bool = False) -> None:
         self.expire()
         if not self.window.contains(self.clock()):
             return
+        group_binding = None if mail_only else self.binding
         with closing(self._connect()) as db:
             pending = db.execute("""
-                SELECT digest FROM reports WHERE binding = ? AND pages IS NOT NULL ORDER BY rowid
-            """, (self.binding,)).fetchall()
+                SELECT digest FROM reports WHERE binding IN (?, ?) AND pages IS NOT NULL ORDER BY rowid
+            """, (group_binding, self.mail_binding)).fetchall()
         for report in pending:
-            self._send_notice(report["digest"])
-            self._deliver(report["digest"])
+            digest = report["digest"]
+            is_mail = digest.startswith(_MAIL_PREFIX)
+            if is_mail:
+                self._deliver(digest)
+            elif not mail_only:
+                self._send_notice(digest)
+                self._deliver(digest)
 
     def __call__(self, application: Application) -> Report:
         digest = sha256(application.message.message_id.encode()).hexdigest()
+        self.store(digest, lambda: self.pipeline(application))
+        return _REPORT_HANDLED
+
+    def store(self, digest: str, build_pages: Callable[[], tuple[DetailPage, ...]]) -> None:
         with closing(self._connect()) as db:
             if db.execute("SELECT 1 FROM reports WHERE digest = ?", (digest,)).fetchone():
-                return _REPORT_HANDLED
+                return
         pages = [self._payload(digest, number, result_card(page))
-                 for number, page in enumerate(self.pipeline(application), 1)]
+                 for number, page in enumerate(build_pages(), 1)]
         if pages:
             with self._write() as db:
                 inserted = db.execute("""
                     INSERT OR IGNORE INTO reports (digest, total_pages, binding, expires_at, pages)
                     VALUES (?, ?, ?, ?, ?)
-                """, (digest, len(pages), self.binding, self.window.end.timestamp(),
+                """, (digest, len(pages), self._binding(digest), self.window.end.timestamp(),
                       json.dumps(pages, ensure_ascii=False))).rowcount
             if inserted:
                 self._deliver(digest)
-        return _REPORT_HANDLED
 
 
 def _processor(
@@ -296,8 +333,13 @@ def _processor(
     *,
     scope: str = "",
     clock: Callable[[], float] = time.time,
+    mail_stop: Event | None = None,
+    mail_scope: str | None = None,
 ) -> _ReportProcessor:
-    return _ReportProcessor(pipeline, send, window, state_path, scope=scope, clock=clock)
+    return _ReportProcessor(
+        pipeline, send, window, state_path, scope=scope, clock=clock,
+        mail_stop=mail_stop, mail_scope=mail_scope,
+    )
 
 
 class _OfflineTransport:
@@ -358,9 +400,90 @@ def _inject(
             state.close()
 
 
+def _load_mail_config(config: Config, env_file: Path) -> Config:
+    try:
+        with env_file.open(encoding="utf-8-sig") as stream:
+            extra = dotenv_values(stream=stream, interpolate=False)
+    except (OSError, UnicodeError):
+        raise ConfigError(_MAIL_CONFIG_ERROR) from None
+    values = {
+        key: config[key]
+        for key in ("MAIL_HOST", "MAIL_PORT", "MAIL_USER", "MAIL_PASSWORD", "MAIL_FOLDER")
+        if key in config
+    }
+    for key in _MAIL_EXTRA:
+        if (value := extra.get(key)) and value.strip():
+            values[key] = value
+    if any(key not in values for key in _MAIL_REQUIRED):
+        raise ConfigError(_MAIL_CONFIG_ERROR)
+    values.setdefault("MAIL_PORT", "993")
+    return Config(values)
+
+
+def _mail_summary(pages: tuple[DetailPage, ...], approved: bool) -> tuple[DetailPage, ...]:
+    # 汇报只允许固定状态和计数。群卡片的字段、摘录和模型输出都留在内存中。
+    status = "解析不完整，需人工确认。"
+    if pages and len(pages[0].elements) > 1:
+        heading = pages[0].elements[1].get("text", {}).get("content", "")
+        if heading == "处理状态\n解析完成，校验执行异常。":
+            status = "解析完成，校验执行异常。"
+        elif count := re.fullmatch(r"处理状态\n解析完成，共 ([0-9]+) 条政策。", heading):
+            total = int(count[1])
+            validated = sum(
+                bool(re.fullmatch(r"政策 [0-9]+ · 处理状态\n解析完成，待群卡片同意", text))
+                for page in pages for element in page.elements
+                if (text := element.get("text", {}).get("content", ""))
+            )
+            status = f"解析完成，共 {total} 条政策。通过校验 {validated} 条，需人工核对 {total - validated} 条。"
+    return detail_pages("邮件", [
+        CardLine("邮件审批", "已获审批" if approved else "不确定，交人工"),
+        CardLine("处理状态", status),
+    ])
+
+
+@contextmanager
+def _mail_worker(
+    config: Config, window: Window, stop: Event, process: Callable[[str, bool, str], None],
+    on_result: Callable[[mail.PollResult], None],
+) -> Iterator[None]:
+    end = window.end.timestamp()
+
+    def wait(delay: float) -> bool:
+        if stop.wait(min(delay, max(0, end - time.time()))):
+            return True
+        if not window.contains(time.time()):
+            stop.set()
+        return stop.is_set()
+
+    def poll() -> None:
+        while not wait(0):
+            try:
+                mail.run_polling(config, process, stop=stop, wait=wait, approval_judge=None, on_result=on_result)
+            except Exception as error:
+                _LOG.warning("mail_poll_failed count=1 category=%s", type(error).__name__)
+                if wait(60):
+                    return
+            else:
+                return
+
+    worker = Thread(target=poll, name="mail-polling", daemon=True)
+    deadline = Timer(max(0, end - time.time()), stop.set)
+    deadline.daemon = True
+    deadline.start()
+    try:
+        worker.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            worker.join(timeout=1)
+    finally:
+        deadline.cancel()
+
+
 def _serve(
     args: argparse.Namespace, settings: Settings, window: Window, tag_dates: dict[str, date],
-    sensitive_values: tuple[str, ...], config: Config,
+    sensitive_values: tuple[str, ...], config: Config, *, mail_config: Config | None = None,
 ) -> None:
     # Anthropic SDK 支持从进程环境覆盖请求头和默认地址。服务只采用 .env 配置。
     if "ANTHROPIC_CUSTOM_HEADERS" in os.environ or (
@@ -386,14 +509,45 @@ def _serve(
         settings.app_id, settings.tenant_key, settings.chat_id, settings.bot_open_id,
         sorted(settings.allowed_senders), settings.approved_fingerprint,
     ])
-    processor = _processor(pipeline, send, window, report_state, scope=scope)
+    stop = Event() if mail_config is not None else None
+    mail_scope = None
+    if mail_config is not None:
+        mail_scope = json.dumps([
+            mail_config["MAIL_HOST"], mail_config["MAIL_USER"], mail_config.get("MAIL_FOLDER") or "INBOX",
+            mail_config["MAIL_APPROVER"].strip().casefold(), mail_config["MAIL_TEST_MARKER"],
+        ])
+    processor = _processor(pipeline, send, window, report_state, scope=scope, mail_stop=stop, mail_scope=mail_scope)
     processor.expire()
     if not window.contains(time.time()):
         raise ValueError("当前不在验收窗口内。")
     service = FeishuService(settings, window, args.state, processor)
     service.entrance.transport = _EntranceTransport(service.transport, processor.resume)
+
+    def process_mail(body: str, approved: bool, fingerprint: str) -> None:
+        digest = _MAIL_PREFIX + fingerprint
+
+        def build_pages() -> tuple[DetailPage, ...]:
+            now = time.time()
+            if not processor._active(digest, now):
+                raise RuntimeError("邮件验收窗口已关闭。")
+            message = Message(fingerprint, settings.chat_id, "", int(now * 1000), "text", "")
+            pages = _mail_summary(pipeline(Application(message, body, ())), approved)
+            if not processor._active(digest, time.time()):
+                raise RuntimeError("邮件验收窗口已关闭。")
+            return pages
+
+        processor.store(digest, build_pages)
+
+    def resume_mail(_result: mail.PollResult) -> None:
+        processor.resume(mail_only=True)
+
+    polling = (
+        _mail_worker(mail_config, window, stop, process_mail, resume_mail)
+        if mail_config is not None and stop is not None else nullcontext()
+    )
     try:
-        service.run()
+        with polling:
+            service.run()
     finally:
         processor.expire()
 
@@ -409,14 +563,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--window-end", type=datetime.fromisoformat, required=True, help="验收窗口结束时刻（含时区）")
     parser.add_argument("--state", type=Path, help="私有目录内的常驻服务 SQLite 状态文件")
     parser.add_argument("--inject", type=Path, help="离线注入文件，卡片以 JSON 行输出")
+    parser.add_argument("--mail", action="store_true", help="在验收窗口内启用只读邮件轮询")
     parser.add_argument("--tag-dates", type=Path, help="私有 JSON 对象，标签名称映射到已确认的结束日期")
     args = parser.parse_args(argv)
     if args.inject is None and args.state is None:
         parser.error("常驻服务须指定 --state。")
+    if args.mail and args.inject is not None:
+        parser.error("--mail 仅用于常驻服务。")
 
     try:
         config = load_config(env_file=args.env_file)
-        setup_logging(config)
+        mail_config = _load_mail_config(config, args.env_file) if args.mail else None
+        setup_logging(config if mail_config is None else {**config, **mail_config})
         settings = load_settings(args.env_file)
         window = Window(args.window_start, args.window_end)
         tag_dates = _tag_dates(args.tag_dates)
@@ -427,7 +585,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.inject is not None:
             _inject(args, settings, window, tag_dates, sensitive_values)
         else:
-            _serve(args, settings, window, tag_dates, sensitive_values, config)
+            _serve(args, settings, window, tag_dates, sensitive_values, config, mail_config=mail_config)
     except ConfigError as error:
         print(error, file=sys.stderr)
         return 1
