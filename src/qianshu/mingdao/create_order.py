@@ -212,20 +212,28 @@ def receipt(value):
 def notice_recipients(config):
     rows = config.get("notice_recipients") if isinstance(config, dict) else None
     require(isinstance(rows, list) and bool(rows) and all(
-        isinstance(row, dict) and row.keys() == {"key", "label"}
-        and receipt(row["key"]) and receipt(row["label"]) for row in rows
+        isinstance(row, dict) and row.keys() == {"key", "label", "role"}
+        and receipt(row["key"]) and receipt(row["label"])
+        and row["role"] in ("approver", "configurator", "owner") for row in rows
     ), "通知名单配置无效")
-    recipients = {row["key"]: row["label"] for row in rows}
+    recipients = {row["key"]: row for row in rows}
     require(len(recipients) == len(rows), "通知名单配置无效")
     return recipients
 
 
 def notice_summary(recipients, notices):
-    return [{"通知对象": label, "已回执": isinstance(notices, dict) and receipt(notices.get(key))}
-            for key, label in recipients.items()]
+    return [{"通知对象": row["label"], "已回执": isinstance(notices, dict) and receipt(notices.get(key))}
+            for key, row in recipients.items()]
 
 
-def require_cleanup_notice(recipients, notices):
+def require_notices(recipients, evidence):
+    roles = {row["role"] for row in recipients.values()}
+    if "notice_waiver" in evidence:
+        require(receipt(evidence["notice_waiver"]), "免通知登记无效")
+        require(len(recipients) == 1 and roles == {"owner"}, "免通知名单须仅含产品负责人")
+    else:
+        require({"approver", "configurator"} <= roles, "通知名单须覆盖审批人与配置人")
+    notices = evidence.get("notices", {})
     require(isinstance(notices, dict), "通知回执登记无效")
     missing = [key for key in recipients if not receipt(notices.get(key))]
     require(not missing, "通知回执缺失：" + compact(missing))
@@ -240,7 +248,7 @@ def no_log_continuation(result):
 def preflight(evidence, recipients, config_data, draft_data, login_data, clock):
     require(evidence.get("is_test") is True, "登记须明确授权测试单")
     require(all(receipt(evidence.get(key)) for key in _EVIDENCE), "当次前置留痕不完整")
-    require_cleanup_notice(recipients, evidence.get("notices", {}))
+    require_notices(recipients, evidence)
     reviews = evidence.get("two_reviews")
     require(isinstance(reviews, dict)
             and all(receipt(reviews.get(key)) for key in ("internal", "external"))
@@ -436,7 +444,7 @@ class Official:
         require(all(uuid_record(record_id) for record_id in ids), "用户标签记录编号未确认")
         unique_ids = {record_id.lower() for record_id in ids}
         require(len(unique_ids) == 1, "用户标签查询未获得唯一同名记录，需人工")
-        return next(iter(unique_ids))
+        return ids[0]
 
     def history(self, current):
         result = self._request("logs", current.record_id, params={"pageIndex": 1, "pageSize": _LOG_PAGE_SIZE})
@@ -460,7 +468,8 @@ class Official:
                         and type(change.get("isDeleted")) is bool, "状态历史字段改动结构无效")
                 if change["id"] == self.config["status_control"]:
                     require(not change["isDeleted"] and isinstance(change["newValue"], str)
-                            and change["newText"] in (_NEW, _PENDING),
+                            and change["newText"] in (_NEW, _PENDING)
+                            and change["oldText"] in (None, "", _NEW, _PENDING),
                             "状态历史包含待配置、后续状态或未确认的状态")
 
     def delete(self, current):
@@ -655,17 +664,19 @@ def fixed_cells(config, schema, draft_controls):
     fixed = config.get("fixed")
     official = config["official"]
     status_control = official["status_control"]
+    applicant = config.get("applicant_control")
+    require(receipt(applicant) and applicant != status_control, "固定申请人控件配置无效")
+    expected = {status_control, applicant}
     protected = {draft_controls[key] for key in (*_VARIABLE, "approval_url")}
-    require(isinstance(fixed, dict) and status_control in fixed and fixed.keys() <= schema.keys()
-            and not (fixed.keys() & protected), "固定字段配置无效")
+    require(isinstance(fixed, dict) and fixed.keys() == expected and expected <= schema.keys()
+            and not (expected & protected), "固定字段配置无效")
     require(schema[status_control]["type"] in _SELECT, "固定政策状态配置无效")
     encoded = {control: encode_cell(value, schema[control]) for control, value in fixed.items()}
     state = unpack_array(encoded[status_control])
     status_map = official["status_map"]
     require(len(state) == 1 and status_map.get(encoded[status_control], status_map.get(state[0])) == _NEW,
             "固定政策状态须为新建")
-    applicant = config.get("applicant_control")
-    require(receipt(applicant) and applicant in encoded and schema[applicant]["type"] == 26
+    require(schema[applicant]["type"] == 26
             and len(unpack_array(encoded[applicant])) == 1, "固定申请人须为单个成员")
     return encoded
 
@@ -675,7 +686,9 @@ def assemble(values, template_cells, config, resolve_tag, *, is_test):
     draft_controls = cell_schema(schema, config["readback_skip"])
     require(is_test is True, "正式单不得照抄任务审批链接，需人工")
     fixed = fixed_cells(config, schema, draft_controls)
-    require(isinstance(template_cells, dict) and schema.keys() - fixed.keys() <= template_cells.keys(),
+    tag_control = draft_controls["user_tags"]
+    require(isinstance(template_cells, dict)
+            and schema.keys() - fixed.keys() - {tag_control} <= template_cells.keys(),
             "模板字段不全")
     approval_link = template_cells[draft_controls["approval_url"]]
     require(receipt(approval_link) and urlsplit(approval_link).scheme in ("http", "https")
@@ -686,15 +699,14 @@ def assemble(values, template_cells, config, resolve_tag, *, is_test):
             == encode_cell(template_cells.get(country_control), schema[country_control]),
             "模板国家与登记不一致")
     require(encode_cell(country["value"], schema[country_control]) not in ("", "[]")
-            and country_control not in (draft_controls[key] for key in _VARIABLE)
+            and country_control not in (draft_controls[key] for key in (*_VARIABLE, "user_tags"))
             and (country_control not in fixed
                  or fixed[country_control] == encode_cell(country["value"], schema[country_control])),
             "模板国家绑定无效")
 
     package_control = draft_controls["packages"]
-    if package_control not in fixed:
-        require(package_names(subtable_rows(template_cells[package_control]), schema[package_control])
-                == values["packages"], "节目包与模板不同，需人工")
+    require(package_names(subtable_rows(template_cells[package_control]), schema[package_control])
+            == values["packages"], "节目包与模板不同，需人工")
     for key in values.keys() - set((*_VARIABLE, "packages", "user_tags")):
         control = draft_controls.get(key)
         require(control is not None, f"草稿字段 {key} 无法核对模板，需人工")
@@ -703,18 +715,15 @@ def assemble(values, template_cells, config, resolve_tag, *, is_test):
         spec = schema[control]
         require(equivalent(draft_cell(values[key], spec), encode_cell(template_cells[control], spec), spec),
                 f"字段 {spec['label']} 与模板不同，需人工")
-    tag_control = draft_controls["user_tags"]
-    if tag_control not in fixed:
-        spec = schema[tag_control]
-        requested = encode_cell([resolve_tag(tag) for tag in values["user_tags"]], spec)
-        require(equivalent(requested, encode_cell(template_cells[tag_control], spec), spec),
-                "用户标签与模板不同，需人工")
+    tag_ids = [resolve_tag(tag) for tag in values["user_tags"]]
 
     controls, summary = [], []
     for control, spec in schema.items():
         key = spec.get("draft")
         if control in fixed:
             source, encoded = "固定值", fixed[control]
+        elif control == tag_control:
+            source, encoded = "草稿", encode_cell(tag_ids, spec)
         elif key in _VARIABLE:
             source, encoded = "草稿", encode_cell(values[key], spec)
         else:
@@ -872,7 +881,7 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
 
     try:
         ledger.registered(record_id)
-        require_cleanup_notice(recipients, evidence.get("notices", {}))
+        require_notices(recipients, evidence)
         announce("开始核验 D15 删除条件")
         deadline = monotonic() + _STABILITY_TIMEOUT
         earlier = checked_record(readback)
