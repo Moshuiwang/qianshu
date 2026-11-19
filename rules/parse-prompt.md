@@ -13,7 +13,7 @@
 | `policy_name` | 优惠政策名称，字符串 |
 | `maintain_mutual_exclusion_group` | 是否需要维护互斥组，「是」或「否」 |
 | `company` | 公司名称，字符串 |
-| `policy_type` | 政策类型，选项名称 |
+| `policy_type` | 原文明确写出的政策类型，选项名称。缺失时返回 `null`，程序按用户标签判定 |
 | `start_date` | 申请开始日期，`YYYY-MM-DD` |
 | `end_date` | 申请结束日期，`YYYY-MM-DD` |
 | `benefit_type` | 优惠类型，选项名称 |
@@ -26,8 +26,8 @@
 | `user_tags` | 用户标签名称，字符串数组 |
 | `packages` | 节目包行数组，每行 `{"current_package": "当前包名", "gift_package": "赠送包名"}`，明确无赠送包时 `gift_package` 为 `null` |
 | `user_scope` | 用户范围，字符串 |
-| `approval_url` | 本批存档文档的网址，字符串 |
-| `approval_attachments` | 审批件附件引用，字符串数组 |
+| `approval_url` | 原文明确标为本批存档文档的网址，字符串。缺失时返回 `null`，由建单阶段补齐 |
+| `approval_attachments` | 审批件附件，程序按默认留空 |
 
 ## Trace #12 · sc5 取值补充
 
@@ -42,5 +42,5 @@
 - `trigger_once` 填「否」。原文明写只触发一次或表述不确定时返回 `null`，保留相关摘录。未写时模型返回 `null` 和空依据，由程序填默认值。填「否」时程序提示「是否只触发一次按默认填否」。
 - `repeat_bonus` 明确允许多买多赠或多买多送填「是」，明确不允许填「否」，并摘录原文。说明有冲突或含义不清时返回 `null`。未写时模型返回 `null` 和空依据，由程序默认填「是」并提示「多买多送按默认填是」。
 - `effective_multiplier` 明确为 1 时填写并摘录原文。原文写了其他倍数、存在冲突或含义不清时返回 `null`。未写时模型返回 `null` 和空依据，由程序默认填 1 并提示「生效倍数按默认填 1」。
-- `approval_attachments` 返回 `null`，依据和候选均留空。程序提示「审批件由人工处理」。
+- `approval_attachments` 返回 `null`，依据和候选均留空。段落边界确定时，程序填确定的空列表并提示「审批件按默认留空」（G168）。
 - 这五项由程序按本条政策及适用的批次共享原文复核。段落边界不确定时各项标为不确定，程序不应用默认值。`hints` 由程序生成，模型沿用已有字段结构。

@@ -39,13 +39,13 @@ _FIELD_LABELS = {
 _DEFAULT_MUTEX = "互斥组按默认填是"
 _DEFAULT_HINTS = {
     _DEFAULT_MUTEX, "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1",
+    parse._ATTACHMENTS_HINT, parse._POLICY_TYPE_HINT,
 }
-_MANUAL_ATTACHMENTS = "审批件由人工处理"
 _MUTEX_NO = "申请要求不维护互斥组，需人工确认"
 _BOUNDARY_HINT = "段落边界无法确定，需人工确认"
 _RED_HINTS = {_MUTEX_NO, _BOUNDARY_HINT}
 _RULE_PENDING_FIELDS = (
-    "policy_name", "trigger_once", "repeat_bonus", "effective_multiplier", "approval_attachments",
+    "policy_name", "trigger_once", "repeat_bonus", "effective_multiplier",
 )
 _RULE_PENDING_REASON = "取值规则待确认。"
 _CHINESE_ORDINAL = r"[一二三四五六七八九十百两]+"
@@ -230,11 +230,23 @@ class _Policy:
     hints: tuple[str, ...]
     validation: validate.ValidationResult | None = None
 
+    @property
+    def approval_url_deferred(self) -> bool:
+        field = self.draft.approval_url
+        return field.value is None and field.uncertainty is None
+
+    def parsing_errors(self) -> Iterable[validate.Finding]:
+        if self.validation is not None:
+            for item in self.validation.errors:
+                # 空链接在建单时补齐，建单校验仍保留 R9。
+                if (item.rule, item.field) != ("R9", "approval_url") or not self.approval_url_deferred:
+                    yield item
+
     def status_line(self, prefix: str) -> CardLine:
         draft = self.draft
         if self.validation is None:
             status = "停在校验。"
-        elif (self.validation.errors or draft.uncertain_fields()
+        elif (any(self.parsing_errors()) or draft.uncertain_fields()
               or draft.maintain_mutual_exclusion_group.value != "是"):
             pending = [_FIELD_LABELS[name] for name in _RULE_PENDING_FIELDS if _rule_pending(draft, name)]
             if pending:
@@ -258,13 +270,9 @@ class _Policy:
             section = "自动调整" if hint in _DEFAULT_HINTS else "提醒项"
             yield CardLine(f"{prefix} · {section}", hint, red=hint in _RED_HINTS)
         if result:
-            for item in result.errors:
-                if item.rule == "R5":
-                    attachments = self.draft.approval_attachments.uncertainty
-                    if _rule_pending(self.draft, item.field) or (
-                        item.field == "approval_attachments" and attachments and attachments.reason == _MANUAL_ATTACHMENTS
-                    ):
-                        continue
+            for item in self.parsing_errors():
+                if item.rule == "R5" and _rule_pending(self.draft, item.field):
+                    continue
                 yield CardLine(f"{prefix} · 需追问 · {_FIELD_LABELS[item.field]}", item.reason)
             for item in result.adjustments:
                 if item.rule != "R7":
@@ -273,7 +281,11 @@ class _Policy:
                 yield CardLine(f"{prefix} · 提醒项 · {_FIELD_LABELS[item.field]}", item.reason)
         for field in fields(self.draft):
             label = _FIELD_LABELS[field.name]
-            yield from _field_lines(f"{prefix} · {label}", getattr(self.draft, field.name))
+            title = f"{prefix} · {label}"
+            if field.name == "approval_url" and self.approval_url_deferred:
+                yield CardLine(title, "建单时填写")
+            else:
+                yield from _field_lines(title, getattr(self.draft, field.name))
 
 
 class Pipeline:
