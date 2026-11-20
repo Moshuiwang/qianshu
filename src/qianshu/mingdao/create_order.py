@@ -294,7 +294,7 @@ def extract_token(logged, name):
     require(len(matches) == 1, "登录会话无法核实")
     cookie = matches[0]
     require(cookie["domain"] in (_CREATE_HOST, ".mingdao.com", "mingdao.com")
-            and cookie.get("secure") is True and isinstance(cookie.get("path"), str)
+            and isinstance(cookie.get("path"), str)
             and (_CREATE_PATH == cookie["path"] or _CREATE_PATH.startswith(cookie["path"].rstrip("/") + "/"))
             and type(cookie.get("expires")) in (int, float)
             and (cookie["expires"] == -1 or cookie["expires"] > time.time())

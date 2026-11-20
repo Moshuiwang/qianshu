@@ -1481,7 +1481,8 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     order.exclusive(draft_path, {key: {"value": value} for key, value in draft.items()})
     order.exclusive(login_path, {"cookies": [{
         "name": case.config["create"]["session_cookie"], "value": case.session_token,
-        "domain": order._CREATE_HOST, "path": "/", "secure": True, "expires": -1,
+        # 明道云真实下发形态：父域、会话期、未标 secure（2026-11-20 X5 首跑实测）
+        "domain": ".mingdao.com", "path": "/", "secure": False, "expires": -1,
     }]})
     official_key = case.config["official"]["token_key"]
     env_file.write_text("\n".join([
@@ -1602,3 +1603,15 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     assert all(value not in captured.out + captured.err for value in case.evidence["notices"].values())
     for token in (case.session_token, case.official_token, case.ids["official_app"]):
         assert token not in captured.out + captured.err
+
+
+def test_extract_token_accepts_real_mingdao_cookie_shape_and_keeps_other_checks():
+    # 建单固定经 HTTPS 发往登记主机，cookie 是否标 secure 不影响传输安全，不作为门禁。
+    real = {"name": "md_pss_id", "value": "placeholder-session-value", "domain": ".mingdao.com",
+            "path": "/", "secure": False, "expires": -1}
+    assert order.extract_token({"cookies": [real]}, "md_pss_id") == "placeholder-session-value"
+    for bad in ({"domain": "evil.example"}, {"path": "/other"}, {"expires": 1.0}, {"expires": "never"}):
+        with pytest.raises(order.Stop, match="登录会话无法核实"):
+            order.extract_token({"cookies": [{**real, **bad}]}, "md_pss_id")
+    with pytest.raises(order.Stop, match="登录会话无法核实"):
+        order.extract_token({"cookies": [real, dict(real)]}, "md_pss_id")
