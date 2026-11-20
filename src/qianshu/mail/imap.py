@@ -6,7 +6,7 @@ import re
 import ssl
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager, suppress
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 SUMMARY = "HEADER.FIELDS (FROM SUBJECT MESSAGE-ID IN-REPLY-TO REFERENCES)"
 _BODY_QUERY = re.compile(
@@ -133,7 +133,11 @@ class ReadOnlyMailbox:
         return tuple(sorted({int(uid) for uid in uids}))
 
     def marked(self, marker: str, approver: str) -> tuple[int, ...]:
-        return self._search("SUBJECT", _quoted(marker), "FROM", _quoted(approver))
+        # 部分服务器（X7 实测）的 SUBJECT / FROM / HEADER 搜索恒返回空，只有日期条件可用。
+        # 这里只按日期取近两天的候选，标题、发件人和回复头由调用方逐封解码核对。
+        _quoted(marker), _quoted(approver)  # 先拒绝控制字符。
+        since = datetime.now(timezone.utc).date() - timedelta(days=1)
+        return self._search("SINCE", _imap_date(since))
 
     def replies(self, message_id: str) -> tuple[int, ...]:
         quoted_id = _quoted(message_id)
