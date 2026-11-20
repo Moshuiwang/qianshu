@@ -88,6 +88,9 @@ class FakeIMAP:
                 # 模拟服务器宽松匹配，调用端须二次校验回复链。
                 assert args[1:3] == ("HEADER", "In-Reply-To")
                 assert args[4:6] == ("HEADER", "References")
+            elif criteria == "SINCE" and len(args) == 2:
+                # 模拟 X7 实测服务器：只支持日期条件，候选由调用方逐封核对。
+                pass
             else:
                 assert criteria == "SINCE" and args[2] == "BEFORE"
             return "OK", [b" ".join(str(uid).encode() for uid in messages)]
@@ -331,7 +334,9 @@ def test_poll_only_delivers_marked_request_once_and_refreshes_approval(config, c
     assert fake.flags == {inbox: {2}, sent: {7}}
     assert fake.fetched(inbox, 2, SUMMARY)
     assert not fake.fetched(inbox, 2, "HEADER")
-    assert not fake.fetched(inbox, 3, SUMMARY)
+    # 服务器只按日期给候选（X7 实测），无关邮件只读摘要头，不读正文与完整信头。
+    assert not fake.fetched(inbox, 3, "HEADER")
+    assert not fake.fetched(inbox, 3, "1")
     assert not fake.fetched(inbox, 1, "2")
     assert not fake.fetched(inbox, 1, "3")
     assert not fake.fetched(sent, 7, "HEADER")
@@ -1135,3 +1140,27 @@ def test_resident_mail_window_stops_even_while_feishu_is_running(resident, monke
     assert entry.main(resident.argv(seconds=1)) == 0
     assert observed == [True, True]
     assert not resident.models and not resident.cards
+
+
+
+def test_poll_delivers_marked_mail_when_server_content_search_is_empty(config):
+    # X7 实测：服务器对 SUBJECT / FROM / HEADER / TEXT 搜索恒返回空，只有日期条件生效。
+    class DateOnlyIMAP(FakeIMAP):
+        def uid(self, command, *args):
+            if command == "SEARCH" and args and args[0] in ("SUBJECT", "FROM", "HEADER", "TEXT"):
+                self.calls.append((command, self.folder, *args))
+                return "OK", [b""]
+            return super().uid(command, *args)
+
+    inbox = config["MAIL_FOLDER"]
+    approver, marker = config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"]
+    fake = DateOnlyIMAP()
+    fake.add(inbox, 1, mail(approver, "无标记的先发邮件", "无关正文"))
+    fake.add(inbox, 2, mail(approver, f"中文标题 {marker}", "合成正文"))
+    fake.add(inbox, 3, mail("other@example.invalid", f"转发: {marker}", "无关正文"))
+    calls = []
+    result = poll_once(config, lambda *args: calls.append(args), factory=fake.factory)
+    assert (result.total, result.matched, result.delivered) == (3, 1, True)
+    assert [body for body, _approved, _digest in calls] == ["合成正文"]
+    searches = [call for call in fake.calls if call[0] == "SEARCH" and call[1] == inbox]
+    assert searches and all(call[2] == "SINCE" and len(call) == 4 for call in searches)
