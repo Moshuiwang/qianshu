@@ -137,6 +137,17 @@ def assemble(case):
     return order.assemble(case.values, case.cells, case.config, case.relations.__getitem__, is_test=True)
 
 
+def company_relation(case):
+    control = case.control["company"]
+    display_key = str(uuid4())
+    case.config["fields"][control].update(type=29, display_name_key=display_key)
+    other = {**record_identity(str(uuid4())), display_key: "占位其他公司"}
+    matched = {**record_identity(str(uuid4())), display_key: case.values["company"]}
+    case.relations[control] = [other, matched]
+    case.cells[control] = len(case.relations[control])
+    return control, display_key, matched
+
+
 def add_notice_recipients(case):
     del case.evidence["notice_waiver"]
     roles = (("b", "占位通知对象乙", "approver"), ("c", "占位通知对象丙", "configurator"))
@@ -283,6 +294,42 @@ def test_fixed_company_cannot_replace_missing_template_value(case):
     case.config["fixed"][company] = "占位固定公司"
     with pytest.raises(order.Stop, match="固定字段配置无效"):
         assemble(case)
+
+
+@pytest.mark.parametrize("scenario", ["no_match", "duplicate_name", "missing_name", "missing_key", "skip_readback"])
+def test_company_selection_requires_one_provable_display_name_match(case, scenario):
+    control, display_key, matched = company_relation(case)
+    reason = "公司显示名不确定"
+    if scenario == "no_match":
+        matched[display_key] = "占位不同显示名"
+    elif scenario == "duplicate_name":
+        case.relations[control][0][display_key] = matched[display_key]
+    elif scenario == "missing_name":
+        del case.relations[control][0][display_key]
+    elif scenario == "missing_key":
+        del case.config["fields"][control]["display_name_key"]
+    else:
+        case.config["readback_skip"].append(control)
+        reason = "不可跳过建单关键字段的回读"
+    with pytest.raises(order.Stop, match=reason):
+        assemble(case)
+
+
+def test_changed_company_outside_readable_template_stops_before_create(case):
+    control, _, matched = company_relation(case)
+    case.relations[control] = [matched]
+    case.cells[control] = 1
+    assemble(case)
+    case.values["company"] = "占位改表后公司"
+    platform = Platform(case)
+    approvals = Approvals(platform)
+
+    with pytest.raises(order.Stop, match="模板可读关联中无同名公司"):
+        run_case(case, platform, approvals)
+
+    assert platform.create_count == 0
+    assert not approvals.notices
+    assert not list(case.private.iterdir())
 
 
 @pytest.mark.parametrize("field", ["status", "member"])
@@ -509,6 +556,12 @@ class Platform:
                 ]
                 for control in (packages, tags):
                     raw_cells[control] = len(json.loads(raw_cells[control]))
+                company = case.control["company"]
+                if case.config["fields"][company]["type"] == 29:
+                    selected = {item["sid"] for item in json.loads(raw_cells[company])}
+                    platform.created_relations[company] = [deepcopy(row) for row in platform.relations[company]
+                                                           if row["rowId"] in selected]
+                    raw_cells[company] = len(selected)
                 mutual_exclusion = case.control["maintain_mutual_exclusion_group"]
                 key, = json.loads(raw_cells[mutual_exclusion])
                 raw_cells[mutual_exclusion] = [{"key": key, "value": "占位选项"}]
@@ -724,7 +777,8 @@ def run_case(case, platform, approvals, *, clock=order.time.time, stop=None, pau
                 ledger, api, create, approvals, case.window, create.payload(controls),
                 order.card_summary(case.values), controls, case.config, case.evidence,
                 '<at user_id="placeholder">占位</at>', lambda: None, stop or Event(),
-                packages=case.values["packages"], clock=clock, pause=pause or (lambda _: None),
+                packages=case.values["packages"], company=case.values["company"], clock=clock,
+                pause=pause or (lambda _: None),
                 monotonic=monotonic or (lambda: 0),
             )
 
@@ -1160,6 +1214,42 @@ def test_readback_report_counts_and_modes(case, platform):
     assert report["可能由工作流回填"] == [{"字段名": "赠送天数", "类型": 6}]
     assert any("一致 12 / 不一致 1 / 缺失 1 / 跳过 1 / 无法核对 0" in text for text in approvals.notices)
     assert all(file.stat().st_mode & 0o777 == 0o600 for file in case.private.iterdir())
+
+
+@pytest.mark.parametrize("mode", ["match", "wrong_name", "wrong_record", "incomplete"])
+def test_company_is_selected_and_read_back_by_display_name(case, mode, monkeypatch):
+    control, display_key, matched = company_relation(case)
+    platform = Platform(case)
+
+    def relations(key, rows):
+        if key == control:
+            if mode == "wrong_name":
+                rows[0][display_key] = "占位回读不同显示名"
+            elif mode == "wrong_record":
+                rows[0]["rowId"] = str(uuid4())
+            elif mode == "incomplete":
+                return platform.response({"rows": [], "total": 1})
+        return platform.relation_response(rows)
+
+    platform.created_relation_response = relations
+    delete_test = order.delete_test
+    cleanup_calls = []
+
+    def cleanup(*args, **kwargs):
+        cleanup_calls.append(True)
+        return delete_test(*args, **kwargs)
+
+    monkeypatch.setattr(order, "delete_test", cleanup)
+    approvals = Approvals(platform)
+    assert run_case(case, platform, approvals) == (mode == "match")
+    assert json.loads(platform.created_cells[control]) == [{"sid": matched["rowId"]}]
+    assert platform.actions.count("created_relations:" + control) == 1
+    path, = case.private.glob("create-readback-*.json")
+    results = {row["字段名"]: row["结果"] for row in json.loads(path.read_text())["字段比对"]}
+    assert results["公司"] == ("一致" if mode == "match" else "不确定")
+    assert any("公司回读不确定，已保留记录，需人工核对" in text for text in approvals.notices) == (mode != "match")
+    assert len(cleanup_calls) == platform.actions.count("delete") == int(mode == "match")
+    assert events(case)[-1] == ("delete_verified" if mode == "match" else "readback_compared")
 
 
 @pytest.mark.parametrize(("mode", "field", "result"), [

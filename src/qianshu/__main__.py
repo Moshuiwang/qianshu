@@ -31,7 +31,7 @@ from .feishu.cards import CardLine, DetailPage, detail_pages, interrupted_report
 from .feishu.entrance import Application, Attachment, Transport, fingerprint
 from .feishu.sdk import _Transport
 from .logs import setup_logging
-from .parse import _DEFAULT_COMPANIES_FILE
+from .parse.companies import DEFAULT_COMPANIES_FILE
 from .parse.model import configured_model
 from .pipeline import Pipeline
 
@@ -389,6 +389,7 @@ def _inject(
     transport = _OfflineTransport()
     pipeline = Pipeline(
         model=model, tag_dates=tag_dates, sensitive_values=sensitive_values, companies_file=args.companies_file,
+        legacy_companies=args.legacy_companies,
     )
     with tempfile.TemporaryDirectory(prefix="qianshu-inject-") as directory:
         state = State(Path(directory) / "state.sqlite", settings)
@@ -554,6 +555,7 @@ def _serve(
     pipeline = Pipeline(
         model=complete, tag_dates=tag_dates, sensitive_values=sensitive_values,
         companies_file=args.companies_file,
+        legacy_companies=args.legacy_companies,
         on_reply=partial(_save_raw_reply, args.raw_output_dir) if args.raw_output_dir is not None else None,
     )
 
@@ -624,7 +626,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mail", action="store_true", help="在验收窗口内启用只读邮件轮询")
     parser.add_argument("--tag-dates", type=Path, help="私有 JSON 对象，标签名称映射到已确认的结束日期")
     parser.add_argument("--companies-file", type=Path,
-                        help="公司对照表路径，常驻服务默认 .private/companies.tsv。")
+                        help="私有公司对照表 CSV 或 TSV 路径，默认 .private/companies.tsv。")
+    parser.add_argument("--legacy-companies", action="store_true",
+                        help="按无表头两列或三列 TSV 读取公司对照表，默认关闭。")
     parser.add_argument("--raw-output-dir", type=Path, help="常驻服务保存原始模型回复的现有 0700 目录。")
     args = parser.parse_args(argv)
     if args.inject is None and args.state is None:
@@ -637,7 +641,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.inject is None:
             if args.companies_file is None:
-                args.companies_file = _DEFAULT_COMPANIES_FILE
+                args.companies_file = DEFAULT_COMPANIES_FILE
             _check_companies_file(args.companies_file)
             if args.raw_output_dir is not None:
                 with _raw_output_directory(args.raw_output_dir):

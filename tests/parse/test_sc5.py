@@ -5,6 +5,7 @@ import pytest
 
 from qianshu.draft import PackageRow
 from qianshu.parse import parse_application
+from qianshu.parse.companies import load_company_rules
 from qianshu.parse.scope import _preamble_policy_field
 
 MONTH_HINT = "充值 / 赠送天数按 1 月 = 30 天换算"
@@ -14,6 +15,7 @@ FIELD_RULE_HINTS = {
 }
 COMPANIES_FILE = Path(__file__).parent / "fixtures" / "companies.tsv"
 INTERVAL = "2099.2.1-2099.3.31"
+COMPANY_HEADER = "国家\t关键词\t公司内部编号\t公司显示名\n"
 
 
 def field(value, *evidence):
@@ -156,7 +158,8 @@ def test_company_qualified_preamble_requires_a_matching_company_in_the_body(tmp_
         f"{headings[0]}\n公司为 Placeholder Co A\n{headings[1]}\n公司为 Placeholder Co B\n{headings[2]}\n赠送30天"
     )
     table = tmp_path / "table.tsv"
-    table.write_text("赞比亚\tPlaceholder Co A\tPlaceholder Co A\n赞比亚\tPlaceholder Co B\tPlaceholder Co B\n", encoding="utf-8")
+    table.write_text(COMPANY_HEADER + "赞比亚\tPlaceholder Co A\t0001\tPlaceholder Co A\n"
+                     "赞比亚\tPlaceholder Co B\t0002\tPlaceholder Co B\n", encoding="utf-8")
     matching, other, unknown = parse(body, *[
         {"policy_name": field(None, title), "company": field(name, f"公司为 {name}"), **dates(INTERVAL)}
         for title, name in zip(headings, ("Placeholder Co A", "Placeholder Co B", "Placeholder Co A"), strict=True)
@@ -260,7 +263,7 @@ def test_packages_match_title_and_derived_gift_package(current, gift, extra, bod
 
 
 @pytest.mark.parametrize("local_days", [True, False])
-@pytest.mark.parametrize("other_keyword", ["", "赞比亚\t占位公司乙\tPLACEHOLDER\n"])
+@pytest.mark.parametrize("other_keyword", ["", "赞比亚\tPLACEHOLDER\t0002\t占位公司乙\n"])
 def test_six_numbered_policies_share_dates_and_keep_their_own_packages(local_days, other_keyword, tmp_path):
     title = "赞比亚占位外呼安排如下："
     preamble = "占位前言：换包不限，拟充2个月后赠送2个月。"
@@ -287,7 +290,7 @@ def test_six_numbered_policies_share_dates_and_keep_their_own_packages(local_day
         })
     lines.extend(["三、备注", "1.本次占位用户活动结束后停在原包。", "2.请占位人员协助。"])
     table = tmp_path / "companies.tsv"
-    table.write_text("赞比亚\t占位公司甲\n" + other_keyword, encoding="utf-8")
+    table.write_text(COMPANY_HEADER + "赞比亚\t\t0001\t占位公司甲\n" + other_keyword, encoding="utf-8")
     drafts = parse("\n".join(lines), *replies, companies_file=table)
     for draft, name in zip(drafts, names, strict=True):
         assert_dates(draft)
@@ -409,15 +412,116 @@ def test_missing_or_invalid_company_rules_leave_only_company_uncertain(tmp_path,
         table.mkdir()
     draft, = parse("赞比亚占位申请，赠送30天", {
         "company": field("Placeholder Unmapped Co", "赞比亚"), "gift_days": field(30, "赠送30天"),
-    }, companies_file=table)
+    }, companies_file=table, legacy_companies=True)
     assert_uncertain(draft, "company")
     assert draft.gift_days.value == 30
     assert "公司对照表缺失或无效" in draft.to_dict()["hints"]
 
 
+@pytest.mark.parametrize("delimiter", [",", "\t"])
+def test_editable_company_table_retains_number_and_uses_display_name(tmp_path, delimiter):
+    table = tmp_path / "companies"
+    header = COMPANY_HEADER.replace("\t", delimiter)
+    table.write_text(header + delimiter.join(("赞比亚", "", "0009", '"占位,""甲""公司"')) + "\n"
+                     + delimiter.join(("赞比亚", "SYNTHKEY", "0010", "占位关键词公司")) + "\n", encoding="utf-8-sig")
+    rules = load_company_rules(Path("rules"), table)
+    assert rules.table["赞比亚"][""].internal_number == "0009"
+    for body, name in [("赞比亚占位申请", '占位,"甲"公司'), ("赞比亚占位申请 synthKEY", "占位关键词公司")]:
+        draft, = parse(body, {"company": field(None, body)}, companies_file=table)
+        assert draft.company.value == name
+        assert "0009" not in json.dumps(draft.to_dict()) and "0010" not in json.dumps(draft.to_dict())
+
+
+@pytest.mark.parametrize(("data", "line"), [
+    pytest.param("国家\t关键词\t公司内部编号\t占位错误表头\n", 1, id="wrong_header"),
+    pytest.param("国家\t公司显示名\n", 1, id="short_header"),
+    pytest.param("地区\t编号\n赞比亚\t0009\n", 1, id="two_column_header_with_number"),
+    pytest.param(COMPANY_HEADER + "赞比亚\t\t0009\t占位公司甲\n赞比亚\t\t0010\t占位公司乙", 3, id="two_defaults"),
+    pytest.param(COMPANY_HEADER + "赞比亚\t\t\t占位公司甲", 2, id="missing_number"),
+    pytest.param(COMPANY_HEADER + "赞比亚\t\t0009\t", 2, id="missing_display_name"),
+    pytest.param(COMPANY_HEADER + "\t\t0009\t占位公司甲", 2, id="missing_country"),
+    pytest.param(COMPANY_HEADER + "赞比亚\tSYNTHKEY\t0009\t占位公司甲\n赞比亚\tsynthkey\t0010\t占位公司乙",
+                 3, id="duplicate_keyword"),
+    pytest.param(COMPANY_HEADER + "赞比亚\tSYNTHKEY\t0009\t占位公司甲\n赞比亚\tSYNTHKEY ZZ\t0010\t占位公司乙",
+                 3, id="overlapping_keywords"),
+    pytest.param(COMPANY_HEADER + "赞比亚\t\t0009", 2, id="wrong_column_count"),
+    pytest.param(COMPANY_HEADER + '赞比亚\t\t0009\t"占位未闭合', 2, id="unclosed_quote"),
+    pytest.param(COMPANY_HEADER.encode() + b"\xff", 2, id="invalid_utf8"),
+])
+def test_editable_company_table_errors_only_log_line_number(tmp_path, caplog, data, line):
+    table = tmp_path / "companies.tsv"
+    table.write_bytes(data.encode() if isinstance(data, str) else data)
+    draft, = parse("赞比亚占位申请，赠送30天", {
+        "company": field(None, "赞比亚"), "gift_days": field(30, "赠送30天"),
+    }, companies_file=table)
+    assert_uncertain(draft, "company")
+    assert draft.gift_days.value == 30
+    assert caplog.messages == [f"公司对照表第 {line} 行"]
+    assert "0009" not in json.dumps(draft.to_dict())
+
+
+@pytest.mark.parametrize(("legacy", "unknown"), [
+    (False, "占位未收录国\t\t0009\t占位未知公司\n"),
+    (True, "占位未收录国\t占位未知公司\n"),
+])
+def test_unknown_country_skips_only_that_row(tmp_path, caplog, legacy, unknown):
+    table = tmp_path / "companies.tsv"
+    known = "赞比亚\t占位已知公司\n" if legacy else "赞比亚\t\t0010\t占位已知公司\n"
+    header = "" if legacy else COMPANY_HEADER
+    options = {"companies_file": table, "legacy_companies": legacy}
+    table.write_text(header + unknown + known, encoding="utf-8")
+    known_draft, = parse("赞比亚占位申请", {"company": field(None, "赞比亚")}, **options)
+    assert known_draft.company.value == "占位已知公司"
+    assert caplog.messages == [f"公司对照表第 {1 if legacy else 2} 行"]
+    unknown_draft, = parse("占位未收录国申请", {"company": field(None, "占位未收录国")}, **options)
+    assert_uncertain(unknown_draft, "company")
+    table.write_text(header + unknown, encoding="utf-8")
+    draft, = parse("赞比亚占位申请", {"company": field(None, "赞比亚")}, **options)
+    assert_uncertain(draft, "company")
+    assert "公司对照表缺失或无效" in draft.hints
+
+
+@pytest.mark.parametrize(("legacy", "bad_row"), [
+    pytest.param(False, "占位未收录国\t占位未知公司", id="two_columns"),
+    pytest.param(False, "赞比亚,SYNTHKEY,0009,占位关键词公司", id="mixed_delimiters"),
+    pytest.param(False, "赞比亚SYNTHKEY\t0009\t占位关键词公司", id="missing_delimiter"),
+    pytest.param(False, "赞比\t亚\tSYNTHKEY\t0009\t占位关键词公司", id="extra_delimiter"),
+    pytest.param(False, "赞比亚SYNTHKEY", id="truncated_row"),
+    pytest.param(False, "# 占位说明", id="comment"),
+    pytest.param(False, "占位未收录国\tSYNTHKEY\t\t占位关键词公司", id="missing_number"),
+    pytest.param(False, "占位未收录国\tSYNTHKEY\t0009\t", id="missing_display_name"),
+    pytest.param(True, "占位未收录国", id="legacy_truncated_row"),
+    pytest.param(True, "占位未收录国\t\tSYNTHKEY", id="legacy_missing_display_name"),
+])
+def test_malformed_company_row_prevents_default_fallback(tmp_path, caplog, legacy, bad_row):
+    table = tmp_path / "companies.tsv"
+    prefix = "赞比亚\t占位默认公司\n" if legacy else COMPANY_HEADER + "赞比亚\t\t0010\t占位默认公司\n"
+    table.write_text(prefix + bad_row + "\n", encoding="utf-8")
+    body = "赞比亚占位申请 SYNTHKEY，赠送30天"
+    draft, = parse(body, {"company": field(None, "赞比亚"), "gift_days": field(30, "赠送30天")},
+                   companies_file=table, legacy_companies=legacy)
+    assert_uncertain(draft, "company")
+    assert "公司对照表缺失或无效" in draft.hints
+    assert draft.gift_days.value == 30
+    assert caplog.messages == [f"公司对照表第 {2 if legacy else 3} 行"]
+
+
+@pytest.mark.parametrize("unknown_first", [True, False])
+def test_legacy_company_row_with_header_word_is_skipped_in_either_order(tmp_path, caplog, unknown_first):
+    table = tmp_path / "companies.tsv"
+    known = "赞比亚\t占位已知公司\n"
+    unknown = "占位未收录国\t占位未知公司\t关键词\n"
+    table.write_text(unknown + known if unknown_first else known + unknown, encoding="utf-8")
+    draft, = parse("赞比亚占位申请", {"company": field(None, "赞比亚")},
+                   companies_file=table, legacy_companies=True)
+    assert draft.company.value == "占位已知公司"
+    assert draft.company.uncertainty is None
+    assert caplog.messages == [f"公司对照表第 {1 if unknown_first else 2} 行"]
+
+
 def test_single_company_rule_uses_country_as_original_evidence(tmp_path):
     table = tmp_path / "companies.tsv"
-    table.write_text("肯尼亚\t占位公司甲\n", encoding="utf-8")
+    table.write_text(COMPANY_HEADER + "肯尼亚\t\t0001\t占位公司甲\n", encoding="utf-8")
     for name in (None, "占位公司甲", "Placeholder Unmapped Co", "占位虚构公司"):
         draft, = parse("肯尼亚占位申请", {"company": field(name, "肯尼亚")}, companies_file=table)
         assert draft.company.value == "占位公司甲"
@@ -600,7 +704,7 @@ def test_omitted_draft_cannot_supply_another_drafts_fields():
 
 def test_repository_company_example_is_not_a_mapping(monkeypatch, tmp_path):
     rules_dir = Path("rules").resolve()
-    assert (rules_dir / "companies.txt").read_text(encoding="utf-8").splitlines()[-1] == "赞比亚\tZambia Corp."
+    assert (rules_dir / "companies.txt").read_text(encoding="utf-8") == COMPANY_HEADER + "赞比亚\t\t0001\t占位示例公司\n"
     monkeypatch.chdir(tmp_path)
     draft, = parse_application(
         "赞比亚占位申请", model=lambda **_: '[{"company":{"evidence":["赞比亚"]}}]', rules_dir=rules_dir,

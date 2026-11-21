@@ -943,7 +943,7 @@ def resident(config, tmp_path, monkeypatch):
     monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
     env = tmp_path / ".env"
     companies = tmp_path / "companies.tsv"
-    companies.write_text("赞比亚\t占位公司\n", encoding="utf-8")
+    companies.write_text("国家\t关键词\t公司内部编号\t公司显示名\n赞比亚\t\t0001\t占位公司\n", encoding="utf-8")
 
     def argv(*, enabled=True, seconds=120):
         env.write_text("".join(f"{key}={value}\n" for key, value in config.items()), encoding="utf-8")

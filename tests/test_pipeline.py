@@ -189,11 +189,13 @@ def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
     args = [*_resident_args(tmp_path), "--env-file", str(tmp_path / ".env")]
     if save_raw:
         companies_file = tmp_path / "占位对照表.tsv"
-        args.extend(("--companies-file", str(companies_file)))
+        args.extend(("--companies-file", str(companies_file), "--legacy-companies"))
+        companies_data = "赞比亚\t占位常驻公司\n"
     else:
         companies_file = tmp_path / ".private" / "companies.tsv"
         companies_file.parent.mkdir()
-    companies_file.write_text("赞比亚\t占位常驻公司\n", encoding="utf-8")
+        companies_data = "国家\t关键词\t公司内部编号\t公司显示名\n赞比亚\t\t0001\t占位常驻公司\n"
+    companies_file.write_text(companies_data, encoding="utf-8")
     output = tmp_path / "占位回复目录"
     output.mkdir(mode=0o700)
     if save_raw:
@@ -567,6 +569,31 @@ def test_pipeline_turns_confirmed_mutex_no_into_red_uncertainty(monkeypatch):
 def _application(body):
     message = Message("<合成消息>", "<合成群>", "<合成发送者>", 0, "text", "")
     return Application(message, body, ())
+
+
+def test_pipeline_reads_one_company_table_per_application(tmp_path, monkeypatch, single_policy):
+    body, reply = single_policy
+    table = tmp_path / "companies.csv"
+    header = "国家,关键词,公司内部编号,公司显示名\n"
+    table.write_text(header + "赞比亚,,0009,占位换表前公司\n", encoding="utf-8")
+    original_read = Path.read_bytes
+    reads = []
+
+    def read(path):
+        raw = original_read(path)
+        if path == table:
+            reads.append(path)
+            table.write_text(header + "赞比亚,,0010,占位换表后公司\n", encoding="utf-8")
+        return raw
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    pipeline = Pipeline(model=lambda **_: json.dumps(reply), tag_dates={}, companies_file=table)
+    first = "\n".join(_contents(list(map(result_card, pipeline(_application(body))))))
+    assert reads == [table]
+    assert "占位换表前公司" in first and "占位换表后公司" not in first and "0009" not in first
+    second = "\n".join(_contents(list(map(result_card, pipeline(_application(body))))))
+    assert reads == [table, table]
+    assert "占位换表后公司" in second and "占位换表前公司" not in second and "0010" not in second
 
 
 @pytest.mark.parametrize("scenario", ["retry", "fail", "expired", "notice_failed"])

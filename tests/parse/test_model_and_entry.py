@@ -215,7 +215,9 @@ def test_parse_entry_writes_only_to_a_new_private_file(monkeypatch, tmp_path, ca
     monkeypatch.chdir(tmp_path)
     (tmp_path / "rules").symlink_to(Path(__file__).resolve().parents[2] / "rules", target_is_directory=True)
     Path(".private").mkdir()
-    Path(".private/companies.tsv").write_text("赞比亚\t占位公司甲\n", encoding="utf-8")
+    Path(".private/companies.tsv").write_text(
+        "国家\t关键词\t公司内部编号\t公司显示名\n赞比亚\t\t0001\t占位公司甲\n", encoding="utf-8",
+    )
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(output)])
     monkeypatch.setattr(sys, "stdin", io.StringIO("赞比亚占位申请"))
     assert main() == 0
@@ -252,16 +254,20 @@ def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp
     assert json.loads(Path("drafts.json").read_text(encoding="utf-8")) == []
 
 
-def test_replay_entry_uses_explicit_company_table_instead_of_default(monkeypatch, tmp_path):
+@pytest.mark.parametrize("legacy", [False, True])
+def test_replay_entry_uses_explicit_company_table_instead_of_default(monkeypatch, tmp_path, legacy):
     rules = Path("rules").resolve()
     monkeypatch.chdir(tmp_path)
     Path(".private").mkdir()
-    Path(".private/companies.tsv").write_text("赞比亚\t占位默认公司\n", encoding="utf-8")
-    Path("selected.tsv").write_text("赞比亚\t占位所选公司\n", encoding="utf-8")
+    header = "国家\t关键词\t公司内部编号\t公司显示名\n"
+    Path(".private/companies.tsv").write_text(header + "赞比亚\t\t0001\t占位默认公司\n", encoding="utf-8")
+    selected = "赞比亚\t占位所选公司\n" if legacy else header + "赞比亚\t\t0002\t占位所选公司\n"
+    Path("selected.tsv").write_text(selected, encoding="utf-8")
     Path("model.json").write_text('[{"company":{"value":"占位模型公司","evidence":["赞比亚"]}}]', encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [
         "qianshu.parse", "--output", "drafts.json", "--replay", "model.json",
         "--rules-dir", str(rules), "--companies-file", "selected.tsv",
+        *(["--legacy-companies"] if legacy else []),
     ])
     monkeypatch.setattr(sys, "stdin", io.StringIO("赞比亚占位申请"))
     assert main() == 0

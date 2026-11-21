@@ -12,11 +12,12 @@ from urllib.parse import urlsplit
 from qianshu.config import load_config
 from qianshu.draft import Candidate, DraftField, PackageRow, PolicyDraft, SourceExcerpt, Uncertainty
 
+from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, CompanyTable, load_company_rules
 from .model import ModelError, ParseModel, configured_model
 from .scope import (
     CHINESE_DURATION_NUMBERS, DATE_PERIOD, DATE_TEXT, DURATION, PERIOD_CLAUSE_BREAKS, PolicyReference, Scope,
     clause_spans, company_mentioned, country_matches, duration_in_context, policy_scopes, quoted_company_heading,
-    read_countries, without_batch_intro, without_list_prefix,
+    without_batch_intro, without_list_prefix,
 )
 
 __all__ = ["ModelError", "ParseError", "parse_application"]
@@ -63,12 +64,10 @@ _MUTEX = "maintain_mutual_exclusion_group"
 _MUTEX_NO_HINT = "申请要求不维护互斥组，需人工确认"
 _BOUNDARY_HINT = "段落边界无法确定，需人工确认"
 _COMPANY_TABLE_HINT = "公司对照表缺失或无效"
-_DEFAULT_COMPANIES_FILE = Path(".private/companies.tsv")
 _COMPANY_SUBJECT = re.compile(
     r"(?:(?:适用|申请)?(?:公司(?:名称)?|主体))\s*(?:[:：=]|为|是)\s*(.+)"
 )
 _COMPANY_SUBJECT_SEPARATOR = re.compile(r"\s*(?:或者?|以及|、|\s+[和与及]\s+)\s*")
-type _CompanyTable = dict[str, dict[str, str]]
 _MUTEX_NEGATIVE = r"不需要|不需|无需|不用"
 _MUTEX_ANSWER = re.compile(
     r"(?:是否(?:需要)?|需不需要|需要)?(?:维护)?互斥组\s*[:：=]\s*"
@@ -167,8 +166,10 @@ def parse_application(
     config: Mapping[str, str] | None = None,
     model: ParseModel | None = None,
     rules_dir: Path = Path("rules"),
-    companies_file: Path = _DEFAULT_COMPANIES_FILE,
+    companies_file: Path = DEFAULT_COMPANIES_FILE,
+    legacy_companies: bool = False,
     on_reply: Callable[[str], None] | None = None,
+    company_rules: CompanyRules | None = None,
 ) -> list[ParsedPolicyDraft]:
     """接收申请正文并返回草稿。on_reply 在校验模型回复前收到原始文本。"""
     if not body.strip():
@@ -182,13 +183,11 @@ def parse_application(
     except (OSError, UnicodeError, ValueError):
         raise ParseError("申请解析规则不可读或选项表格式无效。") from None
     try:
-        countries = read_countries((rules_dir / "countries.txt").read_text(encoding="utf-8"))
+        if company_rules is None:
+            company_rules = load_company_rules(rules_dir, companies_file, legacy=legacy_companies)
     except (OSError, UnicodeError, ValueError):
         raise ParseError("申请解析国家名规则不可读或格式无效。") from None
-    try:
-        companies = _read_companies(companies_file.read_text(encoding="utf-8"), countries)
-    except (OSError, UnicodeError, ValueError):
-        companies = None
+    countries, companies = company_rules.countries, company_rules.table
 
     if model is None:
         model = configured_model(config if config is not None else load_config())
@@ -232,8 +231,7 @@ def parse_application(
         ))
 
     drafts = []
-    company_names = {country: list(rows.values()) for country, rows in (companies or {}).items()}
-    scopes = policy_scopes(body, references, countries, company_names)
+    scopes = policy_scopes(body, references, countries, company_rules.names)
     for policy, scope in zip(policies, scopes, strict=True):
         draft_fields = {
             name: _draft_field(
@@ -292,29 +290,8 @@ def _read_options(table: str) -> dict[str, dict[str, str]]:
     return options
 
 
-def _read_companies(table: str, countries: Mapping[str, object]) -> _CompanyTable:
-    companies: _CompanyTable = {}
-    for line in table.splitlines():
-        if line.lstrip().startswith("#") or ("\t" not in line and not line.strip()):
-            continue
-        cells = [cell.strip() for cell in line.split("\t")]
-        if len(cells) not in (2, 3) or not all(cells):
-            raise ValueError
-        country, name, *keywords = cells
-        if country not in countries:
-            raise ValueError
-        keyword = keywords[0].casefold() if keywords else ""
-        rows = companies.setdefault(country, {})
-        if keyword in rows:
-            raise ValueError
-        rows[keyword] = name
-    if not companies:
-        raise ValueError
-    return companies
-
-
 def _company(
-    body: str, scope: Scope, countries: dict[str, re.Pattern[str]], companies: _CompanyTable | None,
+    body: str, scope: Scope, countries: dict[str, re.Pattern[str]], companies: CompanyTable | None,
 ) -> DraftField[str]:
     if companies is None:
         return DraftField(uncertainty=Uncertainty(reason=_COMPANY_TABLE_HINT))
@@ -350,18 +327,19 @@ def _company(
     if len(matches) > 1:
         return DraftField(evidence=evidence, uncertainty=Uncertainty(
             reason="该国有多个公司关键词命中。",
-            candidates=[Candidate(value=rows[keyword], evidence=[quote]) for keyword, quote in matches.items()],
+            candidates=[Candidate(value=rows[keyword].display_name, evidence=[quote])
+                        for keyword, quote in matches.items()],
         ))
     if matches:
         keyword, = matches
-        name = rows[keyword]
+        name = rows[keyword].display_name
         if conflict := _company_subject_conflict(body, scope, excerpts, countries, country, keyword, name):
             if conflict not in evidence:
                 evidence.append(conflict)
             return DraftField(evidence=evidence, uncertainty=Uncertainty(reason="公司关键词与原文明确主体冲突。"))
         return DraftField(value=name, evidence=evidence)
     if default := rows.get(""):
-        return DraftField(value=default, evidence=evidence)
+        return DraftField(value=default.display_name, evidence=evidence)
     return DraftField(evidence=evidence, uncertainty=Uncertainty(reason="公司对照表未能确定该国公司。"))
 
 
