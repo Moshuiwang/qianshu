@@ -107,8 +107,6 @@ def select(plan: dict, reviews: dict) -> tuple[list[dict], list[dict]]:
                 "rank": rank, "quota": layer["quota"],
                 "selection": "replacement" if rank > layer["quota"] else "included",
             })
-        if chosen < layer["quota"] and plan["mode"] == "sample":
-            raise RegressionError(f"当前层审定通过的候选不足，缺 {layer['quota'] - chosen} 条。")
     if not selected:
         raise RegressionError("没有审定纳入的考题。")
     return selected, rejected

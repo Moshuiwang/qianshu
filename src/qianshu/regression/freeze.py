@@ -1,6 +1,6 @@
 """冻结考题、配对的人工配置和各字段的分母。"""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,6 +53,51 @@ def _denominators(pairs: list[dict], fields: Iterable[str]) -> dict:
         "fields": result,
         "whole_policy": sorted(set.intersection(*(set(entry["ids"]) for entry in result.values()))),
     }
+
+
+def _strata_with_counts(layers: list[dict], samples: Iterable[dict]) -> list[dict]:
+    counts = Counter((sample["policy_type"], sample["benefit_type"]) for sample in samples)
+    strata = []
+    seen = set()
+    for layer in layers:
+        policy, benefit, quota = layer["policy_type"], layer["benefit_type"], layer["quota"]
+        if policy not in POLICY_TYPES or benefit not in BENEFIT_TYPES or type(quota) is not int:
+            raise RegressionError("冻结的分层类别或配额无效。")
+        key = (policy, benefit)
+        if key in seen:
+            raise RegressionError("冻结的分层类别重复。")
+        seen.add(key)
+        included = counts[key]
+        shortfall = quota - included
+        if (
+            shortfall < 0
+            or layer.get("included_count", included) != included
+            or layer.get("shortfall", shortfall) != shortfall
+        ):
+            raise RegressionError("冻结的分层计数与样例清单不一致。")
+        strata.append({
+            "policy_type": policy, "benefit_type": benefit, "quota": quota,
+            "included_count": included, "shortfall": shortfall,
+        })
+    return strata
+
+
+def _check_plan_strata(manifest: dict, plan: dict) -> None:
+    planned = {
+        (layer["policy_type"], layer["benefit_type"]): (layer["quota"], len(layer["candidates"]))
+        for layer in plan["strata"]
+    }
+    recorded = {
+        (layer["policy_type"], layer["benefit_type"]): (layer["quota"], layer["candidate_count"])
+        for layer in manifest["strata"]
+    }
+    if (
+        planned != recorded
+        or any(type(candidates) is not int for _, candidates in recorded.values())
+        or plan["size"] != manifest["target"]
+        or plan["candidate_count"] != manifest["candidate_count"]
+    ):
+        raise RegressionError("冻结的分层类别、配额或候选数与抽样计划不一致。")
 
 
 def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path: Path,
@@ -127,9 +172,8 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
         "plan_sha256": digest(plan_raw), "count": len(samples), "documents": len(documents),
         "candidate_count": plan["candidate_count"], "target": plan["size"],
         "strata": [
-            {"policy_type": layer["policy_type"], "benefit_type": layer["benefit_type"],
-             "quota": layer["quota"], "candidate_count": len(layer["candidates"])}
-            for layer in plan["strata"]
+            {**summary, "candidate_count": len(layer["candidates"])}
+            for layer, summary in zip(plan["strata"], _strata_with_counts(plan["strata"], samples), strict=True)
         ],
         "rejected": rejected, "source_sha256": source_hashes,
         "artifact_sha256": {name: digest(raw) for name, raw in artifacts.items()},
@@ -151,7 +195,7 @@ def _indexed(raw: bytes, key: str) -> dict:
     return indexed
 
 
-def load_freeze(files: PrivateFiles, directory: Path, *, verify_sources: bool = False) -> dict:
+def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = False, verify_sources: bool = False) -> dict:
     manifest_raw = files.read(directory / "manifest.json")
     manifest = read_json(manifest_raw)
     if manifest["schema"] not in (1, 2) or manifest["comparison_version"] != 1 or json_bytes(manifest) != manifest_raw:
@@ -196,11 +240,27 @@ def load_freeze(files: PrivateFiles, directory: Path, *, verify_sources: bool = 
 
     if json_bytes(_denominators(list(pairs.values()), frozen_fields)) != raw["denominators.json"]:
         raise RegressionError("冻结的字段分母与审定配置不一致。")
-    if verify_sources:
-        for name, checksum in manifest["source_sha256"].items():
-            if digest(files.read(name)) != checksum:
-                raise RegressionError("冻结的语料来源指纹已变化。")
+    strata = _strata_with_counts(manifest["strata"], samples.values())
+    if (
+        sum(layer["quota"] for layer in strata) != manifest["target"]
+        or sum(layer["included_count"] for layer in strata) != manifest["count"]
+    ):
+        raise RegressionError("冻结的分层合计与目标配额或样例总数不一致。")
+    if verify_plan or verify_sources:
+        sources = manifest["source_sha256"]
+        plan_checksum = manifest["plan_sha256"]
+        plan_name = next((name for name, checksum in sources.items() if checksum == plan_checksum), None)
+        if plan_name is None:
+            raise RegressionError("冻结的来源清单缺少抽样计划指纹。")
+        plan_raw = files.read(plan_name)
+        if digest(plan_raw) != plan_checksum:
+            raise RegressionError("冻结的抽样计划指纹已变化。")
+        _check_plan_strata(manifest, read_json(plan_raw))
+        if verify_sources:
+            for name, checksum in sources.items():
+                if name != plan_name and digest(files.read(name)) != checksum:
+                    raise RegressionError("冻结的语料来源指纹已变化。")
     return {
         "fingerprint": digest(manifest_raw), "samples": samples, "pairs": pairs, "documents": documents,
-        "denominators": denominators, "companies_text": raw["companies.tsv"].decode("utf-8"),
+        "denominators": denominators, "strata": strata, "companies_text": raw["companies.tsv"].decode("utf-8"),
     }

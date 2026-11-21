@@ -41,9 +41,9 @@ def _arguments(argv: list[str] | None):
     build.add_argument("--companies", required=True)
     build.add_argument("--out", required=True)
 
-    verify = commands.add_parser("verify", help="核验冻结产物的指纹和引用。")
+    verify = commands.add_parser("verify", help="核验冻结产物的指纹、引用和抽样分层。")
     verify.add_argument("--frozen", required=True)
-    verify.add_argument("--sources", action="store_true", help="一并检查冻结时的私有输入文件。")
+    verify.add_argument("--sources", action="store_true", help="一并检查冻结时的其余私有输入文件。")
 
     run = commands.add_parser("run", help="用冻结输入运行解析，生成统计及私有明细。")
     run.add_argument("--frozen", required=True)
@@ -73,7 +73,7 @@ def main(argv: list[str] | None = None, *, model: ParseModel | None = None) -> i
                 )
                 print(checksum)
             elif args.command == "verify":
-                snapshot = load_freeze(files, files.argument(args.frozen), verify_sources=args.sources)
+                snapshot = load_freeze(files, files.argument(args.frozen), verify_plan=True, verify_sources=args.sources)
                 print(snapshot["fingerprint"])
             else:
                 snapshot = load_freeze(files, files.argument(args.frozen))
