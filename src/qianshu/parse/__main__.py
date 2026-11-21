@@ -9,9 +9,11 @@ from pathlib import Path
 from qianshu.config import ConfigError, load_config
 
 from . import _DEFAULT_COMPANIES_FILE, ModelError, ParseError, parse_application
+from ._output import check_output_path
 
 
 def _write_private(path: Path, text: str) -> None:
+    check_output_path(path)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
         output.write(text)
@@ -19,8 +21,10 @@ def _write_private(path: Path, text: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="解析标准输入中的申请正文。")
-    parser.add_argument("--output", type=Path, required=True, help="私有草稿 JSON 文件，必须是新路径。")
-    parser.add_argument("--raw-output", type=Path, help="私有原始模型回复文件，必须是新路径。")
+    parser.add_argument("--output", type=Path, required=True,
+                        help="私有草稿 JSON 新文件。Git 工作区内须使用忽略路径。")
+    parser.add_argument("--raw-output", type=Path,
+                        help="私有原始模型回复新文件。Git 工作区内须使用忽略路径。")
     parser.add_argument("--replay", type=Path, help="读取保存的原始模型回复，离线重放。")
     parser.add_argument("--env-file", type=Path, default=Path(".env"), help="配置文件路径，默认 .env。")
     parser.add_argument("--rules-dir", type=Path, default=Path("rules"), help="规则目录路径，默认 rules。")
@@ -39,6 +43,9 @@ def main() -> int:
         if args.raw_output is not None and os.path.realpath(args.output) == os.path.realpath(args.raw_output):
             print("草稿与原始回复须使用不同的输出路径。", file=sys.stderr)
             return 1
+        check_output_path(args.output)
+        if args.raw_output is not None:
+            check_output_path(args.raw_output)
 
         def replay_model(*, system: str, user: str) -> str:
             return args.replay.read_bytes().decode("utf-8")

@@ -32,6 +32,7 @@ from .feishu.entrance import Application, Attachment, Transport, fingerprint
 from .feishu.sdk import _Transport
 from .logs import setup_logging
 from .parse import _DEFAULT_COMPANIES_FILE
+from .parse._output import check_output_path
 from .parse.model import configured_model
 from .pipeline import Pipeline
 
@@ -499,6 +500,7 @@ def _check_companies_file(path: Path) -> None:
 
 @contextmanager
 def _raw_output_directory(path: Path) -> Iterator[int]:
+    check_output_path(path)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
@@ -518,6 +520,7 @@ def _save_raw_reply(path: Path, application: Application, reply: str) -> None:
             timestamp = time.time_ns()
             while True:
                 name = f"{timestamp}-{digest}.txt"
+                check_output_path(path / name)
                 try:
                     fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
                     break
@@ -625,7 +628,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--tag-dates", type=Path, help="私有 JSON 对象，标签名称映射到已确认的结束日期")
     parser.add_argument("--companies-file", type=Path,
                         help="公司对照表路径，常驻服务默认 .private/companies.tsv。")
-    parser.add_argument("--raw-output-dir", type=Path, help="常驻服务保存原始模型回复的现有 0700 目录。")
+    parser.add_argument("--raw-output-dir", type=Path,
+                        help="常驻服务保存原始模型回复的现有 0700 目录。Git 工作区内须使用忽略目录。")
     args = parser.parse_args(argv)
     if args.inject is None and args.state is None:
         parser.error("常驻服务须指定 --state。")
