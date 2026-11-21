@@ -33,7 +33,7 @@ def test_service_help_describes_current_offline_input(capsys):
 
 
 @pytest.mark.parametrize(("model_config", "expected"), [
-    ({}, "claude-opus-5-5"),
+    ({}, "claude-sonnet-5-5"),
     ({"ANTHROPIC_MODEL": "placeholder-model"}, "placeholder-model"),
 ])
 def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, caplog):
