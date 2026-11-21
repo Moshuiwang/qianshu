@@ -131,7 +131,7 @@ def _new_field_status(draft, name: str) -> str:
     return "determined" if field.value is not None else "missing"
 
 
-def evaluate(frozen: dict, model: ParseModel, rules_dir: Path) -> tuple[dict, dict]:
+def evaluate(frozen: dict, model: ParseModel, rules_dir: Path, *, legacy_companies: bool = False) -> tuple[dict, dict]:
     samples = frozen["samples"]
     pairs = defaultdict(list)
     for pair in frozen["pairs"].values():
@@ -161,6 +161,7 @@ def evaluate(frozen: dict, model: ParseModel, rules_dir: Path) -> tuple[dict, di
         try:
             drafts = parse_application(
                 document["body"], model=model, rules_dir=rules_dir, companies_text=frozen["companies_text"],
+                legacy_companies=legacy_companies,
             )
         except ModelError:
             status = "model_failed"

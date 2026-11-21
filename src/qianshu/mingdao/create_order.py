@@ -521,7 +521,7 @@ def draft_values(draft):
         require(field.get("uncertainty") is None, f"草稿字段 {key} 待确认，需人工")
         if field["value"] is not None:
             values[key] = field["value"]
-    require(all(key in values for key in (*_VARIABLE, "user_tags", "packages")), "草稿缺少必填字段")
+    require(all(key in values for key in (*_VARIABLE, "user_tags", "packages", "company")), "草稿缺少必填字段")
     require(receipt(values["user_scope"]), "草稿用户范围格式无效，需人工")
     name = values["policy_name"]
     require(receipt(name) and len(name) > len(_PREFIX) and not any(c in name for c in "\r\n<>"),
@@ -713,6 +713,18 @@ def template_relation_rows(cells, control, read_relations, label):
     return rows
 
 
+def select_company_id(rows, spec, display_name):
+    error = "公司显示名不确定，需人工核对"
+    key = spec.get("display_name_key")
+    require(receipt(key) and receipt(display_name) and all(
+        isinstance(row, dict) and uuid_record(row.get("rowId")) and receipt(row.get(key)) for row in rows
+    ), error)
+    matches = [row["rowId"] for row in rows if row[key] == display_name]
+    require(matches, "公司显示名不确定，模板可读关联中无同名公司，需人工核对")
+    require(len(matches) == 1, error)
+    return matches[0]
+
+
 def cell_schema(fields_config, skip):
     require(isinstance(fields_config, dict) and isinstance(skip, list)
             and all(isinstance(key, str) for key in skip) and set(skip) <= fields_config.keys(),
@@ -737,13 +749,15 @@ def cell_schema(fields_config, skip):
             require(key in _DRAFT_FIELDS and key not in draft_controls, "草稿与模板字段映射不唯一")
             draft_controls[key] = control
     require(set(_VARIABLE + _TEMPLATE_CHECKS) <= draft_controls.keys(), "草稿与模板字段映射不全")
-    require(all(draft_controls[key] not in skip for key in (*_VARIABLE, "approval_url", "user_tags", "packages")),
+    require(all(draft_controls[key] not in skip
+                for key in (*_VARIABLE, "approval_url", "user_tags", "packages", "company")),
             "不可跳过建单关键字段的回读")
     expected_types = {"user_tags": {29}, "packages": {34}}
     require(all(fields_config[draft_controls[key]]["type"] not in _ARRAY
                 for key in (*_VARIABLE, "approval_url")), "草稿标量字段的控件类型无效")
     require(all(fields_config[draft_controls[key]]["type"] in kinds
                 for key, kinds in expected_types.items()), "关键字段的控件类型无效")
+    require(fields_config[draft_controls["company"]]["type"] not in _ARRAY - {29}, "公司控件类型无效")
     packages = fields_config[draft_controls["packages"]]
     require(all(packages[key]["control"] in packages["children"] for key in ("current", "gift")),
             "节目包名称控件须在已登记的子控件中")
@@ -769,7 +783,7 @@ def fixed_cells(config, schema, draft_controls):
     applicant = config.get("applicant_control")
     require(receipt(applicant) and applicant != status_control, "固定申请人控件配置无效")
     expected = {status_control, applicant}
-    protected = {draft_controls[key] for key in (*_VARIABLE, "approval_url")}
+    protected = {draft_controls[key] for key in (*_VARIABLE, "approval_url", "company")}
     require(isinstance(fixed, dict) and fixed.keys() == expected and expected <= schema.keys()
             and not (expected & protected), "固定字段配置无效")
     require(schema[status_control]["type"] in _SELECT, "固定政策状态配置无效")
@@ -789,6 +803,7 @@ def assemble(values, template_cells, config, read_relations, *, is_test):
     require(is_test is True, "正式单不得照抄任务审批链接，需人工")
     fixed = fixed_cells(config, schema, draft_controls)
     tag_control = draft_controls["user_tags"]
+    company_control = draft_controls["company"]
     require(isinstance(template_cells, dict)
             and schema.keys() - fixed.keys() <= template_cells.keys(),
             "模板字段不全")
@@ -797,7 +812,7 @@ def assemble(values, template_cells, config, read_relations, *, is_test):
             and bool(urlsplit(approval_link).hostname), "模板任务审批链接缺失或无效")
     country = config["template"]["country"]
     country_control = country["control"]
-    require(country_control not in (draft_controls[key] for key in (*_VARIABLE, "user_tags", "packages")),
+    require(country_control not in (draft_controls[key] for key in (*_VARIABLE, "user_tags", "packages", "company")),
             "模板国家绑定无效")
     require(encode_cell(country["value"], schema[country_control])
             == encode_cell(template_cells.get(country_control), schema[country_control]),
@@ -807,7 +822,19 @@ def assemble(values, template_cells, config, read_relations, *, is_test):
                  or fixed[country_control] == encode_cell(country["value"], schema[country_control])),
             "模板国家绑定无效")
 
-    for key in values.keys() - set((*_VARIABLE, "packages", "user_tags")):
+    company = values.get("company")
+    require(receipt(company), "公司显示名不确定，需人工核对")
+    company_spec = schema[company_control]
+    company_is_relation = company_spec["type"] == 29
+    if company_is_relation:
+        rows = template_relation_rows(template_cells, company_control, read_relations, "公司")
+        company_id = select_company_id(rows, company_spec, company)
+        company_value = encode_cell([company_id], company_spec)
+    else:
+        require(template_cells[company_control] == company, "公司显示名不确定，需人工核对")
+        company_value = encode_cell(company, company_spec)
+
+    for key in values.keys() - set((*_VARIABLE, "packages", "user_tags", "company")):
         control = draft_controls.get(key)
         require(control is not None, f"草稿字段 {key} 无法核对模板，需人工")
         if control in fixed:
@@ -830,6 +857,8 @@ def assemble(values, template_cells, config, read_relations, *, is_test):
             source, encoded = "草稿", encode_cell(tag_ids, spec)
         elif control == package_control:
             source, encoded = "模板", compact(packages)
+        elif control == company_control:
+            source, encoded = ("草稿" if company_is_relation else "模板"), company_value
         elif key in _VARIABLE:
             source, encoded = "草稿", encode_cell(values[key], spec)
         else:
@@ -838,6 +867,21 @@ def assemble(values, template_cells, config, read_relations, *, is_test):
         summary.append({"字段名": spec["label"], "类型": spec["type"], "来源": source,
                         "值指纹": digest(encoded.encode())[:12]})
     return controls, summary
+
+
+def compare_company(control, actual, field, read_relations, display_name):
+    if field["type"] != 29:
+        return "一致" if actual == control["value"] else "不确定"
+    if type(actual) is not int or actual != 1:
+        return "不确定"
+    try:
+        rows = read_relations(control["controlId"])
+        if len(rows) != 1:
+            return "不确定"
+        company_id = select_company_id(rows, field, display_name)
+    except Stop:
+        return "不确定"
+    return "一致" if company_id.lower() == decode(control["value"])[0]["sid"].lower() else "不确定"
 
 
 def compare_relation(control, count, field, read_relations, packages):
@@ -863,7 +907,7 @@ def compare_relation(control, count, field, read_relations, packages):
     return "一致" if matches else "不一致"
 
 
-def compare(expected, raw_cells, config, *, read_relations, packages):
+def compare(expected, raw_cells, config, *, read_relations, packages, company=None):
     results, differences = [], []
     for control in expected:
         key = control["controlId"]
@@ -871,6 +915,8 @@ def compare(expected, raw_cells, config, *, read_relations, packages):
         actual = raw_cells.get(key, _NO_CELL)
         if key in config["readback_skip"]:
             result = "跳过"
+        elif field.get("draft") == "company":
+            result = compare_company(control, actual, field, read_relations, company)
         elif field.get("draft") in ("user_tags", "packages"):
             result = compare_relation(control, actual, field, read_relations, packages)
         elif actual is _NO_CELL:
@@ -1055,7 +1101,8 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
 
 
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
-              contact, login_check, stop, *, packages, clock=time.time, pause=time.sleep, monotonic=time.monotonic):
+              contact, login_check, stop, *, packages, company,
+              clock=time.time, pause=time.sleep, monotonic=time.monotonic):
     def announce(text):
         feishu.transport.announce(f"{ledger.name} · {text}\n{contact}")
 
@@ -1120,11 +1167,15 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         raw = api.read(record_id)
         observed = api.detail(raw, record_id)
         report, counts = compare(controls, observed, config,
-                                 read_relations=lambda control: api.relations(record_id, control), packages=packages)
+                                 read_relations=lambda control: api.relations(record_id, control),
+                                 packages=packages, company=company)
         exclusive(ledger.directory / f"create-readback-{registration_hash}.json", report)
         ledger.append("readback_compared", record_id, counts=dict(counts))
         announce(f"官方回读 一致 {counts['一致']} / 不一致 {counts['不一致']} / "
                  f"缺失 {counts['缺失']} / 跳过 {counts['跳过']} / 无法核对 {counts['无法核对']}")
+        if counts["不确定"]:
+            announce("公司回读不确定，已保留记录，需人工核对")
+            return False
     except (Exception, KeyboardInterrupt) as error:
         ledger.append("readback_unconfirmed", record_id)
         announce("官方回读未获确认，已停止，需人工核对")
@@ -1233,7 +1284,7 @@ def run(args, directory, *, clock=time.time):
                 raise
             return service.run_create(lambda stop: run_order(
                 ledger, api, create, service, window, payload, summary, controls, config, evidence,
-                contact, login_check, stop, packages=values["packages"], clock=clock,
+                contact, login_check, stop, packages=values["packages"], company=values["company"], clock=clock,
             ))
 
 

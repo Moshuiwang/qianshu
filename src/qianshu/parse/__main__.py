@@ -8,8 +8,9 @@ from pathlib import Path
 
 from qianshu.config import ConfigError, load_config
 
-from . import _DEFAULT_COMPANIES_FILE, ModelError, ParseError, parse_application
+from . import ModelError, ParseError, parse_application
 from ._output import check_output_path
+from .companies import DEFAULT_COMPANIES_FILE
 
 
 def _write_private(path: Path, text: str) -> None:
@@ -28,8 +29,10 @@ def main() -> int:
     parser.add_argument("--replay", type=Path, help="读取保存的原始模型回复，离线重放。")
     parser.add_argument("--env-file", type=Path, default=Path(".env"), help="配置文件路径，默认 .env。")
     parser.add_argument("--rules-dir", type=Path, default=Path("rules"), help="规则目录路径，默认 rules。")
-    parser.add_argument("--companies-file", type=Path, default=_DEFAULT_COMPANIES_FILE,
-                        help="公司对照表路径，默认 .private/companies.tsv。")
+    parser.add_argument("--companies-file", type=Path, default=DEFAULT_COMPANIES_FILE,
+                        help="私有公司对照表 CSV 或 TSV 路径，默认 .private/companies.tsv。")
+    parser.add_argument("--legacy-companies", action="store_true",
+                        help="按无表头两列或三列 TSV 读取公司对照表，默认关闭。")
     args = parser.parse_args()
 
     try:
@@ -59,6 +62,7 @@ def main() -> int:
             model=replay_model if args.replay is not None else None,
             rules_dir=args.rules_dir,
             companies_file=args.companies_file,
+            legacy_companies=args.legacy_companies,
             on_reply=save_reply if args.raw_output is not None else None,
         )
         result = json.dumps([draft.to_dict() for draft in drafts], ensure_ascii=False, indent=2)

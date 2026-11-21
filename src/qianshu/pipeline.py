@@ -13,6 +13,7 @@ from . import parse, validate
 from .draft import Candidate, DraftField, PackageRow, PolicyDraft, SourceExcerpt, Uncertainty
 from .feishu.cards import CardLine, DetailPage, detail_pages
 from .feishu.entrance import Application
+from .parse.companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
 from .parse.model import ParseModel
 from .parse.scope import Span, clause_spans, numbered_field, policy_layout, without_list_prefix
 
@@ -90,9 +91,12 @@ def _rule_pending(draft: PolicyDraft, name: str) -> bool:
 
 
 def _policy_boundaries(
-    body: str, *, companies_file: Path | None = None,
+    body: str, *, companies_file: Path | None = None, company_rules: CompanyRules | None = None,
 ) -> tuple[list[int], dict[int, Span], set[int], tuple[Span, ...]]:
-    headings, excluded = policy_layout(body, companies_file=companies_file)
+    if company_rules is None:
+        company_rules = load_company_rules(Path("rules"), companies_file or DEFAULT_COMPANIES_FILE)
+    configured_names = {name for names in company_rules.names.values() for name in names}
+    headings, excluded = policy_layout(body, company_rules.countries, configured_names)
     heading_starts = {heading.start for heading in headings}
     explicit = set()
     uncertain = set()
@@ -297,12 +301,14 @@ class Pipeline:
         today: Callable[[], date] = _utc_today,
         sensitive_values: Iterable[str] = (),
         companies_file: Path | None = None,
+        legacy_companies: bool = False,
         on_reply: Callable[[Application, str], None] | None = None,
     ) -> None:
         self.model = model
         self.tag_dates = tag_dates
         self.today = today
         self.companies_file = companies_file
+        self.legacy_companies = legacy_companies
         self._on_reply = on_reply
         values = sorted({
             literal for value in sensitive_values if value
@@ -327,13 +333,15 @@ class Pipeline:
         try:
             body = application.text
             suspected = _suspected_policy_count(body)
-            starts, required, uncertain, excluded = _policy_boundaries(body, companies_file=self.companies_file)
+            company_rules = load_company_rules(
+                Path("rules"), self.companies_file or DEFAULT_COMPANIES_FILE, legacy=self.legacy_companies,
+            )
+            starts, required, uncertain, excluded = _policy_boundaries(body, company_rules=company_rules)
             reminders = self._boundary_reminders(body, starts, uncertain)
             parse_failed = False
             try:
-                options = {} if self.companies_file is None else {"companies_file": self.companies_file}
                 on_reply = None if self._on_reply is None else partial(self._on_reply, application)
-                drafts = parse.parse_application(body, model=self.model, on_reply=on_reply, **options)
+                drafts = parse.parse_application(body, model=self.model, on_reply=on_reply, company_rules=company_rules)
             except Exception:
                 if len(starts) == 1 and not uncertain and not suspected:
                     raise

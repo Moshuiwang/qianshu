@@ -3,7 +3,6 @@
 import re
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from pathlib import Path
 from unicodedata import normalize
 
 from qianshu.draft import SourceExcerpt
@@ -397,19 +396,9 @@ class PolicyReference:
 
 
 def policy_layout(
-    body: str, *, companies_file: Path | None = None,
+    body: str, countries: dict[str, re.Pattern[str]], configured_names: set[str],
 ) -> tuple[list[Heading], tuple[Span, ...]]:
     """独立识别标题，另返回不用于证明单条政策覆盖的共享段和备注范围。"""
-    from . import _DEFAULT_COMPANIES_FILE, _read_companies
-
-    countries = read_countries(Path("rules/countries.txt").read_text(encoding="utf-8"))
-    try:
-        companies = _read_companies(
-            (companies_file or _DEFAULT_COMPANIES_FILE).read_text(encoding="utf-8"), countries,
-        )
-    except (OSError, UnicodeError, ValueError):
-        companies = {}
-    configured_names = {name for rows in companies.values() for name in rows.values()}
     headings, remarks, _ = _headings(body, set(), countries, configured_names)
     stops = sorted([heading.start for heading in headings] + [remark.span[0] for remark in remarks])
     return headings, (*_shared_spans(body, stops), *(remark.span for remark in remarks))

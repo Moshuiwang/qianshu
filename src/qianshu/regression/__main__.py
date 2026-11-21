@@ -50,6 +50,7 @@ def _arguments(argv: list[str] | None):
     run.add_argument("--expect-sha256", required=True, help="freeze 或 verify 返回的预期冻结指纹。")
     run.add_argument("--out", required=True)
     run.add_argument("--live", action="store_true", help="显式允许调用现有模型接口。")
+    run.add_argument("--legacy-companies", action="store_true", help="按无表头两列或三列 TSV 读取冻结的公司对照表。")
     return parser.parse_args(argv)
 
 
@@ -86,7 +87,9 @@ def main(argv: list[str] | None = None, *, model: ParseModel | None = None) -> i
                     previous = logging.root.manager.disable
                     logging.disable(logging.CRITICAL)
                     try:
-                        report, details = evaluate(snapshot, model, files.repo / "rules")
+                        report, details = evaluate(
+                            snapshot, model, files.repo / "rules", legacy_companies=args.legacy_companies,
+                        )
                     finally:
                         logging.disable(previous)
                     output.write("mismatches.json", json_bytes(details))

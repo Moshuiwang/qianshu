@@ -347,8 +347,9 @@ def test_handoff_startup_never_initializes_application_pipeline(tmp_path, monkey
     monkeypatch.setattr(handoff.HandoffService, "run", run)
     monkeypatch.setattr(entry, "setup_logging", lambda _: None)
     assert entry.main(["--handoff-only", "--env-file", str(config)]) == 0
-    with pytest.raises(SystemExit, match="2"):
-        entry.main(["--handoff-only", "--mail", "--env-file", str(config)])
+    for flag in ("--mail", "--legacy-companies"):
+        with pytest.raises(SystemExit, match="2"):
+            entry.main(["--handoff-only", flag, "--env-file", str(config)])
 
 
 def test_sdk_message_ingress_checks_group_app_tenant_and_bot(setup, monkeypatch):

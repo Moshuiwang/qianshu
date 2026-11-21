@@ -144,7 +144,10 @@ def corpus(repo):
         },
     }
     put_json(repo / "review.json", review)
-    (repo / "companies.tsv").write_text("赞比亚\t占位公司甲\n莫桑比克\t占位公司乙\n")
+    (repo / "companies.tsv").write_text(
+        "国家\t关键词\t公司内部编号\t公司显示名\n赞比亚\t\t0001\t占位公司甲\n莫桑比克\t\t0002\t占位公司乙\n",
+        encoding="utf-8-sig",
+    )
     return root
 
 
@@ -539,7 +542,14 @@ def test_broad_real_draft_checks_repeated_evidence_in_sampled_paragraph(first_du
     assert [item["status"] for item in diagnostics] == ([] if expected == "matched" else ["ambiguous"])
 
 
-def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denominators(repo, frozen, capsys, caplog):
+@pytest.mark.parametrize("legacy", [False, True], ids=["four-columns", "legacy"])
+def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denominators(repo, corpus, capsys, caplog, legacy):
+    if legacy:
+        (repo / "companies.tsv").write_text("赞比亚\t占位公司甲\n莫桑比克\t占位公司乙\n", encoding="utf-8")
+    assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
+    assert main(["freeze", *FREEZE]) == 0
+    frozen = capsys.readouterr().out.splitlines()[-1]
+    (repo / "companies.tsv").unlink()
     calls = []
 
     def model(*, system, user):
@@ -553,13 +563,18 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
             {"company": {"evidence": [FIRST]}, "user_scope": {"value": "占位不同值", "evidence": ["占位正文甲"]}},
         ], ensure_ascii=False)
 
-    assert main(run_args(frozen), model=model) == 0
+    args = run_args(frozen)
+    if legacy:
+        args.append("--legacy-companies")
+    assert main(args, model=model) == 0
     assert sorted(calls) == sorted([BATCH, "占位单条原稿\n"])
     output = repo / "run"
     report = get_json(output / "public-report.json")
     assert report["freeze_sha256"] == frozen
     assert report["documents"] == {"parsed": 1, "model_failed": 1, "parse_failed": 0}
     assert report["sample_alignment"]["matched"] == 2
+    assert report["by_field"]["company"]["match"] == 1
+    assert report["by_field"]["company"]["error"] == 1
     assert report["by_field"]["user_scope"] == {
         "denominator": 3, "match": 1, "error": 1, "uncertain": 0,
         "missing": 0, "anomaly": 1, "match_percent": 33.33,
