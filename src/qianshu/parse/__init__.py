@@ -129,6 +129,8 @@ class ParsedPolicyDraft(PolicyDraft):
 
     _converted_months = False
     _company_table_unavailable = False
+    source_span: tuple[int, int] | None = None
+    source_evidence_spans: tuple[tuple[int, int], ...] = ()
 
     @property
     def hints(self) -> list[str]:
@@ -168,9 +170,13 @@ def parse_application(
     model: ParseModel | None = None,
     rules_dir: Path = Path("rules"),
     companies_file: Path = _DEFAULT_COMPANIES_FILE,
+    companies_text: str | None = None,
     on_reply: Callable[[str], None] | None = None,
 ) -> list[ParsedPolicyDraft]:
-    """接收申请正文并返回草稿。on_reply 在校验模型回复前收到原始文本。"""
+    """接收申请正文并返回草稿。可直接传入冻结的公司表文本。
+
+    on_reply 在校验模型回复前收到原始文本。
+    """
     if not body.strip():
         return []
 
@@ -186,7 +192,8 @@ def parse_application(
     except (OSError, UnicodeError, ValueError):
         raise ParseError("申请解析国家名规则不可读或格式无效。") from None
     try:
-        companies = _read_companies(companies_file.read_text(encoding="utf-8"), countries)
+        table = companies_file.read_text(encoding="utf-8") if companies_text is None else companies_text
+        companies = _read_companies(table, countries)
     except (OSError, UnicodeError, ValueError):
         companies = None
 
@@ -251,6 +258,8 @@ def parse_application(
         raw_mutex = policy.get(_MUTEX, {})
         _validate_field_shape(raw_mutex)
         draft = ParsedPolicyDraft(**draft_fields, maintain_mutual_exclusion_group=_mutex(body, scope))
+        draft.source_span = scope.duplicate_span if scope.boundary_uncertain else scope.local
+        draft.source_evidence_spans = _source_evidence_spans(body, policy)
         draft._company_table_unavailable = companies is None
         draft._converted_months = any(
             (field := draft_fields[name]).value is not None
@@ -259,6 +268,22 @@ def parse_application(
         )
         drafts.append(draft)
     return drafts
+
+
+def _source_evidence_spans(body: str, policy: dict) -> tuple[tuple[int, int], ...]:
+    """模型引用在整篇原稿中唯一出现时，保留坐标供段落归属核对。"""
+    quotes = {
+        quote
+        for raw in policy.values()
+        for item in [raw, *_candidate_items(raw)]
+        for quote in item.get("evidence", [])
+        if quote.strip()
+    }
+    return tuple(sorted(
+        (start, start + len(quote))
+        for quote in quotes
+        if (start := body.find(quote)) >= 0 and body.find(quote, start + 1) < 0
+    ))
 
 
 def _unwrap(reply: str) -> str:
