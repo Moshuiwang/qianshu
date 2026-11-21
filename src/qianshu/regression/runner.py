@@ -223,6 +223,7 @@ def evaluate(frozen: dict, model: ParseModel, rules_dir: Path, *, legacy_compani
         "freeze_sha256": frozen["fingerprint"],
         "rules_sha256": rules_hash,
         "samples": len(samples),
+        "strata": frozen["strata"],
         "documents": {key: documents[key] for key in DOCUMENT_RESULTS},
         "sample_alignment": {key: alignments[key] for key in ALIGNMENTS},
         "draft_alignment": {key: draft_counts[key] for key in DRAFT_RESULTS},
@@ -275,9 +276,18 @@ def markdown_report(report: dict) -> bytes:
         f"回复解析失败 {report['documents']['parse_failed']} 篇",
         f"- 唯一对齐 {report['sample_alignment']['matched']} 条，未对齐 {report['sample_alignment']['unmatched']} 条，"
         f"歧义 {report['sample_alignment']['ambiguous']} 条", "",
-        *lines("字段", {FIELD_LABELS[name][0]: counts for name, counts in report["by_field"].items()}),
-        *lines("整单", {"所有字段均可比的样例": report["whole_policy"]}),
+        "## 分层配额与缺口", "",
+        "| 政策类型 | 优惠类型 | 配额 | 实际纳入 | 缺口 |",
+        "| --- | --- | ---: | ---: | ---: |",
     ]
+    for layer in report["strata"]:
+        result.append(
+            f"| {layer['policy_type']} | {layer['benefit_type']} | {layer['quota']} | "
+            f"{layer['included_count']} | {layer['shortfall']} |"
+        )
+    result.append("")
+    result.extend(lines("字段", {FIELD_LABELS[name][0]: counts for name, counts in report["by_field"].items()}))
+    result.extend(lines("整单", {"所有字段均可比的样例": report["whole_policy"]}))
     if report["new_field_counts"]:
         result.extend([
             "## 新增字段计数", "",

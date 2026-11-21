@@ -189,8 +189,8 @@ def test_stratifies_by_largest_remainder_and_replaces_only_within_layer(repo):
     assert rejected == [{"row_id": rejected_id, "rank": 1, "reason": "insufficient_evidence"}]
     assert selected[-1]["selection"] == "replacement"
     reviews[timing["candidates"][-2]["row_id"]] = {"exclude": "historical_rule"}
-    reviews[timing["candidates"][-1]["row_id"]] = {"exclude": "historical_rule"}
-    with pytest.raises(RegressionError, match="缺 1 条"):
+    del reviews[timing["candidates"][-1]["row_id"]]
+    with pytest.raises(RegressionError, match="抽样顺序中仍有未审定候选，当前层尚需 1 条"):
         select(plan, reviews)
 
 
@@ -241,11 +241,98 @@ def test_independent_freezes_have_identical_content_fingerprints(repo, frozen, m
     assert get_json(first / "audit.json") != get_json(second / "audit.json")
 
 
+def test_sample_freeze_records_reviewed_stratum_shortfall(repo, corpus, capsys):
+    assert main(["plan", "--corpus", *PLAN, "--size", "3"]) == 0
+    review_path = repo / "review.json"
+    review = get_json(review_path)
+    del review["reviews"]["policy-b"]
+    put_json(review_path, review)
+    assert main(["freeze", *FREEZE]) == 1
+    assert "抽样顺序中仍有未审定候选" in capsys.readouterr().err
+    assert not (repo / "frozen").exists()
+
+    review["reviews"]["policy-b"] = {"exclude": "insufficient_evidence"}
+    put_json(review_path, review)
+    assert main(["freeze", *FREEZE]) == 0
+    fingerprint = capsys.readouterr().out.strip()
+    strata = [
+        {"policy_type": "公开政策", "benefit_type": "升级权益", "quota": 1, "included_count": 1, "shortfall": 0},
+        {"policy_type": "定向政策", "benefit_type": "赠送时长", "quota": 2, "included_count": 1, "shortfall": 1},
+    ]
+    manifest_path = repo / "frozen" / "manifest.json"
+    manifest = get_json(manifest_path)
+    assert manifest["target"] == 3
+    assert manifest["count"] == 2
+    assert manifest["strata"] == [{**strata[0], "candidate_count": 1}, {**strata[1], "candidate_count": 2}]
+    assert digest(manifest_path.read_bytes()) == fingerprint
+    assert main(["freeze", *FREEZE[:-1], ".private/recreated"]) == 0
+    assert capsys.readouterr().out.strip() == fingerprint
+    assert main(["verify", "--frozen", ".private/frozen", "--sources"]) == 0
+    assert capsys.readouterr().out.strip() == fingerprint
+
+    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    report = get_json(repo / "run" / "public-report.json")
+    assert report["strata"] == strata
+    assert sum(layer["included_count"] for layer in report["strata"]) == report["samples"] == 2
+    assert report["by_field"]["user_scope"]["denominator"] == 2
+    markdown = (repo / "run" / "public-report.md").read_text()
+    assert "| 公开政策 | 升级权益 | 1 | 1 | 0 |" in markdown
+    assert "| 定向政策 | 赠送时长 | 2 | 1 | 1 |" in markdown
+    capsys.readouterr()
+
+    manifest["strata"].pop()
+    manifest_path.write_bytes(json_bytes(manifest))
+    verify_args = ["verify", "--frozen", ".private/frozen"]
+    for args in (verify_args, [*verify_args, "--sources"]):
+        assert main(args) == 1
+        result = capsys.readouterr()
+        assert not result.out
+        assert "分层合计" in result.err
+
+    # 将目标配额改成剩余层的配额，单独验证纳入数合计仍会阻止报告。
+    manifest["target"] = manifest["strata"][0]["quota"]
+    manifest_path.write_bytes(json_bytes(manifest))
+    calls = []
+    tampered_fingerprint = digest(manifest_path.read_bytes())
+    assert main(run_args(tampered_fingerprint, ".private/tampered-run"), model=lambda **kw: calls.append(kw)) == 1
+    assert "分层合计" in capsys.readouterr().err
+    assert calls == []
+    assert not (repo / "tampered-run").exists()
+
+
+@pytest.mark.parametrize("change", ["missing-layer", "candidate-count", "duplicate-layer"])
+def test_verify_checks_all_plan_layers_even_without_included_samples(repo, corpus, capsys, change):
+    assert main(["plan", "--corpus", *PLAN, "--size", "1"]) == 0
+    assert main(["freeze", *FREEZE]) == 0
+    capsys.readouterr()
+
+    manifest_path = repo / "frozen" / "manifest.json"
+    manifest = get_json(manifest_path)
+    zero_quota = next(layer for layer in manifest["strata"] if layer["quota"] == 0)
+    if change == "missing-layer":
+        manifest["strata"].remove(zero_quota)
+    elif change == "candidate-count":
+        zero_quota["candidate_count"] += 1
+    else:
+        manifest["strata"].append(zero_quota)
+    manifest_path.write_bytes(json_bytes(manifest))
+
+    verify_args = ["verify", "--frozen", ".private/frozen"]
+    for args in (verify_args, [*verify_args, "--sources"]):
+        assert main(args) == 1
+        result = capsys.readouterr()
+        assert not result.out
+        assert "分层" in result.err
+
+
 def test_loads_previous_manifest_fingerprint_without_package_style(repo, frozen, capsys):
     snapshot = repo / "frozen"
     manifest = get_json(snapshot / "manifest.json")
     manifest["schema"] = 1
     manifest.update(get_json(snapshot / "audit.json"))
+    for layer in manifest["strata"]:
+        del layer["included_count"]
+        del layer["shortfall"]
     docs = snapshot / "documents.jsonl"
     records = [json.loads(line) for line in docs.read_bytes().splitlines()]
     for record in records:
@@ -259,6 +346,7 @@ def test_loads_previous_manifest_fingerprint_without_package_style(repo, frozen,
     assert capsys.readouterr().out.strip() == fingerprint
     assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
     report = get_json(repo / "run" / "public-report.json")
+    assert [(layer["included_count"], layer["shortfall"]) for layer in report["strata"]] == [(1, 0), (2, 0)]
     assert report["package_writing_by_document"]["unreviewed"] == 2
     assert report["package_writing_by_document"]["neither_recognized"] == 0
 
