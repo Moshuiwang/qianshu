@@ -39,8 +39,12 @@ def _warn_row(line: int) -> None:
     _LOG.warning("公司对照表第 %d 行", line)
 
 
-def load_company_rules(rules_dir: Path, path: Path, *, legacy: bool = False) -> CompanyRules:
+def load_company_rules(
+    rules_dir: Path, path: Path, *, legacy: bool = False, companies_text: str | None = None,
+) -> CompanyRules:
     countries = read_countries((rules_dir / "countries.txt").read_text(encoding="utf-8"))
+    if companies_text is not None:
+        return CompanyRules(countries, _read_companies(companies_text.removeprefix("\ufeff"), countries, legacy=legacy))
     try:
         raw = path.read_bytes()
     except OSError:

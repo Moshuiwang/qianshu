@@ -14,7 +14,7 @@ from http import HTTPStatus
 from pathlib import Path
 from secrets import token_urlsafe
 from threading import Event, Lock
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from uuid import NAMESPACE_OID, uuid5
 
 import httpx
@@ -23,7 +23,7 @@ from lark_oapi.api.im.v1 import (
     CreateMessageReactionRequest, CreateMessageReactionRequestBody,
     CreateMessageRequest, CreateMessageRequestBody, Emoji,
     GetChatMembersRequest, GetMessageResourceRequest, ListMessageRequest,
-    ReplyMessageRequest, ReplyMessageRequestBody,
+    ReplyMessageRequest, ReplyMessageRequestBody, ReplyMessageResponse,
 )
 from lark_oapi.core.http import Transport as SDKTransport
 from lark_oapi.core.token import (
@@ -56,6 +56,10 @@ class _EndpointUnavailable(ws.ServerException):
     """取址暂时失败，可以在窗口内重试。"""
 
 
+class _ReplyNotSent(RuntimeError):
+    """原消息的回复请求还未交给飞书发送接口。"""
+
+
 def _checked(response):
     if not response.success():
         raise RuntimeError("飞书 API 请求失败。")
@@ -66,18 +70,21 @@ def _approval_warning(content: str) -> P2CardActionTriggerResponse:
     return P2CardActionTriggerResponse({"toast": {"type": "warning", "content": content}})
 
 
-def _message(message, sender_id: str, kind: str, content: str, bot_keys, bot_open_id: str) -> Message:
+def _message(
+    message, sender_id: str, kind: str, content: str, bot_keys, bot_open_id: str,
+    *, sender_type: str = "user",
+) -> Message:
     keys = tuple(bot_keys)
     if kind == "post" and keys:
         keys += (bot_open_id,)
     return Message(
         message.message_id or "", message.chat_id or "", sender_id or "",
-        int(message.create_time), kind, content, keys,
+        int(message.create_time), kind, content, keys, sender_type,
     )
 
 
 class _Transport:
-    def __init__(self, settings: Settings, window: Window, clock: Callable[[], float]):
+    def __init__(self, settings: Settings, window: Window | None, clock: Callable[[], float]):
         self.settings, self.window, self.clock = settings, window, clock
         self.im = (
             lark.Client.builder().app_id(settings.app_id).app_secret(settings.app_secret)
@@ -85,28 +92,51 @@ class _Transport:
         )
 
     def _require_window(self) -> None:
-        if not self.window.contains(self.clock()):
+        if self.window is not None and not self.window.contains(self.clock()):
             raise RuntimeError("飞书验收窗口已关闭。")
 
-    def react(self, message_id: str) -> None:
+    def react(self, message_id: str, *, deadline: float | None = None) -> None:
         body = CreateMessageReactionRequestBody.builder().reaction_type(
             Emoji.builder().emoji_type("OK").build(),
         ).build()
-        request = CreateMessageReactionRequest.builder().message_id(message_id).request_body(body)
+        request = CreateMessageReactionRequest.builder().message_id(message_id).request_body(body).build()
         self._require_window()
-        _checked(self.im.message_reaction.create(request.build()))
+        if deadline is None:
+            _checked(self.im.message_reaction.create(request))
+            return
 
-    def reply(self, message_id: str, text: str, *, deadline: float) -> None:
+        async def send():
+            async with asyncio.timeout(deadline - time.monotonic()):
+                token = await self._tenant_token()
+                if time.monotonic() >= deadline:
+                    raise TimeoutError
+                option = lark.RequestOption.builder().tenant_access_token(token).build()
+                _checked(await self.im.message_reaction.acreate(request, option))
+
+        asyncio.run(send())
+
+    def reply(self, message_id: str, text: str, *, deadline: float, purpose: str = "") -> None:
+        dedup_key = f"qianshu-handoff:{purpose}:{message_id}" if purpose else message_id
         body = ReplyMessageRequestBody.builder().msg_type("text").content(
             json.dumps({"text": text}, ensure_ascii=False),
         ).uuid(
-            str(uuid5(NAMESPACE_OID, message_id)),
+            str(uuid5(NAMESPACE_OID, dedup_key)),
         ).build()
         request = ReplyMessageRequest.builder().message_id(message_id).request_body(body).build()
+        attempted = False
+
+        async def trace(event: str, info: dict) -> None:
+            nonlocal attempted
+            # 代理 CONNECT 也会写请求头，只有实际回复的 POST 才占用幂等期限。
+            if (event in ("http11.send_request_headers.started", "http2.send_request_headers.started")
+                and info["request"].method == b"POST"):
+                attempted = True
 
         async def send():
             self._require_window()
-            remaining = min(deadline - time.monotonic(), self.window.end.timestamp() - self.clock())
+            remaining = deadline - time.monotonic()
+            if self.window is not None:
+                remaining = min(remaining, self.window.end.timestamp() - self.clock())
             if remaining <= 0:
                 raise TimeoutError
             async with asyncio.timeout(remaining):
@@ -114,10 +144,35 @@ class _Transport:
                 self._require_window()
                 if time.monotonic() >= deadline:
                     raise TimeoutError
-                option = lark.RequestOption.builder().tenant_access_token(token).build()
-                _checked(await self.im.message.areply(request, option))
+                if purpose:
+                    response = _checked(await self._handoff_reply(request, token, trace))
+                    if not response.data or not response.data.message_id:
+                        raise RuntimeError("飞书未确认转交回复发送成功。")
+                else:
+                    option = lark.RequestOption.builder().tenant_access_token(token).build()
+                    _checked(await self.im.message.areply(request, option))
 
-        asyncio.run(send())
+        try:
+            asyncio.run(send())
+        except Exception:
+            if purpose and not attempted:
+                raise _ReplyNotSent("飞书回复请求尚未发出。") from None
+            raise
+
+    async def _handoff_reply(
+        self, request: ReplyMessageRequest, token: str, trace: Callable[[str, dict], Awaitable[None]],
+    ) -> ReplyMessageResponse:
+        # SDK 的异步回复接口不接收 HTTPX 请求扩展。
+        path = request.uri.replace(":message_id", quote(request.message_id, safe=""))
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            response = await client.post(
+                self.im.message.config.domain + path,
+                headers={"Authorization": f"Bearer {token}"},
+                json=json.loads(lark.JSON.marshal(request.request_body)),
+                extensions={"trace": trace},
+            )
+        response.raise_for_status()
+        return lark.JSON.unmarshal(response.text, ReplyMessageResponse)
 
     async def _tenant_token(self) -> str:
         # 复用 SDK 1.8 的令牌缓存和请求模型，用可取消的异步传输处理缓存未命中。
@@ -201,40 +256,28 @@ class _Transport:
             self._require_window()
             _checked(await self.im.message.acreate(request, option))
 
-    def history(self, start: float, end: float) -> Iterator[Message]:
+    def _history_items(
+        self, container_type: str, container_id: str, *, start: float | None = None,
+        end: float | None = None, newest_first: bool = False,
+    ):
         page = None
         seen_pages = set()
         while True:
             self._require_window()
             request = (
-                ListMessageRequest.builder().container_id_type("chat").container_id(self.settings.chat_id)
-                .start_time(str(math.floor(start))).end_time(str(math.ceil(end)))
-                .sort_type("ByCreateTimeAsc").page_size(50)
+                ListMessageRequest.builder().container_id_type(container_type).container_id(container_id)
+                .sort_type("ByCreateTimeDesc" if newest_first else "ByCreateTimeAsc").page_size(50)
             )
+            if start is not None:
+                request.start_time(str(math.floor(start)))
+            if end is not None:
+                request.end_time(str(math.ceil(end)))
             if page:
                 request.page_token(page)
             data = _checked(self.im.message.list(request.build())).data
-            for item in data.items or ():
-                sender = item.sender
-                if (
-                    item.deleted or item.chat_id != self.settings.chat_id or not sender
-                    or sender.sender_type != "user" or not item.body
-                ):
-                    continue
-                keys = (
-                    mention.key for mention in item.mentions or ()
-                    if mention.key and mention.id_type == "open_id"
-                    and mention.id == self.settings.bot_open_id
-                )
-                try:
-                    message = _message(
-                        item, sender.id if sender.id_type == "open_id" else "",
-                        item.msg_type, item.body.content, keys, self.settings.bot_open_id,
-                    )
-                except (TypeError, ValueError):
-                    continue
-                if start <= message.created_ms / 1000 <= end:
-                    yield message
+            if type(data.has_more) is not bool:
+                raise RuntimeError("飞书未返回有效的历史分页状态。")
+            yield from data.items or ()
             if not data.has_more:
                 return
             page = data.page_token
@@ -242,34 +285,100 @@ class _Transport:
                 raise RuntimeError("飞书历史分页游标无效。")
             seen_pages.add(page)
 
-    def download(self, message_id: str, attachment: Attachment) -> bytes:
+    def _history_message(self, item, *, include_all_senders: bool = False) -> Message | None:
+        if item.deleted or item.chat_id != self.settings.chat_id:
+            return None
+        sender = item.sender
+        sender_type = (sender.sender_type or "unknown") if sender else "unknown"
+        if not include_all_senders and (sender_type != "user" or not item.body):
+            return None
+        expected_type = {"user": "open_id", "app": "app_id"}.get(sender_type)
+        sender_id = sender.id if sender and expected_type and sender.id_type == expected_type else ""
+        keys = tuple(
+            mention.key for mention in item.mentions or ()
+            if mention.key and mention.id_type == "open_id"
+            and mention.id == self.settings.bot_open_id
+        )
+        try:
+            return _message(
+                item, sender_id, item.msg_type, item.body.content if item.body else "",
+                keys, self.settings.bot_open_id, sender_type=sender_type,
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def history(
+        self, start: float, end: float, *, newest_first: bool = False, include_all_senders: bool = False,
+    ) -> Iterator[Message]:
+        for item in self._history_items("chat", self.settings.chat_id, start=start, end=end,
+                                        newest_first=newest_first):
+            message = self._history_message(item, include_all_senders=include_all_senders)
+            if message is not None and start <= message.created_ms / 1000 <= end:
+                yield message
+
+    def handoff_history(self, start: float, end: float, stop: Event) -> Iterator[Message]:
+        # 旧根消息也可能在停机期间收到回复。话题接口不接受起止时间，按倒序读到窗口前。
+        visited_threads = set()
+        incomplete = False
+        for item in self._history_items("chat", self.settings.chat_id, end=end, newest_first=True):
+            if stop.is_set():
+                return
+            message = self._history_message(item)
+            if message is not None and start <= message.created_ms / 1000 <= end:
+                yield message
+            thread_id = getattr(item, "thread_id", None)
+            if item.chat_id != self.settings.chat_id or not thread_id or thread_id in visited_threads:
+                continue
+            visited_threads.add(thread_id)
+            try:
+                for reply in self._history_items("thread", thread_id, newest_first=True):
+                    if stop.is_set():
+                        return
+                    created = int(reply.create_time) / 1000
+                    if created < start:
+                        break
+                    if created <= end and reply.message_id != item.message_id:
+                        message = self._history_message(reply)
+                        if message is not None:
+                            yield message
+            except Exception:
+                if stop.is_set():
+                    return
+                incomplete = True
+        if incomplete:
+            raise RuntimeError("飞书话题历史补扫不完整。")
+
+    def download(self, message_id: str, attachment: Attachment, *, limit: int | None = None) -> bytes:
         request = GetMessageResourceRequest.builder().message_id(message_id).file_key(
             attachment.key,
         ).type(attachment.kind)
         self._require_window()
         response = _checked(self.im.message_resource.get(request.build()))
         with response.file as stream:
-            return stream.read()
+            data = stream.read() if limit is None else stream.read(limit + 1)
+        if limit is not None and len(data) > limit:
+            raise ValueError("飞书附件超过读取限制。")
+        return data
 
 
 class _Connection(ws.Client):
     """绑定 SDK 帧与当前连接。SDK 升级时需复核这些私有生命周期方法。"""
 
-    def __init__(self, service: "FeishuService"):
+    def __init__(self, service, *, approvals: bool = True):
         self.service = service
+        self._approvals = approvals
         self._dispatch = ContextVar("feishu_dispatch", default=(None, 0.0, 0.0))
         self.receiver = None
         self.frames = set()
         self._generation = 0
-        dispatcher = (
-            lark.EventDispatcherHandler.builder("", "")
-            .register_p2_im_message_receive_v1(self._receive)
-            .register_p2_card_action_trigger(self._approve)
-            .build()
+        dispatcher = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(
+            self._receive,
         )
+        if approvals:
+            dispatcher.register_p2_card_action_trigger(self._approve)
         super().__init__(
             service.settings.app_id, service.settings.app_secret,
-            event_handler=dispatcher, log_level=lark.LogLevel.ERROR,
+            event_handler=dispatcher.build(), log_level=lark.LogLevel.ERROR,
         )
 
     async def _connect(self):
@@ -298,7 +407,8 @@ class _Connection(ws.Client):
         # 固定版本的 SDK 在这里直接调用无超时的 requests.post。
         headers = {"locale": "zh", ws.USER_AGENT: self._user_agent}
         body = {"AppID": self._app_id, "AppSecret": self._app_secret}
-        limit = min(_HTTP_TIMEOUT, self.service._remaining())
+        remaining = self.service._remaining()
+        limit = _HTTP_TIMEOUT if remaining is None else min(_HTTP_TIMEOUT, remaining)
         try:
             async with asyncio.timeout(limit):
                 async with httpx.AsyncClient(timeout=httpx.Timeout(limit, connect=limit)) as client:
@@ -377,7 +487,7 @@ class _Connection(ws.Client):
 
     async def _handle_data_frame(self, frame):
         # 沿用 SDK 帧格式和分发器，在编码应答前等待审批回调。
-        origin, started, _ = self._dispatch.get()
+        origin, started, deadline = self._dispatch.get()
         headers = frame.headers
         frame_type = ws._get_by_key(headers, ws.HEADER_TYPE)
         if frame_type not in (ws.MessageType.EVENT.value, ws.MessageType.CARD.value):
@@ -385,14 +495,22 @@ class _Connection(ws.Client):
         payload = frame.payload
         count = int(ws._get_by_key(headers, ws.HEADER_SUM))
         if count > 1:
+            msg_id = ws._get_by_key(headers, ws.HEADER_MESSAGE_ID)
+            timing_key = f"handoff-timing:{self._generation}:{msg_id}"
+            if not self._approvals:
+                first = self._cache.get(timing_key)
+                if first is None or started < first[0]:
+                    first = (started, deadline)
+                self._cache.set(timing_key, first, 5)
+                started, deadline = first
             payload = self._combine(
-                ws._get_by_key(headers, ws.HEADER_MESSAGE_ID), count,
-                int(ws._get_by_key(headers, ws.HEADER_SEQ)), payload,
+                msg_id, count, int(ws._get_by_key(headers, ws.HEADER_SEQ)), payload,
             )
             if payload is None:
                 return
 
         response = ws.Response(code=HTTPStatus.OK)
+        timing = self._dispatch.set((origin, started, deadline))
         try:
             if frame_type == ws.MessageType.CARD.value:
                 header = json.loads(payload).get("header")
@@ -408,6 +526,8 @@ class _Connection(ws.Client):
                 response.data = base64.b64encode(ws.JSON.marshal(warning).encode())
             else:
                 response = ws.Response(code=HTTPStatus.INTERNAL_SERVER_ERROR)
+        finally:
+            self._dispatch.reset(timing)
         header = headers.add()
         header.key = ws.HEADER_BIZ_RT
         header.value = str(round((time.monotonic() - started) * 1000))
@@ -454,7 +574,11 @@ class _Connection(ws.Client):
             )
         except (TypeError, ValueError):
             return
-        self.service.entrance.inject_message(incoming)
+        if self._approvals:
+            self.service.entrance.inject_message(incoming)
+        else:
+            _, _, deadline = self._dispatch.get()
+            self.service.entrance.inject_message(incoming, deadline=deadline)
 
     async def _approve(self, data: P2CardActionTrigger) -> P2CardActionTriggerResponse:
         if not self._from_current_app(data):

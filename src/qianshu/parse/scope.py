@@ -324,6 +324,7 @@ class Scope:
     countries: frozenset[str] = frozenset()
     country_sources: tuple[Span, ...] = ()
     explicit_shared: tuple[Span, ...] = ()
+    duplicate_span: Span | None = None
 
     def spans(self, *, dates: bool = False) -> tuple[Span, ...]:
         local = () if self.local is None else (self.local,)
@@ -558,7 +559,7 @@ def policy_scopes(
             preamble_dates=date_ranges, date_prefixes=date_prefixes,
             title=_policy_heading_title(heading.text) if heading else "",
             countries=frozenset(target_countries), country_sources=country_sources,
-            explicit_shared=explicit_shared,
+            explicit_shared=explicit_shared, duplicate_span=span if local is None else None,
         ))
     return scopes
 

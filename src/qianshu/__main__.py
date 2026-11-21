@@ -30,7 +30,9 @@ from .feishu import Entrance, FeishuService, Message, Report, Settings, State, W
 from .feishu.cards import CardLine, DetailPage, detail_pages, interrupted_report_card, result_card
 from .feishu.entrance import Application, Attachment, Transport, fingerprint
 from .feishu.sdk import _Transport
+from .feishu.settings import load_handoff_settings
 from .logs import setup_logging
+from .parse._output import check_output_path
 from .parse.companies import DEFAULT_COMPANIES_FILE
 from .parse.model import configured_model
 from .pipeline import Pipeline
@@ -500,6 +502,7 @@ def _check_companies_file(path: Path) -> None:
 
 @contextmanager
 def _raw_output_directory(path: Path) -> Iterator[int]:
+    check_output_path(path)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
     except OSError:
@@ -519,6 +522,7 @@ def _save_raw_reply(path: Path, application: Application, reply: str) -> None:
             timestamp = time.time_ns()
             while True:
                 name = f"{timestamp}-{digest}.txt"
+                check_output_path(path / name)
                 try:
                     fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
                     break
@@ -614,13 +618,13 @@ def _serve(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="在登记的验收窗口内处理飞书群申请。",
+        description="常驻转交飞书群 @，或在登记的验收窗口内处理飞书群申请。",
         epilog="离线文件为 JSON，message 按飞书入口 Message 字段填写，content 为 JSON 字符串。"
                "model_reply 为合成模型回复字符串。",
     )
     parser.add_argument("--env-file", type=Path, default=Path(".env"), help="私有 .env 文件")
-    parser.add_argument("--window-start", type=datetime.fromisoformat, required=True, help="验收窗口开始时刻（含时区）")
-    parser.add_argument("--window-end", type=datetime.fromisoformat, required=True, help="验收窗口结束时刻（含时区）")
+    parser.add_argument("--window-start", type=datetime.fromisoformat, help="验收窗口开始时刻（含时区）")
+    parser.add_argument("--window-end", type=datetime.fromisoformat, help="验收窗口结束时刻（含时区）")
     parser.add_argument("--state", type=Path, help="私有目录内的常驻服务 SQLite 状态文件")
     parser.add_argument("--inject", type=Path, help="离线注入文件，卡片以 JSON 行输出")
     parser.add_argument("--mail", action="store_true", help="在验收窗口内启用只读邮件轮询")
@@ -629,8 +633,39 @@ def main(argv: list[str] | None = None) -> int:
                         help="私有公司对照表 CSV 或 TSV 路径，默认 .private/companies.tsv。")
     parser.add_argument("--legacy-companies", action="store_true",
                         help="按无表头两列或三列 TSV 读取公司对照表，默认关闭。")
-    parser.add_argument("--raw-output-dir", type=Path, help="常驻服务保存原始模型回复的现有 0700 目录。")
+    parser.add_argument("--raw-output-dir", type=Path,
+                        help="常驻服务保存原始模型回复的现有 0700 目录。Git 工作区内须使用忽略目录。")
+    parser.add_argument("--handoff-only", action="store_true", help="只把飞书群 @ 转交守望者。")
+    parser.add_argument("--business-env-file", type=Path, help="仅转交监听器用于出站比对的业务私有配置。")
+    parser.add_argument("--mingdao-config", type=Path, help="仅转交监听器用于定位官方接口令牌键名的明道云 JSON 配置。")
     args = parser.parse_args(argv)
+    if args.handoff_only:
+        if any((args.window_start, args.window_end, args.state, args.inject, args.mail,
+                args.tag_dates, args.companies_file, args.legacy_companies, args.raw_output_dir)):
+            parser.error("--handoff-only 只与 --env-file、--business-env-file、--mingdao-config 一起使用。")
+        try:
+            from .feishu.handoff import HandoffService, MentionLog
+
+            settings, path = load_handoff_settings(
+                args.env_file, for_listener=True, business_env_file=args.business_env_file,
+                mingdao_config=args.mingdao_config,
+            )
+            setup_logging({"FEISHU_APP_SECRET": settings.app_secret})
+            with closing(MentionLog(path, settings, create=True)) as store:
+                HandoffService(store).run()
+        except ConfigError as error:
+            print(error, file=sys.stderr)
+            return 1
+        except Exception:
+            print("飞书 @ 转交服务启动或运行失败，请核对私有转交日志和长连接配置。", file=sys.stderr)
+            return 1
+        return 0
+    if args.business_env_file is not None:
+        parser.error("--business-env-file 仅用于 --handoff-only。")
+    if args.mingdao_config is not None:
+        parser.error("--mingdao-config 仅用于 --handoff-only。")
+    if args.window_start is None or args.window_end is None:
+        parser.error("群申请入口须指定 --window-start 和 --window-end。")
     if args.inject is None and args.state is None:
         parser.error("常驻服务须指定 --state。")
     if args.mail and args.inject is not None:

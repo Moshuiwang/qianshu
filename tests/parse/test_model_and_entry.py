@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import subprocess
 import sys
 from contextlib import nullcontext
 from pathlib import Path
@@ -32,7 +33,7 @@ def test_service_help_describes_current_offline_input(capsys):
 
 
 @pytest.mark.parametrize(("model_config", "expected"), [
-    ({}, "claude-opus-5-5"),
+    ({}, "claude-sonnet-5-5"),
     ({"ANTHROPIC_MODEL": "placeholder-model"}, "placeholder-model"),
 ])
 def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, caplog):
@@ -375,3 +376,114 @@ def test_replay_matches_direct_stub_without_reading_api_config(monkeypatch, tmp_
     assert json.loads(output.read_text(encoding="utf-8")) == [draft.to_dict() for draft in expected]
     assert raw.read_bytes() == replay.read_bytes()
     config.assert_not_called()
+
+
+@pytest.fixture
+def output_worktree(tmp_path):
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    subprocess.run(["git", "init", "--quiet", "--template="], cwd=worktree, check=True)
+    (worktree / ".gitignore").write_text(".private/\n", encoding="utf-8")
+    (worktree / ".private").mkdir(mode=0o700)
+    return worktree
+
+
+@pytest.mark.parametrize("blocked_flag", ["--output", "--raw-output"])
+def test_parse_rejects_unignored_output_before_reading_config(
+    monkeypatch, tmp_path, capsys, output_worktree, blocked_flag,
+):
+    monkeypatch.chdir(tmp_path)
+    draft = Path("worktree", ".private" if blocked_flag == "--raw-output" else "", "draft.json")
+    raw = Path("worktree", ".private" if blocked_flag == "--output" else "", "raw.json")
+    config = Mock(side_effect=AssertionError("不应读取配置"))
+    monkeypatch.setattr("qianshu.parse.__main__.load_config", config)
+    monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(draft), "--raw-output", str(raw)])
+
+    assert main() == 1
+    assert capsys.readouterr() == ("", "输出路径位于 Git 工作区，须已被 Git 忽略且未被跟踪。\n")
+    config.assert_not_called()
+    assert not draft.exists()
+    assert not raw.exists()
+
+
+@pytest.mark.parametrize("path_type", ["tracked", "symlink"])
+def test_parse_rejects_path_under_ignored_directory(monkeypatch, capsys, output_worktree, path_type):
+    private = output_worktree / ".private"
+    if path_type == "tracked":
+        output = private / "draft.json"
+        output.touch()
+        subprocess.run(["git", "add", "-f", "--", output], cwd=output_worktree, check=True)
+        output.unlink()
+        target = output
+    else:
+        alias = private / "alias"
+        alias.symlink_to(output_worktree, target_is_directory=True)
+        output = alias / "draft.json"
+        target = output_worktree / output.name
+    monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(output)])
+
+    assert main() == 1
+    assert capsys.readouterr() == ("", "输出路径位于 Git 工作区，须已被 Git 忽略且未被跟踪。\n")
+    assert not target.exists()
+
+
+@pytest.mark.parametrize("override", ["worktree", "index"])
+def test_parse_checks_output_worktree_and_its_index(monkeypatch, capsys, output_worktree, override):
+    other = output_worktree.with_name("other-worktree")
+    other.mkdir()
+    subprocess.run(["git", "init", "--quiet", "--template="], cwd=other, check=True)
+    (other / ".gitignore").write_text("/draft.json\n/.private/\n", encoding="utf-8")
+    if override == "worktree":
+        output = output_worktree / "draft.json"
+        monkeypatch.setenv("GIT_DIR", str(other / ".git"))
+        monkeypatch.setenv("GIT_WORK_TREE", str(other))
+    else:
+        output = output_worktree / ".private" / "draft.json"
+        output.touch()
+        subprocess.run(["git", "add", "-f", "--", output], cwd=output_worktree, check=True)
+        output.unlink()
+        monkeypatch.setenv("GIT_INDEX_FILE", str(other / ".git" / "index"))
+    config = Mock(side_effect=AssertionError("不应读取配置"))
+    monkeypatch.setattr("qianshu.parse.__main__.load_config", config)
+    monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(output)])
+
+    assert main() == 1
+    assert capsys.readouterr() == ("", "输出路径位于 Git 工作区，须已被 Git 忽略且未被跟踪。\n")
+    config.assert_not_called()
+    assert not output.exists()
+
+
+def test_parse_writes_git_ignored_outputs(monkeypatch, capsys, output_worktree):
+    fixtures = Path(__file__).parent / "fixtures"
+    replay = fixtures / "model-reply.json"
+    monkeypatch.chdir(output_worktree)
+    draft = Path(".private/draft.json")
+    raw = Path(".private/raw.json")
+    monkeypatch.setattr(sys, "argv", [
+        "qianshu.parse", "--output", str(draft), "--raw-output", str(raw), "--replay", str(replay),
+        "--rules-dir", str(fixtures.parents[2] / "rules"), "--companies-file", str(fixtures / "companies.tsv"),
+    ])
+    monkeypatch.setattr(sys, "stdin", io.StringIO((fixtures / "application.txt").read_text(encoding="utf-8")))
+
+    assert main() == 0
+    assert capsys.readouterr() == ("", "")
+    assert draft.is_file()
+    assert raw.read_bytes() == replay.read_bytes()
+    result = subprocess.run(["git", "status", "--porcelain", "--", draft, raw], capture_output=True, check=True)
+    assert result.stdout == b""
+
+
+def test_service_rejects_unignored_private_raw_directory(monkeypatch, capsys, output_worktree):
+    output = output_worktree / "raw"
+    output.mkdir(mode=0o700)
+    config = Mock(side_effect=AssertionError("不应读取配置"))
+    monkeypatch.setattr("qianshu.__main__.load_config", config)
+
+    assert service_main([
+        "--state", str(output_worktree / "state.sqlite"),
+        "--window-start", "2099-01-01T00:00:00+00:00", "--window-end", "2099-01-02T00:00:00+00:00",
+        "--companies-file", str(Path(__file__).parent / "fixtures" / "companies.tsv"), "--raw-output-dir", str(output),
+    ]) == 1
+    assert capsys.readouterr() == ("", "输出路径位于 Git 工作区，须已被 Git 忽略且未被跟踪。\n")
+    config.assert_not_called()
+    assert not list(output.iterdir())
