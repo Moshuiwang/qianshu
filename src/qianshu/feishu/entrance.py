@@ -31,6 +31,7 @@ class Message:
     kind: str
     content: str
     bot_mention_keys: tuple[str, ...] = ()
+    sender_type: str = "user"
 
 
 @dataclass(frozen=True, repr=False)
