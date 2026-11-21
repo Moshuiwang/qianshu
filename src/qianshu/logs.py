@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import sys
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from copy import copy
 from datetime import UTC, datetime
 from typing import TextIO
@@ -16,7 +16,7 @@ class _Redactor:
     _MIN_PREFIX_LENGTH = 8
     _MIN_SECRET_LENGTH = 12
 
-    def __init__(self, values: Iterable[str]) -> None:
+    def __init__(self, values: Iterable[str], *, exact_values: Collection[str] = ()) -> None:
         literals = set()
         self._prefix_values: dict[str, list[str]] = {}
         for value in values:
@@ -26,7 +26,7 @@ class _Redactor:
                 json.dumps(value)[1:-1],
                 json.dumps(value, ensure_ascii=False)[1:-1],
             ))
-            if len(value) >= self._MIN_SECRET_LENGTH:
+            if len(value) >= self._MIN_SECRET_LENGTH and value not in exact_values:
                 prefix = value[:self._MIN_PREFIX_LENGTH]
                 self._prefix_values.setdefault(prefix, []).append(value)
                 literals.add(prefix)
