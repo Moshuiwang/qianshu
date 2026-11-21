@@ -132,6 +132,35 @@ def test_stream_returns_all_text_blocks(stub_stream):
     get_final_message.assert_called_once_with()
 
 
+@pytest.mark.parametrize("stop_reason", ["end_turn", "max_tokens"])
+def test_result_callback_records_text_blocks_and_use_without_changing_return(stub_stream, stop_reason):
+    _, get_final_message = stub_stream
+    get_final_message.return_value = SimpleNamespace(
+        stop_reason=stop_reason,
+        model="synthetic-resolved-model",
+        usage=SimpleNamespace(input_tokens=9, output_tokens=4),
+        content=[
+            SimpleNamespace(type="text", text="["),
+            SimpleNamespace(type="thinking", thinking="占位思考"),
+            SimpleNamespace(type="text", text="]"),
+        ],
+    )
+    captured = []
+    complete = configured_model({"ANTHROPIC_API_KEY": "placeholder-key"}, on_result=captured.append)
+    if stop_reason == "end_turn":
+        assert complete(system="", user="") == "[]"
+    else:
+        with pytest.raises(ModelError, match="max_tokens"):
+            complete(system="", user="")
+    result, = captured
+    assert result.reply == "[]"
+    assert result.stop_reason == stop_reason
+    assert result.blocks == (("text", 1), ("thinking", 4), ("text", 1))
+    assert (result.input_tokens, result.output_tokens, result.model) == (9, 4, "synthetic-resolved-model")
+    assert result.elapsed_ms >= 0
+    assert result.failure_stage == (None if stop_reason == "end_turn" else "model_incomplete")
+
+
 @pytest.mark.parametrize(("stop_reason", "output_tokens"), [("refusal", 1), ("max_tokens", 32000)])
 def test_unsuccessful_stop_reason_rejects_even_valid_json(stub_stream, stop_reason, output_tokens):
     _, get_final_message = stub_stream

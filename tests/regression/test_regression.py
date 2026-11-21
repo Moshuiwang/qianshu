@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import subprocess
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -825,3 +826,327 @@ def test_output_moved_during_model_run_is_not_written(repo, frozen):
     assert moved.is_dir()
     assert list(moved.iterdir()) == []
     assert list((repo / "run").iterdir()) == []
+
+
+def _replay_args(fingerprint, source=".private/run", out=".private/replay"):
+    return ["replay", "--recording", source, *run_args(fingerprint, out)[1:]]
+
+
+def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, monkeypatch, capsys):
+    from qianshu.parse.model import CallResult
+    from qianshu.regression.__main__ import _MODEL_SETTINGS
+
+    for key in _MODEL_SETTINGS:
+        monkeypatch.delenv(key, raising=False)
+
+    attempts = Counter()
+    responses = {
+        BATCH: '[{"company":{"evidence":["' + FIRST + '"]}}]',
+        "占位单条原稿\n": "占位无效回包",
+    }
+
+    def configured(_settings, *, on_result):
+        def model(*, system, user):
+            body = json.loads(user)["application"]
+            attempts[body] += 1
+            if attempts[body] == 1:
+                on_result(CallResult(None, (), None, None, 7, "synthetic-model", None, "model_call"))
+                raise RuntimeError("占位保密失败详情")
+            reply = responses[body]
+            on_result(CallResult("end_turn", (("thinking", 5), ("text", len(reply))),
+                                 12, 3, 20, "synthetic-model", reply))
+            return reply
+        return model
+
+    monkeypatch.setattr("qianshu.regression.__main__.configured_model", configured)
+    assert main([*run_args(frozen), "--live", "--release", "--threshold", "3"]) == 0
+    assert attempts == {BATCH: 2, "占位单条原稿\n": 2}
+    recording = get_json(repo / "run" / "recording.json")
+    assert recording["threshold"] == 3
+    assert recording["schema"] == 1 and len(recording["documents_by_user_sha256"]) == 2
+    for name, checksum in recording["artifact_sha256"].items():
+        path = repo / "run" / name
+        assert digest(path.read_bytes()) == checksum
+        record = get_json(path)
+        assert record["run_id"] == recording["run_id"]
+        assert record["configuration"] == recording["configuration"]
+        assert len(record["user_sha256"]) == len(record["system_sha256"]) == 64
+        for kind in ("freeze", "code", "rules", "companies", "prompt", "model", "pairing"):
+            assert len(record["configuration"][f"{kind}_sha256"]) == 64
+        failed, final = record["attempts"]
+        assert failed["failure_stage"] == "model_call"
+        assert final == {
+            "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
+                                                 {"type": "text", "length": len(final["reply"])}],
+            "input_tokens": 12, "output_tokens": 3, "elapsed_ms": 20,
+            "model": "synthetic-model", "reply": final["reply"], "failure_stage": None,
+        }
+        assert final["reply"] in responses.values()
+        assert record["failure_stage"] == ("reply_parse" if final["reply"] == responses["占位单条原稿\n"] else None)
+        assert "占位保密失败详情" not in path.read_text()
+        assert path.stat().st_mode & 0o777 == 0o600
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline replay attempted model access")
+
+    monkeypatch.setattr("qianshu.regression.__main__.configured_model", forbidden)
+    assert main(_replay_args(frozen), model=forbidden) == 0
+    for name in runner.RUN_FILES:
+        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    report = get_json(repo / "run" / "public-report.json")
+    assert report["business"]["counts"]["reply_parse_failed"] == 1
+    assert report["documents"]["parse_failed"] == 1 and report["void"] is False
+    assert report["usage"]["input_tokens"] == {"captured_attempts": 2, "total": 24}
+    assert report["usage"]["elapsed_ms"] == {"captured_attempts": 4, "total": 54}
+    public = (repo / "run" / "public-report.md").read_text() + (repo / "run" / "public-report.json").read_text()
+    assert "唯一对齐" in public and "可比字段全对率" in public
+    for private in ("占位无效回包", "占位保密失败详情", "synthetic-model"):
+        assert private not in public + capsys.readouterr().err
+
+    name = next(iter(recording["artifact_sha256"]))
+    (repo / "run" / name).unlink()
+    assert main(_replay_args(frozen, out=".private/missing"), model=forbidden) == 1
+    assert "录制缺少对应的回复文件" in capsys.readouterr().err
+
+
+def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
+    def probe(*, system, user):
+        user_sha = digest(user.encode())
+        reply = "[]"
+        put_json(repo / "probe" / f"{user_sha}.json", {
+            "system_sha": digest(system.encode()), "user_sha": user_sha,
+            "reply": reply, "error": None, "secs": 0.2,
+        })
+        return reply
+
+    assert main(run_args(frozen), model=probe) == 0
+    arguments = ["import", "--probe", ".private/probe", "--model-id", "synthetic",
+                 *run_args(frozen, ".private/imported")[1:]]
+    assert main(arguments) == 0
+    imported = get_json(repo / "imported" / "recording.json")
+    assert imported["origin"] == "probe" and imported["source_code_measured"] is False
+    for name in imported["artifact_sha256"]:
+        record = get_json(repo / "imported" / name)
+        assert record["attempts"] == [{
+            "reply": "[]", "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
+            "input_tokens": None, "output_tokens": None, "elapsed_ms": None,
+        }]
+    assert "未采集" in (repo / "imported" / "public-report.md").read_text()
+    assert main(_replay_args(frozen, ".private/imported")) == 0
+    assert (repo / "imported" / "public-report.json").read_bytes() == (repo / "replay" / "public-report.json").read_bytes()
+
+    for unsafe in ("probe", str(repo / "probe"), ".private/../probe"):
+        arguments[2] = unsafe
+        assert main(arguments) == 1
+        assert ".private" in capsys.readouterr().err
+    link = repo / "linked"
+    link.symlink_to(repo / "probe", target_is_directory=True)
+    arguments[2] = ".private/linked"
+    arguments[-1] = ".private/link-output"
+    assert main(arguments) == 1
+    assert not (repo / "link-output" / "recording.json").exists()
+
+
+def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, frozen, capsys):
+    def no_policies(**kwargs):
+        return "[]"
+
+    def one_failed_reply(*, system, user):
+        if json.loads(user)["application"] == BATCH:
+            raise RuntimeError("占位失败")
+        return "占位无法解码"
+
+    for name, model in (("first", no_policies), ("second", no_policies), ("void", one_failed_reply)):
+        assert main([*run_args(frozen, f".private/{name}"), "--release"], model=model) == 0
+    void = get_json(repo / "void" / "public-report.json")
+    assert void["void"] and void["business"] == {"counts": {"reply_parse_failed": 1}}
+    assert "sample_alignment" not in void
+    args = ["summarize", "--recording", ".private/first", "--recording", ".private/second",
+            "--recording", ".private/void", "--out", ".private/summary"]
+    assert main(args) == 0
+    summary = get_json(repo / "summary" / "public-summary.json")
+    assert (summary["runs"], summary["valid_runs"], summary["void_runs"]) == (3, 2, 1)
+    assert summary["business_counts"]["reply_parse_failed"] == {"values": [0, 0, 1], "mean": 1 / 3, "min": 0, "max": 1}
+    assert summary["old_alignment"]["unmatched"] == {"values": [3, 3], "mean": 3, "min": 3, "max": 3}
+    assert summary["business_rates_percent"]["all_correct"]["fractions"] == [
+        {"numerator": 0, "denominator": 3}, {"numerator": 0, "denominator": 3},
+    ]
+
+    assert main(_replay_args(frozen, ".private/first")) == 0
+    args[4], args[-1] = ".private/replay", ".private/duplicated"
+    assert main(args) == 1
+    assert "不能计为独立运行" in capsys.readouterr().err
+    assert main([*run_args(frozen, ".private/other"), "--release", "--threshold", "3"], model=no_policies) == 0
+    args[4] = ".private/other"
+    assert main(args) == 1
+    assert "同一冻结" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize(("scores", "matches", "ties"), [
+    ([[9, 8], [7, None]], {0: 1, 1: 0}, set()),
+    ([[5, 5], [5, 5]], {0: 0, 1: 1}, {0, 1}),
+    ([[None, 5], [None, 5], [None, None]], {0: 1}, {0}),
+    ([[], []], {}, set()),
+    ([], {}, set()),
+])
+def test_business_pairing_maximizes_whole_assignment(scores, matches, ties):
+    from qianshu.regression.business import optimal_pairs
+
+    assert optimal_pairs(scores) == (matches, ties)
+
+
+@pytest.mark.parametrize(("entry", "mark", "value", "confirmation", "start", "status"), [
+    ({"value": 30}, {"inferable": True, "auto_allowed": True}, 30, False, 0, "correct"),
+    ({"value": 30}, {"inferable": True, "auto_allowed": True}, 5, False, 0, "false_determined"),
+    ({"value": 30}, {"inferable": True, "auto_allowed": True}, 30, False, 1, "false_determined"),
+    ({"value": 30}, {"inferable": False, "auto_allowed": True}, 30, False, 0, "false_determined"),
+    ({"value": 30}, {"inferable": True, "auto_allowed": False}, 30, False, 0, "false_determined"),
+    ({"value": 30}, {"inferable": True, "auto_allowed": True}, None, True, 0, "overasked"),
+    ({"value": 30}, {"inferable": False, "auto_allowed": True}, None, True, 0, "justified_confirmation"),
+    ({"value": 30}, {"inferable": True, "auto_allowed": False}, None, True, 0, "justified_confirmation"),
+    ({"value": 30}, {"inferable": True, "auto_allowed": True}, None, None, 0, "missing"),
+    ({"value": 30}, {"inferable": True}, None, None, 0, "unknown"),
+    ({}, {"inferable": True, "auto_allowed": True}, 30, False, 0, "unknown"),
+])
+def test_business_grades_all_categories(entry, mark, value, confirmation, start, status):
+    from qianshu.draft import SourceExcerpt
+    from qianshu.regression.business import grade
+
+    field = DraftField(value=value, evidence=[SourceExcerpt(text="占位 30 天", start=start)],
+                       uncertainty=Uncertainty(reason="占位待确认") if confirmation else None)
+    draft = SimpleNamespace(recharge_days=field) if confirmation is not None else None
+    assert grade("recharge_days", entry, mark, draft, "占位 30 天") == status
+
+
+def test_business_counts_gold_only_and_separates_extras_from_unknown():
+    from qianshu.draft import SourceExcerpt
+    from qianshu.regression.business import BusinessScore, grade, pairing_audit
+
+    mark = {"inferable": True, "auto_allowed": True}
+    default = SimpleNamespace(trigger_once=DraftField(value="否"))
+    assert grade("trigger_once", {"value": "否"}, mark, default, "") == "correct"
+    assert grade("trigger_once", {"value": "否"}, {**mark, "default_allowed": False}, default, "") == "false_determined"
+
+    def draft(name, value=None):
+        return SimpleNamespace(
+            company=DraftField(value=name),
+            recharge_days=DraftField(value=value, evidence=[SourceExcerpt(text="占位 30 天", start=0)]),
+            to_dict=lambda: {},
+        )
+
+    pairs = [
+        {"id": name, "configuration": {"company": {"value": company}, "recharge_days": {"value": 30}},
+         "business": {"recharge_days": marks}}
+        for name, company, marks in (("first", "占位甲", mark), ("unknown", "占位乙", {}), ("missing", "占位丙", mark))
+    ]
+    snapshot = {
+        "samples": {pair["id"]: {"country": "占位地区", "benefit_type": "赠送时长"} for pair in pairs},
+        "denominators": {"fields": {"recharge_days": {"ids": ["first", "unknown", "missing"]}}},
+    }
+    score = BusinessScore(snapshot, 2, {})
+    complete = score.add({"body": "占位 30 天", "complete": True}, pairs[:2],
+                         [draft("占位甲", 30), draft("占位甲", 30), draft("占位乙", 7)])
+    partial = score.add({"body": "占位 30 天", "complete": False}, pairs[2:], [draft("占位丁", 8)])
+    report = score.report(reply_parse_failed=1)
+    assert report["counts"] == {
+        "unknown_fields": 1, "missing_policies": 1, "extra_policies": 1, "unclassified_drafts": 1,
+        "tied_pairs": 1, "matched_policies": 2, "comparable_policies": 1, "reply_parse_failed": 1,
+    }
+    assert (report["rates"]["all_correct"]["numerator"], report["rates"]["all_correct"]["denominator"]) == (1, 3)
+    assert report["rates"]["safe_confirmation"]["numerator"] == 2
+    assert report["rates"]["false_determined"]["denominator"] == 2
+    assert report["rates"]["overasked"]["denominator"] == 2
+    assert report["rates"]["zero_edit"]["percent"] is None
+    assert report["field_categories"] == {
+        "correct": 1, "false_determined": 0, "overasked": 0, "justified_confirmation": 0, "missing": 1, "unknown": 1,
+    }
+    audit = pairing_audit([{"token": "complete", **complete}, {"token": "partial", **partial}])
+    assert [len(audit[key]) for key in ("matched", "missing", "extra_or_unknown", "ties")] == [2, 1, 2, 1]
+
+
+def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch):
+    from qianshu.draft import SourceExcerpt
+
+    review = {
+        "schema": 1,
+        "items": {
+            "policy-a": {"token": "doc-batch", "span": [0, BATCH.index(SECOND)], "mention": "具体包名",
+                         "rows": [{"package": "占位包甲", "gift": "占位赠包甲"}],
+                         "complete": True, "basis": "占位审定"},
+            "policy-b": {"token": "doc-batch", "span": [BATCH.index(SECOND), len(BATCH)], "mention": "只写档位",
+                         "rows": [], "complete": True, "basis": "占位审定"},
+        },
+    }
+    put_json(repo / "package-review.json", review)
+    args = ["freeze-packages", "--corpus", ".private/archive", "--reviews", ".private/package-review.json",
+            "--companies", ".private/companies.tsv", "--out", ".private/packages"]
+    assert main(args) == 0
+    fingerprint = capsys.readouterr().out.strip()
+
+    def parsed(body, *, model, on_reply, **kwargs):
+        on_reply(model(system="占位提示", user=body))
+        base = {name: DraftField() for name in parse.ParsedPolicyDraft.__dataclass_fields__}
+        return [parse.ParsedPolicyDraft(**{
+            **base,
+            "company": DraftField(value=company),
+            "benefit_type": DraftField(value="赠送时长"),
+            "packages": field,
+        }) for company, field in (
+            ("占位默认公司", DraftField(value=[PackageRow(current_package="占位包甲", gift_package="占位赠包甲")],
+                                      evidence=[SourceExcerpt(text=FIRST, start=BATCH.index(FIRST))])),
+            ("占位默认公司", DraftField(uncertainty=Uncertainty(reason="占位仅档位"))),
+        )]
+
+    monkeypatch.setattr(runner, "parse_application", parsed)
+    args = ["--frozen", ".private/packages", "--expect-sha256", fingerprint]
+    assert main(["run", *args, "--out", ".private/package-run"], model=lambda **_: "[]") == 0
+    assert main(["replay", *args, "--recording", ".private/package-run", "--out", ".private/package-replay"]) == 0
+    report = get_json(repo / "package-replay" / "public-report.json")
+    for key in ("package_rows_exact", "package_tier_confirmation"):
+        assert report["business"]["rates"][key] == {"numerator": 1, "denominator": 1, "percent": 100.0}
+
+
+def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_documents(repo, corpus, capsys):
+    assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
+    review = get_json(repo / "review.json")
+    review["reviews"]["policy-a"].update(
+        business={"recharge_days": {"inferable": True, "auto_allowed": False}},
+        pairing={"recharge_amount": "19.90"},
+        card_complete=False,
+    )
+    put_json(repo / "review.json", review)
+    assert main(["freeze", *FREEZE, "--dataset", "blind"]) == 0
+    checksum = capsys.readouterr().out.splitlines()[-1]
+    files = PrivateFiles(Path.cwd())
+    with files.open():
+        frozen = freeze_module.load_freeze(files, Path("frozen"))
+    assert frozen["dataset"] == "blind" and frozen["fingerprint"] == checksum
+    pair = next(pair for pair in frozen["pairs"].values() if pair["row_id"] == "policy-a")
+    assert pair["business"] == {"recharge_days": {"inferable": True, "auto_allowed": False}}
+    assert pair["pairing"]["recharge_amount"] == "19.90" and not pair["card_complete"]
+
+    assert main(["run", *run_args(checksum)[1:]], model=lambda **_: "[]") == 0
+    assert main(_replay_args(checksum)) == 0
+    assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
+
+    inputs = [*FREEZE[:-1], ".private/second-freeze"]
+    assert main(["freeze", *inputs, "--dataset", "blind", "--exclude-frozen", ".private/frozen"]) == 1
+    assert "排除集" in capsys.readouterr().err
+    assert not (repo / "second-freeze").exists()
+
+
+def test_amount_dates_and_candidates_only_count_derived_business_keys():
+    from qianshu.draft import Candidate
+    from qianshu.regression.business import _draft_keys, _score, pairing_fingerprint
+
+    gold = {
+        "country": "占位", "recharge_amount": "19.90", "gift_days": 30,
+        "start_date": "2099-01-01", "end_date": "2099-01-15",
+    }
+    draft = SimpleNamespace(
+        recharge_amount=DraftField(value=19.9),
+        gift_days=DraftField(uncertainty=Uncertainty(reason="占位", candidates=[Candidate(value=30)])),
+        start_date=DraftField(value="2099-01-15"), end_date=DraftField(value="2099-02-01"),
+    )
+    assert _score(gold, _draft_keys(draft, {})) == ["recharge_amount", "date_overlap"]
+    assert pairing_fingerprint(2) != pairing_fingerprint(3)

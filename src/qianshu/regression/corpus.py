@@ -183,6 +183,16 @@ def _linked_name(raw: object) -> str | None:
     raise RegressionError("节目包关联未能确定唯一完整名称。")
 
 
+def document_body(doc: dict, token: str, ids: set[str]) -> str:
+    if (
+        doc["complete"] is not True or doc["token"] != token
+        or not ids <= set(doc["policy_row_ids"]) or not isinstance(doc["plain_text"], str)
+        or not doc["plain_text"].strip()
+    ):
+        raise RegressionError("原稿快照缺失、不完整或与审定配对不符。")
+    return doc["plain_text"]
+
+
 class Corpus:
     def __init__(self, files: PrivateFiles, root: Path, review: dict):
         self.files = files
@@ -210,13 +220,7 @@ class Corpus:
 
     def document(self, token: str, ids: set[str]) -> str:
         doc = read_json(self.read(Path("wiki-corpus/docs") / f"{token}.json"))
-        if (
-            doc["complete"] is not True or doc["token"] != token
-            or not ids <= set(doc["policy_row_ids"]) or not isinstance(doc["plain_text"], str)
-            or not doc["plain_text"].strip()
-        ):
-            raise RegressionError("原稿快照缺失、不完整或与审定配对不符。")
-        return doc["plain_text"]
+        return document_body(doc, token, ids)
 
     def configuration(self, sample: dict, decisions: dict) -> dict:
         row_id = sample["row_id"]

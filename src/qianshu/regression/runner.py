@@ -7,11 +7,13 @@ from typing import get_origin
 
 from qianshu.draft import DraftField, PolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
+from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.model import ParseModel
 
+from .business import COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
 from .freeze import PACKAGE_STYLES
-from .storage import digest, json_bytes
+from .storage import RegressionError, digest, json_bytes
 
 RUN_FILES = ("mismatches.json", "public-report.md", "public-report.json")
 RULES = ("countries.txt", "parse-options.tsv", "parse-prompt.md", "parse-rules.md")
@@ -131,7 +133,10 @@ def _new_field_status(draft, name: str) -> str:
     return "determined" if field.value is not None else "missing"
 
 
-def evaluate(frozen: dict, model: ParseModel, rules_dir: Path, *, legacy_companies: bool = False) -> tuple[dict, dict]:
+def evaluate(
+    frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
+    threshold: int = DEFAULT_THRESHOLD, recording=None,
+) -> tuple[dict, dict]:
     samples = frozen["samples"]
     pairs = defaultdict(list)
     for pair in frozen["pairs"].values():
@@ -145,7 +150,10 @@ def evaluate(frozen: dict, model: ParseModel, rules_dir: Path, *, legacy_compani
     country_groups = {
         label: str(index) for index, label in enumerate(sorted({row["country"] for row in samples.values()}), start=1)
     }
-    model = _guard_model(model)
+    if recording is None:
+        if model is None:
+            raise RegressionError("回归解析须提供模型或已保存的回复。")
+        model = _guard_model(model)
     rules_hash = digest(json_bytes({name: digest((rules_dir / name).read_bytes()) for name in RULES}))
     field_counts = defaultdict(Counter)
     country_counts = defaultdict(lambda: defaultdict(Counter))
@@ -156,20 +164,53 @@ def evaluate(frozen: dict, model: ParseModel, rules_dir: Path, *, legacy_compani
     package_styles = Counter(document.get("package_style", "unreviewed") for document in frozen["documents"].values())
     whole_policy = Counter()
     details = {"country_groups": {group: key for key, group in country_groups.items()}, "samples": [], "documents": []}
+    try:
+        company_rules = load_company_rules(
+            rules_dir, DEFAULT_COMPANIES_FILE, legacy=legacy_companies, companies_text=frozen["companies_text"],
+        )
+    except (OSError, UnicodeError, ValueError):
+        company_rules = None
+    common_countries = defaultdict(set)
+    if company_rules is not None:
+        for country, names in company_rules.names.items():
+            for name in names:
+                common_countries[name].add(country)
+    business = BusinessScore(frozen, threshold, {
+        name: next(iter(countries)) for name, countries in common_countries.items() if len(countries) == 1
+    })
+    business_details = []
+    reply_failures = 0
 
     for token, document in frozen["documents"].items():
+        call = recording.for_document(token) if recording is not None else model
+        received = False
+
+        def on_reply(_reply: str) -> None:
+            nonlocal received
+            received = True
+
+        drafts = []
         try:
             drafts = parse_application(
-                document["body"], model=model, rules_dir=rules_dir, companies_text=frozen["companies_text"],
-                legacy_companies=legacy_companies,
+                document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
+                legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
             )
         except ModelError:
             status = "model_failed"
         except ParseError:
             status = "parse_failed"
+        except Exception:
+            if recording is not None and received:
+                recording.finish(token, "parse_failed", received)
+            raise
         else:
             status = "parsed"
+        if status == "parse_failed" and received:
+            reply_failures += 1
+        if recording is not None:
+            recording.finish(token, status, received)
         documents[status] += 1
+        business_details.append({"token": token, **business.add(document, pairs[token], drafts)})
         if status == "parsed":
             outcomes, diagnostics = align(drafts, pairs[token], document)
             if diagnostics:
@@ -251,10 +292,23 @@ def evaluate(frozen: dict, model: ParseModel, rules_dir: Path, *, legacy_compani
             for name, counts in availability.items()
         },
     }
+    report["business"] = business.report(reply_failures)
+    details["business"] = business_details
+    details["pairing_audit"] = pairing_audit(business_details)
     return report, details
 
 
 def markdown_report(report: dict) -> bytes:
+    if report.get("void"):
+        return (
+            "# 解析回归计数\n\n"
+            f"- 冻结指纹 `{report['freeze_sha256']}`\n"
+            f"- 运行配置指纹 `{report['configuration_sha256']}`\n"
+            f"- 模型调用失败 {report['documents']['model_failed']} 篇\n"
+            f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇\n\n"
+            "本次放行运行作废。\n"
+        ).encode()
+
     def lines(title, data):
         yield f"## {title}"
         yield ""
@@ -312,4 +366,19 @@ def markdown_report(report: dict) -> bytes:
                 counts.update({status: field[status] for status in STATUSES})
             groups[label] = _rate_counts(counts)
         result.extend(lines(f"{title}（按字段项汇总）", groups))
+    result.extend(["## 业务配对量尺", "", f"- 配对配置指纹 `{report['business']['pairing_sha256']}`"])
+    for key, metric in report["business"].get("rates", {}).items():
+        numerator, denominator, percent = (metric[key] for key in ("numerator", "denominator", "percent"))
+        fraction = f"{numerator}/{denominator}" if denominator is not None else "—"
+        value = f"{percent:.2f}%" if percent is not None else "不可判定"
+        result.append(f"- {METRIC_LABELS[key]} {fraction}（{value}）")
+    for key, label in COUNT_LABELS.items():
+        result.append(f"- {label} {report['business']['counts'][key]}")
+    if "configuration_sha256" in report:
+        result.extend(["", f"- 运行配置指纹 `{report['configuration_sha256']}`"])
+        for key, label in (("input_tokens", "输入 token"), ("output_tokens", "输出 token"), ("elapsed_ms", "耗时毫秒")):
+            entry = report["usage"][key]
+            value = "未采集" if entry["total"] is None else f"{entry['total']}（{entry['captured_attempts']} 次采集）"
+            result.append(f"- {label} {value}")
+    result.append("")
     return "\n".join(result).encode("utf-8")
