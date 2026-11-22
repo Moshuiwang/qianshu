@@ -656,11 +656,9 @@ class FeishuService:
         if self.entrance is not None:
             self.entrance.recover()
 
-    def _disconnected(self, stop=None) -> None:
+    def _disconnected(self) -> None:
         with self._lock:
             self._approval_disconnected.set()
-            if stop is not None and self.window.contains(self.clock()):
-                stop.set()
             was_connected = self._origin is not None
             self._origin = None
             self._connected_at = None
@@ -772,7 +770,7 @@ class FeishuService:
             now = self.clock()
             if (
                 origin is not None and origin is self._origin and origin.close_code is None
-                and generation == self._approval_generation
+                and generation == self._approval_generation and not self._approval_disconnected.is_set()
                 and connected_at is not None and connected_at == self._connected_at
                 and created_at is not None and self.window.contains(now) and self.window.contains(created_at)
                 and connected_at <= created_at <= now
@@ -904,11 +902,13 @@ class FeishuService:
             if self._remaining() > 0:
                 raise
 
-    async def _stop(self) -> None:
+    async def _stop(self, *, finish_frames=False) -> None:
         if self._client.receiver is not None:
             self._client.receiver.cancel()
             await asyncio.gather(self._client.receiver, return_exceptions=True)
         frames = tuple(self._client.frames)
+        if finish_frames and frames:
+            await asyncio.wait(frames, timeout=_CALLBACK_BUDGET)
         for frame in frames:
             frame.cancel()
         await asyncio.gather(*frames, return_exceptions=True)
@@ -949,14 +949,19 @@ class FeishuService:
     def run_create(self, work):
         """审批监听在 SDK 事件循环运行，阻塞业务在工作线程运行。"""
         stop = Event()
+        serving = ws.loop.create_task(self._serve())
 
         async def listen():
             try:
-                await self._serve()
+                await serving
             except Exception:
                 _LOG.error("feishu_create_listener_failed")
             finally:
-                self._disconnected(stop)
+                # 先关审批资格。持久化清理可能等待证明写锁，原连接仍须按时回包。
+                self._approval_disconnected.set()
+                if self.window.contains(self.clock()):
+                    stop.set()
+                await asyncio.to_thread(self._disconnected)
 
         listener = ws.loop.create_task(listen())
         worker = ws.loop.create_task(asyncio.to_thread(work, stop))
@@ -968,9 +973,9 @@ class FeishuService:
             ws.loop.run_until_complete(asyncio.gather(worker, return_exceptions=True))
             raise
         finally:
-            listener.cancel()
+            serving.cancel()
             try:
                 ws.loop.run_until_complete(asyncio.gather(listener, return_exceptions=True))
-                ws.loop.run_until_complete(self._stop())
+                ws.loop.run_until_complete(self._stop(finish_frames=True))
             finally:
                 self._state.close()

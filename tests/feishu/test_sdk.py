@@ -1343,3 +1343,63 @@ def test_timely_decision_can_finish_proof_in_reserved_time(connected, monkeypatc
         service._state._writer.set_trace_callback(None)
     assert socket.responses == ["success"]
     assert service._state.claim_create(value["approval_id"], value["record_id"]) == service.window.end.timestamp()
+
+
+def test_run_create_window_expiry_during_proof_warns_on_original_socket(
+    connected, monkeypatch, ticking_socket_loop,
+):
+    from qianshu.feishu import State
+
+    service, socket, _ = connected
+    expires = time.monotonic() + 1
+    monkeypatch.setattr(service, "clock", lambda: service.window.end.timestamp() + time.monotonic() - expires)
+    data = publish(connected, monkeypatch)
+    value = data["event"]["action"]["value"]
+    key = value["approval_id"], value["record_id"]
+    received = []
+    sent = []
+    proof_commits = []
+    proof = False
+    original_send = socket.send
+
+    def stall_proof(sql):
+        nonlocal proof
+        if "INSERT INTO feishu_decision_proofs" in sql:
+            proof = True
+        if proof and sql == "COMMIT":
+            proof = False
+            proof_commits.append(time.monotonic())
+            time.sleep(max(0, received[0] + 3.1 - time.monotonic()))
+
+    async def connect():
+        timing = service._client._frame_timing(socket)
+        received.append(timing[1])
+        asyncio.create_task(service._client._handle_message(encoded_frame(data, ws.MessageType.CARD), timing))
+
+    async def send(raw):
+        assert socket.close_code is None
+        await original_send(raw)
+        sent.append(time.monotonic())
+
+    async def quiet_notice(*notice):
+        pass
+
+    def work(stop):
+        time.sleep(max(0, expires - time.monotonic()) + 0.1)
+
+    monkeypatch.setattr(service._client, "_connect", connect)
+    monkeypatch.setattr(socket, "send", send)
+    monkeypatch.setattr(service.transport, "notify_callback_timeout", quiet_notice)
+    monkeypatch.setattr(service._client, "_ping_loop", socket.recv)
+    service._state._writer.set_trace_callback(stall_proof)
+    service.run_create(work)
+
+    assert len(proof_commits) == 1 and received[0] <= proof_commits[0] < expires, socket.callback_responses
+    assert len(sent) == 1 and expires <= sent[0] < received[0] + 3
+    assert socket.callback_responses == [
+        {"toast": {"type": "warning", "content": "审批决定未确认，请人工核对"}},
+    ]
+    with closing(State(service._state.path, service.settings)) as reader:
+        assert reader.approval_status(*key) == "closed"
+        assert reader.claim_create(*key) is None
+        assert not reader.dispatch_create(*key, pytest.fail)
