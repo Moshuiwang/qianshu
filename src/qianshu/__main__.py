@@ -779,7 +779,7 @@ def main(argv: list[str] | None = None) -> int:
         window = Window(args.window_start, args.window_end)
         tag_dates = _tag_dates(args.tag_dates)
         sensitive_values = tuple(
-            config[key] for key in ("FEISHU_APP_SECRET", "ANTHROPIC_API_KEY", "MINGDAO_PASSWORD",
+            config[key] for key in ("FEISHU_APP_SECRET", "ANTHROPIC_API_KEY", "AI_BACKUP_API_KEY", "MINGDAO_PASSWORD",
                                     "MINGDAO_ACCOUNT", "MAIL_PASSWORD", "MAIL_USER") if key in config
         )
         if args.inject is not None:
