@@ -235,6 +235,26 @@ def test_local_remark_overlap_marks_both_policies_and_keeps_other_fields():
     assert all(draft.repeat_bonus.value == "是" for draft in drafts)
 
 
+def test_local_remark_overlap_includes_full_clause_of_each_reference():
+    body = "甲备注中间乙段"
+    first, second, remark = span(0, 3), span(5, 7), span(1, 3)
+    name = "user_scope"
+    p1 = policy("p1", first, {name: statement("确定", value="甲", evidence=[quote(body, "备注", "r")])})
+    p2 = policy("p2", second, {name: statement("确定", value="乙", evidence=[quote(body, "乙段", "c")])},
+                shared=["c"])
+    clauses = [clause("r", [remark], [name], ["p1"], kind="备注"),
+               clause("c", [second, remark], [name], ["p2"], scope="共享")]
+
+    result = parse_fixed(body, document(body, [p1, p2], clauses))
+
+    pending, = result.pending
+    assert (pending.span.start, pending.span.end) == (1, 3)
+    assert pending.code == "local_remark_overlap"
+    assert pending.fields_by_policy == {"p1": {name}, "p2": {name}}
+    assert all(draft.user_scope.value is None for draft in result)
+    assert all(draft.repeat_bonus.value == "是" for draft in result)
+
+
 @pytest.mark.parametrize("coverage,field", [("gap", None), ("pending", "user_scope"), ("all", None)])
 def test_coverage_and_pending_ranges_use_structural_bindings(coverage, field):
     body = "甲主段乙主段其他"
@@ -251,6 +271,43 @@ def test_coverage_and_pending_ranges_use_structural_bindings(coverage, field):
     result = parse_fixed(body, document(body, policies, coverage=covered, pending=pending))
     assert bool(result.pending) == (coverage != "all")
     assert [draft.repeat_bonus.value for draft in result] == ([None, None] if coverage == "gap" else ["是", "是"])
+
+
+def test_overlapping_input_blocks_each_require_coverage_description():
+    from qianshu.parse.protocol import SourceBlock
+
+    body = "合成申请"
+    extra = [SourceBlock(block_id, body[:3], "body") for block_id in ("part-a", "part-b")]
+    reply = document(body, [policy("p1", span(0, len(body)))])
+    reply["coverage"].append({"span": span(0, 3, "part-a"), "use": "其他文本"})
+
+    result = parse_fixed(body, reply, additional_blocks=extra)
+    pending, = result.pending
+    assert pending.code == "missing_block_coverage"
+    assert pending.block_id == "part-b"
+    assert result[0].maintain_mutual_exclusion_group.value is None
+
+    reply["coverage"].append({"span": span(0, 3, "part-b"), "use": "其他文本"})
+    result = parse_fixed(body, reply, additional_blocks=extra)
+    assert not result.pending
+    assert result[0].maintain_mutual_exclusion_group.value == "是"
+
+
+def test_policy_type_candidates_retain_their_own_evidence():
+    body = "公开政策，标签：占位标签甲"
+    reply = fixed_reply(body, [{
+        "policy_type": {"value": "公开政策", "evidence": ["公开政策"]},
+        "user_tags": {"value": ["占位标签甲"], "evidence": ["占位标签甲"]},
+    }])
+
+    draft, = parse_fixed(body, reply)
+
+    assert draft.policy_type.value is None
+    assert [item.text for item in draft.policy_type.evidence] == ["公开政策"]
+    assert {item.value: [quote.text for quote in item.evidence] for item in draft.policy_type.uncertainty.candidates} == {
+        "公开政策": ["公开政策"],
+        "定向政策": ["占位标签甲"],
+    }
 
 
 @pytest.mark.parametrize(("tag", "expected"), [("TAG-AB", ["TAG-AB"]), ("TAG-A", None), ("AG-AB", None)])

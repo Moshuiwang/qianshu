@@ -1,4 +1,7 @@
-"""从标准输入读取申请，将草稿写入仅当前用户可读的新文件。"""
+"""从标准输入读取申请，将草稿写入仅当前用户可读的新文件。
+
+通常输出草稿列表。有文档级判定时输出包含 document 和 drafts 的对象。
+"""
 
 import argparse
 import json
@@ -56,7 +59,7 @@ def main() -> int:
         def save_reply(reply: str) -> None:
             _write_private(args.raw_output, reply)
 
-        drafts = parse_application(
+        parsed = parse_application(
             sys.stdin.read(),
             config=load_config(env_file=args.env_file) if args.replay is None else None,
             model=replay_model if args.replay is not None else None,
@@ -65,7 +68,12 @@ def main() -> int:
             legacy_companies=args.legacy_companies,
             on_reply=save_reply if args.raw_output is not None else None,
         )
-        result = json.dumps([draft.to_dict() for draft in drafts], ensure_ascii=False, indent=2)
+        drafts = [draft.to_dict() for draft in parsed]
+        payload = drafts if parsed.document is None else {
+            "document": parsed.document.model_dump(mode="json"),
+            "drafts": drafts,
+        }
+        result = json.dumps(payload, ensure_ascii=False, indent=2)
         _write_private(args.output, result + "\n")
     except (ConfigError, ModelError, ParseError) as error:
         print(error, file=sys.stderr)

@@ -24,6 +24,8 @@ from qianshu.feishu import Message, Window
 from qianshu.feishu.cards import CardLine, detail_pages, result_card
 from qianshu.feishu.entrance import Application, fingerprint
 from qianshu.feishu.sdk import _Transport
+from qianshu.parse.evidence import ReviewRange
+from qianshu.parse.protocol import Span
 from qianshu.pipeline import Pipeline
 from tests.protocol_fixtures import fixed_reply, span
 
@@ -762,6 +764,35 @@ def test_command_displays_pending_range_and_keeps_partial_draft(tmp_path, single
     assert "政策 1 · 用户范围" in content
     assert "未校验" in content
     assert "待群卡片同意" not in content
+
+
+def test_pending_range_preview_redacts_secrets_at_range_edges():
+    pipeline = Pipeline(model=lambda **_: pytest.fail("不应调用模型"), tag_dates={}, sensitive_values=[SECRET])
+    body = f"甲{SECRET}乙"
+    pending = [
+        ReviewRange(Span(source_id="body", start=start, end=end), "declared_pending")
+        for start, end in [(1, len(body) - 1), (0, 5), (5, len(body))]
+    ]
+
+    whole, clipped_end, clipped_start = pipeline._pending_range_reminders(body, pending)
+
+    assert "[已脱敏]" in whole.text
+    assert SECRET not in whole.text
+    assert clipped_end.text == "body [0, 5)"
+    assert clipped_start.text == f"body [5, {len(body)})"
+
+
+@pytest.mark.parametrize("has_title", [True, False])
+def test_command_requires_package_confirmation_when_model_reports_no_title(tmp_path, single_policy, has_title):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    reply["policies"][0]["has_title"] = has_title
+    cards = _run(tmp_path, body, reply, tag_dates={"占位标签甲": "2099-02-15"})
+    content = "\n".join(_contents(cards))
+    assert ("政策 1 · 节目包 · 待确认" in content) is not has_title
+    assert ("缺少本条政策的标题" in content) is not has_title
+    assert ("待群卡片同意" in content) is has_title
 
 
 def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy):

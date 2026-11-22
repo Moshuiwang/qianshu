@@ -18,8 +18,11 @@ def package_rows(value: list[RequestedPackage]) -> list[PackageRow] | None:
     return [PackageRow(current_package=row.current_package, gift_package=row.gift_package)]
 
 
-def resolve_packages(results: dict[str, FieldResult]) -> None:
+def resolve_packages(results: dict[str, FieldResult], *, has_title: bool) -> None:
     result = results["packages"]
+    if not has_title:
+        results["packages"] = issue(result, "package_title_required")
+        return
     benefit = results["benefit_type"]
     if not verified_value(result):
         return

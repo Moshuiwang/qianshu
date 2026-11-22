@@ -19,6 +19,7 @@ class ReviewRange:
     code: str
     policy_ids: tuple[str, ...] = ()
     fields_by_policy: dict[str, frozenset[str]] | None = None
+    block_id: str | None = None
 
 
 class Sources:
@@ -131,10 +132,13 @@ class EvidenceReview:
         if reply.document and reply.document.status is not DocumentStatus.NO_POLICY:
             self.pending.append(ReviewRange(None, "document_pending"))
         unique = dict.fromkeys(
-            (item.span, item.code, item.policy_ids, tuple(sorted((item.fields_by_policy or {}).items())))
+            (item.span, item.code, item.policy_ids, tuple(sorted((item.fields_by_policy or {}).items())), item.block_id)
             for item in self.pending
         )
-        self.pending = [ReviewRange(span, code, ids, dict(by_policy)) for span, code, ids, by_policy in unique]
+        self.pending = [
+            ReviewRange(span, code, ids, dict(by_policy), block_id)
+            for span, code, ids, by_policy, block_id in unique
+        ]
 
     def _locate_all(self, spans: list[Span]) -> tuple[Span, ...]:
         return tuple(located for span in spans if (located := self.sources.locate(span)) is not None)
@@ -185,21 +189,26 @@ class EvidenceReview:
         for policy in self.reply.policies:
             if policy.id == owner:
                 continue
-            quote_spans = [located for name in FIELD_IDS for quote in _quotes(getattr(policy.fields, name))
-                           if (located := self.sources.locate(quote.span)) is not None]
+            reference_spans = tuple(
+                part for name in FIELD_IDS for part in self._reference_spans(getattr(policy.fields, name))
+            )
             for remark in self.clause_spans[clause.id]:
-                collisions = {overlap for span in (*self.local[policy.id], *quote_spans)
+                collisions = {overlap for span in (*self.local[policy.id], *reference_spans)
                               if (overlap := intersect(remark, span))}
                 for overlap in sorted(collisions, key=lambda span: (span.source_id, span.start, span.end)):
                     by_policy = {p.id: self._fields_at(p, overlap) for p in (self.policies[owner], policy)}
                     self.pending.append(ReviewRange(overlap, "local_remark_overlap", (owner, policy.id), by_policy))
 
+    def _reference_spans(self, statement: Finding) -> Iterable[Span]:
+        for quote in _quotes(statement):
+            if location := self.sources.locate(quote.span):
+                yield location
+            yield from self.clause_spans.get(quote.clause_id, ())
+
     def _fields_at(self, policy: Policy, span: Span) -> frozenset[str]:
         return frozenset(
             name for name in FIELD_IDS
-            if any(intersect(span, self.sources.locate(q.span)) or any(
-                intersect(span, part) for part in self.clause_spans.get(q.clause_id, ())
-            ) for q in _quotes(getattr(policy.fields, name)))
+            if any(intersect(span, part) for part in self._reference_spans(getattr(policy.fields, name)))
         )
 
     def _check_coverage(self) -> None:
@@ -214,12 +223,14 @@ class EvidenceReview:
                 support[use].extend(self.clause_spans[clause.id])
 
         coverage = []
+        described_blocks = set()
         declared_pending = self._locate_all([pending.span for pending in self.reply.pending])
         for item in self.reply.coverage:
             span = self.sources.locate(item.span)
             if span is None:
                 self.pending.append(ReviewRange(None, "invalid_coverage"))
                 continue
+            described_blocks.add(item.span.source_id)
             if item.use in ("其他文本", "待确认范围"):
                 coverage.append(span)
                 if item.use == "待确认范围":
@@ -232,6 +243,8 @@ class EvidenceReview:
         for block in self.sources.blocks.values():
             if block.text:
                 span = Span(source_id=block.source_id, start=block.start, end=block.start + len(block.text))
+                if block.id not in described_blocks:
+                    self.pending.append(replace(self._inferred_range(span, "missing_block_coverage"), block_id=block.id))
                 for gap in uncovered(span, coverage):
                     self.pending.append(self._inferred_range(gap, "coverage_gap"))
 

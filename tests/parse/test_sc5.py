@@ -21,7 +21,15 @@ def field(value, *evidence):
 
 
 def parse(body, *reply, companies_file=COMPANIES_FILE, **kwargs):
-    return parse_application(body, model=lambda **_: json.dumps(fixed_reply(body, reply)), companies_file=companies_file, **kwargs)
+    rows = []
+    for original in reply:
+        row = dict(original)
+        if row.get("company") == field(None, "赞比亚"):
+            # 冻结的日志测试用旧 company 回包携带国家引文。
+            del row["company"]
+            row["country"] = field("赞比亚", "赞比亚")
+        rows.append(row)
+    return parse_application(body, model=lambda **_: json.dumps(fixed_reply(body, rows)), companies_file=companies_file, **kwargs)
 
 
 def assert_uncertain(draft, *names):
@@ -102,7 +110,7 @@ def test_editable_company_table_errors_only_log_line_number(tmp_path, caplog, da
     table = tmp_path / "companies.tsv"
     table.write_bytes(data.encode() if isinstance(data, str) else data)
     draft, = parse("赞比亚占位申请，赠送30天", {
-        "country": field("赞比亚", "赞比亚"), "gift_days": field(30, "赠送30天"),
+        "company": field(None, "赞比亚"), "gift_days": field(30, "赠送30天"),
     }, companies_file=table)
     assert_uncertain(draft, "company")
     assert draft.gift_days.value == 30

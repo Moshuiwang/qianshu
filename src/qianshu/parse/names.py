@@ -56,7 +56,7 @@ def derive_names(results: dict[str, FieldResult]) -> list[str]:
     derived = "定向政策" if tags.value else "公开政策"
     if verified_value(kind) and kind.value != derived:
         results["policy_type"] = issue(
-            accept(kind, derived, ValueSource.LOOKUP, rule="R8", inputs=("user_tags",), evidence=tags.evidence),
+            accept(kind, derived, ValueSource.LOOKUP, rule="R8", inputs=("user_tags",)),
             "policy_type_conflict",
         )
     elif verified_value(kind) or can_use_absence(kind):

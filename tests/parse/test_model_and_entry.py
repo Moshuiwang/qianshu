@@ -19,7 +19,7 @@ from qianshu.parse import ModelError, parse_application
 from qianshu.parse.__main__ import main
 from qianshu.parse.model import ModelReplyError, configured_model
 from qianshu.parse.protocol import ApplicationReply
-from tests.protocol_fixtures import fixed_reply, serialized_empty
+from tests.protocol_fixtures import document, fixed_reply, serialized_empty
 
 
 def test_service_help_describes_current_offline_input(capsys):
@@ -299,9 +299,8 @@ def test_parse_entry_writes_only_to_a_new_private_file(monkeypatch, tmp_path, ca
 
     def recorded_model(config):
         assert config == {}
-        body = "赞比亚占位申请"
-        return lambda **_: json.dumps(fixed_reply(body, [
-            {"country": {"value": "赞比亚", "evidence": [body]}},
+        return lambda **_: json.dumps(fixed_reply("赞比亚占位申请", [
+            {"country": {"value": "赞比亚", "evidence": ["赞比亚占位申请"]}},
         ]))
 
     output = tmp_path / "drafts.json"
@@ -345,7 +344,10 @@ def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp
     expected_model = "placeholder-default" if env_file == ".env" else "placeholder-custom"
     configured.assert_called_once_with({"ANTHROPIC_MODEL": expected_model})
     configured.return_value.assert_called_once()
-    assert json.loads(Path("drafts.json").read_text(encoding="utf-8")) == []
+    assert json.loads(Path("drafts.json").read_text(encoding="utf-8")) == {
+        "document": {"status": "经检查无政策", "reason_code": "fixture"},
+        "drafts": [],
+    }
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -384,7 +386,7 @@ def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_
     monkeypatch.setattr("qianshu.parse.configured_model", lambda _: model)
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(output), "--raw-output", str(raw)])
     monkeypatch.setattr(sys, "stdin", io.StringIO(body))
-    exit_code = 0 if reply.lstrip().startswith("{") else 1
+    exit_code = 0 if reply.lstrip().startswith("[") else 1
     assert main() == exit_code
     assert raw.read_bytes() == reply.encode()
     assert raw.stat().st_mode & 0o777 == 0o600
@@ -392,7 +394,7 @@ def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_
     captured = capsys.readouterr()
     assert not captured.out
     if exit_code:
-        assert "不是有效的结构化 JSON" in captured.err
+        assert "不是有效的政策 JSON" in captured.err
         assert reply.strip() not in captured.err
 
 
@@ -470,6 +472,30 @@ def test_replay_matches_direct_stub_without_reading_api_config(monkeypatch, tmp_
     assert json.loads(output.read_text(encoding="utf-8")) == [draft.to_dict() for draft in expected]
     assert raw.read_bytes() == replay.read_bytes()
     config.assert_not_called()
+
+
+@pytest.mark.parametrize("status", ["经检查无政策", "可能有政策但无法切分", "材料不足"])
+def test_replay_writes_document_finding(monkeypatch, tmp_path, capsys, status):
+    body = "合成申请材料"
+    replay = tmp_path / "reply.json"
+    output = tmp_path / "drafts.json"
+    raw = tmp_path / "raw.json"
+    reply = "  \r\n" + json.dumps(document(body, status=status), ensure_ascii=False) + "\r\n"
+    replay.write_bytes(reply.encode())
+    monkeypatch.setattr(sys, "argv", [
+        "qianshu.parse", "--replay", str(replay), "--output", str(output), "--raw-output", str(raw),
+        "--companies-file", str(Path(__file__).parent / "fixtures" / "companies.tsv"),
+    ])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(body))
+
+    assert main() == 0
+    assert json.loads(output.read_text(encoding="utf-8")) == {
+        "document": {"status": status, "reason_code": "fixture"},
+        "drafts": [],
+    }
+    assert raw.read_bytes() == reply.encode()
+    assert raw.stat().st_mode & 0o777 == 0o600
+    assert capsys.readouterr() == ("", "")
 
 
 @pytest.fixture

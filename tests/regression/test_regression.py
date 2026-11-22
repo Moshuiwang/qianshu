@@ -891,7 +891,7 @@ def test_output_moved_during_model_run_is_not_written(repo, frozen):
         if not moved.exists():
             (repo / "run").rename(moved)
             (repo / "run").mkdir(mode=0o700)
-        return serialized_empty("占位正文")
+        return serialized_empty(json.loads(kwargs["user"])["application"])
 
     assert main(run_args(frozen), model=model) == 1
     assert moved.is_dir()

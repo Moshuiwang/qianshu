@@ -31,6 +31,7 @@ _CONFIRM = {
     "mutex_opt_out": other_fields.MUTEX_NO_HINT,
     "downgrade_confirmation": benefits._DOWNGRADE_HINT,
     "policy_type_conflict": "原文政策类型与用户标签判定冲突。",
+    "package_title_required": "缺少本条政策的标题，请补充标题并确认当前节目包（R5）。",
     "policy_name_conflict": "原文政策名称与唯一的用户标签冲突。",
     "unique_tag_required": "需要一个确定的用户标签才能取优惠政策名称。",
     "company_lookup_unresolved": "公司对照表无法唯一确定公司。",
@@ -38,7 +39,8 @@ _CONFIRM = {
 }
 _STRUCTURAL_ISSUES = {
     "invalid_policy", "overlapping_policy_mains", "invalid_clause", "local_remark_overlap",
-    "invalid_coverage", "unsupported_coverage_use", "coverage_gap", "invalid_pending_reference",
+    "invalid_coverage", "unsupported_coverage_use", "coverage_gap", "missing_block_coverage",
+    "invalid_pending_reference",
     "unbound_pending_coverage", "invalid_evidence", "invalid_checked_range", "invalid_certain_evidence",
     "invalid_date_use", "date_target_mismatch", "tag_evidence_mismatch",
 }
@@ -238,12 +240,12 @@ def _draft(
         *benefits.apply_benefit_rules(results),
         *other_fields.apply_defaults(results),
     ]
-    packages.resolve_packages(results)
+    packages.resolve_packages(results, has_title=policy.has_title)
     if rules.table is None:
         hints.append(_COMPANY_TABLE_HINT)
 
     draft = ParsedPolicyDraft(**{
-        field.name: _project(results[field.name], field.name, policy, review, options)
+        field.name: _project(results, field.name, policy, review, options)
         for field in fields(PolicyDraft)
     })
     draft.policy_id = policy.id
@@ -270,7 +272,8 @@ def _excerpt(quote: Evidence, sources: Sources) -> SourceExcerpt:
     return SourceExcerpt(text=quote.text, start=offsets[0] if offsets is not None else None)
 
 
-def _project(result: FieldResult, name: str, policy, review: EvidenceReview, options) -> DraftField:
+def _project(results: dict[str, FieldResult], name: str, policy, review: EvidenceReview, options) -> DraftField:
+    result = results[name]
     evidence = [_excerpt(quote, review.sources) for quote in result.evidence]
     if not result.needs_confirmation:
         return DraftField(value=result.value if result.has_value else None, evidence=evidence)
@@ -287,8 +290,9 @@ def _project(result: FieldResult, name: str, policy, review: EvidenceReview, opt
         value = _normalized_value(name, statement.value, options)
         if value is not None:
             candidates.append(Candidate(value=value, evidence=evidence))
-    if result.source is ValueSource.LOOKUP and result.has_value and name == "policy_type":
-        candidates.append(Candidate(value=result.value, evidence=evidence))
+    if "policy_type_conflict" in result.issues:
+        tag_evidence = [_excerpt(quote, review.sources) for quote in results["user_tags"].evidence]
+        candidates.append(Candidate(value=result.value, evidence=tag_evidence))
     reason = next((_CONFIRM[code] for code in result.issues if code in _CONFIRM), None)
     if reason is None:
         if _STRUCTURAL_ISSUES.intersection(result.issues):

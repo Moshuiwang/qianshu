@@ -198,20 +198,32 @@ class Pipeline:
         }, key=len, reverse=True)
         self._sensitive = re.compile("|".join(map(re.escape, values))) if values else None
 
-    def _boundary_reminders(self, body: str, pending: Iterable[ReviewRange]) -> list[CardLine]:
+    def _boundary_reminders(self, body: str, starts: list[int], uncertain: set[int]) -> list[CardLine]:
+        reminders = []
+        for index, (start, end) in enumerate(zip(starts, [*starts[1:], len(body)], strict=True), 1):
+            if start not in uncertain:
+                continue
+            segment = body[start:end]
+            if self._sensitive:
+                segment = self._sensitive.sub("[已脱敏]", segment)
+            preview = " ".join(segment.lstrip()[:12].splitlines()).strip()
+            reminders.append(f"段落 {index}：{preview}…，段落边界未确认，请审批人核对")
+        return [CardLine("提醒项", "\n".join(reminders))] if reminders else []
+
+    def _pending_range_reminders(self, body: str, pending: Iterable[ReviewRange]) -> list[CardLine]:
         reminders = []
         sensitive_spans = [match.span() for match in self._sensitive.finditer(body)] if self._sensitive else []
         for index, item in enumerate(pending, 1):
             span = item.span
             location = f"{span.source_id} [{span.start}, {span.end})" if span else "无可定位坐标"
-            if span and span.source_id == "body":
+            if item.block_id is not None:
+                location += f"（输入块 {item.block_id} 缺少覆盖说明）"
+            if span and span.source_id == "body" and span.end <= len(body):
                 start, end = span.start, span.end
-                segment = body[start:end]
-                if self._sensitive:
-                    segment = self._sensitive.sub("[已脱敏]", segment)
                 crosses_edge = any(left < start < right or left < end < right for left, right in sensitive_spans)
-                if not crosses_edge and (preview := " ".join(segment.lstrip()[:12].splitlines()).strip()):
-                    location += f"\n「{preview}」"
+                if not crosses_edge:
+                    preview, = self._boundary_reminders(body[start:end], [0], {0})
+                    location += "\n" + preview.text.removeprefix("段落 1：")
             reminders.append(CardLine(f"待确认范围 {index}", location, red=True))
         return reminders
 
@@ -245,7 +257,7 @@ class Pipeline:
         reminders = []
         if document:
             reminders.append(CardLine("文档判定", document.status.value))
-        reminders.extend(self._boundary_reminders(body, pending))
+        reminders.extend(self._pending_range_reminders(body, pending))
 
         if pending:
             status = "解析不完整，需人工确认\n请核对待确认范围与已提取的草稿。未校验。"
