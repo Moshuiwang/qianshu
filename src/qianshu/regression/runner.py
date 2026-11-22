@@ -2,6 +2,7 @@
 
 from collections import Counter, defaultdict
 from dataclasses import fields
+from datetime import date
 from pathlib import Path
 from typing import get_origin
 
@@ -162,6 +163,7 @@ def _new_field_status(draft, name: str) -> str:
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
     threshold: int = DEFAULT_THRESHOLD, recording=None, package_levels: PackageLevels | None = None,
+    today: date | None = None,
 ) -> tuple[dict, dict]:
     if package_levels is None:
         package_levels = load_package_levels()
@@ -229,7 +231,7 @@ def evaluate(
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
-                package_levels=package_levels,
+                package_levels=package_levels, today=today,
             )
         except IncompleteReply as error:
             received = True

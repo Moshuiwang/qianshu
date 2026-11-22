@@ -1782,6 +1782,8 @@ def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
     pair["configuration"]["packages"] = {"value": [{**rows[0], "gift_package": None}]}
     assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is False
     pair["configuration"]["packages"] = {"value": [*rows, {**rows[0], "current_package": "占位包丙"}]}
+    assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is True
+    pair["configuration"]["packages"] = {"value": []}
     assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is False
     pair["configuration"]["packages"] = {"value": rows}
     pair["source_status"]["benefit_type"] = "冲突"
@@ -2227,9 +2229,23 @@ def test_package_snapshot_reaches_parser_and_scores_two_rows(repo, monkeypatch):
         denominators=dict(whole_policy=[], fields={"packages": {"ids": ["p"], "excluded": {}}}),
     )
     monkeypatch.setattr(cli, "load_freeze", lambda *_: snapshot)
-    shutil.copyfile(COMPANIES.with_name("package-levels.csv"), repo / "package-levels.csv")
-    assert main(run_args(snapshot["fingerprint"]), model=lambda **_: json.dumps(reply)) == 0
+    table = repo / "synthetic.csv"
+    shutil.copyfile(COMPANIES.with_name("package-levels.csv"), table)
+    args = [*run_args(snapshot["fingerprint"]), "--package-levels", ".private/synthetic.csv"]
+    assert main(args, model=lambda **_: json.dumps(reply)) == 0
     business = get_json(repo / "run/public-report.json")["business"]
     assert business["rates"]["package_rows_exact"] == {"numerator": 1, "denominator": 1, "percent": 100}
     assert business["by_benefit_type"]["赠送时长"]["packages"]["correct"] == 1
     assert business["by_field"]["packages"]["false_determined"] == 0
+    replay = ["replay", "--recording", ".private/run", "--frozen", ".private/frozen",
+              "--expect-sha256", snapshot["fingerprint"], "--out", ".private/replay"]
+    table.write_bytes(b"changed")
+    class LaterClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2200, 1, 1, tzinfo=tz)
+
+    monkeypatch.setattr(cli, "datetime", LaterClock)
+    assert main([*replay, "--package-levels", ".private/synthetic.csv"]) == 1
+    assert main(replay) == 0
+    assert get_json(repo / "replay/public-report.json")["business"] == business

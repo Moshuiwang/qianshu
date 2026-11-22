@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from qianshu.config import ConfigError
@@ -161,15 +162,24 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
 
     rules = files.repo / "rules"
     config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries, effort=effort)
+    recorded_levels = origin == "replay" and "package_levels_sha256" in prior
+    levels_path = files.argument(args.package_levels or DEFAULT_LEVELS_FILE)
+    run_day = datetime.now(UTC).date()
+    if recorded_levels:
+        run_day = date.fromisoformat(prior["run_day"])
+        if not args.package_levels:
+            levels_path = saved.directory / DEFAULT_LEVELS_FILE.name
     try:
-        levels_data = files.read(files.argument(args.package_levels or DEFAULT_LEVELS_FILE))
+        levels_data = files.read(levels_path)
     except FileNotFoundError:
         if args.package_levels:
             raise RegressionError("指定的销售品快照不存在。") from None
-        package_levels = PackageLevels()
-    else:
-        package_levels = decode_package_levels(levels_data)
-        config["package_levels_sha256"] = digest(levels_data)
+        levels_data = None
+    config["package_levels_sha256"] = digest(levels_data) if levels_data is not None else None
+    config["run_day"] = run_day.isoformat()
+    if recorded_levels and config["package_levels_sha256"] != prior["package_levels_sha256"]:
+        raise RegressionError("销售品快照与录制指纹不一致。")
+    package_levels = decode_package_levels(levels_data) if levels_data is not None else PackageLevels()
     if legacy_recording:
         source_rules_sha, source_system_sha = _legacy_fingerprints(files.repo)
         if prior.get("source_rules_sha256", prior["rules_sha256"]) != source_rules_sha:
@@ -190,7 +200,9 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
             raise RegressionError("替代放行须引用相同配置下作废的原始录制。")
         replaces_run_id = prior_manifest["run_id"]
     names = doc_names(snapshot)
-    with files.new_output(out, (*RUN_FILES, MANIFEST, *names.values())) as output:
+    with files.new_output(out, (*RUN_FILES, MANIFEST, DEFAULT_LEVELS_FILE.name, *names.values())) as output:
+        if levels_data is not None:
+            output.write(DEFAULT_LEVELS_FILE.name, levels_data)
         recording = Recording(output, names, config, model_id, model=model, source=source,
                               origin=origin, origin_run_id=origin_run_id, replaces_run_id=replaces_run_id,
                               source_system_sha=source_system_sha)
@@ -201,7 +213,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         logging.disable(logging.CRITICAL)
         try:
             report, details = evaluate(snapshot, None, rules, legacy_companies=legacy, threshold=threshold,
-                                       recording=recording, package_levels=package_levels)
+                                       recording=recording, package_levels=package_levels, today=run_day)
         finally:
             logging.disable(previous)
         counts = report["business"]["counts"]
