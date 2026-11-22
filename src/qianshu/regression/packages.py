@@ -61,7 +61,7 @@ def freeze_packages(
             "configuration": {"packages": {"value": rows}},
             "package_style": style,
             "pairing": item.get("pairing", {}),
-            **{key: item[key] for key in ("business", "source_status") if key in item},
+            **{key: item[key] for key in ("business", "source_status", "company_keywords") if key in item},
         }
         _check_business(pair, {"packages"})
         pairs.append(pair)

@@ -1315,6 +1315,7 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
 
 
 def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
+    from qianshu.parse.companies import CompanyRow
     from qianshu.regression.business import _g285_mark
 
     sample = {"country": "占位地区", "benefit_type": "特价优惠"}
@@ -1324,19 +1325,68 @@ def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
         "configuration": {name: {"value": value} for name, value in values.items()},
         "source_status": {"cancel_on_downgrade": "原文未写"},
     }
-    company_names = {"占位地区": ["占位公司"]}
+    company_table = {"占位地区": {"": CompanyRow("占位公司", None)}}
     for name in values:
-        assert _g285_mark(name, pair, sample, "name_only", company_names)["auto_allowed"] is True
+        assert _g285_mark(name, pair, sample, "name_only", company_table)["auto_allowed"] is True
     assert _g285_mark("company", pair, sample, "name_only", {})["auto_allowed"] is False
-    assert _g285_mark("packages", pair, sample, "tier_only", company_names)["auto_allowed"] is False
+    assert _g285_mark("packages", pair, sample, "tier_only", company_table)["auto_allowed"] is False
     pair["configuration"]["packages"] = {"value": [{**rows[0], "gift_package": None}]}
-    assert _g285_mark("packages", pair, sample, "name_only", company_names)["auto_allowed"] is False
+    assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is False
     pair["configuration"]["packages"] = {"value": [*rows, {**rows[0], "current_package": "占位包丙"}]}
-    assert _g285_mark("packages", pair, sample, "name_only", company_names)["auto_allowed"] is False
+    assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is False
     pair["configuration"]["packages"] = {"value": rows}
     pair["source_status"]["benefit_type"] = "冲突"
     for name in ("packages", "cancel_on_downgrade"):
-        assert _g285_mark(name, pair, sample, "name_only", company_names)["auto_allowed"] is False
+        assert _g285_mark(name, pair, sample, "name_only", company_table)["auto_allowed"] is False
+
+
+@pytest.mark.parametrize(("company_status", "keywords", "default_name", "review"), [
+    ("原文未写", None, None, True),
+    ("原文未写", None, "占位公司甲", False),
+    ("原文未写", [], None, True),
+    ("原文未写", [], "占位公司甲", False),
+    ("原文未写", [], "占位公司乙", True),
+    ("原文未写", ["SYNTHETIC-A"], None, False),
+    ("原文未写", ["synthetic-a", "synthetic-b"], "占位公司甲", True),
+    ("冲突", [], "占位公司甲", True),
+])
+def test_g285_rates_company_using_r10_table_and_frozen_facts(company_status, keywords, default_name, review):
+    from qianshu.draft import SourceExcerpt
+    from qianshu.parse.companies import CompanyRow
+    from qianshu.regression.business import BusinessScore
+
+    sample = {"country": "占位地区", "benefit_type": "赠送时长"}
+    frozen = {"samples": {"policy": sample}, "denominators": {"fields": {"company": {"ids": ["policy"]}}}}
+    company = "占位公司甲"
+    rows = {"synthetic-a": CompanyRow(company, None), "synthetic-b": CompanyRow("占位公司乙", None)}
+    if default_name:
+        rows[""] = CompanyRow(default_name, None)
+    pair = {"id": "policy", "configuration": {"company": {"value": company}},
+            "source_status": {"company": company_status}}
+    if keywords is not None:
+        pair["company_keywords"] = keywords
+    # 正文含其他政策的关键词。评分只取本条独立审定的命中结果。
+    body = "占位地区\n其他政策 synthetic-a\n"
+    score = BusinessScore(frozen, 2, {}, company_table={sample["country"]: rows})
+
+    def rate(field):
+        draft = SimpleNamespace(company=field, benefit_type=DraftField(value="赠送时长"), to_dict=lambda: {})
+        return score.add({"body": body}, [pair], [draft])["policies"][0]["fields"]["company"]
+
+    assert rate(DraftField(uncertainty=Uncertainty(reason="占位人工确认"))) == (
+        "justified_confirmation" if review else "overasked"
+    )
+    assert rate(DraftField(value=company, evidence=[SourceExcerpt(text="占位地区", start=0)])) == (
+        "false_determined" if review else "correct"
+    )
+    if not keywords:
+        draft = SimpleNamespace(value=company, evidence=[], uncertainty=None, source_status="原文未写",
+                                value_source="查表派生", evidence_verified=True)
+        assert rate(draft) == ("false_determined" if review else "correct")
+        assert rate(SimpleNamespace(**{**vars(draft), "value_source": "默认规则"})) == "false_determined"
+        draft.evidence_verified = False
+        assert rate(draft) == "false_determined"
+        assert rate(DraftField(value=company)) == ("false_determined" if review else "correct")
 
 
 @pytest.mark.parametrize("name", ["recharge_days", "gift_days"])
@@ -1369,7 +1419,8 @@ def peer_list(repo, dataset, bodies):
     return ["--exclude-frozen", ".private/exam", "--exclude-holdout-list", ".private/peer.json"]
 
 
-def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch):
+@pytest.mark.parametrize("ambiguous_benefit", [False, True])
+def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch, ambiguous_benefit):
     from qianshu.draft import SourceExcerpt
 
     review = {
@@ -1382,6 +1433,8 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch)
                          "rows": [], "complete": True, "basis": "占位审定"},
         },
     }
+    if ambiguous_benefit:
+        review["items"]["policy-a"]["source_status"] = {"benefit_type": "歧义"}
     put_json(repo / "package-review.json", review)
     args = ["freeze-packages", "--corpus", ".private/archive", "--reviews", ".private/package-review.json",
             "--companies", ".private/companies.tsv", "--out", ".private/packages"]
@@ -1401,18 +1454,26 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch)
     fingerprint = capsys.readouterr().out.strip()
     manifest = get_json(repo / "packages/manifest.json")
     assert manifest["excluded_sets_sha256"]["blind"] == blind_sha
+    with PrivateFiles(Path.cwd()).open() as files:
+        frozen = freeze_module.load_freeze(files, Path("packages"))
+    pair = next(pair for pair in frozen["pairs"].values() if pair["row_id"] == "policy-a")
+    assert pair.get("source_status") == ({"benefit_type": "歧义"} if ambiguous_benefit else None)
+    assert frozen["denominators"]["fields"].keys() == {"packages"}
 
     def parsed(body, *, model, on_reply, **kwargs):
         on_reply(model(system="占位提示", user=body))
         base = {name: DraftField() for name in parse.ParsedPolicyDraft.__dataclass_fields__}
+        named_package = DraftField(value=[PackageRow(current_package="占位包甲", gift_package="占位赠包甲")],
+                                   evidence=[SourceExcerpt(text=FIRST, start=BATCH.index(FIRST))])
+        if ambiguous_benefit:
+            named_package = DraftField(uncertainty=Uncertainty(reason="占位优惠类型待确认"))
         return [parse.ParsedPolicyDraft(**{
             **base,
             "company": DraftField(value=company),
             "benefit_type": DraftField(value="赠送时长"),
             "packages": field,
         }) for company, field in (
-            ("占位默认公司", DraftField(value=[PackageRow(current_package="占位包甲", gift_package="占位赠包甲")],
-                                      evidence=[SourceExcerpt(text=FIRST, start=BATCH.index(FIRST))])),
+            ("占位默认公司", named_package),
             ("占位默认公司", DraftField(uncertainty=Uncertainty(reason="占位仅档位"))),
         )]
 
@@ -1421,10 +1482,15 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch)
     assert main(["run", *args, "--out", ".private/package-run"], model=lambda **_: "[]") == 0
     assert main(["replay", *args, "--recording", ".private/package-run", "--out", ".private/package-replay"]) == 0
     report = get_json(repo / "package-replay" / "public-report.json")
-    for key in ("package_rows_exact", "package_tier_confirmation"):
-        assert report["business"]["rates"][key] == {"numerator": 1, "denominator": 1, "percent": 100.0}
-    assert report["business"]["by_field"]["packages"]["correct"] == 1
-    assert report["business"]["by_field"]["packages"]["justified_confirmation"] == 1
+    assert report["business"]["rates"]["package_rows_exact"] == {
+        "numerator": int(not ambiguous_benefit), "denominator": 1, "percent": 0.0 if ambiguous_benefit else 100.0,
+    }
+    assert report["business"]["rates"]["package_tier_confirmation"] == {
+        "numerator": 1, "denominator": 1, "percent": 100.0,
+    }
+    assert report["business"]["by_field"]["packages"]["correct"] == int(not ambiguous_benefit)
+    assert report["business"]["by_field"]["packages"]["justified_confirmation"] == 1 + ambiguous_benefit
+    assert report["business"]["by_field"]["packages"]["overasked"] == 0
 
 
 def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_documents(repo, corpus, capsys):

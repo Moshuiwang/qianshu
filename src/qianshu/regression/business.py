@@ -3,6 +3,8 @@
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 
+from qianshu.parse.companies import CompanyTable
+
 from .compare import compare_field, normalize
 from .storage import RegressionError, digest, json_bytes
 
@@ -28,7 +30,10 @@ G285_MAPPING = {
         "directed_missing_tags": "定向政策",
         "policy_name": {"input": "user_tags", "required_count": 1, "must_match_tag": True},
         "policy_type": {"input": "user_tags", "empty": "公开政策", "nonempty": "定向政策"},
-        "company": {"table_key": "country"},
+        "company": {
+            "table_key": "country", "keyword_matches": "company_keywords", "default_key": "",
+            "unwritten_without_matches": "requires_default", "default_source": "查表派生",
+        },
         "trigger_once": "是",
         "effective_multiplier": {"only_automatic_value": 1},
         "cancel_on_downgrade": {"input": "benefit_type", "benefit_type": "赠送时长", "source_status": "原文未写"},
@@ -215,12 +220,16 @@ def _evidence_passes(name: str, field, mark: dict, body: str) -> bool:
         return False
     status = getattr(field, "source_status", None)
     source = getattr(field, "value_source", None)
-    if status == "原文未写" or source == "默认规则":
+    company_default_source = G285_MAPPING["confirmation"]["company"]["default_source"]
+    if name == "company" and status == "原文未写":
+        if source != company_default_source or verified is not True or field.value != mark.get("default"):
+            return False
+    elif status == "原文未写" or source == "默认规则":
         return (
             status == "原文未写" and source == "默认规则"
             and verified is True and not field.evidence and field.value == mark.get("default")
         )
-    if status not in (None, "确定"):
+    elif status not in (None, "确定"):
         return False
     if field.evidence:
         return all(
@@ -232,10 +241,11 @@ def _evidence_passes(name: str, field, mark: dict, body: str) -> bool:
         )
     if verified is True:
         return True
-    return (
-        status is None and mark.get("default_allowed", True)
-        and name in LEGACY_DEFAULTS and field.value == LEGACY_DEFAULTS[name]
-    )
+    if status is not None or not mark.get("default_allowed", True):
+        return False
+    if name == "company":
+        return field.value == mark.get("default")
+    return name in LEGACY_DEFAULTS and field.value == LEGACY_DEFAULTS[name]
 
 
 def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
@@ -253,7 +263,7 @@ def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
 
 
 def _g285_mark(
-    name: str, pair: dict, sample: dict, package_style: str | None, company_names: dict[str, list[str]] | None,
+    name: str, pair: dict, sample: dict, package_style: str | None, company_table: CompanyTable | None,
 ) -> dict:
     """用冻结的取值与原文事实查 G285 规则表。"""
     configuration = pair["configuration"]
@@ -268,6 +278,9 @@ def _g285_mark(
     uncertain_statuses = rules["source_statuses"]
     unresolved_inputs = (*uncertain_statuses, rules["unwritten_input_status"])
     needs_review = status in uncertain_statuses
+    default = G285_MAPPING["defaults"].get(name)
+    if isinstance(default, dict):
+        default = default.get(benefit)
     if status == "原文未写":
         needs_review |= name in rules["required_without_default"] or (
             name == "user_tags" and sample["policy_type"] == rules["directed_missing_tags"]
@@ -284,8 +297,19 @@ def _g285_mark(
         elif tags is not None:
             expected = rule["nonempty"] if tags else rule["empty"]
             needs_review |= value != expected
-    elif name == "company" and company_names is not None:
-        needs_review |= value not in company_names.get(sample[rule["table_key"]], ())
+    elif name == "company":
+        rows = (company_table or {}).get(sample[rule["table_key"]], {})
+        keywords = pair.get(rule["keyword_matches"])
+        if keywords is None and status != rules["unwritten_input_status"]:
+            # 旧冻结记录可没有独立的关键词审定。
+            needs_review |= not any(row.display_name == value for row in rows.values())
+        elif keywords and len(keywords) > 1:
+            needs_review = True
+        else:
+            selected = rows.get(keywords[0].casefold() if keywords else rule["default_key"])
+            needs_review |= selected is None or selected.display_name != value
+            if not keywords and selected is not None:
+                default = selected.display_name
     elif name == "trigger_once":
         needs_review |= value == rule
     elif name == "effective_multiplier" and value is not None:
@@ -299,9 +323,6 @@ def _g285_mark(
             package_style == rule["package_style"] or source_status.get(rule["input"]) in unresolved_inputs
             or len(value) != rule["required_rows"] or (rule["required_gift"] and any(not row["gift_package"] for row in value))
         )
-    default = G285_MAPPING["defaults"].get(name)
-    if isinstance(default, dict):
-        default = default.get(benefit)
     return {"inferable": "value" in entry, "auto_allowed": not needs_review, "default": default}
 
 
@@ -315,13 +336,13 @@ def ratio(numerator: int, denominator: int | None) -> dict:
 class BusinessScore:
     def __init__(
         self, frozen: dict, threshold: int, countries: dict[str, str], *,
-        company_names: dict[str, list[str]] | None = None,
+        company_table: CompanyTable | None = None,
     ):
         self.threshold = threshold
         self.fingerprint = pairing_fingerprint(threshold)
         self.measure_fingerprint = measure_fingerprint(threshold)
         self.countries = countries
-        self.company_names = company_names
+        self.company_table = company_table
         self.samples = frozen["samples"]
         self.dataset = frozen.get("dataset", "exam")
         self.eligible = defaultdict(list)
@@ -357,7 +378,7 @@ class BusinessScore:
             by_field = {}
             for name in self.eligible[sample_id]:
                 mark = _g285_mark(
-                    name, pair, self.samples[sample_id], package_style or document.get("package_style"), self.company_names,
+                    name, pair, self.samples[sample_id], package_style or document.get("package_style"), self.company_table,
                 )
                 status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
                 self.field_counts[name][status] += 1

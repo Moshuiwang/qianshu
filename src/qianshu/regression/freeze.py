@@ -166,10 +166,17 @@ def _check_plan_strata(manifest: dict, plan: dict) -> None:
 def _check_business(pair: dict, frozen_fields) -> None:
     statuses = pair.get("source_status", {})
     if (
-        not isinstance(statuses, dict) or not statuses.keys() <= frozen_fields
+        not isinstance(statuses, dict) or not statuses.keys() <= FIELD_LABELS.keys()
         or any(not isinstance(status, str) or status not in SOURCE_STATUSES for status in statuses.values())
     ):
         raise RegressionError("业务审定的原文状态无效。")
+    keywords = pair.get("company_keywords", [])
+    if (
+        not isinstance(keywords, list)
+        or any(not isinstance(keyword, str) or not keyword.strip() or keyword != keyword.strip() for keyword in keywords)
+        or len({keyword.casefold() for keyword in keywords}) != len(keywords)
+    ):
+        raise RegressionError("独立审定的公司关键词格式无效或有重复值。")
     business = pair.get("business", {})
     if not isinstance(business, dict) or not business.keys() <= frozen_fields:
         raise RegressionError("业务审定标记和冻结字段不一致。")
@@ -268,7 +275,8 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
             pair = {
                 "id": sample_id, "row_id": row_id, "token": token, "span": span, "basis": audit["basis"],
                 "materials": materials, "configuration": configuration,
-                **{key: audit[key] for key in ("business", "card_complete", "pairing", "source_status") if key in audit},
+                **{key: audit[key] for key in ("business", "card_complete", "pairing", "source_status", "company_keywords")
+                   if key in audit},
             }
             _check_business(pair, FIELD_LABELS.keys())
             pairs.append(pair)
