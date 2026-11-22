@@ -963,7 +963,7 @@ def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monk
 
 @pytest.mark.parametrize(("interruption", "retry_reply"), [
     ("timeout", None), ("disconnect", None), ("eof", None),
-    ("timeout", "[]"), ("timeout", "["),
+    ("timeout", "valid"), ("timeout", "invalid"),
 ])
 def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, interruption, retry_reply):
     import anthropic
@@ -981,13 +981,21 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
                     "content": [], "stop_reason": None, "stop_sequence": None,
                     "usage": {"input_tokens": 1, "output_tokens": 0},
                 }},
-                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": self.text}},
             ]
-            if not self.interrupted:
+            if self.interrupted:
                 events.extend([
+                    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": self.text}},
+                ])
+            else:
+                events.extend([
+                    {"type": "content_block_start", "index": 0, "content_block": {
+                        "type": "tool_use", "id": "toolu_placeholder", "name": "submit_application_reply", "input": {},
+                    }},
+                    {"type": "content_block_delta", "index": 0,
+                     "delta": {"type": "input_json_delta", "partial_json": self.text}},
                     {"type": "content_block_stop", "index": 0},
-                    {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
                      "usage": {"output_tokens": 1}},
                     {"type": "message_stop"},
                 ])
@@ -1004,7 +1012,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         user = json.loads(request.content)["messages"][0]["content"]
         body = json.loads(user)["application"]
         requests[body] += 1
-        final_reply = serialized_empty(body) if retry_reply == "[]" else retry_reply
+        final_reply = {None: None, "valid": serialized_empty(body), "invalid": "{}"}[retry_reply]
         text = (final_reply if requests[body] > 1 else None) if body == BATCH else serialized_empty(body)
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=ReplyStream("[" if text is None else text, text is None))
@@ -1021,21 +1029,27 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
     assert report["usage"]["attempts"] == 3
     assert report["void"] is (retry_reply is None)
     assert report["documents"] == {
-        "model_failed": int(retry_reply is None), "parse_failed": int(retry_reply == "["),
-        "parsed": 1 + int(retry_reply == "[]"),
+        "model_failed": int(retry_reply is None), "parse_failed": int(retry_reply == "invalid"),
+        "parsed": 1 + int(retry_reply == "valid"),
     }
     assert report["business"]["counts"]["reply_parse_failed"] == 1
     assert report["business"]["reply_parse_failure_reasons"] == {
-        "reply_truncated": 1, "reply_parse": int(retry_reply == "["), "reply_incomplete": 0,
+        "reply_truncated": 1, "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0,
     }
     record = get_json(repo / "run/document-00001.json")
     first, second = record["attempts"]
     partial_stage = "model_incomplete" if interruption == "eof" else "reply_truncated"
     assert (first["failure_stage"], first["reply"]) == (partial_stage, "[")
-    assert (second["failure_stage"], second["reply"]) == (
-        (partial_stage, "[") if retry_reply is None
-        else (None, serialized_empty(BATCH) if retry_reply == "[]" else retry_reply)
-    )
+    if retry_reply is None:
+        assert (second["failure_stage"], second["reply"]) == (partial_stage, "[")
+    elif retry_reply == "valid":
+        assert second["failure_stage"] is None
+        assert json.loads(second["reply"]) == json.loads(serialized_empty(BATCH))
+    else:
+        assert second["failure_stage"] == record["reason_code"] == "reply_schema"
+        assert record["structure_path"] == ["policies"]
+        block, = json.loads(second["reply"])
+        assert block["type"] == "tool_use" and block["input"] == {}
     assert main(_replay_args(frozen)) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
     for name in runner.RUN_FILES:

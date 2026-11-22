@@ -8,7 +8,7 @@ from typing import get_origin
 from qianshu.draft import DraftField, PolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
-from qianshu.parse.model import ModelReplyError, ParseModel
+from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
 
 from .business import COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
@@ -215,8 +215,9 @@ def evaluate(
         except ModelReplyError as error:
             received = True
             status = "parse_failed"
-            reply_failure = error.code
-            failure_code = error.code
+            if error.code not in REPLY_FORMAT_ERRORS:
+                reply_failure = error.code
+            failure_code, failure_path = error.code, error.path
         except ModelError:
             status = "model_failed"
         except ParseError as error:

@@ -7,7 +7,7 @@ from pathlib import Path
 from re import fullmatch
 from uuid import uuid4
 
-from qianshu.parse.model import CallResult, ModelError, ParseModel
+from qianshu.parse.model import REPLY_FORMAT_ERRORS, CallResult, ModelError, ModelReplyError, ParseModel
 from qianshu.parse.protocol import PROTOCOL_VERSION
 
 from .business import measure_fingerprint, pairing_fingerprint
@@ -15,7 +15,7 @@ from .runner import RULES, IncompleteReply
 from .storage import Output, PrivateFiles, RegressionError, digest, json_bytes, read_json
 
 MANIFEST = "recording.json"
-FAILURES = {None, "model_call", "model_incomplete", "model_invalid", "reply_truncated"}
+FAILURES = {None, "model_call", "model_incomplete", "model_invalid", "reply_truncated", *REPLY_FORMAT_ERRORS}
 USAGE_KEYS = ("input_tokens", "output_tokens", "elapsed_ms")
 
 
@@ -165,6 +165,11 @@ class Recording:
             result = attempts[-1]
             if _retryable(result):
                 raise ModelError("回归模型调用失败。")
+            if result["failure_stage"] in REPLY_FORMAT_ERRORS:
+                raise ModelReplyError(
+                    result["failure_stage"], result["reply"], "申请解析模型回复解析失败。",
+                    path=tuple(result.get("structure_path", ())),
+                )
             if reason := _reply_failure(result):
                 raise IncompleteReply(reason)
             if result["failure_stage"] is not None:
@@ -179,7 +184,10 @@ class Recording:
         self.call_result = None
         try:
             reply = self.model(system=system, user=user)
-        except Exception:
+        except Exception as error:
+            if isinstance(error, ModelReplyError) and error.code in REPLY_FORMAT_ERRORS:
+                data = self.call_result or _untimed_attempt(self.model_id, error.reply, error.code)
+                return {**data, "structure_path": error.path}
             if self.call_result is None:
                 return _untimed_attempt(self.model_id, None, "model_call")
             return {**self.call_result, "failure_stage": self.call_result["failure_stage"] or "model_call"}

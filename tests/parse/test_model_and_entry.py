@@ -11,12 +11,13 @@ from unittest.mock import Mock
 import anthropic
 import httpx
 import pytest
+from anthropic.types import TextBlock, ThinkingBlock, ToolUseBlock
 
 from qianshu.__main__ import main as service_main
 from qianshu.config import ConfigError
 from qianshu.parse import ModelError, parse_application
 from qianshu.parse.__main__ import main
-from qianshu.parse.model import configured_model
+from qianshu.parse.model import ModelReplyError, configured_model
 from qianshu.parse.protocol import ApplicationReply
 from tests.protocol_fixtures import fixed_reply, serialized_empty
 
@@ -40,6 +41,7 @@ def test_service_help_describes_current_offline_input(capsys):
 ])
 def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, caplog):
     client_type = anthropic.Anthropic
+    raw = serialized_empty("占位正文")
 
     def mocked_reply(request):
         assert request.url.host == "model.example.invalid"
@@ -48,7 +50,14 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
         assert payload["model"] == expected
         assert payload["system"] == "占位规则"
         assert payload["messages"] == [{"role": "user", "content": "占位正文"}]
-        assert "tools" not in payload
+        assert "output_config" not in payload
+        assert payload["tools"] == [{
+            "name": "submit_application_reply", "description": "提交一份申请解析声明。",
+            "input_schema": ApplicationReply.model_json_schema(),
+        }]
+        assert payload["tool_choice"] == {
+            "type": "tool", "name": "submit_application_reply", "disable_parallel_tool_use": True,
+        }
         assert payload["stream"] is True
         assert payload["max_tokens"] == 32000
         events = [
@@ -62,12 +71,14 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
                 "stop_sequence": None,
                 "usage": {"input_tokens": 1, "output_tokens": 0},
             }},
-            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "[]"}},
+            {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "tool_use", "name": "submit_application_reply", "id": "toolu_placeholder", "input": {},
+            }},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": raw}},
             {"type": "content_block_stop", "index": 0},
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
                 "usage": {"output_tokens": 1},
             },
             {"type": "message_stop"},
@@ -91,7 +102,7 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
         **model_config,
     }
     with caplog.at_level(logging.DEBUG):
-        assert configured_model(config)(system="占位规则", user="占位正文") == "[]"
+        assert json.loads(configured_model(config)(system="占位规则", user="占位正文")) == json.loads(raw)
     assert "占位正文" not in caplog.text
     assert "model.example.invalid" not in caplog.text
 
@@ -103,65 +114,97 @@ def test_unsupported_platform_is_rejected():
 
 @pytest.fixture
 def stub_stream(monkeypatch):
-    stream = Mock()
+    stream = Mock(current_message_snapshot=None)
     open_stream = Mock(return_value=nullcontext(stream))
     client = SimpleNamespace(messages=SimpleNamespace(stream=open_stream))
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
     return open_stream, stream.get_final_message
 
 
-def test_stream_returns_all_text_blocks(stub_stream):
-    open_stream, get_final_message = stub_stream
+def _reply_tool(input, *, name="submit_application_reply"):
+    return ToolUseBlock(type="tool_use", id="toolu_placeholder", name=name, input=input)
+
+
+def test_stream_returns_only_tool_input(stub_stream):
+    _, get_final_message = stub_stream
+    payload = json.loads(serialized_empty("占位正文"))
     get_final_message.return_value = SimpleNamespace(
-        stop_reason="end_turn",
+        stop_reason="tool_use",
         content=[
-            SimpleNamespace(type="text", text="["),
-            SimpleNamespace(type="thinking"),
-            SimpleNamespace(type="text", text="]"),
+            TextBlock(type="text", text="占位说明"),
+            _reply_tool(payload),
+            ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
         ],
     )
     complete = configured_model({
         "ANTHROPIC_API_KEY": "placeholder-key",
         "ANTHROPIC_MODEL": "placeholder-model",
     })
-    assert complete(system="占位规则", user="占位正文") == "[]"
-    open_stream.assert_called_once_with(
-        model="placeholder-model",
-        system="占位规则",
-        messages=[{"role": "user", "content": "占位正文"}],
-        max_tokens=32000,
-        output_config={"format": {"type": "json_schema", "schema": anthropic.transform_schema(ApplicationReply)}},
-    )
+    assert json.loads(complete(system="占位规则", user="占位正文")) == payload
     get_final_message.assert_called_once_with()
 
 
-@pytest.mark.parametrize("stop_reason", ["end_turn", "max_tokens"])
-def test_result_callback_records_text_blocks_and_use_without_changing_return(stub_stream, stop_reason):
+@pytest.mark.parametrize(("case", "code", "path"), [
+    ("missing", "reply_tool_missing", ()),
+    ("multiple", "reply_tool_multiple", ()),
+    ("unexpected", "reply_tool_unexpected", ()),
+    ("invalid", "reply_schema", ("document", "status")),
+])
+def test_stream_rejects_bad_tool_reply_and_records_content(stub_stream, case, code, path):
     _, get_final_message = stub_stream
+    payload = json.loads(serialized_empty("占位正文"))
+    invalid = {**payload, "document": {"status": "无效状态", "reason_code": "synthetic"}}
+    tools = {
+        "missing": [], "multiple": [_reply_tool(payload), _reply_tool(invalid)],
+        "unexpected": [_reply_tool(payload, name="unexpected_tool")], "invalid": [_reply_tool(invalid)],
+    }[case]
+    blocks = [TextBlock(type="text", text=json.dumps(payload)), *tools]
+    get_final_message.return_value = SimpleNamespace(
+        stop_reason="end_turn" if case == "missing" else "tool_use", content=blocks,
+    )
+    captured = []
+    complete = configured_model({"ANTHROPIC_API_KEY": "placeholder-key"}, on_result=captured.append)
+
+    with pytest.raises(ModelReplyError, match="回复解析失败") as exc:
+        complete(system="", user="")
+    assert (exc.value.code, exc.value.path) == (code, path)
+    result, = captured
+    assert result.failure_stage == code
+    assert result.reply == exc.value.reply
+    assert json.loads(result.reply) == [block.model_dump(exclude_unset=True) for block in blocks]
+
+
+@pytest.mark.parametrize("stop_reason", ["tool_use", "max_tokens"])
+def test_result_callback_records_blocks_and_use_without_changing_return(stub_stream, stop_reason):
+    _, get_final_message = stub_stream
+    payload = json.loads(serialized_empty("占位正文"))
+    blocks = [
+        TextBlock(type="text", text="占位说明"),
+        ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
+        _reply_tool(payload),
+    ]
     get_final_message.return_value = SimpleNamespace(
         stop_reason=stop_reason,
         model="synthetic-resolved-model",
         usage=SimpleNamespace(input_tokens=9, output_tokens=4),
-        content=[
-            SimpleNamespace(type="text", text="["),
-            SimpleNamespace(type="thinking", thinking="占位思考"),
-            SimpleNamespace(type="text", text="]"),
-        ],
+        content=blocks,
     )
     captured = []
     complete = configured_model({"ANTHROPIC_API_KEY": "placeholder-key"}, on_result=captured.append)
-    if stop_reason == "end_turn":
-        assert complete(system="", user="") == "[]"
+    if stop_reason == "tool_use":
+        assert json.loads(complete(system="", user="")) == payload
     else:
-        with pytest.raises(ModelError, match="max_tokens"):
+        with pytest.raises(ModelReplyError, match="max_tokens") as exc:
             complete(system="", user="")
+        assert exc.value.code == "reply_truncated"
     result, = captured
-    assert result.reply == "[]"
+    expected = payload if stop_reason == "tool_use" else [block.model_dump(exclude_unset=True) for block in blocks]
+    assert json.loads(result.reply) == expected
     assert result.stop_reason == stop_reason
-    assert result.blocks == (("text", 1), ("thinking", 4), ("text", 1))
+    assert result.blocks == (("text", 4), ("thinking", 4), ("tool_use", len(blocks[-1].model_dump_json())))
     assert (result.input_tokens, result.output_tokens, result.model) == (9, 4, "synthetic-resolved-model")
     assert result.elapsed_ms >= 0
-    assert result.failure_stage == (None if stop_reason == "end_turn" else "model_incomplete")
+    assert result.failure_stage == (None if stop_reason == "tool_use" else "model_incomplete")
 
 
 @pytest.mark.parametrize(("stop_reason", "output_tokens"), [("refusal", 1), ("max_tokens", 32000)])
@@ -198,8 +241,9 @@ def test_stream_error_is_sanitized(stub_stream, error_type):
 class _BrokenStream(httpx.SyncByteStream):
     """先送出部分事件，再按指定方式中断，模拟流读取中途失败。"""
 
-    def __init__(self, error):
+    def __init__(self, error, block_type):
         self._error = error
+        self._block_type = block_type
 
     def __iter__(self):
         start = {"type": "message_start", "message": {
@@ -207,24 +251,30 @@ class _BrokenStream(httpx.SyncByteStream):
             "content": [], "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": 1, "output_tokens": 0},
         }}
-        delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "占位回复"}}
         if self._error is not None:
-            for event in (start, {"type": "content_block_start", "index": 0,
-                                  "content_block": {"type": "text", "text": ""}}, delta):
+            if self._block_type == "tool_use":
+                block = {"type": "tool_use", "id": "toolu_placeholder", "name": "submit_application_reply", "input": {}}
+                delta = {"type": "input_json_delta", "partial_json": '{"policies": ['}
+            else:
+                block = {"type": "text", "text": ""}
+                delta = {"type": "text_delta", "text": "占位回复"}
+            for event in (start, {"type": "content_block_start", "index": 0, "content_block": block},
+                          {"type": "content_block_delta", "index": 0, "delta": delta}):
                 yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
             raise self._error
 
 
-@pytest.mark.parametrize("error", [
-    httpx.ReadError("占位错误详情"),
-    httpx.ReadTimeout("占位错误详情"),
-    httpx.RemoteProtocolError("占位错误详情"),
-    None,  # 流在 message_start 前正常结束
+@pytest.mark.parametrize(("error", "block_type"), [
+    (httpx.ReadError("占位错误详情"), "text"),
+    (httpx.ReadTimeout("占位错误详情"), "text"),
+    (httpx.RemoteProtocolError("占位错误详情"), "text"),
+    (httpx.ReadTimeout("占位错误详情"), "tool_use"),
+    (None, "text"),  # 流在 message_start 前正常结束
 ])
-def test_stream_interrupted_midway_is_sanitized(monkeypatch, error):
+def test_stream_interrupted_midway_is_sanitized(monkeypatch, error, block_type):
     client_type = anthropic.Anthropic
     http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
-        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream(error),
+        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream(error, block_type),
     )))
     monkeypatch.setattr(
         anthropic, "Anthropic",
@@ -236,7 +286,11 @@ def test_stream_interrupted_midway_is_sanitized(monkeypatch, error):
         configured_model(config, on_result=captured.append)(system="", user="占位正文")
     result, = captured
     assert result.failure_stage == ("model_call" if error is None else "reply_truncated")
-    assert result.reply == (None if error is None else "占位回复")
+    if block_type == "tool_use":
+        block, = json.loads(result.reply)
+        assert block["type"] == "tool_use" and block["input"] == {"policies": []}
+    else:
+        assert result.reply == (None if error is None else "占位回复")
     assert str(exc.value) == "申请解析模型调用失败。"
 
 
