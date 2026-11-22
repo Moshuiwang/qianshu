@@ -28,13 +28,19 @@ jobs:
       - name: Decide check level
         id: level
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
           HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
         run: |
           set -euo pipefail
-          level="$(python3 scripts/ci_level.py "$BASE" "$HEAD")"
-          level="$(sh scripts/ci_guard.sh "$BASE" "$HEAD" "$level")"
-          echo "level=$level" >> "$GITHUB_OUTPUT"
+          result="$RUNNER_TEMP/ci-level"
+          sh scripts/ci_select.sh "$BASE" "$HEAD" > "$result"
+          # Read through EOF so extra lines and embedded NULs cannot disappear.
+          if IFS= read -r -d '' level < "$result"; then exit 1; fi
+          level=${level%$'\n'}
+          case "$level" in
+            docs|full) echo "level=$level" >> "$GITHUB_OUTPUT" ;;
+            *) echo 'Invalid CI level: expected docs or full' >&2; exit 1 ;;
+          esac
       - name: Docs-only change
         if: steps.level.outputs.level == 'docs'
         run: echo "只改了文档，跳过代码检查。"

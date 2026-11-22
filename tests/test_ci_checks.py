@@ -1,8 +1,10 @@
 """Exercise CI entry points against synthetic repositories and manifests."""
 
 from pathlib import Path
+from shutil import copyfile
 import subprocess
 import sys
+from textwrap import dedent
 from zipfile import ZipFile
 
 import pytest
@@ -75,7 +77,7 @@ def guard(base, proposed):
 
 
 @pytest.mark.parametrize("path", [
-    "scripts/ci_level.py", "scripts/ci_guard.sh", ".github/pull_request_template.md",
+    "scripts/ci_level.py", "scripts/ci_guard.sh", "scripts/ci_select.sh", ".github/pull_request_template.md",
     ".github/workflows/checks.yml", "pyproject.toml", "uv.lock",
 ])
 def test_guard_overrides_docs(repo, path):
@@ -103,6 +105,75 @@ def test_guard_baselines(repo):
     manual.check_returncode()
     assert manual.stdout == "full\n"
     assert guard("unknown-revision", "docs").returncode != 0
+
+
+@pytest.fixture
+def select_step(repo, monkeypatch, tmp_path_factory):
+    runner = tmp_path_factory.mktemp("runner")
+    output = runner / "github-output"
+    output.touch()
+    monkeypatch.setenv("RUNNER_TEMP", str(runner))
+    monkeypatch.setenv("GITHUB_OUTPUT", str(output))
+    monkeypatch.setenv("HEAD", "HEAD")
+    scripts = repo / "scripts"
+    scripts.mkdir()
+    copyfile(SCRIPTS / "ci_select.sh", scripts / "ci_select.sh")
+    # Force a docs proposal so only the baseline guard can upgrade it.
+    (scripts / "ci_level.py").write_text('print("docs")\n')
+
+    workflow = (SCRIPTS.parent / ".github/workflows/checks.yml").read_text()
+    step = workflow.split("      - name: Decide check level\n", 1)[1]
+    shell = dedent(step.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
+
+    def run(base):
+        monkeypatch.setenv("BASE", base)
+        result = subprocess.run(["bash", "-c", shell], capture_output=True, text=True)
+        return result, output.read_text()
+
+    return run
+
+
+def test_select_uses_baseline_guard(repo, select_step):
+    path = repo / "scripts/ci_guard.sh"
+    copyfile(SCRIPTS / "ci_guard.sh", path)
+    base = commit()
+    path.write_text("echo docs\n")
+    commit()
+    result, output = select_step(base)
+    result.check_returncode()
+    assert output == "level=full\n"
+
+
+@pytest.mark.parametrize("revision", ["missing-guard", "unknown-revision", ""])
+def test_select_without_baseline_guard(repo, select_step, revision):
+    base = commit()
+    (repo / "scripts/ci_guard.sh").write_text("echo docs\n")
+    commit()
+    result, output = select_step(base if revision == "missing-guard" else revision)
+    result.check_returncode()
+    assert output == "level=full\n"
+
+
+@pytest.mark.parametrize("body", [
+    "echo docs; exit 1", "echo unknown", "echo docs; echo full", "echo docs; echo",
+    r"printf 'docs\000'", ":",
+])
+def test_select_rejects_failed_or_invalid_guard(repo, select_step, body):
+    (repo / "scripts/ci_guard.sh").write_text(body)
+    base = commit()
+    result, output = select_step(base)
+    assert result.returncode != 0
+    assert output == ""
+
+
+def test_select_pure_docs(repo, select_step):
+    copyfile(SCRIPTS / "ci_guard.sh", repo / "scripts/ci_guard.sh")
+    base = commit()
+    write(repo / "docs/change.md")
+    commit()
+    result, output = select_step(base)
+    result.check_returncode()
+    assert output == "level=docs\n"
 
 
 def test_diverged_base_and_head(repo):
