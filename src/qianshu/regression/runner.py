@@ -12,7 +12,7 @@ from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
 from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel, StreamingModel, recorded_shape_error
-from qianshu.parse.package_levels import PackageLevels, load_package_levels
+from qianshu.parse.package_levels import PackageLevels
 
 from .business import CATEGORIES, COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
@@ -211,8 +211,9 @@ def evaluate(
     threshold: int = DEFAULT_THRESHOLD, recording=None, package_levels: PackageLevels | None = None,
     today: date | None = None, package_run_day: date | None = None, benefit_catalog=None,
 ) -> tuple[dict, dict]:
+    snapshot_supplied = package_levels is not None
     if package_levels is None:
-        package_levels = load_package_levels()
+        package_levels = PackageLevels()
     samples = frozen["samples"]
     pairs = defaultdict(list)
     for pair in frozen["pairs"].values():
@@ -381,6 +382,7 @@ def evaluate(
         counts = Counter(entry["excluded"].values())
         excluded[name] = {reason: counts[reason] for reason in EXCLUSIONS}
     report = {
+        "package_levels_supplied": snapshot_supplied,
         "freeze_sha256": frozen["fingerprint"],
         "rules_sha256": rules_hash,
         "samples": len(samples),
@@ -440,6 +442,8 @@ def markdown_report(report: dict) -> bytes:
     review_lines = [review_line, *(f"  - {label} {reasons[code]} 篇" for code, label in STRUCTURE_REASONS.items())]
     review_lines.append(f"- 首次形状错误 {report['documents'].get('first_shape_errors', 0)} 篇，"
                         f"最终回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇")
+    if report.get("package_levels_supplied") is False:
+        review_lines.append("- 未提供销售品快照，按空表核对。")
     if cost := report.get("cost"):
         usage = report["usage"]
         def shown(value):

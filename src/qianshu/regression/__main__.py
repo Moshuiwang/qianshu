@@ -1,12 +1,14 @@
 """本地生成、核验及运行私有回归考题集。"""
 
 import argparse
+import csv
 from contextlib import ExitStack, nullcontext
 import logging
 import os
 import subprocess
 import sys
 from datetime import UTC, date, datetime
+from io import StringIO
 from pathlib import Path
 from pydantic import TypeAdapter
 from qianshu.parse.benefits import BenefitCatalog, DEFAULT_CATALOG_FILE
@@ -14,7 +16,7 @@ from qianshu.parse.benefits import BenefitCatalog, DEFAULT_CATALOG_FILE
 from qianshu.config import ConfigError
 from qianshu.parse import system_message
 from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_effort, configured_model
-from qianshu.parse.package_levels import DEFAULT_LEVELS_FILE, PackageLevels, decode_package_levels
+from qianshu.parse.package_levels import DEFAULT_LEVELS_FILE, _COLUMNS, _SUMMARY, decode_package_levels
 from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE
 
 from . import baseline, tiers
@@ -151,6 +153,23 @@ def _legacy_fingerprints(repo: Path) -> tuple[str, str]:
     return digest(json_bytes(hashes)), digest(system.encode())
 
 
+def _decode_snapshot(data: bytes):
+    levels = decode_package_levels(data)
+    if levels.offers:
+        return levels
+    # 线上读取失败也返回空表；回归只接受表头完整且仅含零行或汇总行的空表。
+    try:
+        reader = csv.DictReader(StringIO(data.decode("utf-8-sig"), newline=""), strict=True)
+        header = reader.fieldnames or []
+        if (_COLUMNS.issubset(header) and len(header) == len(set(header))
+                and all(None not in row and None not in row.values() and row["record_type"] in _SUMMARY
+                        for row in reader)):
+            return levels
+    except (UnicodeError, csv.Error):
+        pass
+    raise RegressionError("销售品快照格式无效。")
+
+
 def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: ExitStack) -> None:
     snapshot = load_freeze(files, files.argument(args.frozen))
     parent_sha = snapshot["fingerprint"]
@@ -246,24 +265,22 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
     if origin == "replay" and prior.get("historical_catalog_unverified"):
         config["historical_catalog_unverified"] = True
     recorded_levels = origin == "replay" and "package_levels_sha256" in prior
-    levels_path = files.argument(args.package_levels or DEFAULT_LEVELS_FILE)
+    levels_path = files.argument(args.package_levels) if args.package_levels else None
     run_day = getattr(args, "run_day", None) or datetime.now(UTC).date()
     if recorded_levels:
         recorded_day = manifest.get("run_day", prior.get("run_day"))
         if recorded_day:
             run_day = date.fromisoformat(recorded_day)
-        if recorded_day and not args.package_levels:
+        if prior["package_levels_sha256"] and not args.package_levels:
             levels_path = saved.directory / DEFAULT_LEVELS_FILE.name
     try:
-        levels_data = files.read(levels_path)
+        levels_data = files.read(levels_path) if levels_path is not None else None
     except FileNotFoundError:
-        if args.package_levels:
-            raise RegressionError("指定的销售品快照不存在。") from None
-        levels_data = None
+        raise RegressionError("指定或录制的销售品快照不存在。") from None
     config["package_levels_sha256"] = digest(levels_data) if levels_data is not None else None
     if recorded_levels and config["package_levels_sha256"] != prior["package_levels_sha256"]:
         raise RegressionError("销售品快照与录制指纹不一致。")
-    package_levels = decode_package_levels(levels_data) if levels_data is not None else PackageLevels()
+    package_levels = _decode_snapshot(levels_data) if levels_data is not None else None
     config["today"] = today.isoformat() if today else None
     if legacy_recording:
         source_rules_sha, source_system_sha = _legacy_fingerprints(files.repo)
@@ -386,7 +403,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
         if void:
             reasons = report["business"]["reply_parse_failure_reasons"]
             report = {key: report[key] for key in (
-                "freeze_sha256", "rules_sha256", "samples", "documents", "evidence_location",
+                "freeze_sha256", "rules_sha256", "samples", "documents", "evidence_location", "package_levels_supplied",
                 "full_document_review", "full_document_review_reasons",
             )}
             report["business"] = {
