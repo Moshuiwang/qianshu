@@ -4,6 +4,7 @@ import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, fields, replace
 from datetime import UTC, date, datetime
+from functools import cache
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -12,9 +13,10 @@ from qianshu.draft import Candidate, DraftField, OfferPolicyDraft, SourceExcerpt
 
 from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
-from .evidence import EvidenceReview, PolicyStructureIssue, Sources, issue
+from .evidence import EvidenceReview, PolicyStructureIssue, Sources, can_use_absence, issue
 from .model import ModelError, ModelReplyError, ParseModel, configured_model, validate_reply_json
 from .model import load_model_config as load_config
+from .package_levels import PackageLevels, load_package_levels
 from .protocol import (
     ApplicationReply, Evidence, FieldResult, Finding, Policy, SourceBlock, Span, UnusedPassage,
 )
@@ -36,6 +38,11 @@ _CONFIRM = {
     **benefits.CONFIRMATION_REASONS,
     "policy_type_conflict": "原文政策类型与用户标签判定冲突。",
     "package_title_required": "缺少本条政策的标题，请补充标题并确认当前节目包（R5）。",
+    "package_tier_pending": "档位需要人工核对，候选仅供查阅。",
+    "package_lookup_pending": "销售品级别表无法唯一核实当前包、主体或有效期，请核对所有行。",
+    "package_copy_pending": "受赠基本包或其有效同步附属包未能唯一查实（R6）。",
+    "gift_package_conflict": "赠送时长的受赠目标与当前包冲突。",
+    "gift_package_required": "请补充活动期间的受赠基本包。",
     "policy_name_conflict": "原文政策名称与唯一的用户标签冲突。",
     "unique_tag_required": "需要一个确定的用户标签才能取优惠政策名称。",
     "company_lookup_unresolved": "公司对照表无法唯一确定公司。",
@@ -56,6 +63,8 @@ class ParseError(ValueError):
 class ParsedPolicyDraft(OfferPolicyDraft):
     """草稿及其协议证据，供卡片、私有记录和回归入口使用。"""
 
+    tier_field: DraftField | None = None
+    package_tier_candidates: tuple[str, ...] = ()
     hints: list[str]
 
     source_span: tuple[int, int] | None = None
@@ -72,9 +81,12 @@ class ParsedPolicyDraft(OfferPolicyDraft):
     def to_dict(self) -> dict[str, object]:
         return {**super().to_dict(), "hints": getattr(self, "hints", []), "policy_id": self.policy_id,
                 "scope": self.scope, "policy_name_source": self.policy_name_source,
+                "package_tier_candidates": list(self.package_tier_candidates),
                 "field_results": {
                     name: {
                         **asdict(result),
+                        **({"value": result.statement.model_dump(mode="json")["value"]}
+                           if name == "package_tiers" and result.has_value else {}),
                         "statement": result.statement.model_dump(mode="json"),
                         "evidence": [quote.model_dump(mode="json") for quote in result.evidence],
                         "issues": list(result.issues),
@@ -118,6 +130,8 @@ def parse_application(
     company_rules: CompanyRules | None = None,
     additional_blocks: Iterable[SourceBlock] = (),
     benefit_catalog: benefits.BenefitCatalog | None = None,
+    package_levels: PackageLevels | None = None,
+    package_run_day: date | None = None,
     today: date | None = None,
     country_codes: Mapping[str, str] | None = None,
     known_policy_names: Iterable[str] = (),
@@ -172,11 +186,19 @@ def parse_application(
     review = EvidenceReview(parsed, sources)
     if benefit_catalog is None:
         benefit_catalog = benefits.load_benefit_catalog()
-    resolved = [_resolve_fields(policy, review, company_rules, options, country_codes, reference_date, benefit_catalog)
+    @cache
+    def levels_snapshot() -> PackageLevels:
+        if package_levels is not None:
+            return package_levels
+        # 冻结录制没有提供销售品快照时，不能混入当前目录的私有表。
+        return PackageLevels() if companies_text is not None else load_package_levels()
+
+    resolved = [_resolve_fields(policy, review, company_rules, options, country_codes, reference_date,
+                                benefit_catalog, levels_snapshot, package_run_day or reference_date)
                 for policy in parsed.policies]
-    names.check_names([results for results, _ in resolved], known_policy_names)
-    drafts = [_draft(policy, review, options, results, hints)
-              for policy, (results, hints) in zip(parsed.policies, resolved, strict=True)]
+    names.check_names([results for results, _, _ in resolved], known_policy_names)
+    drafts = [_draft(policy, review, options, results, hints, candidates)
+              for policy, (results, hints, candidates) in zip(parsed.policies, resolved, strict=True)]
     return ParseResult(drafts, structure_issues=review.structure_issues, evidence_locations=review.evidence_locations,
                        unused_passages=parsed.unused_passages or ())
 
@@ -217,6 +239,8 @@ def _normalized_value(name: str, value: object, options: dict[str, dict[str, str
         return names.policy_option(value, options[name])
     if name in ("recharge_days", "gift_days") or name in benefits.OFFER_FIELD_LABELS:
         return benefits.normalize_benefit_value(name, value)
+    if name == "package_tiers":
+        return value if value and all(item.role and item.tier for item in value) else None
     if name == "packages":
         return packages.package_rows(value)
     if name == "approval_url":
@@ -231,8 +255,10 @@ def _normalized_value(name: str, value: object, options: dict[str, dict[str, str
 def _resolve_fields(
     policy: Policy, review: EvidenceReview, rules: CompanyRules, options: dict[str, dict[str, str]],
     codes: Mapping[str, str], reference_date: date | None, benefit_catalog: benefits.BenefitCatalog,
-) -> tuple[dict[str, FieldResult], list[str]]:
-    results = {name: review.field(policy, name) for name in policy.fields.__class__.model_fields}
+    levels_snapshot: Callable[[], PackageLevels], package_run_day: date | None,
+) -> tuple[dict[str, FieldResult], list[str], tuple[str, ...]]:
+    results = {name: review.field(policy, name) for name in policy.fields.__class__.model_fields
+               if name != "package_tiers" or name in policy.fields.model_fields_set}
     for name, result in results.items():
         if result.has_value and not result.needs_confirmation:
             value = _normalized_value(name, result.value, options)
@@ -251,21 +277,26 @@ def _resolve_fields(
         *benefit_hints,
         *other_fields.apply_defaults(results),
     ]
-    packages.resolve_packages(results, has_title=policy.has_title)
+    tier_candidates = packages.resolve_packages(results, has_title=policy.has_title, levels_snapshot=levels_snapshot,
+                                                rules=rules, today=package_run_day)
     if rules.table is None:
         hints.append(_COMPANY_TABLE_HINT)
 
-    return results, hints
+    return results, hints, tier_candidates
 
 
 def _draft(
     policy: Policy, review: EvidenceReview, options: dict[str, dict[str, str]],
-    results: dict[str, FieldResult], hints: list[str],
+    results: dict[str, FieldResult], hints: list[str], tier_candidates: tuple[str, ...],
 ) -> ParsedPolicyDraft:
     draft = ParsedPolicyDraft(**{
         field.name: _project(results, field.name, review, options)
         for field in fields(OfferPolicyDraft)
     })
+    tiers = results.get("package_tiers")
+    if tiers is not None and not can_use_absence(tiers):
+        draft.tier_field = _project(results, "package_tiers", review, options)
+    draft.package_tier_candidates = tier_candidates
     draft.policy_id = policy.id
     corrected = policy.model_copy(update={
         "main": review.corrected_span(policy.main) or policy.main,

@@ -1,0 +1,7 @@
+record_type,company_id,company_name,offer_id,offer_name,offer_type,is_synchronized,parent_offer_id,offer_level_type,offer_level,status,sale_start_date,sale_end_date
+OFFER,0001,占位公司甲,b1,占位甲,基本,否,,DTT,1,在售,2000-01-01,2100-01-01
+OFFER,0001,占位公司甲,c1,占位甲_copy,附属,是,b1,DTT,1,在售,2000-01-01,2100-01-01
+OFFER,0001,占位公司甲,b2,占位甲包,基本,否,,DTT,2,在售,2000-01-01,2100-01-01
+OFFER,0001,占位公司甲,c2,占位甲包_copy,附属,是,b2,DTT,2,在售,2000-01-01,2100-01-01
+OFFER,0001,占位公司甲,b3,占位乙包,基本,否,,DTT,3,在售,2000-01-01,2100-01-01
+OFFER,0001,占位公司甲,c3,占位乙包_copy,附属,是,b3,DTT,3,在售,2000-01-01,2100-01-01

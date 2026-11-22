@@ -1192,15 +1192,23 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
 
 
-def test_valid_replacement_references_original_void_recording(repo, frozen):
+class LaterClock(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2200, 1, 1, tzinfo=tz)
+
+
+def test_valid_replacement_references_original_void_recording(repo, frozen, monkeypatch):
     def unavailable(**_):
         raise RuntimeError("占位调用失败")
 
     assert main([*run_args(frozen), "--release"], model=unavailable) == 0
     original = (repo / "run/recording.json").read_bytes()
+    monkeypatch.setattr("qianshu.regression.__main__.datetime", LaterClock)
     assert main([*run_args(frozen, ".private/replacement"), "--release", "--replaces-recording", ".private/run"],
                 model=no_policies) == 0
     replacement = get_json(repo / "replacement/recording.json")
+    assert replacement["run_day"] != json.loads(original)["run_day"]
     original_id = json.loads(original)["run_id"]
     assert replacement["replaces_run_id"] == original_id != replacement["run_id"]
     assert (repo / "run/recording.json").read_bytes() == original
@@ -1782,6 +1790,8 @@ def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
     pair["configuration"]["packages"] = {"value": [{**rows[0], "gift_package": None}]}
     assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is False
     pair["configuration"]["packages"] = {"value": [*rows, {**rows[0], "current_package": "占位包丙"}]}
+    assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is True
+    pair["configuration"]["packages"] = {"value": []}
     assert _g285_mark("packages", pair, sample, "name_only", company_table)["auto_allowed"] is False
     pair["configuration"]["packages"] = {"value": rows}
     pair["source_status"]["benefit_type"] = "冲突"
@@ -2210,3 +2220,35 @@ def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, ca
     put_json(manifest_path, manifest)
     assert main([*_replay_args(frozen, out=".private/changed-rules"), "--legacy-recording"], model=forbidden) == 1
     assert "录制时的规则文件" in capsys.readouterr().err
+
+
+def test_package_snapshot_reaches_parser_and_scores_two_rows(repo, monkeypatch):
+    from qianshu.regression import __main__ as cli
+    from tests.parse.test_package_rows import COMPANIES, NAMES, example
+
+    body, reply = example("赠送时长", [(name, None) for name in NAMES[:2]])
+    gold = [dict(current_package=name, gift_package=name + "_copy") for name in NAMES[:2]]
+    snapshot = dict(
+        fingerprint="a" * 64, dataset="packages", strata=[], companies_text=COMPANIES.read_text(),
+        documents={"doc": dict(body=body, complete=True, other_spans=[])},
+        samples={"p": dict(country="赞比亚", benefit_type="赠送时长", policy_type="定向政策")},
+        pairs={"p": dict(id="p", row_id="row", token="doc", span=[0, len(body)], package_style="name_only",
+                         configuration={"packages": {"value": normalize("packages", gold)}})},
+        denominators=dict(whole_policy=[], fields={"packages": {"ids": ["p"], "excluded": {}}}),
+    )
+    monkeypatch.setattr(cli, "load_freeze", lambda *_: snapshot)
+    table = repo / "synthetic.csv"
+    shutil.copyfile(COMPANIES.with_name("package-levels.csv"), table)
+    args = [*run_args(snapshot["fingerprint"]), "--package-levels", ".private/synthetic.csv"]
+    assert main(args, model=lambda **_: json.dumps(reply)) == 0
+    business = get_json(repo / "run/public-report.json")["business"]
+    assert business["rates"]["package_rows_exact"] == {"numerator": 1, "denominator": 1, "percent": 100}
+    assert business["by_benefit_type"]["赠送时长"]["packages"]["correct"] == 1
+    assert business["by_field"]["packages"]["false_determined"] == 0
+    replay = ["replay", "--recording", ".private/run", "--frozen", ".private/frozen",
+              "--expect-sha256", snapshot["fingerprint"], "--out", ".private/replay"]
+    table.write_bytes(b"changed")
+    monkeypatch.setattr(cli, "datetime", LaterClock)
+    assert main([*replay, "--package-levels", ".private/synthetic.csv"]) == 1
+    assert main(replay) == 0
+    assert get_json(repo / "replay/public-report.json")["business"] == business

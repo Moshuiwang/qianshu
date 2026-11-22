@@ -18,6 +18,7 @@ from .parse.benefits import ADJUSTMENT_HINTS, OFFER_FIELD_LABELS, BenefitCatalog
 from .parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from .parse.evidence import STRUCTURE_REASONS, PolicyStructureIssue
 from .parse.model import ParseModel
+from .parse.protocol import RequestedTier
 from .parse.names import PROPOSED_NAME_LABEL
 
 _FIELD_LABELS = {
@@ -232,6 +233,8 @@ def _field_lines(
 
 
 def _value_parts(value: object, *, nested: bool = False) -> Iterator[str | _ModelText]:
+    if isinstance(value, RequestedTier):
+        value = value.model_dump(exclude_none=True)
     if isinstance(value, (dict, list)):
         mapping = isinstance(value, dict)
         yield "{" if mapping else "["
@@ -325,6 +328,8 @@ class _Policy:
     hints: tuple[str, ...]
     explanations: Mapping[str, str]
     validation: validate.ValidationResult | None = None
+    tier_candidates: tuple[str, ...] = ()
+    tier_field: DraftField | None = None
     policy_name_source: str | None = None
 
     @property
@@ -380,6 +385,13 @@ class _Policy:
                     yield CardLine(f"{prefix} · 自动调整 · {_FIELD_LABELS[item.field]}", item.reason)
             for item in result.warnings:
                 yield CardLine(f"{prefix} · 提醒项 · {_FIELD_LABELS[item.field]}", item.reason)
+        if self.tier_field:
+            yield from _field_lines(f"{prefix} · 节目包档位", self.tier_field, self.explanations.get("package_tiers"), redact, offer=True)
+        for candidate in self.tier_candidates:
+            yield _ModelLine(f"{prefix} · 节目包档位候选", "", parts=(_ModelText(candidate, "value"),))
+        if self.tier_candidates and self.tier_field:
+            parts = tuple(_ModelText(q.text, "evidence", start=q.start) for q in self.tier_field.evidence)
+            yield _ModelLine(f"{prefix} · 节目包档位候选", "档位原文　", parts=parts)
         inactive, required = benefit_applicability(self.draft)
         for field in fields(self.draft):
             value = getattr(self.draft, field.name)
@@ -518,6 +530,8 @@ class Pipeline:
                     if (explanation := result.statement.explanation) and explanation.strip()
                 }
                 policies.append(_Policy(draft, hints, explanations,
+                                        tier_candidates=getattr(parsed, "package_tier_candidates", ()),
+                                        tier_field=getattr(parsed, "tier_field", None),
                                         policy_name_source=getattr(parsed, "policy_name_source", None)))
         except Exception:
             return self._detail_pages(display_body, [

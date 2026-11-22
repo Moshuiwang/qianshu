@@ -12,6 +12,7 @@ from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
 from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
+from qianshu.parse.package_levels import PackageLevels, load_package_levels
 
 from .business import CATEGORIES, COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
@@ -162,8 +163,11 @@ def _new_field_status(draft, name: str) -> str:
 
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
-    threshold: int = DEFAULT_THRESHOLD, recording=None, today: date | None = None,
+    threshold: int = DEFAULT_THRESHOLD, recording=None, package_levels: PackageLevels | None = None,
+    today: date | None = None, package_run_day: date | None = None,
 ) -> tuple[dict, dict]:
+    if package_levels is None:
+        package_levels = load_package_levels()
     samples = frozen["samples"]
     pairs = defaultdict(list)
     for pair in frozen["pairs"].values():
@@ -230,6 +234,7 @@ def evaluate(
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
+                package_levels=package_levels, package_run_day=package_run_day,
                 today=today, country_codes=codes,
                 recorded_reply=getattr(recording, "origin", None) in ("replay", "probe"),
             )

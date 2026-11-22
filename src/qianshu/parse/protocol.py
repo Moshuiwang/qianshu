@@ -116,6 +116,20 @@ class RequestedPackage(Declaration):
     gift_package: str | None
 
 
+class RequestedTier(Declaration):
+    role: Literal["当前包", "受赠目标"] | None = None
+    tier: Literal["低", "中", "高", "最高"] | None = None
+    platform: str | None = None
+
+    @field_validator("role", "tier", mode="wrap")
+    @classmethod
+    def _optional_tier_enum(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            return None
+
+
 class RequestedTariff(Declaration):
     base_package: str
     price_plan: str
@@ -170,6 +184,7 @@ class Findings(Declaration):
     effective_multiplier: Finding[int | float]
     user_tags: Finding[list[str]]
     packages: Finding[list[RequestedPackage]]
+    package_tiers: OptionalOffer[list[RequestedTier]] = Field(default_factory=OfferFinding)
     user_scope: Finding[str]
     approval_url: Finding[str]
     approval_attachments: Finding[list[str]]
