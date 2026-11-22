@@ -65,6 +65,42 @@ def test_congo_old_names_normalize_before_uniqueness_checks(legacy):
     assert [d.company.value for d in _parse(body, reply, table + duplicate, legacy=legacy)] == [None, None]
 
 
+@pytest.mark.parametrize("name", ["刚果", "Congo", "The Congo"])
+def test_unspecified_congo_requires_country_and_company_confirmation(name):
+    table = HEADER + "刚果（金）\t\t0001\t占位甲公司\n刚果（布）\t\t0002\t占位乙公司\n"
+    reply = fixed_reply(name, [{"country": _field(name, name)}])
+    draft, = _parse(name, reply, table)
+    country = draft.field_results["country"]
+    assert country.needs_confirmation
+    assert "unknown_country" in country.issues
+    assert draft.field_results["company"].needs_confirmation
+
+
+@pytest.mark.parametrize(("name", "canonical"), [
+    ("刚果金", "刚果（金）"),
+    ("刚果民主共和国", "刚果（金）"),
+    ("Democratic Republic of the Congo", "刚果（金）"),
+    ("刚果布", "刚果（布）"),
+    ("刚果共和国", "刚果（布）"),
+    ("Republic of the Congo", "刚果（布）"),
+])
+def test_specific_congo_alias_resolves_to_canonical_country(name, canonical):
+    reply = fixed_reply(name, [{"country": _field(name, name)}])
+    draft, = _parse(name, reply)
+    country = draft.field_results["country"]
+    assert (country.value, country.needs_confirmation) == (canonical, False)
+
+
+def test_company_table_skips_unspecified_congo_row():
+    from pathlib import Path
+    from qianshu.parse.companies import load_company_rules
+
+    table = HEADER + "刚果\t\t0001\t占位甲公司\n贝宁\t\t0002\t占位乙公司\n"
+    rules_dir = Path(__file__).resolve().parents[2] / "rules"
+    rules = load_company_rules(rules_dir, Path("unused.tsv"), companies_text=table)
+    assert rules.names == {"贝宁": ["占位乙公司"]}
+
+
 @pytest.mark.parametrize("status", ["歧义", "冲突", "带条件", "缺证据"])
 @pytest.mark.parametrize("name", ["country", "company_keyword", "company"])
 def test_r10_does_not_fill_from_unverified_inputs(name, status):
