@@ -7,13 +7,13 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from qianshu.config import load_config
 from qianshu.draft import Candidate, DraftField, PolicyDraft, SourceExcerpt, Uncertainty
 
 from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
 from .evidence import EvidenceReview, ReviewRange, Sources, issue
-from .model import ModelError, ModelReplyError, ParseModel, configured_model
+from .model import ModelError, ModelReplyError, ParseModel, configured_model, validate_reply_json
+from .model import load_model_config as load_config
 from .protocol import (
     ApplicationReply, DocumentFinding, DocumentStatus, Evidence, FieldResult, Finding, Policy,
     SourceBlock, Span, ValueSource,
@@ -156,20 +156,9 @@ def parse_application(
     return ParseResult(drafts, pending=review.pending, document=parsed.document, declaration=parsed)
 
 
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result = dict(pairs)
-    if len(result) != len(pairs):
-        raise ValueError
-    return result
-
-
-def _reject_constant(_: str) -> None:
-    raise ValueError
-
-
 def _decode(reply: str) -> ApplicationReply:
     try:
-        json.loads(reply, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+        validate_reply_json(reply)
     except (ValueError, TypeError, RecursionError):
         raise ParseError("申请解析模型回复不是有效的政策 JSON。", code="reply_json") from None
     try:

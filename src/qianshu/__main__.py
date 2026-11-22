@@ -34,7 +34,7 @@ from .feishu.settings import load_handoff_settings
 from .logs import setup_logging
 from .parse._output import check_output_path
 from .parse.companies import DEFAULT_COMPANIES_FILE
-from .parse.model import configured_model
+from .parse.model import configured_model, load_model_config
 from .pipeline import Pipeline
 
 
@@ -549,7 +549,7 @@ def _serve(
         "ANTHROPIC_BASE_URL" in os.environ and "ANTHROPIC_BASE_URL" not in config
     ):
         raise ConfigError("请通过 .env 配置 AI 接口，并移除 SDK 的进程环境覆盖。")
-    model = configured_model(config)
+    model = configured_model(load_model_config(env_file=args.env_file, config=config))
 
     def complete(*, system: str, user: str) -> str:
         if not window.contains(time.time()):

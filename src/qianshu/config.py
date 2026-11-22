@@ -27,7 +27,6 @@ CONFIG_KEYS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
-    "ANTHROPIC_EFFORT",
 )
 
 # 端口、邮箱文件夹名和模型名仅用于选择连接端口、收件范围和模型，允许写入日志。
@@ -79,10 +78,7 @@ def load_config(*required: str, env_file: Path = Path(".env")) -> Config:
     config = {}
     for key in CONFIG_KEYS:
         value = raw_values.get(key)
-        if key == "ANTHROPIC_EFFORT" and key in raw_values:
-            # 显式空值也交给模型配置校验。
-            config[key] = value or ""
-        elif value and value.strip():
+        if value and value.strip():
             config[key] = value
 
     missing = [key for key in required if key not in config]

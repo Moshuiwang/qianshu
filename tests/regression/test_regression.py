@@ -921,9 +921,9 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
         assert "tool_choice" not in payload
         assert "必须调用 `submit_application_reply` 一次" in payload["system"]
         assert "不要用文字回答" in payload["system"]
-        return nullcontext(SimpleNamespace(get_final_message=lambda: reply))
+        return nullcontext([SimpleNamespace(type="message_start", message=reply)])
 
-    client = SimpleNamespace(messages=SimpleNamespace(stream=stream))
+    client = SimpleNamespace(messages=SimpleNamespace(create=stream))
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
@@ -1013,6 +1013,80 @@ def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monk
     assert report["void"] is True
 
 
+def _stream_reply_events(text, *, interrupted=False):
+    events = [
+        {"type": "message_start", "message": {
+            "id": "msg_placeholder", "role": "assistant", "type": "message", "model": "placeholder-model",
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+        }},
+    ]
+    if interrupted:
+        events.extend([
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+        ])
+    else:
+        events.append({"type": "content_block_start", "index": 0, "content_block": {
+            "type": "tool_use", "id": "toolu_placeholder", "name": "submit_application_reply", "input": {},
+        }})
+        split = len(text) // 2
+        events.extend(
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "input_json_delta", "partial_json": chunk}}
+            for chunk in (text[:split], text[split:])
+        )
+        events.extend([
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+             "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        ])
+    for event in events:
+        yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+
+
+@pytest.mark.parametrize("damage", ["missing_brace", "duplicate_key", "nonfinite", "invalid_character"])
+def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, frozen, monkeypatch, damage):
+    import anthropic
+    import httpx
+
+    valid = serialized_empty(BATCH)
+    invalid = {
+        "missing_brace": valid.removesuffix("}"),
+        "duplicate_key": valid.removesuffix("}") + ', "policies": []}',
+        "nonfinite": valid.removesuffix("}") + ', "nonfinite": NaN}',
+        "invalid_character": valid + "!",
+    }[damage]
+
+    def reply(request):
+        user = json.loads(request.content)["messages"][0]["content"]
+        body = json.loads(user)["application"]
+        text = invalid if body == BATCH else serialized_empty(body)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content=b"".join(_stream_reply_events(text)))
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+        transport=httpx.MockTransport(reply), **kwargs,
+    ))
+    monkeypatch.setenv("AI_PLATFORM", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
+    assert main([*run_args(frozen), "--live", "--release"]) == 0
+    report = get_json(repo / "run/public-report.json")
+    assert report["void"] is False
+    assert report["documents"] == {"model_failed": 0, "parse_failed": 1, "parsed": 1}
+    assert report["business"]["counts"]["reply_parse_failed"] == 1
+    assert report["business"]["reply_parse_failure_reasons"]["reply_parse"] == 1
+    record = get_json(repo / "run/document-00001.json")
+    attempt, = record["attempts"]
+    assert attempt["failure_stage"] == record["reason_code"] == "tool_input_json"
+    assert (attempt["reply"], attempt["stop_reason"]) == (invalid, "tool_use")
+    assert main(_replay_args(frozen)) == 0
+    for name in runner.RUN_FILES:
+        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+
+
 @pytest.mark.parametrize(("interruption", "retry_reply"), [
     ("timeout", None), ("disconnect", None), ("eof", None),
     ("timeout", "valid"), ("timeout", "invalid"),
@@ -1027,32 +1101,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
             self.interrupted = interrupted
 
         def __iter__(self):
-            events = [
-                {"type": "message_start", "message": {
-                    "id": "msg_placeholder", "role": "assistant", "type": "message", "model": "placeholder-model",
-                    "content": [], "stop_reason": None, "stop_sequence": None,
-                    "usage": {"input_tokens": 1, "output_tokens": 0},
-                }},
-            ]
-            if self.interrupted:
-                events.extend([
-                    {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-                    {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": self.text}},
-                ])
-            else:
-                events.extend([
-                    {"type": "content_block_start", "index": 0, "content_block": {
-                        "type": "tool_use", "id": "toolu_placeholder", "name": "submit_application_reply", "input": {},
-                    }},
-                    {"type": "content_block_delta", "index": 0,
-                     "delta": {"type": "input_json_delta", "partial_json": self.text}},
-                    {"type": "content_block_stop", "index": 0},
-                    {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
-                     "usage": {"output_tokens": 1}},
-                    {"type": "message_stop"},
-                ])
-            for event in events:
-                yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+            yield from _stream_reply_events(self.text, interrupted=self.interrupted)
             if self.interrupted and interruption == "timeout":
                 raise httpx.ReadTimeout("占位超时")
             if self.interrupted and interruption == "disconnect":
@@ -1100,8 +1149,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
     else:
         assert second["failure_stage"] == record["reason_code"] == "reply_schema"
         assert record["structure_path"] == ["policies"]
-        block, = json.loads(second["reply"])
-        assert block["type"] == "tool_use" and block["input"] == {}
+        assert second["reply"] == "{}"
     assert main(_replay_args(frozen)) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
     for name in runner.RUN_FILES:

@@ -9,11 +9,12 @@ import os
 import sys
 from pathlib import Path
 
-from qianshu.config import ConfigError, load_config
+from qianshu.config import ConfigError
 
 from . import ModelError, ParseError, parse_application
 from ._output import check_output_path
 from .companies import DEFAULT_COMPANIES_FILE
+from .model import load_model_config as load_config
 
 
 def _write_private(path: Path, text: str) -> None:
