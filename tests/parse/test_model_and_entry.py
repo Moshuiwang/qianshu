@@ -150,12 +150,18 @@ def stub_stream(monkeypatch):
 
     def events():
         reply = get_reply()
-        yield SimpleNamespace(type="message_start", message=reply)
+        # 和 SDK 一样从空内容开始，逐块提交。
+        message = SimpleNamespace(**{**vars(reply), "content": []})
+        yield SimpleNamespace(type="message_start", message=message)
         for index, block in enumerate(getattr(reply, "content", ())):
+            yield SimpleNamespace(type="content_block_start", index=index, content_block=block)
             if block.type == "tool_use":
                 yield SimpleNamespace(type="content_block_delta", index=index, delta=SimpleNamespace(
                     type="input_json_delta", partial_json=json.dumps(block.input),
                 ))
+
+            yield SimpleNamespace(type="content_block_stop", index=index)
+        yield SimpleNamespace(type="message_stop")
 
     open_stream = Mock(side_effect=lambda **_: nullcontext(events()))
     client = SimpleNamespace(messages=SimpleNamespace(create=open_stream))
@@ -210,7 +216,8 @@ def test_stream_rejects_bad_tool_reply_and_records_content(stub_stream, case, co
     with pytest.raises(ModelReplyError, match="回复解析失败") as exc:
         complete(system="", user="")
     assert (exc.value.code, exc.value.path) == (code, path)
-    result, = captured
+    assert len(captured) == (2 if case == "multiple" else 1)
+    result = captured[-1]
     assert result.failure_stage == code
     assert result.reply == exc.value.reply
     if case == "invalid":
@@ -680,3 +687,120 @@ def test_service_rejects_unignored_private_raw_directory(monkeypatch, capsys, ou
     assert capsys.readouterr() == ("", "输出路径位于 Git 工作区，须已被 Git 忽略且未被跟踪。\n")
     config.assert_not_called()
     assert not list(output.iterdir())
+
+
+@pytest.mark.parametrize("shape", ["missing_evidence", "missing_quote_text", "reply_tool_multiple"])
+@pytest.mark.parametrize("repaired", [False, True])
+def test_shape_retry_through_group_card(stub_stream, monkeypatch, shape, repaired):
+    from copy import deepcopy
+    from qianshu import validate
+    from qianshu.feishu import Message
+    from qianshu.feishu.entrance import Application
+    from qianshu.pipeline import Pipeline
+
+    body = "合成保留标记甲"
+    valid = fixed_reply(body, [{"user_scope": {"value": "占位用户", "evidence": ["合成不在原文的出处"]}}])
+    invalid = deepcopy(valid)
+    finding = invalid["policies"][0]["fields"]["user_scope"]
+    path = ["policies", 0, "fields", "user_scope", "evidence"]
+    if shape == "missing_evidence":
+        del finding["evidence"]
+    elif shape == "missing_quote_text":
+        del finding["evidence"][0]["text"]
+        path += [0, "text"]
+    else:
+        path = ["content"]
+    bad_blocks = [_reply_tool(invalid)] * (2 if shape == "reply_tool_multiple" else 1)
+    stream, get_reply = stub_stream
+    get_reply.side_effect = [SimpleNamespace(stop_reason="tool_use", content=blocks)
+                             for blocks in (bad_blocks, [_reply_tool(valid)] if repaired else bad_blocks)]
+    results = []
+    model = configured_model({"ANTHROPIC_API_KEY": "synthetic"}, on_result=results.append)
+    validate_batch = Mock(wraps=validate.validate_batch)
+    monkeypatch.setattr(validate, "validate_batch", validate_batch)
+    pipeline = Pipeline(model=model, companies_file=Path(__file__).parent / "fixtures/companies.tsv", tag_dates={})
+    message = Message("合成消息", "合成群", "合成发送者", 0, "text", "")
+    pages = pipeline(Application(message, body, ()))
+    elements = [el for page in pages for el in page.elements]
+    card = json.dumps(elements, ensure_ascii=False)
+    assert stream.call_count == 2
+    first, second = (call.kwargs["messages"] for call in stream.call_args_list)
+    assert second[:1] == first
+    assert all(block["input"] == {} for block in second[1]["content"])
+    assert all(json.loads(item["content"]) == {"path": path, "reason": shape} for item in second[2]["content"])
+    assert body not in json.dumps(second[1:], ensure_ascii=False)
+    assert [r.first_shape_error for r in results] == [shape, shape]
+    assert results[-1].retry_result == ("succeeded" if repaired else "failed")
+    if repaired:
+        assert "解析完成，共 1 条政策" in card
+        assert "用户范围 · 待确认" in card
+        validate_batch.assert_called_once()
+    else:
+        assert "解析不完整，需人工确认" in card and "政策 1 ·" not in card
+        validate_batch.assert_not_called()
+        assert all(el["tag"] != "action" for el in elements)
+
+
+@pytest.mark.parametrize("damage", ["bad_start", "negative_delta", "bad_stop", "missing_stop", None])
+def test_stream_requires_matching_indices_and_message_stop(monkeypatch, damage):
+    block = _reply_tool({"policies": []})
+    message = SimpleNamespace(content=[], stop_reason="tool_use", usage=SimpleNamespace(input_tokens=7, output_tokens=1))
+    events = [
+        SimpleNamespace(type="message_start", message=message),
+        SimpleNamespace(type="content_block_start", index=1 if damage == "bad_start" else 0, content_block=block),
+        SimpleNamespace(type="content_block_delta", index=-1 if damage == "negative_delta" else 0,
+                        delta=SimpleNamespace(type="input_json_delta", partial_json=serialized_empty())),
+        SimpleNamespace(type="content_block_stop", index=1 if damage == "bad_stop" else 0),
+    ]
+    if damage != "missing_stop":
+        events.append(SimpleNamespace(type="message_stop"))
+    transport = Mock(return_value=nullcontext(events))
+    client = SimpleNamespace(messages=SimpleNamespace(create=transport))
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
+    calls = []
+    model = configured_model({"ANTHROPIC_API_KEY": "synthetic"}, on_result=calls.append)
+    if damage:
+        with pytest.raises(ModelReplyError) as exc:
+            model(system="", user="")
+        assert exc.value.code == "reply_truncated"
+        assert calls[0].partial_input_tokens == 7 and calls[0].input_tokens is None
+    else:
+        assert model(system="", user="") == serialized_empty()
+        assert calls[0].input_tokens == 7 and calls[0].partial_input_tokens is None
+    assert transport.call_count == len(calls) == 1
+
+
+def test_shape_correction_network_failure_has_no_sdk_retry(monkeypatch):
+    client_type = anthropic.Anthropic
+    requests = []
+
+    def transport(request):
+        requests.append(json.loads(request.content)["messages"])
+        if len(requests) > 1:
+            return httpx.Response(503, json={"type": "error", "error": {"type": "api_error", "message": "synthetic"}})
+        value = fixed_reply("合成材料", [{}])
+        del value["policies"][0]["fields"]["country"]["evidence"]
+        events = [
+            {"type": "message_start", "message": {"id": "msg_synthetic", "type": "message", "role": "assistant",
+             "model": "synthetic", "content": [], "stop_reason": None, "stop_sequence": None,
+             "usage": {"input_tokens": 1, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_synthetic", "name": "submit_application_reply", "input": {}}},
+            {"type": "content_block_delta", "index": 0, "delta": {
+                "type": "input_json_delta", "partial_json": json.dumps(value)}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+             "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        ]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
+
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: client_type(
+        http_client=httpx.Client(transport=httpx.MockTransport(transport)), **kw))
+    results = []
+    model = configured_model({"ANTHROPIC_API_KEY": "synthetic"}, on_result=results.append)
+    with pytest.raises(ModelError):
+        model(system="", user="合成材料")
+    assert len(requests) == len(results) == 2
+    assert results[-1].retry_result == "failed"

@@ -583,4 +583,10 @@ class Pipeline:
             for index, excerpt in enumerate(entry.evidence, 1):
                 lines.append(_ModelLine(f"{title} · 原文出处 {index}", "",
                                         parts=(_ModelText(excerpt.text, "name_evidence", start=excerpt.start),)))
+        # 追加到既有引文之后，使既有片段仍按原顺序连续参与整卡脱敏。
+        for index, policy in enumerate(policies, 1):
+            if policy.approval_url_deferred:
+                for number, excerpt in enumerate(policy.draft.approval_url.evidence, 1):
+                    lines.append(_ModelLine(f"政策 {index} · 任务审批链接 · 原文出处 {number}", "",
+                                            parts=(_ModelText(excerpt.text, "evidence", start=excerpt.start),)))
         return self._detail_pages(display_body, lines, redact)

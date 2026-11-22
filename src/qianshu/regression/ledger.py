@@ -155,13 +155,17 @@ class Ledger:
             if key in items:
                 if items[key]["sha256"] != checksum:
                     raise RegressionError("同一批量结果的字节冲突。")
-                return
-            items[key] = {"sha256": checksum, "usd": cost["known_usd"] or "0"}
+                if "missing" in items[key]:
+                    return
+            items[key] = {"sha256": checksum, "usd": cost["known_usd"] or "0",
+                          "missing": cost["known_usd"] is None or bool(cost["missing_attempts"])}
             total = sum(Decimal(item["usd"]) for item in items.values())
             # 旧版可能已登记整批费用，续取期间保留该已知金额。
             spent = max(total, Decimal(row["spent_usd"]))
-            row.update(spent_usd=str(spent), committed_usd=str(max(Decimal(row["reserved_usd"]) - spent, 0)),
-                       active=True)
+            reserve = Decimal(row["reserved_usd"])
+            if not any(item.get("missing", True) for item in items.values()):
+                reserve = max(reserve - spent, 0)
+            row.update(spent_usd=str(spent), committed_usd=str(reserve), active=True)
 
     def record_cost(self, run_id, cost):
         known = cost["known_usd"]
@@ -171,8 +175,5 @@ class Ledger:
         with transaction(self.files, self.path) as runs:
             row = runs[run_id]
             row["spent_usd"] = str(cost)
-            remaining = Decimal(row["reserved_usd"])
-            if row["mode"] == "batch":
-                remaining = max(remaining - Decimal(cost), 0)
-            row["committed_usd"] = str(remaining) if missing else "0"
+            row["committed_usd"] = row["reserved_usd"] if missing else "0"
             row["active"] = False

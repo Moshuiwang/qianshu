@@ -65,7 +65,7 @@ def test_batch_sdk_record_replay_and_resume(repo, frozen, monkeypatch):
     ledger_path = repo / "regression-ledger.json"
     assert manifest["ledger"] == {"path": str(ledger_path), "sha256": digest(ledger_path.read_bytes())}
     entry = get_json(ledger_path)["r1"]
-    assert entry["spent_usd"] == "0.0002" and entry["committed_usd"] == "2.5998"
+    assert entry["spent_usd"] == "0.0002" and entry["committed_usd"] == "2.6"
     assert entry["active"] is False
     assert main(["run", *subset, "--out", ".private/immediate", "--live", "--run-id", "r2",
                  "--estimate-usd", "2", "--release", "--mode", "instant"]) == 0
@@ -133,7 +133,7 @@ def test_deterministic_whole_document_projection():
         tiers.project(snapshot, tiers.select(snapshot, {k: {"required": True} for k in docs}))
 
 
-@pytest.mark.parametrize("fault", ["lost_create", "missing", "conflict", "unknown", "deadline", "disconnect"])
+@pytest.mark.parametrize("fault", ["lost_create", "missing", "conflict", "unknown", "deadline", "disconnect", "partial_usage"])
 def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
     posts = []
     broken = True
@@ -157,6 +157,10 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
                 first = json.loads(rows[0])
                 first["result"]["usage"] = {"input_tokens": 8000000, "output_tokens": 0}
                 rows[0] = json.dumps(first) + "\n"
+            if fault == "partial_usage":
+                first = json.loads(rows[0])
+                first["result"]["usage"] = {"input_tokens": 250000}
+                rows[0] = json.dumps(first) + "\n"
             if broken:
                 if fault == "missing":
                     rows.pop()
@@ -164,7 +168,7 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
                     rows.append(rows[0].replace("expired", "canceled"))
                 elif fault == "unknown":
                     rows.append('{"custom_id":"unknown","result":{"type":"expired"}}\n')
-                elif fault == "disconnect":
+                elif fault in {"disconnect", "partial_usage"}:
                     return httpx.Response(200, stream=BrokenStream(rows[0].encode()))
             return httpx.Response(200, content="".join(rows + [rows[0]]).encode())
         state = "in_progress" if broken and fault == "deadline" else "ended"
@@ -204,6 +208,12 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
                 for mode in ("batch", "instant"):
                     with pytest.raises(RegressionError, match="预算"):
                         ledger.reserve("next", mode, "1", "next")
+    elif fault == "partial_usage":
+        assert main([*args, "--resume"]) == 1
+        row = get_json(repo / ledger_path)["r"]
+        assert Decimal(row["spent_usd"]) == Decimal("0.25")
+        assert Decimal(row["committed_usd"]) == Decimal("1.30")
+        assert row["active"] is True
     else:
         assert get_json(repo / ledger_path)["r"]["committed_usd"] == "1.3"
     assert main(args) == 1
@@ -513,6 +523,9 @@ def test_instant_disconnect_after_start_keeps_reservation(repo, frozen, monkeypa
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     assert main([*run_args(frozen), "--live", "--mode", "instant", "--trial", "1", "--retries", "1",
                  "--run-id", "broken", "--estimate-usd", "1"]) == 0
+    attempts = get_json(repo / "run/document-00001.json")["attempts"]
+    assert all((a["partial_input_tokens"], a["partial_output_tokens"]) == (1, 0) for a in attempts)
+    assert all(a["input_tokens"] is None and a["output_tokens"] is None for a in attempts)
     cost = get_json(repo / "run/public-report.json")["cost"]
     assert cost["usage_status"] == "用量部分未知" and cost["missing_attempts"] == 2
     row = get_json(repo / "regression-ledger.json")["broken"]
@@ -530,11 +543,12 @@ def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
         manifest = {"run_id": "history", "origin": "live", "source_code_measured": True}
         for _ in range(2):
             ledger.carry_recording(manifest, "history-sha", cost, "1")
-        for key, row in get_json(repo / ledger.path).items():
-            remaining = "1.3" if key == "history" else "1.05"
-            assert row["committed_usd"] == remaining and row["spent_usd"] == "0.25"
+        for row in get_json(repo / ledger.path).values():
+            assert row["committed_usd"] == "1.3" and row["spent_usd"] == "0.25"
             assert row["active"] is False
         for i in range(3):
             ledger.reserve(f"next-{i}", "batch", "1", str(i))
         with pytest.raises(RegressionError, match="名额"):
             ledger.reserve("fourth", "batch", "1", "fourth")
+
+
