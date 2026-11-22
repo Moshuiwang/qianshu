@@ -1713,11 +1713,6 @@ def run(args, directory, *, clock=time.time):
     sensitive = {token, official_token, official_app_id}
     display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
     sensitive.update(value for key, value in secrets.items() if key not in display_settings and receipt(value))
-    tracked = [values["policy_name"], args.registration, *(spec["label"] for spec in config["fields"].values())]
-    require(not any(secret in item for item in tracked for secret in sensitive), "展示字段与凭据冲突", CredentialConflict)
-    require(not any(secret in item for item in (card_summary(values), contact)
-                    for secret in (token, official_token, official_app_id)), "展示字段与凭据冲突", CredentialConflict)
-
 
     def login_check():
         require(not pending, "降包用户取消优惠须确认具体取值")
@@ -1741,6 +1736,10 @@ def run(args, directory, *, clock=time.time):
     settings = load_settings(args.env_file)
     with ledger_open(directory, args.registration, values["policy_name"]) as ledger:
         ledger.check_available()
+        tracked = [values["policy_name"], args.registration, *(spec["label"] for spec in config["fields"].values())]
+        require(not any(secret in item for item in tracked for secret in sensitive), "展示字段与凭据冲突", CredentialConflict)
+        require(not any(secret in item for item in (card_summary(values), contact)
+                        for secret in (token, official_token, official_app_id)), "展示字段与凭据冲突", CredentialConflict)
         timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
         with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             api = Official(official, official_token, official_app_id, client)

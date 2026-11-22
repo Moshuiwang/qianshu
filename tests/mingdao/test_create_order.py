@@ -2191,6 +2191,36 @@ def test_credential_stop_announces_manual_handoff(case, platform, business_cli, 
     assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
 
 
+def test_unknown_create_reentry_with_credential_conflict(case, platform, business_cli, capsys):
+    platform.create_effect = "timeout"
+    code, error = business_cli.run()
+    assert code == 1 and "需人工对账" in error
+    assert events(case)[-2:] == ["create_unknown", "create_reconciled_read"]
+    assert platform.actions[-4:] == ["card", "search", "create", "search"]
+
+    settings = case.private / "synthetic-settings"
+    with settings.open("a") as stream:
+        stream.write(f"PLACEHOLDER_EXTRA={case.values['policy_name']}\n")
+    before = events(case)
+    actions = platform.actions.copy()
+    code = order.main(["--config", str(case.private / "config.json"), "--registration", case.ids["registration"],
+                       "--env-file", str(settings), str(case.private / "draft.json")])
+
+    assert code == 1 and "登记编号已使用" in capsys.readouterr().err
+    assert events(case) == before
+    assert platform.actions == actions
+    assert platform.create_count == 1
+    assert all("未建单" not in message for message in business_cli.notices)
+
+
+def test_fresh_registration_with_credential_conflict(case, platform, business_cli):
+    case.config["fields"][case.control["user_scope"]]["label"] += case.session_token
+    code, error = business_cli.run()
+    assert code == 1 and "展示字段与凭据冲突" in error
+    assert not business_cli.summaries and platform.create_count == 0
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+
+
 def test_unmapped_inactive_control_stops_before_approval(case, platform, business_cli):
     control = str(uuid4())
     case.config["fields"][control] = {"type": 6, "label": "可看天数"}
