@@ -45,7 +45,7 @@ G285_MAPPING = {
         "days_by_benefit": {
             "input": "benefit_type", "fields": ["recharge_days", "gift_days"], "types": ["赠送时长", "升级权益"],
         },
-        "packages": {"input": "benefit_type", "package_style": "tier_only", "required_rows": 1, "required_gift": True},
+        "packages": {"input": "benefit_type", "package_style": "tier_only", "minimum_rows": 1, "required_gift": True},
     },
     "defaults": {
         **LEGACY_DEFAULTS,
@@ -385,7 +385,7 @@ def _g285_mark(
     elif name == "packages" and value is not None:
         needs_review |= (
             package_style == rule["package_style"] or source_status.get(rule["input"]) in unresolved_inputs
-            or len(value) != rule["required_rows"] or (rule["required_gift"] and any(not row["gift_package"] for row in value))
+            or len(value) < rule["minimum_rows"] or (rule["required_gift"] and any(not row["gift_package"] for row in value))
         )
     return {"inferable": "value" in entry, "auto_allowed": not needs_review, "default": default}
 

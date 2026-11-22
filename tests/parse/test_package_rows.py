@@ -188,3 +188,95 @@ def test_two_policies_share_one_snapshot_and_keep_their_own_rows(tmp_path, monke
     drafts = parse.parse_application(body, model=lambda **_: json.dumps(reply), companies_file=COMPANIES)
     assert calls == [1]
     assert [[row.current_package for row in draft.packages.value] for draft in drafts] == [[NAMES[0]], [NAMES[1]]]
+
+
+@pytest.mark.parametrize("missing", ["none", "package_tiers", "null", "bad_shape", "value", "status",
+                                     "evidence", "role", "tier", "platform"])
+def test_tier_optional_parts_only_affect_tier(tmp_path, missing):
+    body, reply = example("赠送时长", [(NAMES[0], None)])
+    fields = reply["policies"][0]["fields"]
+    item = dict(role="当前包", tier="高", platform="DTT")
+    tier = dict(status="确定", value=[item], evidence=[quote(body, "政策标题")])
+    fields["package_tiers"] = tier
+    if missing == "package_tiers":
+        del fields[missing]
+    elif missing in {"null", "bad_shape"}:
+        fields["package_tiers"] = None if missing == "null" else [42]
+    elif missing in item:
+        del item[missing]
+    elif missing in tier:
+        del tier[missing]
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.packages.uncertainty is None and draft.packages.value[0].current_package == NAMES[0]
+    if missing == "package_tiers":
+        assert draft.tier_field is None
+    elif missing in {"none", "platform"}:
+        assert draft.package_tier_candidates and draft.tier_field.uncertainty is None
+    else:
+        assert draft.tier_field.uncertainty and not draft.package_tier_candidates
+
+
+@pytest.mark.parametrize("status", ["歧义", "冲突", "带条件", "缺证据", "确定"])
+def test_unverified_tier_does_not_clear_verified_rows(tmp_path, monkeypatch, status):
+    pairs = [(name, None) for name in NAMES[:2]]
+    body, reply = example("赠送时长", pairs)
+    reply["policies"][0]["fields"]["package_tiers"] = statement(
+        status, value=[dict(role="当前包", tier="高")],
+        evidence=[quote(body, "错误摘录" if status == "确定" else "政策标题")],
+    )
+    levels = load(tmp_path / "levels.csv", details())
+    draft = parse_one(body, reply, levels)
+    assert [row.current_package for row in draft.packages.value] == list(NAMES[:2])
+    assert draft.packages.uncertainty is None and draft.tier_field.uncertainty
+    monkeypatch.setattr(parse, "load_package_levels", lambda: levels)
+    text = card_text(body, reply)
+    assert "节目包档位 · 待确认" in text
+    assert ("缺证据" if status == "确定" else status) in text
+
+
+def test_tier_card_masks_registered_fragments_in_catalog_and_model_text(tmp_path, monkeypatch):
+    secret = "合成ABCD保护串"
+    rows = details()[:2]
+    for row in rows:
+        row["offer_name"] = row["offer_name"].replace(NAMES[0], "独立ABCD包")
+    body, reply = scenario("特价优惠", packages=field(None, "仅当前高档", secret))
+    tier = statement("确定", value=[dict(role="当前包", tier="高")], evidence=[quote(body, "仅当前高档")])
+    reply["policies"][0]["fields"]["package_tiers"] = dict(tier, explanation="候选ABCD说明")
+    levels = load(tmp_path / "levels.csv", rows)
+    monkeypatch.setattr(parse, "load_package_levels", lambda: levels)
+    text = card_text(body, reply, sensitive_values=[secret])
+    assert "节目包档位候选" in text and "独立[已脱敏]包" in text
+    assert "ABCD" not in text
+
+
+@pytest.mark.parametrize("same_name", [True, False])
+def test_historical_offer_does_not_collide_with_active_name_or_level(tmp_path, same_name):
+    rows = details()
+    rows.append(dict(rows[0], status="停售", offer_id="old", offer_name=NAMES[0] if same_name else "历史占位包"))
+    draft = parse_one(*example("赠送时长", [(NAMES[0], None)]), load(tmp_path / "levels.csv", rows))
+    assert draft.packages.uncertainty is None and draft.packages.value[0].gift_package == NAMES[0] + "_copy"
+
+
+def test_default_run_date_excludes_expired_packages(tmp_path):
+    rows = [dict(row, sale_start_date="2000-01-01", sale_end_date="2001-01-01") for row in details()]
+    levels = load(tmp_path / "levels.csv", rows)
+    body, reply = scenario("赠送时长", start_date=field("2000-01-10", "开始日期 2000-01-10"))
+    draft, = parse.parse_application(body, model=lambda **_: json.dumps(reply), companies_file=COMPANIES,
+                                     benefit_catalog=CATALOG, package_levels=levels)
+    assert draft.field_results["packages"].issues == ("package_lookup_pending",)
+    assert draft.packages.uncertainty and draft.packages.value is None
+
+
+def test_two_catalog_candidates_share_card_fragment_check(tmp_path, monkeypatch):
+    rows = details()[:4]
+    for row in rows[2:]:
+        row["offer_name"] = row["offer_name"].replace(NAMES[1], "占位AB")
+    body, reply = scenario("特价优惠", packages=field(None, "仅当前高档"))
+    reply["policies"][0]["fields"]["package_tiers"] = dict(
+        status="确定", value=[dict(role="当前包", tier="高")], evidence=[quote(body, "仅当前高档")],
+    )
+    levels = load(tmp_path / "levels.csv", rows)
+    monkeypatch.setattr(parse, "load_package_levels", lambda: levels)
+    text = card_text(body, reply, sensitive_values=["xAB当前y"])
+    assert "占位AB" not in text
+    assert "占位[已脱敏]" in text and "[已脱敏]包 · 高档" in text

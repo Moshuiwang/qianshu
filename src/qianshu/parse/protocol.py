@@ -117,9 +117,9 @@ class RequestedPackage(Declaration):
 
 
 class RequestedTier(Declaration):
-    role: Literal["当前包", "受赠目标"]
-    tier: Literal["低", "中", "高", "最高"]
-    platform: str | None
+    role: Literal["当前包", "受赠目标"] | None = None
+    tier: Literal["低", "中", "高", "最高"] | None = None
+    platform: str | None = None
 
 
 class RequestedTariff(Declaration):
@@ -147,9 +147,7 @@ class Findings(Declaration):
     effective_multiplier: Finding[int | float]
     user_tags: Finding[list[str]]
     packages: Finding[list[RequestedPackage]]
-    package_tiers: Finding[list[RequestedTier]] = Field(default_factory=lambda: Finding(
-        status=StatementStatus.UNSUPPORTED, reason_code="field_not_reported", value=None, candidates=[], evidence=[],
-    ))
+    package_tiers: OptionalOffer[list[RequestedTier]] = Field(default_factory=OfferFinding)
     user_scope: Finding[str]
     approval_url: Finding[str]
     approval_attachments: Finding[list[str]]

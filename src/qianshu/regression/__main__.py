@@ -10,6 +10,7 @@ from pathlib import Path
 from qianshu.config import ConfigError
 from qianshu.parse import system_message
 from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_effort, configured_model
+from qianshu.parse.package_levels import DEFAULT_LEVELS_FILE, PackageLevels, decode_package_levels
 from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE
 
 from .business import DEFAULT_THRESHOLD
@@ -80,6 +81,7 @@ def _arguments(argv: list[str] | None):
         command.add_argument("--frozen", required=True, help="冻结考题、盲测集或节目包补充集。")
         command.add_argument("--expect-sha256", required=True, help="冻结或 verify 返回的预期冻结指纹。")
         command.add_argument("--out", required=True)
+        command.add_argument("--package-levels", help="本次核对使用的私有销售品 CSV 快照。")
         command.add_argument("--threshold", type=int, help="业务配对最低分。重放默认沿用来源录制配置。")
         command.add_argument("--legacy-companies", action="store_true", default=None,
                              help="按无表头两列或三列 TSV 读取冻结的公司对照表。")
@@ -159,6 +161,15 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
 
     rules = files.repo / "rules"
     config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries, effort=effort)
+    try:
+        levels_data = files.read(files.argument(args.package_levels or DEFAULT_LEVELS_FILE))
+    except FileNotFoundError:
+        if args.package_levels:
+            raise RegressionError("指定的销售品快照不存在。") from None
+        package_levels = PackageLevels()
+    else:
+        package_levels = decode_package_levels(levels_data)
+        config["package_levels_sha256"] = digest(levels_data)
     if legacy_recording:
         source_rules_sha, source_system_sha = _legacy_fingerprints(files.repo)
         if prior.get("source_rules_sha256", prior["rules_sha256"]) != source_rules_sha:
@@ -190,7 +201,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         logging.disable(logging.CRITICAL)
         try:
             report, details = evaluate(snapshot, None, rules, legacy_companies=legacy, threshold=threshold,
-                                       recording=recording)
+                                       recording=recording, package_levels=package_levels)
         finally:
             logging.disable(previous)
         counts = report["business"]["counts"]

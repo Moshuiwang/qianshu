@@ -2210,3 +2210,26 @@ def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, ca
     put_json(manifest_path, manifest)
     assert main([*_replay_args(frozen, out=".private/changed-rules"), "--legacy-recording"], model=forbidden) == 1
     assert "录制时的规则文件" in capsys.readouterr().err
+
+
+def test_package_snapshot_reaches_parser_and_scores_two_rows(repo, monkeypatch):
+    from qianshu.regression import __main__ as cli
+    from tests.parse.test_package_rows import COMPANIES, NAMES, example
+
+    body, reply = example("赠送时长", [(name, None) for name in NAMES[:2]])
+    gold = [dict(current_package=name, gift_package=name + "_copy") for name in NAMES[:2]]
+    snapshot = dict(
+        fingerprint="a" * 64, dataset="packages", strata=[], companies_text=COMPANIES.read_text(),
+        documents={"doc": dict(body=body, complete=True, other_spans=[])},
+        samples={"p": dict(country="赞比亚", benefit_type="赠送时长", policy_type="定向政策")},
+        pairs={"p": dict(id="p", row_id="row", token="doc", span=[0, len(body)], package_style="name_only",
+                         configuration={"packages": {"value": normalize("packages", gold)}})},
+        denominators=dict(whole_policy=[], fields={"packages": {"ids": ["p"], "excluded": {}}}),
+    )
+    monkeypatch.setattr(cli, "load_freeze", lambda *_: snapshot)
+    shutil.copyfile(COMPANIES.with_name("package-levels.csv"), repo / "package-levels.csv")
+    assert main(run_args(snapshot["fingerprint"]), model=lambda **_: json.dumps(reply)) == 0
+    business = get_json(repo / "run/public-report.json")["business"]
+    assert business["rates"]["package_rows_exact"] == {"numerator": 1, "denominator": 1, "percent": 100}
+    assert business["by_benefit_type"]["赠送时长"]["packages"]["correct"] == 1
+    assert business["by_field"]["packages"]["false_determined"] == 0

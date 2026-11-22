@@ -13,7 +13,7 @@ from qianshu.draft import Candidate, DraftField, OfferPolicyDraft, SourceExcerpt
 
 from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
-from .evidence import EvidenceReview, PolicyStructureIssue, Sources, issue
+from .evidence import EvidenceReview, PolicyStructureIssue, Sources, can_use_absence, issue
 from .model import ModelError, ModelReplyError, ParseModel, configured_model, validate_reply_json
 from .model import load_model_config as load_config
 from .package_levels import PackageLevels, load_package_levels
@@ -62,6 +62,7 @@ class ParseError(ValueError):
 class ParsedPolicyDraft(OfferPolicyDraft):
     """草稿及其协议证据，供卡片、私有记录和回归入口使用。"""
 
+    tier_field: DraftField | None = None
     package_tier_candidates: tuple[str, ...] = ()
     hints: list[str]
 
@@ -220,7 +221,7 @@ def _normalized_value(name: str, value: object, options: dict[str, dict[str, str
     if name in ("recharge_days", "gift_days") or name in benefits.OFFER_FIELD_LABELS:
         return benefits.normalize_benefit_value(name, value)
     if name == "package_tiers":
-        return value or None
+        return value if value and all(item.role and item.tier for item in value) else None
     if name == "packages":
         return packages.package_rows(value)
     if name == "approval_url":
@@ -237,7 +238,7 @@ def _draft(
     benefit_catalog: benefits.BenefitCatalog, levels_snapshot: Callable[[], PackageLevels], today: date | None,
 ) -> ParsedPolicyDraft:
     results = {name: review.field(policy, name) for name in policy.fields.__class__.model_fields
-               if name in policy.fields.model_fields_set}
+               if name != "package_tiers" or name in policy.fields.model_fields_set}
     for name, result in results.items():
         if result.has_value and not result.needs_confirmation:
             value = _normalized_value(name, result.value, options)
@@ -265,6 +266,9 @@ def _draft(
         field.name: _project(results, field.name, review, options)
         for field in fields(OfferPolicyDraft)
     })
+    tiers = results.get("package_tiers")
+    if tiers is not None and not can_use_absence(tiers):
+        draft.tier_field = _project(results, "package_tiers", review, options)
     draft.package_tier_candidates = tier_candidates
     draft.policy_id = policy.id
     corrected = policy.model_copy(update={

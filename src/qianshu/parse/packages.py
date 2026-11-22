@@ -2,12 +2,12 @@
 
 from collections.abc import Callable
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 
 from qianshu.draft import PackageRow
 
 from .companies import CompanyRules
-from .evidence import accept, can_use_absence, issue, verified_value
+from .evidence import accept, issue, verified_value
 from .package_levels import Offer, PackageLevels, copy_for, unique_offer
 from .protocol import FieldResult, RequestedPackage, RequestedTier, ValueSource
 
@@ -27,7 +27,7 @@ def package_rows(value: list[RequestedPackage]) -> list[PackageRow] | None:
 def _candidates(rows: tuple[Offer, ...], tiers: list[RequestedTier], day: date) -> tuple[str, ...]:
     candidates = []
     for tier in tiers:
-        eligible = [row for row in rows if row.level is not None and row.kind == "基本"
+        eligible = [row for row in rows if row.active(day) and row.level is not None and row.kind == "基本"
                     and (tier.platform is None or tier.platform == row.platform)
                     and unique_offer(rows, row.name, "基本", day) and copy_for(rows, row, day)]
         for platform in sorted({row.platform for row in eligible}):
@@ -46,16 +46,17 @@ def _candidates(rows: tuple[Offer, ...], tiers: list[RequestedTier], day: date) 
 def resolve_packages(results: dict[str, FieldResult], *, has_title: bool, levels_snapshot: Callable[[], PackageLevels],
                      rules: CompanyRules, today: date | None) -> tuple[str, ...]:
     result = results["packages"]
+    candidates = ()
 
     def pending(code: str) -> tuple[str, ...]:
         results["packages"] = issue(replace(result, value=None, has_value=False, source=None), code)
-        return ()
+        return candidates
 
     if not has_title:
         return pending("package_title_required")
     tiers = results.get("package_tiers")
-    tier_pending = tiers is not None and not can_use_absence(tiers)
-    if not verified_value(result) and not tier_pending:
+    verified_tier = tiers is not None and verified_value(tiers)
+    if not verified_value(result) and not verified_tier:
         return ()
     company = results["company"]
     if company.needs_confirmation or not verified_value(results["start_date"]):
@@ -66,11 +67,10 @@ def resolve_packages(results: dict[str, FieldResult], *, has_title: bool, levels
         return pending("package_lookup_pending")
     rows = levels_snapshot().for_company(company.value, numbers.pop())
     day = date.fromisoformat(results["start_date"].value)
-    if today is not None:
-        day = max(today, day)
-    if tier_pending:
-        pending("package_tier_pending")
-        return _candidates(rows, tiers.value, day) if verified_value(tiers) else ()
+    day = max(today or datetime.now(UTC).date(), day)
+    candidates = _candidates(rows, tiers.value, day) if verified_tier else ()
+    if not verified_value(result):
+        return pending("package_tier_pending")
     benefit = results["benefit_type"]
     if not verified_value(benefit):
         return pending("package_benefit_pending")
@@ -95,4 +95,4 @@ def resolve_packages(results: dict[str, FieldResult], *, has_title: bool, levels
         selected.append(PackageRow(current_package=current.name, gift_package=gift.name))
     results["packages"] = accept(result, selected, ValueSource.LOOKUP, rule="6.2.R6",
                                  inputs=("benefit_type", "company", "start_date", "packages"))
-    return ()
+    return candidates
