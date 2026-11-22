@@ -189,7 +189,8 @@ def test_country_mention_quote_must_locate_uniquely(start, block, accepted):
 
 @pytest.mark.parametrize(("clues", "subject", "default", "expected", "rule"), [
     (["甲线"], None, True, "占位甲公司", "R10.keyword"),
-    (["其他"], None, True, "占位默认公司", "R10.default_company_no_match"),
+    (["其他"], None, True, None, None),
+    (None, "占位默认公司", True, None, None),
     (None, None, True, "占位默认公司", "R10.default_company"),
     (["甲线", "乙线"], None, True, None, None),
     (["其他"], None, False, None, None),

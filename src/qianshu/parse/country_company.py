@@ -59,14 +59,13 @@ def resolve_country_company(
     keywords = clues.value if verified_value(clues) else ()
     matches = [row for keyword, row in rows.items()
                if keyword and company_mentioned(keyword, keywords)]
-    if len(matches) > 1:
+    if len(matches) == 1:
+        row, rule = matches[0], "R10.keyword"
+    elif can_use_absence(clues) and not verified_value(subject):
+        row, rule = rows.get(""), "R10.default_company"
+    else:
         results["company"] = issue(subject, "company_lookup_unresolved")
         return
-    if matches:
-        row, rule = matches[0], "R10.keyword"
-    else:
-        row = rows.get("")
-        rule = "R10.default_company_no_match" if verified_value(clues) else "R10.default_company"
     if row is None:
         results["company"] = issue(subject, "company_lookup_unresolved")
     elif verified_value(subject) and subject.value.casefold() != row.display_name.casefold():
