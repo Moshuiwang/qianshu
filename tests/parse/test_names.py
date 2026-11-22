@@ -209,17 +209,19 @@ def test_proposal_requires_verified_short_name_and_public_type(damage):
     assert draft.policy_name.value is None and draft.policy_name.uncertainty
 
 
-def test_new_reply_requires_short_name_declaration():
-    from pydantic import ValidationError
-    from qianshu.parse.protocol import ApplicationReply
+def test_short_name_is_optional_in_tool_schema_and_live_reply():
+    from qianshu.parse.protocol import ApplicationReply, Findings
 
-    body, fields = application()
+    assert "policy_short_name" not in Findings.model_json_schema()["required"]
+    body, fields = application("合成原名")
     reply = fixed_reply(body, [fields])
     del reply["policies"][0]["fields"]["policy_short_name"]
-    with pytest.raises(ValidationError) as error:
-        ApplicationReply.model_validate_json(json.dumps(reply))
-    assert error.value.errors()[0]["loc"][-1] == "policy_short_name"
-    assert parse_one(body, reply).field_results["policy_short_name"].statement.status == "缺证据"
+    parsed = ApplicationReply.model_validate_json(json.dumps(reply))
+    assert parsed.policies[0].fields.policy_short_name.status == "缺证据"
+    draft = parse_one(body, reply)
+    assert draft.policy_name.value == "合成原名"
+    assert draft.policy_name_source == "申请原文"
+    assert draft.user_scope.value == "占位新用户"
 
 
 def test_offline_name_matches_card_and_keeps_existing_public_order_gate(case):

@@ -181,20 +181,7 @@ def parse_application(
 
 def _decode(reply: str) -> ApplicationReply:
     try:
-        data = validate_reply_json(reply)
-        # 实时工具已按 Findings 严格校验。直接注入的 thin1 录制也可能缺短名。
-        restored_short_name = False
-        policies = data.get("policies") if isinstance(data, dict) else None
-        for policy in policies if isinstance(policies, list) else ():
-            fields = policy.get("fields") if isinstance(policy, dict) else None
-            if isinstance(fields, dict) and "policy_short_name" not in fields:
-                fields["policy_short_name"] = {
-                    "status": "缺证据", "reason_code": "short_name_not_reported",
-                    "value": None, "candidates": [], "evidence": [],
-                }
-                restored_short_name = True
-        if restored_short_name:
-            reply = json.dumps(data, allow_nan=False)
+        validate_reply_json(reply)
     except (ValueError, TypeError, RecursionError):
         raise ParseError("申请解析模型回复不是有效的政策 JSON。", code="reply_json") from None
     try:

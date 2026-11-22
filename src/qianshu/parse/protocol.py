@@ -80,7 +80,10 @@ class RequestedPackage(Declaration):
 
 class Findings(Declaration):
     policy_name: Finding[str]
-    policy_short_name: Finding[str]
+    policy_short_name: Finding[str] = Field(default_factory=lambda: Finding[str](
+        status=StatementStatus.UNSUPPORTED, reason_code="short_name_not_reported",
+        value=None, candidates=[], evidence=[],
+    ))
     maintain_mutual_exclusion_group: Finding[YesNo]
     country: Finding[str]
     company: Finding[str]
