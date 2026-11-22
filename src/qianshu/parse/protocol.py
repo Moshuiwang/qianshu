@@ -80,6 +80,7 @@ class RequestedPackage(Declaration):
 
 class Findings(Declaration):
     policy_name: Finding[str]
+    policy_short_name: Finding[str]
     maintain_mutual_exclusion_group: Finding[YesNo]
     country: Finding[str]
     company: Finding[str]

@@ -1,14 +1,16 @@
 """按冻结业务键配对，并按独立审定的字段分母评分。"""
 
 from collections import Counter, defaultdict
+from datetime import date
 from decimal import Decimal, InvalidOperation
 from re import Pattern
 from unicodedata import normalize as unicode_normalize
 
 from qianshu.parse.companies import CompanyTable
+from qianshu.parse.names import MAX_NAME_LENGTH, ORIGINAL_NAME_LABEL, PROPOSED_NAME_LABEL, compose_public_name
 from qianshu.parse.scope import country_matches
 
-from .compare import compare_field, normalize
+from .compare import POLICY_TYPES, compare_field, normalize
 from .storage import RegressionError, digest, json_bytes
 
 WEIGHTS = {
@@ -397,10 +399,77 @@ def ratio(numerator: int, denominator: int | None) -> dict:
     }
 
 
+def _public_name_grade(pair: dict, country_code: str | None, today: date | None, draft) -> str:
+    """按独立审定的原文事实统计 #58 名称结果。"""
+    statuses = pair.get("source_status", {})
+    configuration = pair["configuration"]
+    gold = configuration.get("policy_name", {})
+    tags = configuration.get("user_tags", {}).get("value", pair.get("pairing", {}).get("user_tags"))
+    status = statuses.get("policy_name")
+    pending = G285_MAPPING["confirmation"]["source_statuses"]
+    if (any(statuses.get(key) in pending for key in ("policy_name", "policy_type", "user_tags"))
+            or statuses.get("user_tags") == "原文未写" or tags
+            or configuration.get("policy_type", {}).get("value") == "定向政策"):
+        return _review_name_grade(draft)
+    if tags != [] or statuses.get("user_tags") != "确定":
+        return "unknown"
+    if status == "确定" and "value" in gold:
+        expected, source = gold["value"], ORIGINAL_NAME_LABEL
+    elif status == "原文未写" and "policy_short_name" in pair:
+        short_name = pair["policy_short_name"]
+        if short_name is None or any(statuses.get(key) in (*pending, "原文未写")
+                                     for key in ("country", "start_date")):
+            return _review_name_grade(draft)
+        start = configuration.get("start_date", {}).get("value", pair.get("pairing", {}).get("start_date"))
+        if not (start and country_code and today):
+            return "unknown"
+        try:
+            start_date = date.fromisoformat(start)
+        except (TypeError, ValueError):
+            return "unknown"
+        expected = compose_public_name(country_code, short_name, start_date, today)
+        source = PROPOSED_NAME_LABEL
+    else:
+        return "unknown"
+    if not isinstance(expected, str) or not expected.strip():
+        return "unknown"
+    if len(expected) > MAX_NAME_LENGTH:
+        return _review_name_grade(draft)
+    if draft is None:
+        return "missing"
+    label = getattr(draft, "policy_name_source", None)
+    field = draft.policy_name
+    if label == PROPOSED_NAME_LABEL:
+        candidates = field.uncertainty.candidates if field.uncertainty else []
+        if (source == PROPOSED_NAME_LABEL and field.value is None and len(candidates) == 1
+                and candidates[0].value == expected and candidates[0].evidence):
+            return "correct_proposal"
+        return "incorrect_proposal"
+    if needs_confirmation(field):
+        return "overasked"
+    if source == label and field.value == expected and any(q.text == expected for q in field.evidence):
+        return "correct"
+    return "false_determined"
+
+
+def _name_totals(counts: Counter) -> dict:
+    return {"comparable": sum(counts.values()) - counts["unknown"],
+            **{key: counts[key] for key in (*CATEGORIES, "correct_proposal", "incorrect_proposal")}}
+
+
+def _review_name_grade(draft) -> str:
+    if draft is None:
+        return "missing"
+    if getattr(draft, "policy_name_source", None) == PROPOSED_NAME_LABEL:
+        return "incorrect_proposal"
+    return "justified_confirmation" if needs_confirmation(getattr(draft, "policy_name", None)) else "false_determined"
+
+
 class BusinessScore:
     def __init__(
         self, frozen: dict, threshold: int, countries: dict[str, str], *,
         company_table: CompanyTable | None = None, country_names: dict[str, Pattern[str]] | None = None,
+        country_codes: dict[str, str] | None = None, today: date | None = None,
     ):
         self.threshold = threshold
         self.fingerprint = pairing_fingerprint(threshold)
@@ -408,6 +477,8 @@ class BusinessScore:
         self.countries = countries
         self.company_table = company_table
         self.country_names = country_names
+        self.country_codes = country_codes or {}
+        self.today = today
         self.samples = frozen["samples"]
         self.dataset = frozen.get("dataset", "exam")
         self.eligible = defaultdict(list)
@@ -416,6 +487,8 @@ class BusinessScore:
                 self.eligible[sample_id].append(name)
         self.counts = Counter()
         self.field_counts = defaultdict(Counter)
+        self.name_counts = {kind: Counter() for kind in POLICY_TYPES}
+        self.name_sources = defaultdict(Counter)
         self.rates = Counter()
         self.package_denominators = Counter()
 
@@ -443,6 +516,7 @@ class BusinessScore:
             draft_index = matches.get(index)
             draft = drafts[draft_index] if draft_index is not None else None
             sample_id = pair["id"]
+            sample = self.samples[sample_id]
             configuration = pair["configuration"]
             package_style = pair.get("package_style")
             by_field = {}
@@ -454,6 +528,21 @@ class BusinessScore:
                 status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
                 self.field_counts[name][status] += 1
                 by_field[name] = status
+            kind = sample.get("policy_type")
+            if kind == "公开政策":
+                code = self.country_codes.get(sample["country"])
+                if code is None and self.country_names:
+                    aliases = country_matches([sample["country"]], self.country_names, exact=True)
+                    if len(aliases) == 1:
+                        code = self.country_codes.get(aliases.pop())
+                name_grade = _public_name_grade(pair, code, self.today, draft)
+                self.name_counts[kind][name_grade] += 1
+                source = {"原文未写": PROPOSED_NAME_LABEL, "确定": ORIGINAL_NAME_LABEL}.get(
+                    pair.get("source_status", {}).get("policy_name"), "待核或未知",
+                )
+                self.name_sources[source][name_grade] += 1
+            elif kind == "定向政策":
+                self.name_counts[kind][by_field.get("policy_name", "unknown")] += 1
             statuses = set(by_field.values())
             all_correct = draft is not None and statuses == {"correct"}
             has_comparable = bool(statuses - {"unknown"})
@@ -515,6 +604,8 @@ class BusinessScore:
             "field_categories": {category: field_totals[category] for category in CATEGORIES},
             "by_field": {name: {category: counts[category] for category in CATEGORIES}
                          for name, counts in self.field_counts.items()},
+            "policy_names": {kind: _name_totals(counts) for kind, counts in self.name_counts.items()},
+            "public_name_sources": {source: _name_totals(counts) for source, counts in self.name_sources.items()},
         }
 
 def pairing_audit(documents: list[dict]) -> dict:
