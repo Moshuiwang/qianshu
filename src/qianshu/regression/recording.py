@@ -169,7 +169,7 @@ class Recording:
         self, output: Output, names: dict[str, str], config: dict, model_id: str, *,
         model: ParseModel | None = None, source: SavedReplies | Callable | None = None,
         origin: str = "live", origin_run_id: str | None = None,
-        replaces_run_id: str | None = None,
+        replaces_run_id: str | None = None, source_system_sha: str | None = None,
     ):
         self.output = output
         self.names = names
@@ -177,6 +177,7 @@ class Recording:
         self.model_id = model_id
         self.model = model
         self.source = source
+        self.source_system_sha = source_system_sha
         self.origin = origin
         self.origin_run_id = origin_run_id
         self.replaces_run_id = replaces_run_id
@@ -196,7 +197,7 @@ class Recording:
         self.document = {"user_sha256": None, "system_sha256": None, "attempts": []}
 
         def call(*, system: str, user: str) -> str:
-            user_sha, system_sha = digest(user.encode()), digest(system.encode())
+            user_sha, system_sha = digest(user.encode()), self.source_system_sha or digest(system.encode())
             self.document.update(user_sha256=user_sha, system_sha256=system_sha)
             saved = self.source if isinstance(self.source, SavedReplies) else None
             if saved is not None:

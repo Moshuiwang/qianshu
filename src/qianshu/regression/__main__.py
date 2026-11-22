@@ -3,10 +3,12 @@
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 from qianshu.config import ConfigError
+from qianshu.parse import system_message
 from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_effort, configured_model
 from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE
 
@@ -15,7 +17,7 @@ from .corpus import make_plan
 from .freeze import freeze, load_exclusions, load_freeze
 from .packages import freeze_packages
 from .recording import MANIFEST, Recording, SavedReplies, configuration, doc_names, probe_replies
-from .runner import RUN_FILES, evaluate, markdown_report
+from .runner import RULES, RUN_FILES, evaluate, markdown_report
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
 from .summary import summarize
 
@@ -92,12 +94,31 @@ def _arguments(argv: list[str] | None):
     return parser.parse_args(argv)
 
 
+_LEGACY_REVISION = "4fb3cb5d52a394f8cd7990572ca72f8009278fea"
+
+
+def _legacy_fingerprints(repo: Path) -> tuple[str, str]:
+    try:
+        blobs = {name: subprocess.check_output(
+            ["git", "--no-replace-objects", "cat-file", "blob", f"{_LEGACY_REVISION}:rules/{name}"],
+            cwd=repo, stderr=subprocess.DEVNULL,
+        ) for name in RULES}
+    except (OSError, subprocess.CalledProcessError):
+        raise RegressionError("无法读取受信旧版本的规则文件。") from None
+    hashes = {name: digest(blob) for name, blob in blobs.items()}
+    system = system_message(*(blobs[name].decode("utf-8") for name in (
+        "parse-prompt.md", "parse-rules.md", "parse-options.tsv",
+    )))
+    return digest(json_bytes(hashes)), digest(system.encode())
+
+
 def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None:
     snapshot = load_freeze(files, files.argument(args.frozen))
     if snapshot["fingerprint"] != args.expect_sha256:
         raise RegressionError("预期冻结指纹与实际冻结指纹不一致。")
     source = origin_run_id = effort = None
     legacy_recording = getattr(args, "legacy_recording", False)
+    source_system_sha = None
     settings = {}
     if args.command == "replay":
         saved = SavedReplies(files, files.argument(args.recording), legacy_recording=legacy_recording)
@@ -139,8 +160,10 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
     rules = files.repo / "rules"
     config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries, effort=effort)
     if legacy_recording:
-        if prior["rules_sha256"] != config["rules_sha256"]:
+        source_rules_sha, source_system_sha = _legacy_fingerprints(files.repo)
+        if prior.get("source_rules_sha256", prior["rules_sha256"]) != source_rules_sha:
             raise RegressionError("旧录制的系统消息须使用录制时的规则文件重建。")
+        config["source_rules_sha256"] = source_rules_sha
         config["source_reply_structure"] = LEGACY_REPLY_STRUCTURE
     replaces_run_id = None
     if getattr(args, "replaces_recording", None):
@@ -158,7 +181,8 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
     names = doc_names(snapshot)
     with files.new_output(out, (*RUN_FILES, MANIFEST, *names.values())) as output:
         recording = Recording(output, names, config, model_id, model=model, source=source,
-                              origin=origin, origin_run_id=origin_run_id, replaces_run_id=replaces_run_id)
+                              origin=origin, origin_run_id=origin_run_id, replaces_run_id=replaces_run_id,
+                              source_system_sha=source_system_sha)
         if origin == "live":
             model_options = {"max_retries": 0} if release else {}
             recording.model = configured_model(settings, on_result=recording.on_result, **model_options)

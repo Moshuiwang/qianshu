@@ -2087,6 +2087,11 @@ def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, ca
     def model(*, system, user):
         return raw if json.loads(user)["application"] == BATCH else json.dumps({"policies": [], "document": None})
 
+    prompt = repo.parent / "rules" / "parse-prompt.md"
+    current_prompt = prompt.read_bytes()
+    prompt.write_text("合成旧提示词")
+    git("add", "rules")
+    monkeypatch.setattr("qianshu.regression.__main__._LEGACY_REVISION", git("write-tree").stdout.decode().strip())
     assert main(run_args(frozen), model=model) == 0
     recording = repo / "run"
     manifest_path = recording / "recording.json"
@@ -2123,6 +2128,9 @@ def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, ca
     assert main(_replay_args(frozen, out=".private/strict"), model=forbidden) == 0
     assert get_json(repo / "strict" / "public-report.json")["documents"]["parse_failed"] == 2
 
+    prompt.write_bytes(current_prompt)
+    assert main(_replay_args(frozen, out=".private/strict-new"), model=forbidden) == 1
+    assert "系统消息指纹" in capsys.readouterr().err
     assert main([*_replay_args(frozen), "--legacy-recording"], model=forbidden) == 0
     diagnostic = repo / "replay"
     report = get_json(diagnostic / "public-report.json")
@@ -2162,7 +2170,7 @@ def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, ca
         assert main([*_replay_args(frozen, out=f".private/{output}"), "--legacy-recording"], model=forbidden) == 0
         assert get_json(repo / output / batch_name)["reason_code"] == code
 
-    prompt = repo.parent / "rules" / "parse-prompt.md"
-    prompt.write_text(prompt.read_text() + "\n合成规则变更\n")
+    manifest["configuration"]["rules_sha256"] = "0" * 64
+    put_json(manifest_path, manifest)
     assert main([*_replay_args(frozen, out=".private/changed-rules"), "--legacy-recording"], model=forbidden) == 1
     assert "录制时的规则文件" in capsys.readouterr().err

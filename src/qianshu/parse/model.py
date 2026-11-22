@@ -214,7 +214,7 @@ def configured_model(
                     model=model,
                     system=system,
                     messages=[{"role": "user", "content": user}],
-                    max_tokens=32000,
+                    max_tokens=128000,
                     output_config={"effort": effort},
                     tools=[{
                         "name": _REPLY_TOOL,

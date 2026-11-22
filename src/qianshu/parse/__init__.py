@@ -95,6 +95,10 @@ class ParseResult(list[ParsedPolicyDraft]):
         return bool(self.structure_issues)
 
 
+def system_message(prompt: str, rules: str, option_table: str) -> str:
+    return f"{prompt}\n\n{rules}\n\n选项表（列以制表符分隔）\n\n{option_table}"
+
+
 def parse_application(
     body: str,
     *,
@@ -139,7 +143,7 @@ def parse_application(
         model = configured_model(config if config is not None else load_config())
     try:
         reply = model(
-            system=f"{prompt}\n\n{rules}\n\n选项表（列以制表符分隔）\n\n{option_table}",
+            system=system_message(prompt, rules, option_table),
             user=json.dumps(user_input, ensure_ascii=False),
         )
     except ModelReplyError as error:

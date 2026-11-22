@@ -62,13 +62,17 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
         schema = payload["tools"][0]["input_schema"]
         assert set(schema["properties"]) == {"policies", "unused_passages"}
         assert schema["required"] == ["policies"]
+        for name, finding in definitions.items():
+            if name.startswith("Finding_"):
+                assert set(finding["required"]) == {"status", "reason_code", "value", "candidates", "evidence"}
+                assert set(finding["properties"]) == {*finding["required"], "explanation"}
         anchor = definitions["PolicyAnchor"]
         assert {"source_id", "start", "end", "text"} == set(anchor["properties"])
         assert "text" not in anchor["required"]
         assert set(definitions["UnusedPassage"]["required"]) == {"text", "reason"}
         assert "tool_choice" not in payload
         assert payload["stream"] is True
-        assert payload["max_tokens"] == 32000
+        assert payload["max_tokens"] == 128000
         events = [
             {"type": "message_start", "message": {
                 "id": "msg_placeholder",
@@ -257,7 +261,7 @@ def test_result_callback_records_blocks_and_use_without_changing_return(stub_str
     assert result.failure_stage == (None if stop_reason == "tool_use" else "model_incomplete")
 
 
-@pytest.mark.parametrize(("stop_reason", "output_tokens"), [("refusal", 1), ("max_tokens", 32000)])
+@pytest.mark.parametrize(("stop_reason", "output_tokens"), [("refusal", 1), ("max_tokens", 128000)])
 def test_unsuccessful_stop_reason_rejects_even_valid_json(stub_stream, stop_reason, output_tokens):
     _, get_reply = stub_stream
     get_reply.return_value = SimpleNamespace(
