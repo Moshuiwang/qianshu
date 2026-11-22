@@ -897,6 +897,78 @@ def test_partial_sensitive_value_is_redacted_before_paginating(size):
     assert suffix not in "\n".join(lines)
 
 
+@pytest.mark.parametrize("secret_in_body", [False, True])
+def test_split_sensitive_value_is_redacted_across_advisories_and_pages(secret_in_body):
+    pieces = ("充", "值赠", "送用户", "范围")
+    fragment = "".join(pieces)
+    secret = f"甲{fragment}乙" if secret_in_body else fragment
+    first = "、".join(pieces) + "。\n"
+    body = first + (secret if secret_in_body else "合成申请。")
+    reply = json.dumps({"policies": [
+        policy("p1", span(0, len(first)), {"user_scope": {
+            **statement("缺证据"), "explanation": pieces[2],
+        }}),
+        policy("p2", span(len(first), len(body)), {"country": {
+            **statement("缺证据"), "explanation": pieces[3],
+        }}),
+    ], "unused_passages": [
+        {"text": "合成段落甲", "reason": pieces[0]},
+        {"text": "丁" * 10000, "reason": pieces[1]},
+    ]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    displayed = []
+    for page in pipeline(_application(body)):
+        for line in _contents([result_card(page)]):
+            if line.startswith("没用上的原文段落") and "\n理由　" in line:
+                displayed.append((page.number, line.split("\n理由　", 1)[1]))
+            elif line.startswith("政策 1 · 用户范围 · 待确认\n"):
+                displayed.append((page.number, line.split("\n模型说明　", 1)[1]))
+            elif line.startswith("政策 2 · 国家 · 模型说明\n"):
+                displayed.append((page.number, line.split("\n", 1)[1]))
+
+    assert len(displayed) == len(pieces)
+    assert displayed[0][0] < displayed[1][0]
+    assert [text for _, text in displayed] == ["[已脱敏]"] * len(pieces)
+
+
+def test_advisories_redact_registered_fragments_absent_from_the_source():
+    body = "充、值。合成申请。"
+    long_secret = "甲合成隔离占位值乙"
+    reply = json.dumps({"policies": [policy("p1", span(0, len(body)), {
+        "user_scope": {**statement("缺证据"), "explanation": "值"},
+        "country": {**statement("缺证据"), "explanation": "需核对隔离占位值。"},
+    })], "unused_passages": [
+        {"text": "合成段落甲", "reason": "核对隔离占位。"},
+        {"text": "合成段落乙", "reason": "充"},
+    ]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[long_secret, "充值"])
+
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+
+    assert "没用上的原文段落\n合成段落甲\n理由　核对[已脱敏]。" in lines
+    assert "没用上的原文段落\n合成段落乙\n理由　[已脱敏]" in lines
+    assert "模型说明　[已脱敏]" in "\n".join(lines)
+    assert "政策 1 · 国家 · 模型说明\n需核对[已脱敏]。" in lines
+
+
+def test_advisories_keep_public_business_words_shared_with_a_sensitive_value():
+    secret = "已充值甲赠送乙用户丙"
+    body = f"已充值、赠送、用户。\n{secret}"
+    reply = json.dumps({"policies": [policy("p1", span(0, len(body)), {
+        "user_scope": {**statement("缺证据"), "explanation": "赠送"},
+        "country": {**statement("缺证据"), "explanation": "用户"},
+    })], "unused_passages": [{"text": "合成段落", "reason": "已充值"}]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+
+    assert "没用上的原文段落\n合成段落\n理由　已充值" in lines
+    assert "模型说明　赠送" in "\n".join(lines)
+    assert "政策 1 · 国家 · 模型说明\n用户" in lines
+    assert "申请原文\n已充值、赠送、用户。\n[已脱敏]" in lines
+
+
 def test_command_shows_country_and_company_keyword_explanations(tmp_path, single_policy):
     body, rows = single_policy
     rows[0]["country"] = rows[0].pop("company")
