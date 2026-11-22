@@ -58,6 +58,11 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
             "name": "submit_application_reply", "description": "提交一份申请解析声明。",
             "input_schema": ApplicationReply.model_json_schema(),
         }]
+        definitions = payload["tools"][0]["input_schema"]["$defs"]
+        clause_span_ref = definitions["Clause"]["properties"]["spans"]["items"]["$ref"]
+        clause_span = definitions[clause_span_ref.removeprefix("#/$defs/")]
+        assert {"source_id", "start", "end", "text"} == set(clause_span["properties"])
+        assert "text" not in clause_span["required"]
         assert "tool_choice" not in payload
         assert payload["stream"] is True
         assert payload["max_tokens"] == 32000

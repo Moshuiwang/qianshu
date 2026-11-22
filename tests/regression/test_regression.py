@@ -1218,11 +1218,13 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
     attempts = Counter()
     batch = fixed_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST, "占位正文甲", "包", "占位缺失引文"]}}])
     _, shifted, tied, _ = batch["policies"][0]["fields"]["country"]["evidence"]
+    clause_span = batch["clauses"][0]["spans"][1]
+    batch["clauses"][0]["spans"][1] = {**clause_span, "start": clause_span["start"] + 1, "text": shifted["text"]}
     shifted["span"]["start"] += 1
     tied["span"]["start"] = (BATCH.index("包") + BATCH.rindex("包")) // 2
     expected_locations = {
-        "numerator": 2, "denominator": 4, "percent": 50.0,
-        "counts": {"exact": 1, "relocated": 1, "ambiguous": 1, "not_found": 1},
+        "numerator": 3, "denominator": 5, "percent": 60.0,
+        "counts": {"exact": 1, "relocated": 2, "ambiguous": 1, "not_found": 1},
     }
     responses = {
         BATCH: json.dumps(batch, ensure_ascii=False),
@@ -1292,8 +1294,9 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
     assert report["usage"]["elapsed_ms"] == {"captured_attempts": 4, "total": 54}
     public = (repo / "run" / "public-report.md").read_text() + (repo / "run" / "public-report.json").read_text()
     assert "唯一对齐" in public and "可比字段全对率" in public
-    assert "证据定位成功率 2/4（50.00%）" in public
-    for label in ("模型坐标原样正确", "程序重新定位", "多处不可分", "引文不存在"):
+    assert "证据定位成功率 3/5（60.00%），含条款引文" in public
+    assert "程序重新定位 2" in public
+    for label in ("模型坐标原样正确", "多处不可分", "引文不存在"):
         assert f"{label} 1" in public
     for private in ("占位无效回包", "占位保密失败详情", "占位缺失引文", FIRST, "synthetic-model"):
         assert private not in public + capsys.readouterr().err

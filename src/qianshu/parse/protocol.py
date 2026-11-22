@@ -48,8 +48,15 @@ class Span(Declaration, frozen=True):
     source_id: Identifier
     start: int
     end: int
-    # 解析端接受带引文的范围，保持发给模型的 schema 不变。
+    # 解析端接受带引文的范围。条款范围另在工具结构中声明引文字段。
     text: SkipJsonSchema[str | None] = Field(default=None, exclude_if=lambda value: value is None)
+
+
+class ClauseSpan(Span):
+    text: str | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+        description="逐字抄录这一段条款原文，保留空格、标点和换行。",
+    )
 
 
 class Evidence(Declaration):
@@ -128,7 +135,7 @@ class DateUse(Declaration):
 class Clause(Declaration):
     id: Identifier
     kind: Literal["正文", "续行", "备注", "前言", "批次说明"]
-    spans: list[Span]
+    spans: list[ClauseSpan]
     field_ids: list[Identifier]
     status: ClauseStatus
     disposition: Literal["生效", "询问", "备选", "带条件", "作废", "冲突", "不明"]

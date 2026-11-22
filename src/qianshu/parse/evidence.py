@@ -67,7 +67,7 @@ class Sources:
             return None, "ambiguous"
         end = nearest + len(text)
         outcome = "exact" if (nearest, end) == (span.start, span.end) else "relocated"
-        return Span(source_id=span.source_id, start=nearest, end=end), outcome
+        return span.model_copy(update={"start": nearest, "end": end, "text": None}), outcome
 
 
 def intersect(left: Span | None, right: Span | None) -> Span | None:
@@ -155,7 +155,7 @@ class EvidenceReview:
                 self._locations[key] = sources.locate_quote(span, text)
             self.evidence_locations[self._locations[key][1]] += 1
         self.pending: list[ReviewRange] = []
-        self._unlocated_clause_fields: dict[str, set[str]] = defaultdict(set)
+        self._unlocated_clauses: dict[str, Clause] = {}
         self.policies = {policy.id: policy for policy in reply.policies}
         self.clauses = {clause.id: clause for clause in reply.clauses}
         self.invalid_policies = {key for key, count in Counter(p.id for p in reply.policies).items() if count > 1}
@@ -239,10 +239,8 @@ class EvidenceReview:
             if invalid or len(spans) != len(clause.spans):
                 self.invalid_clauses.add(clause.id)
                 bound = tuple(sorted((ids | references[clause.id]) & self.policies.keys()))
-                # 引文无法定位时，已有明确绑定的条款只影响其声明字段。
-                if not invalid and clause.field_ids:
-                    for policy_id in bound:
-                        self._unlocated_clause_fields[policy_id].update(clause.field_ids)
+                if not invalid:
+                    self._unlocated_clauses[clause.id] = clause
                 else:
                     self.pending.append(ReviewRange(spans[0] if spans else None, "invalid_clause", bound))
                 continue
@@ -346,9 +344,9 @@ class EvidenceReview:
     def field(self, policy: Policy, name: str) -> FieldResult:
         statement = getattr(policy.fields, name)
         codes = list(self._pending_codes(policy, name))
-        if name in self._unlocated_clause_fields.get(policy.id, ()):
-            codes.append("invalid_clause")
         quotes = list(_quotes(statement))
+        if any(quote.clause_id in self._unlocated_clauses for quote in quotes):
+            codes.append("invalid_clause")
         verified_quotes = [self.verified_quote(policy, name, quote) for quote in quotes]
         valid = tuple(q for q in verified_quotes[:len(statement.evidence)] if q is not None)
         if None in verified_quotes:
@@ -359,6 +357,9 @@ class EvidenceReview:
 
         status = statement.status
         if status is StatementStatus.UNWRITTEN:
+            if any(policy.id in clause.policy_ids and name in clause.field_ids
+                   for clause in self._unlocated_clauses.values()):
+                codes.append("invalid_clause")
             checked = self._locate_all(statement.checked)
             applicable = [clause for clause in self.applicable[policy.id] if name in clause.field_ids]
             required = (*self.local[policy.id], *(

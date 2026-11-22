@@ -238,18 +238,59 @@ def test_tied_quote_in_another_policy_remark_does_not_add_a_scope_conflict():
     assert drafts[0].repeat_bonus.value == drafts[1].repeat_bonus.value == "是"
 
 
-def test_tied_full_clause_quote_only_marks_its_bound_field():
+def test_clause_quote_repairs_one_character_coordinate_shift():
+    body = "例甲乙例"
+    main = span(0, len(body))
+    name = "user_scope"
+    p = policy("p1", main, {name: statement("确定", value="甲", evidence=[quote(body, "甲", "c")])})
+    c = clause("c", [{**span(2, 4), "text": "甲乙"}, {**span(3, 4), "text": "例"}], [name], ["p1"])
+    drafts = parse_fixed(body, document(body, [p], [c]))
+    draft, = drafts
+
+    assert not drafts.pending
+    assert drafts.evidence_locations == {"exact": 2, "relocated": 1}
+    assert draft.user_scope.value == "甲"
+    assert draft.scope["clauses"][0]["spans"] == [span(1, 3), span(3, 4)]
+
+
+@pytest.mark.parametrize(("text", "outcome"), [("甲注", "ambiguous"), ("缺失", "not_found")])
+def test_unlocated_clause_quote_only_marks_fields_that_depend_on_it(text, outcome):
     body = "甲注中间甲注"
     main = span(0, len(body))
     name = "user_scope"
-    p = policy("p1", main, {name: statement("确定", value="甲", evidence=[quote(body, "甲注", "c")])})
-    c = clause("c", [{**span(2, 4), "text": "甲注"}], [name], ["p1"])
-    drafts = parse_fixed(body, document(body, [p], [c]))
+    p = policy("p1", main, {
+        name: statement("确定", value="甲", evidence=[quote(body, "甲注", "c")]),
+        "repeat_bonus": statement("确定", value="否", evidence=[quote(body, "中间", "other")]),
+    })
+    c = clause("c", [{**span(2, 4), "text": text}], [name, "repeat_bonus", "trigger_once"], ["p1"])
+    other = clause("other", [span(2, 4)], ["repeat_bonus"], ["p1"])
+    drafts = parse_fixed(body, document(body, [p], [c, other], coverage=[{"span": main, "use": "政策条款"}]))
+    draft, = drafts
+
     assert not drafts.pending
-    assert drafts.evidence_locations == {"exact": 1, "ambiguous": 1}
-    assert drafts[0].user_scope.value is None
-    assert "invalid_clause" in drafts[0].field_results[name].issues
-    assert drafts[0].repeat_bonus.value == "是"
+    assert drafts.evidence_locations == {"exact": 2, outcome: 1}
+    assert draft.user_scope.value is None
+    assert draft.to_dict()["field_results"][name]["program_status"] == "缺证据"
+    assert draft.repeat_bonus.value == "否"
+    assert not draft.field_results["repeat_bonus"].needs_confirmation
+    assert draft.trigger_once.value is None
+    assert draft.field_results["trigger_once"].issues == ("invalid_clause",)
+
+
+@pytest.mark.parametrize("clause_start", [1, 2])
+def test_clause_without_quote_uses_legacy_coordinates(clause_start):
+    body = "例甲乙例"
+    main = span(0, len(body))
+    name = "user_scope"
+    p = policy("p1", main, {name: statement("确定", value="甲", evidence=[quote(body, "甲", "c")])})
+    c = clause("c", [span(clause_start, clause_start + 2)], [name], ["p1"])
+    drafts = parse_fixed(body, document(body, [p], [c]))
+    draft, = drafts
+
+    assert drafts.evidence_locations == {"exact": 1}
+    assert draft.scope["clauses"][0]["spans"] == c["spans"]
+    assert draft.user_scope.value == ("甲" if clause_start == 1 else None)
+    assert draft.field_results[name].needs_confirmation is (clause_start != 1)
 
 
 def test_tied_checked_range_blocks_only_its_fields_default():

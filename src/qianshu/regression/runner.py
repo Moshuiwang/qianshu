@@ -362,7 +362,7 @@ def markdown_report(report: dict) -> bytes:
     percent = locations["percent"]
     rate = f"{percent:.2f}%" if percent is not None else "不可判定"
     location_lines = [
-        f"- 证据定位成功率 {locations['numerator']}/{locations['denominator']}（{rate}）",
+        f"- 证据定位成功率 {locations['numerator']}/{locations['denominator']}（{rate}），含条款引文",
         *(f"- {label} {locations['counts'][key]}" for key, label in EVIDENCE_LOCATION_LABELS.items()),
     ]
     review = report["full_document_review"]
