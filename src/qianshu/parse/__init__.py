@@ -273,7 +273,9 @@ def _draft(
     draft.field_results = results
     draft.source_span = _body_offsets(review.main[id(policy)])
     draft.source_evidence_spans = tuple(sorted({
-        span for result in results.values() for quote in result.evidence
+        # 短名参与拼名时，其引文已在 policy_name 中。独立短名不参与位置量尺。
+        span for name, result in results.items() if name != "policy_short_name"
+        for quote in result.evidence
         if (span := _body_offsets(review.sources.locate(quote.span))) is not None
     }))
     return draft

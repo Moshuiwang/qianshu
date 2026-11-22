@@ -85,7 +85,7 @@ def derive_names(results: dict[str, FieldResult], codes: Mapping[str, str], toda
         results["policy_type"] = accept(kind, derived, ValueSource.LOOKUP,
                                         rule="R8", inputs=("user_tags",), evidence=(*kind.evidence, *tags.evidence))
 
-    if results["policy_type"].needs_confirmation:
+    if not tags.value and results["policy_type"].needs_confirmation:
         results["policy_name"] = issue(name, "name_type_pending")
     elif not tags.value:
         results["policy_name"] = _public_name(results, codes, today)

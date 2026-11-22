@@ -53,3 +53,37 @@ def test_replay_keeps_recorded_utc_day(repo, frozen):
     for directory in ("run", "replay"):
         record = get_json(repo / directory / "recording.json")
         assert record["configuration"]["today"] == TODAY.isoformat()
+
+
+def test_unused_short_name_does_not_dispute_strict_alignment():
+    from qianshu.regression.runner import align
+
+    body = "合成加赠。名称用合成原名，无需标签。"
+    fields = {"policy_name": {"value": "合成原名", "evidence": ["合成原名"]},
+              "user_tags": {"value": [], "evidence": ["无需标签"]}}
+    pair = {"id": "p", "span": [body.index("名称用"), len(body)]}
+    document = {"body": body, "other_spans": [], "complete": True}
+    for short_name in ({}, {"policy_short_name": {"value": "合成加赠", "evidence": ["合成加赠"]}}):
+        draft = parse_one(body, fixed_reply(body, [fields | short_name]))
+        outcomes, diagnostics = align([draft], [pair], document)
+        assert outcomes["p"] == ("matched", draft) and diagnostics == []
+
+
+def test_copied_public_name_counts_as_correct_in_both_measures():
+    body, fields = application("合成原名")
+    sample = "synthetic-policy"
+    token = "synthetic-document"
+    gold = {
+        "samples": {sample: {"country": "赞比亚", "benefit_type": "赠送时长", "policy_type": "公开政策"}},
+        "pairs": {sample: {"id": sample, "token": token, "span": [0, len(body)],
+                           "configuration": {"policy_name": {"value": "合成原名"}, "user_tags": {"value": []}},
+                           "source_status": {"user_tags": "确定", "policy_name": "确定"}}},
+        "denominators": {"fields": {"policy_name": {"ids": [sample], "excluded": {}}}, "whole_policy": []},
+        "documents": {token: {"body": body, "complete": True, "other_spans": []}},
+        "companies_text": COMPANIES.read_text(), "fingerprint": "synthetic", "strata": [],
+    }
+    report, _ = evaluate(gold, model_reply(fixed_reply(body, [fields])), Path("rules"), today=TODAY)
+    business = report["business"]
+    for counts in (business["policy_names"]["公开政策"], business["by_field"]["policy_name"],
+                   business["field_categories"]):
+        assert counts["correct"] == 1 and counts["false_determined"] == 0

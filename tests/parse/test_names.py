@@ -239,3 +239,66 @@ def test_offline_name_matches_card_and_keeps_existing_public_order_gate(case):
     name, = [row["value"] for row in controls if row["controlId"] == case.control["policy_name"]]
     assert name == COMPOSED
     assert f"优惠政策名称 · 候选 1\n值　{name}" in card_text(body, model_reply(reply))
+
+
+@pytest.mark.parametrize("bad", [None, [], {"status": None}, {"value": 3}, {"evidence": [None]}])
+@pytest.mark.parametrize("explicit", [True, False])
+def test_malformed_short_name_only_affects_composition(bad, explicit):
+    body, fields = application("合成原名" if explicit else None)
+    reply = fixed_reply(body, [fields])
+    reply["policies"][0]["fields"]["policy_short_name"] = bad
+    draft = parse_one(body, reply)
+    short = draft.field_results["policy_short_name"]
+    assert short.statement.status == "缺证据" and short.needs_confirmation
+    assert draft.user_scope.value == "占位新用户"
+    if explicit:
+        assert draft.policy_name.value == "合成原名"
+    else:
+        assert draft.policy_name.uncertainty and not draft.policy_name.uncertainty.candidates
+
+
+def test_short_name_accepts_only_value_status_and_evidence():
+    body, fields = application()
+    reply = fixed_reply(body, [fields])
+    short = reply["policies"][0]["fields"]["policy_short_name"]
+    del short["reason_code"], short["candidates"]
+    assert parse_one(body, reply).policy_name.uncertainty.candidates[0].value == COMPOSED
+
+
+def test_pending_type_keeps_targeted_name_from_unique_tag():
+    body = "适用标签甲。"
+    reply = fixed_reply(body, [{"user_tags": field(["标签甲"], "标签甲")}])
+    reply["policies"][0]["fields"]["policy_type"] = statement("歧义")
+    draft = parse_one(body, reply)
+    assert draft.policy_name.value == "标签甲" and draft.policy_name_source == "用户标签"
+    assert draft.field_results["policy_type"].needs_confirmation and draft.policy_type.uncertainty
+    card = card_text(body, model_reply(reply))
+    assert "优惠政策名称\n值　标签甲" in card and "政策类型 · 待确认" in card
+
+
+def test_card_masks_registered_fragment_split_between_reason_and_name_candidate():
+    body, fields = application()
+    fields["policy_short_name"]["value"] = "丙丁"
+    reply = fixed_reply(body, [fields])
+    # 名称候选前缀是国家代码，验证四字片段横跨候选值与上一段模型文字。
+    reply["policies"][0]["fields"]["policy_name"]["explanation"] = "甲乙"
+    pipeline = Pipeline(model=model_reply(reply), companies_file=COMPANIES, today=lambda: TODAY,
+                        tag_dates={}, sensitive_values=["合成甲乙ZM占位"])
+    message = Message("合成消息", "合成群", "合成发送者", 0, "text", "")
+    lines = [element["text"]["content"] for page in pipeline(Application(message, body, ()))
+             for element in page.elements if element["tag"] == "div"]
+    assert any("模型说明　[已脱敏]" in line for line in lines)
+    assert any("候选 1\n值　[已脱敏]_丙丁_" in line for line in lines)
+
+
+def test_card_masks_sensitive_fragment_split_across_candidates_with_evidence():
+    body, fields = application()
+    fields["policy_name"] = {"candidates": [field("甲乙", "合成加赠"), field("丙丁", "占位甲包")]}
+    model = model_reply(fixed_reply(body, [fields]))
+    pipeline = Pipeline(model=model, companies_file=COMPANIES, today=lambda: TODAY,
+                        tag_dates={}, sensitive_values=["虚拟甲乙丙丁机密"])
+    message = Message("合成消息", "合成群", "合成发送者", 0, "text", "")
+    lines = [element["text"]["content"] for page in pipeline(Application(message, body, ()))
+             for element in page.elements if element["tag"] == "div"]
+    for index, excerpt in enumerate(("合成加赠", "占位甲包"), 1):
+        assert any(f"优惠政策名称 · 候选 {index}\n值　[已脱敏]\n原文出处　「{excerpt}」" in line for line in lines)

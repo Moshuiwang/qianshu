@@ -78,12 +78,17 @@ class RequestedPackage(Declaration):
     gift_package: str | None
 
 
+class ShortNameFinding(Finding[str]):
+    status: StatementStatus = StatementStatus.UNSUPPORTED
+    reason_code: Identifier = "short_name"
+    value: str | None = None
+    candidates: list[ProposedValue[str]] = Field(default_factory=list)
+    evidence: list[Evidence] = Field(default_factory=list)
+
+
 class Findings(Declaration):
     policy_name: Finding[str]
-    policy_short_name: Finding[str] = Field(default_factory=lambda: Finding[str](
-        status=StatementStatus.UNSUPPORTED, reason_code="short_name_not_reported",
-        value=None, candidates=[], evidence=[],
-    ))
+    policy_short_name: ShortNameFinding = Field(default_factory=ShortNameFinding)
     maintain_mutual_exclusion_group: Finding[YesNo]
     country: Finding[str]
     company: Finding[str]
@@ -103,6 +108,14 @@ class Findings(Declaration):
     user_scope: Finding[str]
     approval_url: Finding[str]
     approval_attachments: Finding[list[str]]
+
+    @field_validator("policy_short_name", mode="wrap")
+    @classmethod
+    def _optional_short_name(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            return ShortNameFinding()
 
 
 class Policy(Declaration):
