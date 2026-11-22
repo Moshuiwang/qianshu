@@ -166,8 +166,10 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
     levels_path = files.argument(args.package_levels or DEFAULT_LEVELS_FILE)
     run_day = datetime.now(UTC).date()
     if recorded_levels:
-        run_day = date.fromisoformat(prior["run_day"])
-        if not args.package_levels:
+        recorded_day = manifest.get("run_day", prior.get("run_day"))
+        if recorded_day:
+            run_day = date.fromisoformat(recorded_day)
+        if recorded_day and not args.package_levels:
             levels_path = saved.directory / DEFAULT_LEVELS_FILE.name
     try:
         levels_data = files.read(levels_path)
@@ -176,7 +178,6 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
             raise RegressionError("指定的销售品快照不存在。") from None
         levels_data = None
     config["package_levels_sha256"] = digest(levels_data) if levels_data is not None else None
-    config["run_day"] = run_day.isoformat()
     if recorded_levels and config["package_levels_sha256"] != prior["package_levels_sha256"]:
         raise RegressionError("销售品快照与录制指纹不一致。")
     package_levels = decode_package_levels(levels_data) if levels_data is not None else PackageLevels()
@@ -239,7 +240,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         output.write("mismatches.json", json_bytes(details))
         output.write("public-report.md", markdown_report(report))
         output.write("public-report.json", public)
-        recording.complete(digest(public), threshold)
+        recording.complete(digest(public), threshold, run_day=run_day.isoformat())
     print(f"已统计 {report['samples']} 条冻结样例，生成计数及私有明细。")
 
 

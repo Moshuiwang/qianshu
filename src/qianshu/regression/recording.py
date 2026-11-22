@@ -302,7 +302,7 @@ class Recording:
                     self.usage_totals[key] += attempt[key]
         return any(_interrupted_with_text(attempt) for attempt in attempts)
 
-    def complete(self, report_digest: str, threshold: int) -> None:
+    def complete(self, report_digest: str, threshold: int, *, run_day: str) -> None:
         origin_run_id = self.origin_run_id
         if self.origin == "probe":
             origin_run_id = digest(json_bytes(sorted(self.probe_fingerprints)))
@@ -310,7 +310,7 @@ class Recording:
             "schema": 1, "run_id": self.run_id, "origin": self.origin, "origin_run_id": origin_run_id,
             "replaces_run_id": self.replaces_run_id,
             "source_code_measured": self.origin == "live", "model": self.model_id, "configuration": self.config,
-            "threshold": threshold,
+            "threshold": threshold, "run_day": run_day,
             "artifact_sha256": self.artifacts, "documents_by_user_sha256": self.by_user,
             "public_report_sha256": report_digest,
         }))

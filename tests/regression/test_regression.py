@@ -1192,15 +1192,23 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
 
 
-def test_valid_replacement_references_original_void_recording(repo, frozen):
+class LaterClock(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        return cls(2200, 1, 1, tzinfo=tz)
+
+
+def test_valid_replacement_references_original_void_recording(repo, frozen, monkeypatch):
     def unavailable(**_):
         raise RuntimeError("占位调用失败")
 
     assert main([*run_args(frozen), "--release"], model=unavailable) == 0
     original = (repo / "run/recording.json").read_bytes()
+    monkeypatch.setattr("qianshu.regression.__main__.datetime", LaterClock)
     assert main([*run_args(frozen, ".private/replacement"), "--release", "--replaces-recording", ".private/run"],
                 model=no_policies) == 0
     replacement = get_json(repo / "replacement/recording.json")
+    assert replacement["run_day"] != json.loads(original)["run_day"]
     original_id = json.loads(original)["run_id"]
     assert replacement["replaces_run_id"] == original_id != replacement["run_id"]
     assert (repo / "run/recording.json").read_bytes() == original
@@ -2240,11 +2248,6 @@ def test_package_snapshot_reaches_parser_and_scores_two_rows(repo, monkeypatch):
     replay = ["replay", "--recording", ".private/run", "--frozen", ".private/frozen",
               "--expect-sha256", snapshot["fingerprint"], "--out", ".private/replay"]
     table.write_bytes(b"changed")
-    class LaterClock(datetime):
-        @classmethod
-        def now(cls, tz=None):
-            return cls(2200, 1, 1, tzinfo=tz)
-
     monkeypatch.setattr(cli, "datetime", LaterClock)
     assert main([*replay, "--package-levels", ".private/synthetic.csv"]) == 1
     assert main(replay) == 0
