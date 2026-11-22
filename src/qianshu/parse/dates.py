@@ -2,8 +2,10 @@
 
 from datetime import date
 
+from .companies import CompanyRules
 from .evidence import EvidenceReview, issue, verified_value
-from .protocol import FieldResult, Policy
+from .protocol import DateTarget, FieldResult, Policy
+from .scope import country_matches
 
 FIELDS = ("start_date", "end_date")
 
@@ -17,7 +19,28 @@ def calendar_date(value: str) -> str | None:
         return None
 
 
-def verify_dates(policy: Policy, results: dict[str, FieldResult], review: EvidenceReview) -> None:
+def _matches_target(target: DateTarget, results: dict[str, FieldResult], rules: CompanyRules) -> bool:
+    country = results["country"]
+    if not verified_value(country):
+        return False
+    if target.country is not None and country_matches([target.country], rules.countries, exact=True) != {country.value}:
+        return False
+    if target.company is None:
+        return target.country is not None
+
+    company = results["company"]
+    name = target.company.strip().casefold()
+    if not name or company.needs_confirmation or not company.has_value:
+        return False
+    rows = (rules.table or {}).get(country.value, {})
+    matches = {row.display_name for keyword, row in rows.items()
+               if name in (row.display_name.casefold(), keyword.casefold())}
+    if verified_value(company) and name == company.statement.value.strip().casefold():
+        matches.add(company.value)
+    return matches == {company.value}
+
+
+def verify_dates(policy: Policy, results: dict[str, FieldResult], review: EvidenceReview, rules: CompanyRules) -> None:
     for field in FIELDS:
         result = results[field]
         for quote in result.evidence:
@@ -35,12 +58,7 @@ def verify_dates(policy: Policy, results: dict[str, FieldResult], review: Eviden
                 results[field] = issue(result, "invalid_date_use")
                 break
             if declaration.targets is not None and not any(
-                (target.country is not None or target.company is not None)
-                and (target.country is None or verified_value(results["country"])
-                     and target.country == results["country"].value)
-                and (target.company is None or not results["company"].needs_confirmation
-                     and results["company"].has_value and target.company == results["company"].value)
-                for target in declaration.targets
+                _matches_target(target, results, rules) for target in declaration.targets
             ):
                 results[field] = issue(result, "date_target_mismatch")
                 break

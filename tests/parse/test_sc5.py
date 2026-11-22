@@ -202,6 +202,9 @@ def test_repository_company_example_is_not_a_mapping(monkeypatch, tmp_path):
     ("targets", "expected"),
     [
         ([{"country": "赞比亚", "company": "占位公司甲"}], "2099-03-31"),
+        ([{"country": "ZM", "company": "占位公司甲"}], "2099-03-31"),
+        ([{"country": "Zambia", "company": None}], "2099-03-31"),
+        ([{"country": "未知国家", "company": "占位公司甲"}], None),
         ([{"country": "赞比亚", "company": "占位公司乙"}], None),
         ([{"country": "肯尼亚", "company": "占位公司甲"}], None),
         ([{"country": "肯尼亚", "company": None}, {"country": None, "company": "占位公司甲"}], "2099-03-31"),
@@ -219,6 +222,32 @@ def test_country_qualified_preamble_is_checked_against_policy(targets, expected)
     draft, = parse_application(body, companies_file=COMPANIES_FILE, model=lambda **_: json.dumps(reply))
     assert draft.end_date.value == expected
     assert draft.company.value == "占位公司甲"
+
+
+@pytest.mark.parametrize(("target", "clue", "expected"), [
+    ("synth-a", "synth-A业务", "2099-03-31"),
+    ("占位 SYNTH A 公司", "synth-A业务", "2099-03-31"),
+    ("SYNTH-B", "synth-A业务", None),
+    ("XSYNTH-A", "synth-A业务", None),
+    ("SYNTH-A", "SYNTH-C", None),
+])
+def test_company_qualified_shared_date_uses_verified_company(target, clue, expected):
+    preamble = f"ZM / {target}：合成申请周期到 2099-03-31"
+    body = f"{preamble}\n赞比亚，{clue}"
+    table = (COMPANY_HEADER + "赞比亚\t\t0001\t占位默认公司\n"
+             "赞比亚\tSYNTH-A\t0002\t占位 Synth A 公司\n赞比亚\tSYNTH-B\t0003\t占位乙公司\n")
+    reply = fixed_reply(body, [{
+        "country": field("赞比亚", "赞比亚"),
+        "company_keyword": field([clue], clue),
+        "end_date": field("2099-03-31", preamble),
+    }], policy_ranges=[(len(preamble) + 1, len(body))], shared_dates=True)
+    date_clause = next(c for c in reply["clauses"] if c["date"])
+    date_clause["date"] = date_use("申请周期", targets=[{"country": "ZM", "company": target}])
+    draft, = parse_application(body, companies_text=table, model=lambda **_: json.dumps(reply))
+    assert draft.end_date.value == expected
+    date_result = draft.field_results["end_date"]
+    assert date_result.needs_confirmation is (expected is None)
+    assert date_result.issues == (("date_target_mismatch",) if expected is None else ())
 
 
 def test_policy_field_in_preamble_allows_dates_but_cannot_supply_its_value():
@@ -249,14 +278,17 @@ def test_invalid_or_reversed_dates_require_confirmation(end, expected):
     [
         (None, None, "占位默认公司"),
         (["SYNTH-A"], None, "占位甲公司"),
-        (["SYNTH-C"], None, "占位默认公司"),
+        (["synth-A业务"], None, "占位甲公司"),
+        (["XSYNTH-A"], None, None),
+        (["SYNTH-A2"], None, None),
+        (["SYNTH-C"], None, None),
         (["SYNTH-A", "SYNTH-B"], None, None),
         (["SYNTH-A"], "占位甲公司", "占位甲公司"),
         (["SYNTH-A"], "占位乙公司", None),
     ],
 )
 def test_company_keyword_or_country_default(clues, subject, expected):
-    body = "合成申请，赞比亚，SYNTH-A / SYNTH-B / SYNTH-C，主体占位甲公司或占位乙公司"
+    body = "，".join(["合成申请", "赞比亚", *(clues or []), *([subject] if subject else [])])
     table = (COMPANY_HEADER + "赞比亚\t\t0001\t占位默认公司\n"
              "赞比亚\tSYNTH-A\t0002\t占位甲公司\n赞比亚\tSYNTH-B\t0003\t占位乙公司\n")
     fixed = {"country": field("赞比亚", "赞比亚")}
@@ -266,7 +298,11 @@ def test_company_keyword_or_country_default(clues, subject, expected):
         fixed["company"] = field(subject, subject)
     draft, = parse(body, fixed, companies_text=table)
     assert draft.company.value == expected
-    assert (draft.field_results["company"].source == "查表派生") == (expected is not None)
+    result = draft.field_results["company"]
+    assert result.needs_confirmation is (expected is None)
+    assert (result.source == "查表派生") == (expected is not None)
+    if clues == ["SYNTH-C"]:
+        assert result.issues == ("company_lookup_unresolved",)
 
 
 @pytest.mark.parametrize(("scope", "has_title", "accepted"), [

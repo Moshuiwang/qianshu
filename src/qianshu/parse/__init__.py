@@ -223,7 +223,7 @@ def _draft(
 
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
     country_company.resolve_country_company(results, rules)
-    dates.verify_dates(policy, results, review)
+    dates.verify_dates(policy, results, review, rules)
     hints = [
         *names.derive_names(results),
         *benefits.apply_benefit_rules(results),

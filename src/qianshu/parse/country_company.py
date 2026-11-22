@@ -3,7 +3,7 @@
 from .companies import CompanyRules
 from .evidence import accept, can_use_absence, issue, verified_value
 from .protocol import FieldResult, ValueSource
-from .scope import country_matches
+from .scope import company_mentioned, country_matches
 
 
 FIELDS = ("country", "company", "company_keyword")
@@ -22,15 +22,18 @@ def resolve_country_company(results: dict[str, FieldResult], rules: CompanyRules
         results["company"] = issue(subject, "company_inputs_pending")
         return
     rows = (rules.table or {}).get(country.value, {})
-    keywords = {clue.casefold() for clue in clues.value} if verified_value(clues) else set()
-    matches = [row for keyword, row in rows.items() if keyword and keyword in keywords]
-    row = matches[0] if len(matches) == 1 else rows.get("") if not matches else None
+    if can_use_absence(clues):
+        row = rows.get("")
+        rule = "R10.default_company"
+    else:
+        matches = [row for keyword, row in rows.items() if keyword and company_mentioned(keyword, clues.value)]
+        row = matches[0] if len(matches) == 1 else None
+        rule = "R10.keyword"
     if row is None:
         results["company"] = issue(subject, "company_lookup_unresolved")
     elif verified_value(subject) and subject.value.casefold() != row.display_name.casefold():
         results["company"] = issue(subject, "company_subject_conflict")
     elif verified_value(subject) or can_use_absence(subject):
-        rule = "R10.keyword" if matches else "R10.default_company"
         subject_evidence = (*subject.evidence, *clues.evidence, *country.evidence)
         results["company"] = accept(subject, row.display_name, ValueSource.LOOKUP,
                                     rule=rule, inputs=FIELDS, evidence=subject_evidence)

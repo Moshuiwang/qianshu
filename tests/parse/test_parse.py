@@ -204,10 +204,33 @@ def test_default_requires_all_applicable_declared_ranges(checked):
     name = "maintain_mutual_exclusion_group"
     p = policy("p1", main, values={name: statement("原文未写", checked=ranges[checked])},
                continuations=[cont], shared=["c"])
-    reply = document(body, [p], [clause("c", [shared], [name], ["p1"], scope="共享", kind="备注")])
+    reply = document(body, [p], [clause("c", [shared], [name], ["p1"], scope="共享", kind="备注", disposition="作废")])
     draft, = parse_fixed(body, reply)
     assert getattr(draft, name).value == ("是" if checked == "complete" else None)
     assert draft.field_results[name].source == ("默认规则" if checked == "complete" else None)
+
+
+@pytest.mark.parametrize(("status", "disposition", "needs_confirmation"), [
+    ("确定", "作废", False),
+    ("歧义", "作废", True),
+    ("冲突", "作废", True),
+    ("带条件", "作废", True),
+    ("缺证据", "作废", True),
+    ("确定", "生效", True),
+    ("确定", "询问", True),
+])
+def test_unwritten_field_checks_applicable_clause_status_and_disposition(status, disposition, needs_confirmation):
+    body = "合成条款"
+    s = span(0, len(body))
+    name = "maintain_mutual_exclusion_group"
+    p = policy("p1", s)
+    c = clause("c", [s], [name], ["p1"], status=status, disposition=disposition)
+    draft, = parse_fixed(body, document(body, [p], [c]))
+    result = draft.field_results[name]
+    assert result.needs_confirmation is needs_confirmation
+    assert result.issues == (("uncertain_clause",) if needs_confirmation else ())
+    assert draft.maintain_mutual_exclusion_group.value == (None if needs_confirmation else "是")
+    assert draft.repeat_bonus.value == "是"
 
 
 @pytest.mark.parametrize("status,disposition", [("歧义", "生效"), ("确定", "询问"), ("确定", "作废")])

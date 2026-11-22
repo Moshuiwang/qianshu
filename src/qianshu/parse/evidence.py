@@ -291,13 +291,15 @@ class EvidenceReview:
         status = statement.status
         if status is StatementStatus.UNWRITTEN:
             checked = self._locate_all(statement.checked)
+            applicable = [clause for clause in self.applicable[policy.id] if name in clause.field_ids]
             required = (*self.local[policy.id], *(
-                span for clause in self.applicable[policy.id] if name in clause.field_ids
-                for span in self.clause_spans[clause.id]
+                span for clause in applicable for span in self.clause_spans[clause.id]
             ))
             if (quotes or statement.candidates or statement.value is not None or not checked
                 or len(checked) != len(statement.checked) or any(any(uncovered(span, checked)) for span in required)):
                 codes.append("invalid_checked_range")
+            if any(clause.status != "确定" or clause.disposition != "作废" for clause in applicable):
+                codes.append("uncertain_clause")
         elif status is StatementStatus.CERTAIN and (not valid or statement.candidates):
             codes.append("invalid_certain_evidence")
         verified = status is StatementStatus.CERTAIN and not codes
