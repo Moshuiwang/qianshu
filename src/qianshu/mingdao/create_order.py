@@ -1581,9 +1581,9 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
     def check_before_transport(check_approval):
         login_check()
         stop_if_interrupted(stop)
-        check_approval()
         if check_start_date is not None:
             check_start_date()
+        check_approval()
 
     try:
         while not feishu.approval_connection_ready():

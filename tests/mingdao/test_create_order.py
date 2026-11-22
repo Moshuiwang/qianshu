@@ -2206,6 +2206,30 @@ def test_midnight_during_login_read_stops_transmission(case, platform, business_
     assert any("未建单" in msg and "开始日期" in msg for msg in business_cli.notices)
 
 
+@pytest.mark.parametrize("closure", ["disconnect", "expiry"])
+def test_approval_lost_during_date_check_stops_transmission(
+        case, platform, business_cli, live_approval, monkeypatch, closure):
+    service, now, socket, notices = live_approval
+    monkeypatch.setattr(order, "FeishuService", lambda *args, **kwargs: service)
+    monkeypatch.setattr(service, "run_create", lambda work: work(Event()))
+    effective_start_date = order.effective_start_date
+
+    def date_check(start, today):
+        if "card" in platform.actions:
+            if closure == "disconnect":
+                socket.close_code = 1000
+            else:
+                now[0] = case.window.end.timestamp()
+        return effective_start_date(start, today)
+
+    monkeypatch.setattr(order, "effective_start_date", date_check)
+    code, _ = business_cli.run()
+    assert platform.create_count == 0
+    assert code == 1 and platform.actions.count("card") == 1
+    assert events(case)[-3:] == ["create_attempt", "aborted_before_write", "approval_closed"]
+    assert any("未建单" in notice for notice in notices)
+
+
 @pytest.mark.parametrize("multiple", [True, False])
 def test_targeted_original_name_requires_matching_unique_tag(case, platform, business_cli, multiple):
     if multiple:
