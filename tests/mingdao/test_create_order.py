@@ -1835,6 +1835,7 @@ def business_cli(case, platform, monkeypatch, capsys):
     approvals.publish_approval = record_card
     approvals.run_create = lambda work: work(Event())
     monkeypatch.chdir(private.parent)
+    monkeypatch.setattr(order, "_Transport", lambda *args: approvals.transport)
     monkeypatch.setattr(order, "FeishuService", lambda *args, **kwargs: approvals)
     monkeypatch.setattr(order, "load_settings", lambda _: None)
     monkeypatch.setattr(order, "run", partial(order.run, clock=lambda: now[0]))
@@ -2040,11 +2041,10 @@ def test_order_evidence_masks_intersection_with_loaded_secret(case, platform, bu
     result["evidence"] = result["statement"]["evidence"] = [quote]
     draft["user_scope"]["evidence"] = [{"text": fragment, "start": start}]
     code, error = business_cli.run(export)
-    assert code == 0 and platform.create_count == 1
-    card, = business_cli.summaries
-    assert "用户范围依据：[已脱敏]" in card
-    assert fragment not in card + error + "".join(business_cli.notices)
-    assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
+    assert code == 1 and "凭据" in error
+    assert not business_cli.summaries
+    assert platform.create_count == 0
+    assert fragment not in error + "".join(business_cli.notices)
 
 
 @pytest.mark.parametrize(("name", "mutate", "reason"), [
@@ -2175,6 +2175,20 @@ def test_sensitive_write_value_stops_before_approval(case, platform, business_cl
     code, error = business_cli.run()
     assert code == 1 and "凭据" in error
     assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("source", ["display", "template", "fragment"])
+def test_credential_stop_announces_manual_handoff(case, platform, business_cli, source):
+    if source == "display":
+        case.config["fields"][case.control["user_scope"]]["label"] += case.session_token
+    elif source == "template":
+        platform.template[case.control["approval_url"]] += "/" + case.official_token
+    else:
+        case.values["user_scope"] += case.session_token[4:13]
+    code, error = business_cli.run()
+    assert code == 1 and "凭据" in error
+    assert not business_cli.summaries and platform.create_count == 0
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
 
 
 def test_unmapped_inactive_control_stops_before_approval(case, platform, business_cli):

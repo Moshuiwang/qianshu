@@ -39,7 +39,7 @@ from qianshu.parse.protocol import Duration, SourceBlock, Span
 from qianshu.pipeline import _CardRedaction
 from qianshu.validate import effective_start_date
 from qianshu.feishu.cards import mention
-from qianshu.feishu.sdk import ApprovalClosed, FeishuService
+from qianshu.feishu.sdk import ApprovalClosed, FeishuService, _Transport
 from qianshu.feishu.settings import Window, load_settings
 
 _PREFIX = "【测试】"
@@ -74,9 +74,13 @@ class Stop(RuntimeError):
     """只承载固定原因与私有配置批准的字段名。"""
 
 
-def require(condition, reason):
+class CredentialConflict(Stop):
+    """发卡前命中凭据门禁，须公告转人工。"""
+
+
+def require(condition, reason, error_type=Stop):
     if not condition:
-        raise Stop(reason)
+        raise error_type(reason)
 
 
 def utc(value, *, platform=False):
@@ -1330,7 +1334,7 @@ def check_catalog(values, snapshot, results):
 
 def check_write_credentials(encoded, spec, sensitive):
     reason = "建单字段与凭据冲突"
-    require(not any(secret in encoded for secret in sensitive), reason)
+    require(not any(secret in encoded for secret in sensitive), reason, CredentialConflict)
     if spec["type"] == 34:
         for row in decode(encoded):
             for cell in row:
@@ -1338,7 +1342,7 @@ def check_write_credentials(encoded, spec, sensitive):
     elif spec["type"] in _ARRAY:
         for item in decode(encoded):
             values = item.values() if isinstance(item, dict) else (item,)
-            require(not any(secret in value for value in values for secret in sensitive), reason)
+            require(not any(secret in value for value in values for secret in sensitive), reason, CredentialConflict)
 
 
 def verify_order_request(payload, config, template, relations, values, inactive, sensitive):
@@ -1461,7 +1465,7 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
     def checked_display_value(text):
         for redact, _ in redactions.values():
             displayed, = redact.free_texts([text])
-            require(displayed == text, "建单字段与凭据冲突")
+            require(displayed == text, "建单字段与凭据冲突", CredentialConflict)
         return text
 
     labels = {s["draft"]: s["label"] for s in config["fields"].values() if "draft" in s}
@@ -1480,7 +1484,7 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
     for name, span, text in excerpts:
         redact, offset = redactions[span.source_id]
         summary += f"\n{labels.get(name, name)}依据：" + redact.display(text, offset + span.start)
-    require(not any(secret in summary for secret in secrets), "展示字段与凭据冲突")
+    require(not any(secret in summary for secret in secrets), "展示字段与凭据冲突", CredentialConflict)
     return summary
 
 
@@ -1710,9 +1714,9 @@ def run(args, directory, *, clock=time.time):
     display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
     sensitive.update(value for key, value in secrets.items() if key not in display_settings and receipt(value))
     tracked = [values["policy_name"], args.registration, *(spec["label"] for spec in config["fields"].values())]
-    require(not any(secret in item for item in tracked for secret in sensitive), "展示字段与凭据冲突")
+    require(not any(secret in item for item in tracked for secret in sensitive), "展示字段与凭据冲突", CredentialConflict)
     require(not any(secret in item for item in (card_summary(values), contact)
-                    for secret in (token, official_token, official_app_id)), "展示字段与凭据冲突")
+                    for secret in (token, official_token, official_app_id)), "展示字段与凭据冲突", CredentialConflict)
 
 
     def login_check():
@@ -1795,6 +1799,12 @@ def main(argv=None):
             print("建单回读一致，D15 删除已核验。")
             return 0
         print("验收未通过，请核对群公告与私有报告。", file=sys.stderr)
+    except CredentialConflict as error:
+        try:
+            _Transport(load_settings(args.env_file), None, time.time).announce("未建单（凭据冲突），转人工处理")
+        except Exception:
+            print("转人工公告发送未获确认，请人工核对。", file=sys.stderr)
+        print(f"已停止：{error}", file=sys.stderr)
     except Stop as error:
         print(f"已停止：{error}", file=sys.stderr)
     except KeyboardInterrupt:
