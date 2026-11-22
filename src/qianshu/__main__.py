@@ -653,9 +653,13 @@ def _serve(
         ])
     processor = _processor(pipeline, send, window, report_state, scope=scope, mail_stop=stop, mail_scope=mail_scope)
     processor.expire()
-    if not window.contains(time.time()):
+
+    def log_unfinished() -> None:
         if args.state.exists():
             _LOG.warning("feishu_recovery_unfinished count=%d", len(State.recovery_list(args.state)))
+
+    if not window.contains(time.time()):
+        log_unfinished()
         raise ValueError("当前不在验收窗口内。")
     service = FeishuService(settings, window, args.state, processor)
     processor.attach(service.entrance, service.transport)
@@ -687,6 +691,8 @@ def _serve(
             service.run()
     finally:
         processor.expire()
+        if time.time() >= window.end.timestamp():
+            log_unfinished()
 
 
 def main(argv: list[str] | None = None) -> int:

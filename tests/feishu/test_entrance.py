@@ -712,3 +712,89 @@ def test_incomplete_snapshot_requires_original_binding_and_source(tmp_path, sett
     assert events.count("page request") == 0
     assert events.count("manual") == int(kind != "other binding")
     assert events.count("parse") == 1
+
+
+def test_normal_window_close_logs_unfinished_after_reaction(
+    tmp_path, settings, window, source, monkeypatch, caplog,
+):
+    from types import SimpleNamespace
+    import qianshu.__main__ as entry
+
+    now = 150
+    path = tmp_path / "entry.sqlite"
+    transport = FakeTransport()
+
+    def react_and_close_window(message_id):
+        nonlocal now
+        transport.events.append(("reaction", message_id))
+        now = window.end.timestamp()
+
+    transport.react = react_and_close_window
+
+    def service(settings, window, path, processor):
+        state = State(path, settings)
+        entrance = Entrance(settings, window, state, transport, processor, clock=lambda: now)
+
+        def run():
+            try:
+                entrance.recover().result(timeout=5)
+                entrance.inject_message(source).result(timeout=5).result(timeout=5)
+            finally:
+                entrance.close()
+                state.close()
+
+        return SimpleNamespace(run=run, entrance=entrance, transport=transport)
+
+    monkeypatch.setattr(entry, "time", SimpleNamespace(time=lambda: now))
+    monkeypatch.setattr(entry, "FeishuService", service)
+    monkeypatch.setattr(entry, "load_model_config", lambda **kwargs: None)
+    monkeypatch.setattr(entry, "configured_model", lambda config: None)
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    args = SimpleNamespace(state=path, raw_output_dir=None, env_file=None,
+                           companies_file=None, legacy_companies=False)
+    entry._serve(args, settings, window, {}, (), {})
+    row, = State.recovery_list(path)
+    assert row["digest"] == hashlib.sha256(source.message_id.encode()).hexdigest()
+    assert row["stage"] == "ready"
+    assert transport.events == [("reaction", source.message_id)]
+    assert caplog.messages.count("feishu_recovery_unfinished count=1") == 1
+
+
+def test_report_saved_restart_resumes_only_pending_page(tmp_path, settings, window, source, monkeypatch):
+    import qianshu.__main__ as entry
+    from qianshu.feishu.cards import detail_pages
+
+    factory = entry._processor
+    digest = hashlib.sha256(source.message_id.encode()).hexdigest()
+    second_id, _ = entry._ReportProcessor._payload(digest, 2, {})
+
+    def two_page_processor(pipeline, send, *args, **kwargs):
+        def build_pages(application):
+            return (*pipeline(application), *detail_pages("合成续页", []))
+
+        def interrupt_second_page(card, request_id, notice, check):
+            check()
+            if request_id == second_id:
+                raise TimeoutError
+            if notice:
+                # 合成平台确认第二页发送失败后的中断卡。
+                return
+            send(card, request_id, notice, check)
+
+        return factory(build_pages, interrupt_second_page, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(entry, "_processor", two_page_processor)
+        _crash(tmp_path, settings, window, source, "report_saved")
+    row, = State.recovery_list(tmp_path / "entry.sqlite")
+    assert row["stage"] == "report_saved"
+    with sqlite3.connect(tmp_path / "pages.sqlite") as db:
+        assert db.execute("SELECT sent_pages, total_pages FROM reports").fetchone() == (1, 2)
+    assert not (tmp_path / second_id).exists()
+    events = tmp_path / "events"
+    before = events.read_text().splitlines()
+    assert _run_crash_case(tmp_path, settings, window, source, None) == "done"
+    assert events.read_text().splitlines()[len(before):] == ["page request", "page"]
+    assert (tmp_path / second_id).is_file()
+    assert State.recovery_list(tmp_path / "entry.sqlite") == []
