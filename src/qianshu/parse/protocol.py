@@ -155,3 +155,7 @@ class FieldResult:
     input_fields: tuple[str, ...] = ()
     rule: str | None = None
     evidence: tuple[Evidence, ...] = ()
+
+    @property
+    def evidence_verified(self) -> bool:
+        return self.has_value and not self.issues and not self.needs_confirmation

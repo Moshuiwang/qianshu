@@ -1504,6 +1504,38 @@ def test_business_grades_all_categories(entry, mark, value, confirmation, start,
     assert grade("recharge_days", entry, mark, draft, "占位 30 天") == status
 
 
+@pytest.mark.parametrize(("status", "gold", "issues", "expected"), [
+    ("原文未写", "是", (), "correct"),
+    ("原文未写", "否", (), "false_determined"),
+    ("确定", "是", (), "false_determined"),
+    ("原文未写", "是", ("invalid_unwritten_shape",), "false_determined"),
+])
+def test_business_grades_thin_default(status, gold, issues, expected):
+    from qianshu.parse.protocol import FieldResult, Finding, StatementStatus, ValueSource
+    from qianshu.regression.business import grade
+
+    finding = Finding(status=StatementStatus(status), reason_code="synthetic", value=None,
+                      candidates=[], evidence=[])
+    result = FieldResult(finding, value="是", has_value=True, source=ValueSource.DEFAULT,
+                         needs_confirmation=False, issues=issues)
+    name = "cancel_on_downgrade"
+    draft = SimpleNamespace(cancel_on_downgrade=DraftField(value="是"), field_results={name: result})
+    mark = {"inferable": True, "auto_allowed": True, "default": "是"}
+    assert grade(name, {"value": gold}, mark, draft, "") == expected
+
+
+def test_business_keeps_legacy_default_score_without_verification_metadata():
+    from qianshu.regression.business import grade
+
+    name = "cancel_on_downgrade"
+    draft = SimpleNamespace(cancel_on_downgrade=DraftField(value="是"))
+    mark = {"inferable": True, "auto_allowed": True, "default": "是"}
+    assert grade(name, {"value": "是"}, mark, draft, "") == "false_determined"
+    draft.field_results = {name: SimpleNamespace(statement=SimpleNamespace(status="原文未写"),
+                                                source="默认规则", needs_confirmation=False, issues=())}
+    assert grade(name, {"value": "是"}, mark, draft, "") == "false_determined"
+
+
 def test_business_maps_included_gold_and_separates_extras_from_unknown():
     from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, grade, pairing_audit
