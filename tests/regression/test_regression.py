@@ -172,6 +172,18 @@ def frozen(repo, corpus, capsys):
     return checksum
 
 
+def assert_replay(repo):
+    source = get_json(repo / "run/public-report.json")
+    replay = get_json(repo / "replay/public-report.json")
+    assert replay["cost"]["new_known_usd"] == "0"
+    charge = source["cost"]["new_known_usd"]
+    source["cost"]["new_known_usd"] = "0"
+    assert source == replay
+    assert (repo / "replay/public-report.md").read_text() == (repo / "run/public-report.md").read_text().replace(
+        f"本次新增 {charge} 美元", "本次新增 0 美元")
+    assert (repo / "replay/mismatches.json").read_bytes() == (repo / "run/mismatches.json").read_bytes()
+
+
 def run_args(fingerprint, output=".private/run"):
     return ["run", "--frozen", ".private/frozen", "--expect-sha256", fingerprint, "--out", output]
 
@@ -964,7 +976,7 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.delenv("ANTHROPIC_EFFORT", raising=False)
-    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     assert efforts == ["medium", "medium"]
     report = get_json(repo / "run/public-report.json")
     assert report["documents"] == {"model_failed": 0, "parse_failed": 2, "parsed": 0}
@@ -975,7 +987,7 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
     assert attempt["failure_stage"] == record["reason_code"] == "reply_tool_missing"
     assert json.loads(attempt["reply"]) == [block.model_dump(exclude_unset=True) for block in blocks]
     monkeypatch.setenv("ANTHROPIC_EFFORT", "high")
-    assert main([*run_args(frozen, ".private/high"), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen, ".private/high"), "--live", "--mode", "instant", "--run-id", "high", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     assert efforts == ["medium", "medium", "high", "high"]
     high_record = get_json(repo / "high/document-00001.json")
     assert high_record["attempts"][0]["effort"] == high_record["configuration"]["effort"] == "high"
@@ -983,12 +995,11 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
     assert high_report["configuration_sha256"] != report["configuration_sha256"]
 
     monkeypatch.setenv("ANTHROPIC_EFFORT", "unsupported")
-    assert main([*run_args(frozen, ".private/invalid"), "--live", "--release"]) == 1
+    assert main([*run_args(frozen, ".private/invalid"), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release"]) == 1
     assert not (repo / "invalid").exists()
     assert main(_replay_args(frozen)) == 0
     assert efforts == ["medium", "medium", "high", "high"]
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 @pytest.mark.parametrize(("stop", "reason"), [
@@ -1010,7 +1021,7 @@ def test_incomplete_reply_is_counted_even_when_release_is_void(repo, frozen, mon
         return model
 
     monkeypatch.setattr("qianshu.regression.__main__.configured_model", configured)
-    assert main([*run_args(frozen), "--live", "--release"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release"]) == 0
     report = get_json(repo / "run/public-report.json")
     assert report["void"] is True
     assert report["documents"] == {"model_failed": 1, "parse_failed": 1, "parsed": 0}
@@ -1021,8 +1032,7 @@ def test_incomplete_reply_is_counted_even_when_release_is_void(repo, frozen, mon
     attempt, = record["attempts"]
     assert (attempt["reply"], attempt["stop_reason"]) == ("[", stop)
     assert main(_replay_args(frozen)) == 0
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 @pytest.mark.parametrize("status", [503, 307])
@@ -1042,7 +1052,7 @@ def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monk
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
-    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     report = get_json(repo / "run/public-report.json")
     assert len(requests) == 2 and set(requests.values()) == {2}
     assert report["usage"]["attempts"] == sum(requests.values())
@@ -1108,7 +1118,7 @@ def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, froze
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
-    assert main([*run_args(frozen), "--live", "--release"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release"]) == 0
     report = get_json(repo / "run/public-report.json")
     assert report["void"] is False
     assert report["documents"] == {"model_failed": 0, "parse_failed": 1, "parsed": 1}
@@ -1119,8 +1129,7 @@ def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, froze
     assert attempt["failure_stage"] == record["reason_code"] == "tool_input_json"
     assert (attempt["reply"], attempt["stop_reason"]) == (invalid, "tool_use")
     assert main(_replay_args(frozen)) == 0
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 @pytest.mark.parametrize(("interruption", "retry_reply"), [
@@ -1160,7 +1169,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
-    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
     report = get_json(repo / "run/public-report.json")
     assert report["usage"]["attempts"] == 3
@@ -1169,12 +1178,13 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         "model_failed": int(retry_reply is None), "parse_failed": int(retry_reply == "invalid"),
         "parsed": 1 + int(retry_reply == "valid"),
     }
-    assert report["business"]["counts"]["reply_parse_failed"] == 1
+    assert report["business"]["counts"]["reply_parse_failed"] == int(retry_reply != "valid")
     assert report["business"]["reply_parse_failure_reasons"] == {
-        "reply_truncated": 1, "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0,
+        "reply_truncated": int(retry_reply is None), "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0,
     }
     record = get_json(repo / "run/document-00001.json")
     first, second = record["attempts"]
+    assert sum(report["attempt_failures"].values()) == 1 + int(second["failure_stage"] is not None)
     partial_stage = "model_incomplete" if interruption == "eof" else "reply_truncated"
     assert (first["failure_stage"], first["reply"]) == (partial_stage, "[")
     if retry_reply is None:
@@ -1188,8 +1198,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         assert second["reply"] == "{}"
     assert main(_replay_args(frozen)) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 class LaterClock(datetime):
@@ -1255,7 +1264,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         return model
 
     monkeypatch.setattr("qianshu.regression.__main__.configured_model", configured)
-    assert main([*run_args(frozen), "--live", "--release", "--threshold", "3"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--threshold", "3"]) == 0
     assert attempts == {BATCH: 2, "占位单条原稿\n": 2}
     recording = get_json(repo / "run" / "recording.json")
     assert recording["threshold"] == 3
@@ -1273,7 +1282,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         assert failed["failure_stage"] == "model_call"
         assert failed["effort"] == "medium"
         assert final == {
-            "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
+            "batch_outcome": None, "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
                                                  {"type": "text", "length": len(final["reply"])}],
             "input_tokens": 12, "output_tokens": 3, "elapsed_ms": 20,
             "model": "synthetic-model", "reply": final["reply"], "failure_stage": None, "effort": "medium",
@@ -1293,8 +1302,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
 
     monkeypatch.setattr("qianshu.regression.__main__.configured_model", forbidden)
     assert main(_replay_args(frozen), model=forbidden) == 0
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
     report = get_json(repo / "run" / "public-report.json")
     assert report["evidence_location"] == expected_locations
     assert report["business"]["counts"]["reply_parse_failed"] == 1
@@ -1335,6 +1343,7 @@ def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     for name in imported["artifact_sha256"]:
         record = get_json(repo / "imported" / name)
         assert record["attempts"] == [{
+            "batch_outcome": None,
             "reply": serialized_empty(), "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
             "input_tokens": None, "output_tokens": None, "elapsed_ms": None,
         }]
@@ -1373,7 +1382,7 @@ def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, fro
     assert main(args) == 0
     summary = get_json(repo / "summary" / "public-summary.json")
     assert (summary["runs"], summary["valid_runs"], summary["void_runs"]) == (3, 2, 1)
-    assert summary["business_counts"]["reply_parse_failed"] == {"values": [0, 0, 1], "mean": 1 / 3, "min": 0, "max": 1}
+    assert summary["business_counts"]["reply_parse_failed"] == {"values": [0, 0], "mean": 0, "min": 0, "max": 0}
     assert summary["old_alignment"]["unmatched"] == {"values": [3, 3], "mean": 3, "min": 3, "max": 3}
     assert summary["business_rates_percent"]["all_correct"]["fractions"] == [
         {"numerator": 0, "denominator": 3}, {"numerator": 0, "denominator": 3},

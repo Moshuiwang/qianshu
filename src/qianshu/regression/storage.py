@@ -143,6 +143,7 @@ class Output:
         self.path = path
         self.folder = folder
         self.names = names
+        self.durable = False
 
     def write(self, name: str, data: bytes) -> None:
         if name not in self.names:
@@ -160,3 +161,25 @@ class Output:
         fd = os.open(name, _NEW, mode=0o600, dir_fd=self.folder)
         with os.fdopen(fd, "wb") as stream:
             stream.write(data)
+            if self.durable:
+                stream.flush()
+                os.fsync(stream.fileno())
+
+
+@contextmanager
+def staged_output(files, path, names):
+    """批次可重复取回；只有含完整清单的目录才能占用最终输出名。"""
+    from uuid import uuid4
+    stage = path.with_name(".regression-" + uuid4().hex)
+    with files.new_output(stage, names) as output:
+        output.durable = True
+        yield output
+        os.fsync(output.folder)
+        files._check_ignore(Path(".private") / path, directory=True)
+        for name in names:
+            files._check_ignore(Path(".private") / path / name)
+        with files._directory(path.parent) as parent, files._directory(stage) as checked:
+            if not os.path.samestat(os.fstat(checked), os.fstat(output.folder)):
+                raise RegressionError("批量输出暂存目录已变更。")
+            os.rename(stage.name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+            os.fsync(parent)
