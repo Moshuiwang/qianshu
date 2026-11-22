@@ -494,6 +494,7 @@ class BusinessScore:
                 self.eligible[sample_id].append(name)
         self.counts = Counter()
         self.field_counts = defaultdict(Counter)
+        self.benefit_field_counts = defaultdict(lambda: defaultdict(Counter))
         self.name_counts = {kind: Counter() for kind in POLICY_TYPES}
         self.name_sources = defaultdict(Counter)
         self.rates = Counter()
@@ -534,6 +535,7 @@ class BusinessScore:
                 )
                 status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
                 self.field_counts[name][status] += 1
+                self.benefit_field_counts[self.samples[sample_id]["benefit_type"]][name][status] += 1
                 by_field[name] = status
             kind = sample.get("policy_type")
             if kind == "公开政策":
@@ -609,6 +611,11 @@ class BusinessScore:
             "measure_sha256": self.measure_fingerprint,
             "rates": rates, "counts": {key: self.counts[key] for key in (*COUNT_LABELS, "ambiguous_drafts")},
             "field_categories": {category: field_totals[category] for category in CATEGORIES},
+            "by_benefit_type": {
+                kind: {name: {category: counts[category] for category in CATEGORIES}
+                       for name, counts in fields.items()}
+                for kind, fields in self.benefit_field_counts.items()
+            },
             "by_field": {name: {category: counts[category] for category in CATEGORIES}
                          for name, counts in self.field_counts.items()},
             "policy_names": {kind: _name_totals(counts) for kind, counts in self.name_counts.items()},

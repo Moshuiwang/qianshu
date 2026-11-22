@@ -79,10 +79,17 @@ def _is_web_url(value: str) -> bool:
 
 
 def _required_fields(draft: PolicyDraft, errors: list[Finding]) -> None:
+    from qianshu.parse.benefits import OFFER_FIELD_LABELS, benefit_applicability, benefit_field_format
+
+    inactive_benefits, required_benefits = benefit_applicability(draft)
     for item in fields(draft):
         field = getattr(draft, item.name)
         if field.uncertainty is not None:
             errors.append(Finding("R5", item.name, "字段尚未确认，请申请人确认。"))
+        elif item.name in inactive_benefits:
+            continue
+        elif item.name in OFFER_FIELD_LABELS and item.name not in required_benefits and field.value is None:
+            continue
         elif item.name not in {
             "maintain_mutual_exclusion_group", "company", "approval_url",
             "user_scope", "approval_attachments", "user_tags",
@@ -90,6 +97,11 @@ def _required_fields(draft: PolicyDraft, errors: list[Finding]) -> None:
             value = field.value
             if value is None or (isinstance(value, str) and not value.strip()):
                 errors.append(Finding("R5", item.name, "必填字段缺失，请申请人补充。"))
+            elif not benefit_field_format(item.name, value):
+                errors.append(Finding("R5", item.name, "优惠字段格式无效，请申请人核对。"))
+    for name in sorted(required_benefits):
+        if not hasattr(draft, name):
+            errors.append(Finding("R5", name, "必填字段缺失，请申请人补充。"))
 
     packages = _value(draft.packages)
     if packages is not None and (

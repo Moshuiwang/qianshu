@@ -6,14 +6,14 @@ from datetime import date
 from pathlib import Path
 from typing import get_origin
 
-from qianshu.draft import DraftField, PolicyDraft
+from qianshu.draft import DraftField, OfferPolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
 from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
 
-from .business import COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
+from .business import CATEGORIES, COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
 from .freeze import PACKAGE_STYLES
 from .storage import RegressionError, digest, json_bytes
@@ -170,7 +170,7 @@ def evaluate(
         pairs[pair["token"]].append(pair)
     denominator = frozen["denominators"]
     eligible = {name: set(field["ids"]) for name, field in denominator["fields"].items()}
-    draft_fields = {field.name for field in fields(PolicyDraft) if get_origin(field.type) is DraftField}
+    draft_fields = {field.name for field in fields(OfferPolicyDraft) if get_origin(field.type) is DraftField}
     new_fields = sorted((draft_fields | FIELD_LABELS.keys()) - eligible.keys() - set(APPROVAL_FIELDS))
     new_field_counts = {name: Counter() for name in new_fields}
     full = set(denominator["whole_policy"])
@@ -460,6 +460,12 @@ def markdown_report(report: dict) -> bytes:
     for key, label in COUNT_LABELS.items():
         suffix = breakdown if key == "reply_parse_failed" else ""
         result.append(f"- {label} {report['business']['counts'][key]}{suffix}")
+    result.extend(["", "| 优惠类型 | 业务字段 | 正确确定 | 错判确定 | 多问 | 合理需确认 | 缺失 | 未知 |",
+                   "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"])
+    for kind, field_counts in report["business"]["by_benefit_type"].items():
+        for name, counts in field_counts.items():
+            label = FIELD_LABELS[name][0] if name in FIELD_LABELS else name
+            result.append("| " + " | ".join([kind, label, *(str(counts[key]) for key in CATEGORIES)]) + " |")
     if name_counts := report["business"].get("policy_names"):
         result.extend(["", "## #58 政策名称计数", ""])
         for policy_type, counts in (name_counts | report["business"].get("public_name_sources", {})).items():

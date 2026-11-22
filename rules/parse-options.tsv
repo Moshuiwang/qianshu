@@ -1,3 +1,5 @@
 # 字段<TAB>明道云选项名称<TAB>原文别名（可有多列）。追加行时保留既有条目。
 policy_type	定向政策
 benefit_type	赠送时长	充一送一	买一赠一
+benefit_type	升级权益
+benefit_type	特价优惠

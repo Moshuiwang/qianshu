@@ -231,8 +231,12 @@ def test_offline_name_matches_card_and_keeps_existing_public_order_gate(case):
     body, fields = application()
     reply = fixed_reply(body, [fields])
     draft = parse_one(body, reply)
+    offline_fields = asdict(draft)
+    with pytest.raises(create_order.Stop, match="草稿字段无效"):
+        create_order.draft_values(offline_fields)
+    order_fields = {key: offline_fields[key] for key in create_order._DRAFT_FIELDS}
     with pytest.raises(create_order.Stop, match="policy_name 待确认"):
-        create_order.draft_values(asdict(draft))
+        create_order.draft_values(order_fields)
 
     values = {**case.values, "user_tags": [], "policy_name": draft.policy_name.uncertainty.candidates[0].value}
     controls, _ = create_order.assemble(values, case.cells, case.config, case.relations.__getitem__, is_test=True)
