@@ -65,7 +65,7 @@ def test_batch_sdk_record_replay_and_resume(repo, frozen, monkeypatch):
     ledger_path = repo / "regression-ledger.json"
     assert manifest["ledger"] == {"path": str(ledger_path), "sha256": digest(ledger_path.read_bytes())}
     entry = get_json(ledger_path)["r1"]
-    assert entry["spent_usd"] == "0.0002" and entry["committed_usd"] == "2.5998"
+    assert entry["spent_usd"] == "0.0002" and entry["committed_usd"] == "2.6"
     assert entry["active"] is False
     assert main(["run", *subset, "--out", ".private/immediate", "--live", "--run-id", "r2",
                  "--estimate-usd", "2", "--release", "--mode", "instant"]) == 0
@@ -513,6 +513,9 @@ def test_instant_disconnect_after_start_keeps_reservation(repo, frozen, monkeypa
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     assert main([*run_args(frozen), "--live", "--mode", "instant", "--trial", "1", "--retries", "1",
                  "--run-id", "broken", "--estimate-usd", "1"]) == 0
+    attempts = get_json(repo / "run/document-00001.json")["attempts"]
+    assert all((a["partial_input_tokens"], a["partial_output_tokens"]) == (1, 0) for a in attempts)
+    assert all(a["input_tokens"] is None and a["output_tokens"] is None for a in attempts)
     cost = get_json(repo / "run/public-report.json")["cost"]
     assert cost["usage_status"] == "用量部分未知" and cost["missing_attempts"] == 2
     row = get_json(repo / "regression-ledger.json")["broken"]
@@ -530,9 +533,8 @@ def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
         manifest = {"run_id": "history", "origin": "live", "source_code_measured": True}
         for _ in range(2):
             ledger.carry_recording(manifest, "history-sha", cost, "1")
-        for key, row in get_json(repo / ledger.path).items():
-            remaining = "1.3" if key == "history" else "1.05"
-            assert row["committed_usd"] == remaining and row["spent_usd"] == "0.25"
+        for row in get_json(repo / ledger.path).values():
+            assert row["committed_usd"] == "1.3" and row["spent_usd"] == "0.25"
             assert row["active"] is False
         for i in range(3):
             ledger.reserve(f"next-{i}", "batch", "1", str(i))

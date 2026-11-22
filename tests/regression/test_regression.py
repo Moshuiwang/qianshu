@@ -969,7 +969,7 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
         assert "tool_choice" not in payload
         assert "必须调用 `submit_application_reply` 一次" in payload["system"]
         assert "不要用文字回答" in payload["system"]
-        return nullcontext([SimpleNamespace(type="message_start", message=reply)])
+        return nullcontext([SimpleNamespace(type="message_start", message=reply), SimpleNamespace(type="message_stop")])
 
     client = SimpleNamespace(messages=SimpleNamespace(create=stream))
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
@@ -1005,6 +1005,7 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
 @pytest.mark.parametrize(("stop", "reason"), [
     ("max_tokens", "reply_truncated"),
     ("stop_sequence", "reply_incomplete"),
+    ("refusal", "reply_refused"),
 ])
 def test_incomplete_reply_is_counted_even_when_release_is_void(repo, frozen, monkeypatch, stop, reason):
     from qianshu.parse.model import CallResult, ModelError
@@ -1028,6 +1029,7 @@ def test_incomplete_reply_is_counted_even_when_release_is_void(repo, frozen, mon
     assert report["business"]["counts"]["reply_parse_failed"] == 1
     assert report["business"]["reply_parse_failure_reasons"][reason] == 1
     record = get_json(repo / "run/document-00001.json")
+    assert f"拒答 {int(stop == 'refusal')}" in (repo / "run/public-report.md").read_text()
     assert record["failure_stage"] == reason
     attempt, = record["attempts"]
     assert (attempt["reply"], attempt["stop_reason"]) == ("[", stop)
@@ -1180,12 +1182,12 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
     }
     assert report["business"]["counts"]["reply_parse_failed"] == int(retry_reply != "valid")
     assert report["business"]["reply_parse_failure_reasons"] == {
-        "reply_truncated": int(retry_reply is None), "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0,
+        "reply_truncated": int(retry_reply is None), "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0, "reply_refused": 0,
     }
     record = get_json(repo / "run/document-00001.json")
     first, second = record["attempts"]
     assert sum(report["attempt_failures"].values()) == 1 + int(second["failure_stage"] is not None)
-    partial_stage = "model_incomplete" if interruption == "eof" else "reply_truncated"
+    partial_stage = "reply_truncated"
     assert (first["failure_stage"], first["reply"]) == (partial_stage, "[")
     if retry_reply is None:
         assert (second["failure_stage"], second["reply"]) == (partial_stage, "[")
@@ -1282,6 +1284,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         assert failed["failure_stage"] == "model_call"
         assert failed["effort"] == "medium"
         assert final == {
+            "first_shape_error": None, "retry_result": None, "partial_input_tokens": None, "partial_output_tokens": None,
             "batch_outcome": None, "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
                                                  {"type": "text", "length": len(final["reply"])}],
             "input_tokens": 12, "output_tokens": 3, "elapsed_ms": 20,
@@ -1374,7 +1377,7 @@ def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, fro
     void = get_json(repo / "void" / "public-report.json")
     assert void["void"] and void["business"] == {
         "counts": {"reply_parse_failed": 1},
-        "reply_parse_failure_reasons": {"reply_parse": 1, "reply_incomplete": 0, "reply_truncated": 0},
+        "reply_parse_failure_reasons": {"reply_parse": 1, "reply_incomplete": 0, "reply_truncated": 0, "reply_refused": 0},
     }
     assert "sample_alignment" not in void
     args = ["summarize", "--recording", ".private/first", "--recording", ".private/second",
@@ -2261,3 +2264,62 @@ def test_package_snapshot_reaches_parser_and_scores_two_rows(repo, monkeypatch):
     assert main([*replay, "--package-levels", ".private/synthetic.csv"]) == 1
     assert main(replay) == 0
     assert get_json(repo / "replay/public-report.json")["business"] == business
+
+
+@pytest.mark.parametrize("repaired", [True, False, None])
+def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen, monkeypatch, repaired):
+    import anthropic
+    import httpx
+
+    requests = []
+
+    def reply(request):
+        messages = json.loads(request.content)["messages"]
+        body = json.loads(messages[0]["content"])["application"]
+        requests.append(messages)
+        if repaired is None and len(messages) > 1:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content=b"".join(_stream_reply_events("[", interrupted=True)))
+        payload = fixed_reply(body, [{}])
+        if body == BATCH and (len(messages) == 1 or not repaired):
+            del payload["policies"][0]["fields"]["country"]["evidence"]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content=b"".join(_stream_reply_events(json.dumps(payload))))
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(reply), **kw))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "shape",
+                 "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
+    assert len(requests) == 3
+    report = get_json(repo / "run/public-report.json")
+    assert report["documents"]["first_shape_errors"] == 1
+    assert report["business"]["counts"]["reply_parse_failed"] == int(not repaired)
+    assert report["usage"]["attempts"] == 3
+    total = 2 if repaired is None else 3
+    assert report["usage"]["input_tokens"]["total"] == report["usage"]["output_tokens"]["total"] == total
+    assert report["void"] == (repaired is None)
+    first, final = get_json(repo / "run/document-00001.json")["attempts"]
+    assert first["first_shape_error"] == final["first_shape_error"] == "missing_evidence"
+    assert final["retry_result"] == ("succeeded" if repaired else "failed")
+    assert main(_replay_args(frozen)) == 0
+    assert len(requests) == 3
+    assert_replay(repo)
+    if repaired is True:
+        from qianshu.regression.storage import digest
+
+        # 每次只去掉一个录制扩展键；重放仍用同一份最终回复出草稿。
+        artifact = "document-00001.json"
+        for key in ("first_shape_error", "retry_result", "partial_input_tokens", "partial_output_tokens", "request"):
+            source = repo / ("without-" + key)
+            shutil.copytree(repo / "run", source)
+            document = get_json(source / artifact)
+            for attempt in document["attempts"]:
+                attempt.pop(key, None)
+            put_json(source / artifact, document)
+            manifest = get_json(source / "recording.json")
+            manifest["artifact_sha256"][artifact] = digest((source / artifact).read_bytes())
+            put_json(source / "recording.json", manifest)
+            output = "replay-" + key
+            assert main(_replay_args(frozen, ".private/" + source.name, ".private/" + output)) == 0
+            assert get_json(repo / output / "public-report.json")["documents"] == report["documents"]

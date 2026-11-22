@@ -1108,3 +1108,30 @@ def test_command_blocks_overlapping_policy_anchors(tmp_path, single_policy):
     assert "未校验" in content
     assert "待群卡片同意" not in content
     assert "政策 1 · 用户范围\n值　占位休眠用户" in content
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_deferred_archive_card_shows_only_verified_evidence(tmp_path, explicit):
+    body = "合成申请，本批未附存档链接。"
+    reply = fixed_reply(body, [{}])
+    if explicit:
+        reply["policies"][0]["fields"]["approval_url"] = statement(
+            "确定", evidence=[quote(body, "本批未附存档链接")],
+        )
+    lines = _contents(_run(tmp_path, body, reply, separator=""))
+    assert "政策 1 · 任务审批链接\n建单时填写" in lines
+    assert ("政策 1 · 任务审批链接 · 原文出处 1\n本批未附存档链接" in lines) == explicit
+
+
+def test_deferred_archive_excerpt_respects_source_redaction():
+    secret = "A1B2C3D4"
+    body = "合成无链接说明" + secret
+    reply = fixed_reply(body, [{}])
+    reply["policies"][0]["fields"]["approval_url"] = statement(
+        "确定", evidence=[quote(body, "合成无链接说明A1")],
+    )
+    pipeline = Pipeline(model=lambda **_: json.dumps(reply), tag_dates={}, companies_file=COMPANIES_FIXTURE,
+                        sensitive_values=[secret])
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+    assert "政策 1 · 任务审批链接 · 原文出处 1\n合成无链接说明[已脱敏]" in lines
+    assert "A1" not in "\n".join(lines)

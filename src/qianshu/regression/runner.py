@@ -11,7 +11,7 @@ from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
-from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
+from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel, StreamingModel, recorded_shape_error
 from qianshu.parse.package_levels import PackageLevels, load_package_levels
 
 from .business import CATEGORIES, COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
@@ -161,6 +161,51 @@ def _new_field_status(draft, name: str) -> str:
     return "determined" if field.value is not None else "missing"
 
 
+def _document_model(recording, token):
+    recorded = recording.for_document(token)
+    model = recording.model
+    if recording.source is not None or not isinstance(model, StreamingModel):
+        return recorded
+
+    def call(*, system, user):
+        # 使用和批量/重放相同的 attempts 入口，使每次物理请求独立计费和落盘。
+        from .recording import _call_data, _retryable
+
+        def source(_token, _user_sha, _system_sha):
+            attempts = []
+            first_request = {}
+
+            def collect(result):
+                attempt = _call_data(result)
+                if result.retry_result and "request" in recording.document:
+                    attempt["request"] = recording.document["request"]
+                elif not first_request and "request" in recording.document:
+                    first_request.update({key: recording.document[key] for key in ("request", "request_sha256")})
+                attempts.append(attempt)
+
+            observed = StreamingModel(model.send, collect)
+            for _ in range(recording.config["retries"] + 1):
+                try:
+                    observed(system=system, user=user)
+                except ModelReplyError as error:
+                    attempts[-1]["structure_path"] = error.path
+                except ModelError:
+                    pass
+                last = attempts[-1]
+                if last.get("retry_result") or not _retryable(last):
+                    break
+            recording.document.update(first_request)
+            return attempts
+
+        recording.source = source
+        try:
+            return recorded(system=system, user=user)
+        finally:
+            recording.source = None
+
+    return call
+
+
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
     threshold: int = DEFAULT_THRESHOLD, recording=None, package_levels: PackageLevels | None = None,
@@ -216,11 +261,12 @@ def evaluate(
     evidence_locations = Counter()
     full_review_cards = full_review_policies = 0
     full_review_reasons = Counter()
-    reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
+    reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated", "reply_refused"), 0)
     reply_failed_documents = 0
+    first_shape_errors = 0
 
     for token, document in frozen["documents"].items():
-        call = recording.for_document(token) if recording is not None else model
+        call = _document_model(recording, token) if recording is not None else model
         received = False
 
         def on_reply(_reply: str) -> None:
@@ -274,6 +320,11 @@ def evaluate(
             evidence_location=_evidence_location_report(location_counts),
         ):
             failure_reasons.add("reply_truncated")
+        if recording is not None:
+            attempts = recording.document["attempts"]
+            first_shape_errors += any(recorded_shape_error(attempt) for attempt in attempts)
+            if attempts and attempts[-1].get("retry_result") == "failed" and not failure_reasons:
+                failure_reasons.add("reply_incomplete")
         reply_failed_documents += bool(failure_reasons)
         for reason in failure_reasons:
             reply_failures[reason] = reply_failures.get(reason, 0) + 1
@@ -365,6 +416,8 @@ def evaluate(
     }
     report["business"] = business.report(reply_failed_documents)
     report["business"]["reply_parse_failure_reasons"] = reply_failures
+    if first_shape_errors:
+        report["documents"]["first_shape_errors"] = first_shape_errors
     details["business"] = business_details
     details["pairing_audit"] = pairing_audit(business_details)
     return report, details
@@ -372,7 +425,7 @@ def evaluate(
 
 def markdown_report(report: dict) -> bytes:
     failures = report["business"]["reply_parse_failure_reasons"]
-    breakdown = f"（截断 {failures['reply_truncated']}，其他未完整结束 {failures['reply_incomplete']}，解码或解析 {failures['reply_parse']}）"
+    breakdown = f"（截断 {failures['reply_truncated']}，其他未完整结束 {failures['reply_incomplete']}，拒答 {failures.get('reply_refused', 0)}，解码或解析 {failures['reply_parse']}）"
     locations = report["evidence_location"]
     percent = locations["percent"]
     rate = f"{percent:.2f}%" if percent is not None else "不可判定"
@@ -384,6 +437,8 @@ def markdown_report(report: dict) -> bytes:
     review_line = f"- 需核对全文的卡片数 {review['cards']}（政策数 {review['policies']}），按政策结构与空材料计"
     reasons = report["full_document_review_reasons"]
     review_lines = [review_line, *(f"  - {label} {reasons[code]} 篇" for code, label in STRUCTURE_REASONS.items())]
+    review_lines.append(f"- 首次形状错误 {report['documents'].get('first_shape_errors', 0)} 篇，"
+                        f"最终回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇")
     if cost := report.get("cost"):
         usage = report["usage"]
         def shown(value):

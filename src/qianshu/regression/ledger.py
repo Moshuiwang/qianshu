@@ -171,8 +171,5 @@ class Ledger:
         with transaction(self.files, self.path) as runs:
             row = runs[run_id]
             row["spent_usd"] = str(cost)
-            remaining = Decimal(row["reserved_usd"])
-            if row["mode"] == "batch":
-                remaining = max(remaining - Decimal(cost), 0)
-            row["committed_usd"] = str(remaining) if missing else "0"
+            row["committed_usd"] = row["reserved_usd"] if missing else "0"
             row["active"] = False

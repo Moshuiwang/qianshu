@@ -424,3 +424,15 @@ def test_name_value_and_evidence_use_w1_card_text_check(monkeypatch):
     reply["policies"][0]["fields"]["country"]["explanation"] = "合成国家说明"
     assert "优惠政策名称\n值　合成原名" in card_text(body, model_reply(reply))
     assert any(parts.count("合成原名") >= 2 and "合成国家说明" in parts for parts in calls)
+
+
+@pytest.mark.parametrize(("text", "tag", "accepted"), [
+    ("EXAMPLE.", "EXAMPLE", True), ("EXAMPLE. Next", "EXAMPLE", True),
+    ("EXAMPLE.ONE.", "EXAMPLE.ONE", True), ("EXAMPLE.ONE", "EXAMPLE", False),
+    ("标签甲.乙", "标签甲", False), ("EXAMPLE.ONE", "ONE", False), ("EXAMPLE-ONE", "EXAMPLE", False),
+])
+def test_tag_format_checks_whole_identifier(text, tag, accepted):
+    body = "合成标签：" + text
+    draft = parse_one(body, fixed_reply(body, [{"user_tags": field([tag], tag)}]))
+    assert (draft.user_tags.uncertainty is None) == accepted
+    assert (draft.policy_name.value == tag) == accepted
