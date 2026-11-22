@@ -1,7 +1,8 @@
 import json
 from dataclasses import replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -130,6 +131,30 @@ def tariff_scenario(**overrides):
         "first_recharge_day_only": field("是", "仅首次充值当天可享受"),
         **overrides,
     })
+
+
+@pytest.mark.parametrize(("options", "name_date", "version", "amount"), [
+    ({}, "20990120", "占位新版", 60),
+    ({"today": date(2099, 1, 19)}, "20990119", "占位版本", 40),
+    ({"recorded_reply": True}, None, "占位版本", 40),
+], ids=["live-utc", "explicit-today", "recorded-reply"])
+def test_tariff_and_proposed_name_share_effective_start(monkeypatch, options, name_date, version, amount):
+    clock = Mock()
+    clock.now.return_value = datetime(2099, 1, 20, tzinfo=UTC)
+    monkeypatch.setattr(parse, "datetime", clock)
+    new_rate = replace(RATE, version="占位新版", amount=30, valid_from=date(2099, 1, 20), valid_until=None)
+    body, reply = tariff_scenario(
+        user_tags=field([], "面向全体且用户标签留空"),
+        policy_short_name=field("合成特价", "合成特价"),
+    )
+    draft, = parse.parse_application(
+        body, model=lambda **_: json.dumps(reply), companies_file=COMPANIES,
+        benefit_catalog=replace(CATALOG, tariffs=(RATE, new_rate)), **options,
+    )
+    candidates = [candidate.value for candidate in draft.policy_name.uncertainty.candidates]
+    assert candidates == ([f"ZM_合成特价_{name_date}"] if name_date else [])
+    assert draft.tariff.value == {**TARIFF, "version": version}
+    assert draft.recharge_amount.value == amount
 
 
 def test_tariff_lookup_explicit_end_target_and_decimal_floor(tmp_path, monkeypatch):

@@ -126,7 +126,7 @@ def parse_application(
     """解析正文及已转成文本的附件。on_reply 收到私有重放所需的结构化回复。"""
     if recorded_reply and model is None:
         raise ParseError("旧回复投影须提供离线录制。")
-    name_date = today if recorded_reply or today is not None else datetime.now(UTC).date()
+    reference_date = today if recorded_reply or today is not None else datetime.now(UTC).date()
     attachments = tuple(additional_blocks)
     if not body.strip() and not any(block.text.strip() for block in attachments):
         return ParseResult(structure_issues=(PolicyStructureIssue(None, "empty_material"),))
@@ -172,7 +172,7 @@ def parse_application(
     review = EvidenceReview(parsed, sources)
     if benefit_catalog is None:
         benefit_catalog = benefits.load_benefit_catalog()
-    resolved = [_resolve_fields(policy, review, company_rules, options, country_codes, name_date, benefit_catalog, today)
+    resolved = [_resolve_fields(policy, review, company_rules, options, country_codes, reference_date, benefit_catalog)
                 for policy in parsed.policies]
     names.check_names([results for results, _ in resolved], known_policy_names)
     drafts = [_draft(policy, review, options, results, hints)
@@ -230,7 +230,7 @@ def _normalized_value(name: str, value: object, options: dict[str, dict[str, str
 
 def _resolve_fields(
     policy: Policy, review: EvidenceReview, rules: CompanyRules, options: dict[str, dict[str, str]],
-    codes: Mapping[str, str], name_date: date | None, benefit_catalog: benefits.BenefitCatalog, today: date | None,
+    codes: Mapping[str, str], reference_date: date | None, benefit_catalog: benefits.BenefitCatalog,
 ) -> tuple[dict[str, FieldResult], list[str]]:
     results = {name: review.field(policy, name) for name in policy.fields.__class__.model_fields}
     for name, result in results.items():
@@ -245,9 +245,9 @@ def _resolve_fields(
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
     country_company.resolve_country_company(results, rules)
     dates.verify_dates(results)
-    benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, today, policy.fields.model_fields_set)
+    benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, reference_date, policy.fields.model_fields_set)
     hints = [
-        *names.derive_names(results, codes, name_date),
+        *names.derive_names(results, codes, reference_date),
         *benefit_hints,
         *other_fields.apply_defaults(results),
     ]
