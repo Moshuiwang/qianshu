@@ -96,11 +96,23 @@ def test_copy_requires_unique_catalog_relation_for_every_row(tmp_path, defect):
         child[key] = value
     draft = parse_one(*example("特价优惠", [(name, name) for name in NAMES[:2]]), load(tmp_path / "levels.csv", rows))
     assert draft.packages.value is None and draft.packages.uncertainty
+    if defect == "level":
+        assert draft.field_results["packages"].issues == ("package_copy_pending",)
     with pytest.raises(ValueError, match="待确认"):
         assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)
 
 
-@pytest.mark.parametrize("defect", ["missing", "header", "summary", "duplicate_level", "encoding"])
+def test_named_package_can_share_platform_and_level(tmp_path):
+    rows = details()
+    for row in rows[2:4]:
+        row["offer_level"] = rows[0]["offer_level"]
+    draft = parse_one(*example("特价优惠", [(NAMES[0], NAMES[1])]), load(tmp_path / "levels.csv", rows))
+    assert draft.packages.uncertainty is None
+    current, = draft.packages.value
+    assert (current.current_package, current.gift_package) == (NAMES[0], NAMES[1] + "_copy")
+
+
+@pytest.mark.parametrize("defect", ["missing", "header", "summary", "encoding"])
 def test_package_level_table_failure_requires_review(tmp_path, defect, caplog):
     path = tmp_path / "levels.csv"
     if defect == "header":
@@ -109,10 +121,6 @@ def test_package_level_table_failure_requires_review(tmp_path, defect, caplog):
         path.write_bytes(b"\xff")
     elif defect == "summary":
         load(path, [dict(details()[0], record_type="TIER_COUNT")])
-    elif defect == "duplicate_level":
-        rows = details()
-        rows[2]["offer_level"] = rows[0]["offer_level"]
-        load(path, rows)
     draft = parse_one(*example("特价优惠", [(NAMES[0], NAMES[0])]), load_package_levels(path))
     assert draft.packages.uncertainty and draft.packages.value is None
     assert draft.benefit_type.value == "特价优惠"
@@ -215,6 +223,22 @@ def test_tier_optional_parts_only_affect_tier(tmp_path, missing):
         assert draft.package_tier_candidates and draft.tier_field.uncertainty is None
     else:
         assert draft.tier_field.uncertainty and not draft.package_tier_candidates
+
+
+@pytest.mark.parametrize("key", ["role", "tier"])
+def test_unknown_tier_enum_only_requires_tier_confirmation(tmp_path, key):
+    body, reply = example("赠送时长", [(NAMES[0], None)])
+    item = dict(role="当前包", tier="高", platform="DTT")
+    item[key] = "枚举外占位值"
+    reply["policies"][0]["fields"]["package_tiers"] = statement(
+        "确定", value=[item], evidence=[quote(body, "政策标题")],
+    )
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.tier_field.uncertainty and not draft.package_tier_candidates
+    assert draft.packages.uncertainty is None
+    row, = draft.packages.value
+    assert (row.current_package, row.gift_package) == (NAMES[0], NAMES[0] + "_copy")
+    assert draft.benefit_type.value == "赠送时长"
 
 
 @pytest.mark.parametrize("status", ["歧义", "冲突", "带条件", "缺证据", "确定"])

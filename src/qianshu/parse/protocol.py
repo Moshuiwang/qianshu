@@ -121,6 +121,14 @@ class RequestedTier(Declaration):
     tier: Literal["低", "中", "高", "最高"] | None = None
     platform: str | None = None
 
+    @field_validator("role", "tier", mode="wrap")
+    @classmethod
+    def _optional_tier_enum(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            return None
+
 
 class RequestedTariff(Declaration):
     base_package: str

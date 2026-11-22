@@ -99,11 +99,6 @@ def unique_offer(rows: tuple[Offer, ...], name: str, kind: str, day: date) -> Of
     row = matches[0]
     if row.kind != kind or sum(other.id == row.id for other in active) != 1:
         return None
-    if row.kind == "基本" and row.level is not None and sum(
-        other.kind == "基本" and (other.platform, other.level) == (row.platform, row.level)
-        for other in active
-    ) != 1:
-        return None
     return row
 
 
