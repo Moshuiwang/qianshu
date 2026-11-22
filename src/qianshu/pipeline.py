@@ -51,6 +51,69 @@ _RULE_PENDING_FIELDS = (
     "policy_name", "trigger_once", "repeat_bonus", "effective_multiplier",
 )
 _RULE_PENDING_REASON = "取值规则待确认。"
+_INPUT_LABELS = {"country": "国家", "company_keyword": "公司关键词"}
+
+
+def _mask_spans(text: str, spans: Iterable[tuple[int, int]]) -> str:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(spans):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = merged[-1][0], max(merged[-1][1], end)
+        else:
+            merged.append((start, end))
+    parts = []
+    offset = 0
+    for start, end in merged:
+        parts.extend((text[offset:start], "[已脱敏]"))
+        offset = end
+    return "".join((*parts, text[offset:]))
+
+
+class _CardRedaction:
+    def __init__(self, body: str, sensitive: re.Pattern[str] | None) -> None:
+        self.body = body
+        self.sensitive = re.compile(f"(?=({sensitive.pattern}))") if sensitive else None
+        self.spans = self._matches(self.sensitive, body)
+        self.fragments = None
+        if self.spans:
+            # 自由文本没有坐标。短而又出现在非敏感原文里的字面值无法仅凭字面归属。
+            # 四字及以上的复制片段即使在别处重复，也按敏感文字遮蔽。
+            public_parts = _mask_spans(body, self.spans).split("[已脱敏]")
+            fragments = set()
+            for start, end in self.spans:
+                for index in range(start, end):
+                    for size in range(1, min(4, end - index) + 1):
+                        fragment = body[index:index + size]
+                        if size == 4 or not any(fragment in part for part in public_parts):
+                            fragments.add(fragment)
+            if fragments:
+                alternatives = "|".join(map(re.escape, sorted(fragments, key=len, reverse=True)))
+                self.fragments = re.compile(f"(?=({alternatives}))")
+
+    @staticmethod
+    def _matches(pattern: re.Pattern[str] | None, text: str) -> tuple[tuple[int, int], ...]:
+        return tuple(match.span(1) for match in pattern.finditer(text)) if pattern else ()
+
+    def _overlaps(self, start: int, length: int) -> Iterable[tuple[int, int]]:
+        for left, right in self.spans:
+            if start < right and left < start + length:
+                yield max(0, left - start), min(length, right - start)
+
+    def display(self, text: str, start: int | None = None) -> str:
+        if not text or self.sensitive is None:
+            return text
+        if start is not None and self.body.startswith(text, start):
+            return _mask_spans(text, self._overlaps(start, len(text)))
+        matches = [*self._matches(self.sensitive, text), *self._matches(self.fragments, text)]
+        length = len(text)
+        for left, right in self.spans:
+            # 只检查能与敏感坐标相交的原文匹配，保留单字摘录等短片段的坐标保护。
+            stop = right + length - 1
+            offset = self.body.find(text, max(0, left - length + 1), stop)
+            while offset >= 0:
+                matches.append((max(0, left - offset), min(length, right - offset)))
+                offset = self.body.find(text, offset + 1, stop)
+        return _mask_spans(text, matches)
 
 
 def _rule_pending(draft: PolicyDraft, name: str) -> bool:
@@ -94,12 +157,15 @@ def _package_row(row: PackageRow) -> dict:
     return {"当前节目包": row.current_package, "赠送节目包": row.gift_package}
 
 
-def _evidence(excerpts: Iterable[SourceExcerpt]) -> str:
-    return "\n".join(f"「{excerpt.text}」" for excerpt in excerpts) or "无原文摘录"
+def _evidence(excerpts: Iterable[SourceExcerpt], redact: _CardRedaction) -> str:
+    return "\n".join(f"「{redact.display(excerpt.text, excerpt.start)}」" for excerpt in excerpts) or "无原文摘录"
 
 
-def _field_lines(prefix: str, field: DraftField, explanation: str | None) -> Iterable[CardLine]:
-    yield CardLine(prefix, f"值　{_value(field.value)}\n原文出处　{_evidence(field.evidence)}")
+def _field_lines(
+    prefix: str, field: DraftField, explanation: str | None, redact: _CardRedaction,
+) -> Iterable[CardLine]:
+    value = "未确定" if field.value is None else redact.display(_value(field.value))
+    yield CardLine(prefix, f"值　{value}\n原文出处　{_evidence(field.evidence, redact)}")
     if uncertainty := field.uncertainty:
         reason = f"{uncertainty.reason}\n模型说明　{explanation}" if explanation else uncertainty.reason
         yield CardLine(f"{prefix} · 待确认", reason)
@@ -108,7 +174,7 @@ def _field_lines(prefix: str, field: DraftField, explanation: str | None) -> Ite
         for index, candidate in enumerate(uncertainty.candidates, 1):
             yield CardLine(
                 f"{prefix} · 候选 {index}",
-                f"值　{_value(candidate.value)}\n原文出处　{_evidence(candidate.evidence)}",
+                f"值　{redact.display(_value(candidate.value))}\n原文出处　{_evidence(candidate.evidence, redact)}",
             )
     elif explanation:
         yield CardLine(f"{prefix} · 模型说明", explanation)
@@ -151,7 +217,7 @@ class _Policy:
             status = "解析完成，待群卡片同意"
         return CardLine(f"{prefix} · 处理状态", status)
 
-    def lines(self, prefix: str) -> Iterable[CardLine]:
+    def lines(self, prefix: str, redact: _CardRedaction) -> Iterable[CardLine]:
         result = self.validation
         hints = self.hints
         # 校验可调整互斥组默认值，保留解析时的所有提示并补上校验产生的默认提示。
@@ -179,7 +245,10 @@ class _Policy:
                 if explanation:
                     yield CardLine(f"{title} · 模型说明", explanation)
             else:
-                yield from _field_lines(title, getattr(self.draft, field.name), explanation)
+                yield from _field_lines(title, getattr(self.draft, field.name), explanation, redact)
+        for name, label in _INPUT_LABELS.items():
+            if explanation := self.explanations.get(name):
+                yield CardLine(f"{prefix} · {label} · 模型说明", explanation)
 
 
 class Pipeline:
@@ -219,16 +288,20 @@ class Pipeline:
 
     def _structure_reminders(
         self, body: str, issues: Iterable[PolicyStructureIssue], sensitive_spans: Sequence[tuple[int, int]],
+        display: Callable[[str], str] = str,
     ) -> Iterable[CardLine]:
         for index, item in enumerate(issues, 1):
             span = item.span
-            location = f"{span.source_id} [{span.start}, {span.end})" if span else "无可定位坐标"
+            location = f"{display(span.source_id)} [{span.start}, {span.end})" if span else "无可定位坐标"
             location += f"\n{STRUCTURE_REASONS[item.code]}（{item.code}）"
             if span and span.source_id == "body" and span.end <= len(body):
                 start, end = span.start, span.end
                 crosses_edge = any(left < start < right or left < end < right for left, right in sensitive_spans)
                 if not crosses_edge:
-                    preview, = self._boundary_reminders(body[start:end], [0], {0})
+                    segment = _mask_spans(body[start:end], (
+                        (left - start, right - start) for left, right in sensitive_spans if start <= left and right <= end
+                    ))
+                    preview, = self._boundary_reminders(segment, [0], {0})
                     location += "\n" + preview.text.removeprefix("段落 1：")
             yield CardLine(f"政策结构问题 {index}", location, red=True)
 
@@ -240,18 +313,8 @@ class Pipeline:
 
     def __call__(self, application: Application) -> tuple[DetailPage, ...]:
         body = application.text
-        sensitive_spans = [match.span() for match in self._sensitive.finditer(body)] if self._sensitive else []
-
-        def display(text: str) -> str:
-            # 完整值在分页前统一脱敏。逐字片段的任一边切入原文敏感值时，只显示掩码。
-            if sensitive_spans:
-                start = body.find(text)
-                while start >= 0:
-                    end = start + len(text)
-                    if any(left < start < right or left < end < right for left, right in sensitive_spans):
-                        return "[已脱敏]"
-                    start = body.find(text, start + 1)
-            return text
+        redact = _CardRedaction(body, self._sensitive)
+        display_body = redact.display(body, 0)
 
         try:
             company_rules = load_company_rules(
@@ -266,13 +329,13 @@ class Pipeline:
                 if parsed.maintain_mutual_exclusion_group.value == "否":
                     hints = (*hints, _MUTEX_NO)
                 explanations = {
-                    name: display(explanation)
+                    name: redact.display(explanation)
                     for name, result in getattr(parsed, "field_results", {}).items()
                     if (explanation := result.statement.explanation) and explanation.strip()
                 }
                 policies.append(_Policy(draft, hints, explanations))
         except Exception:
-            return self._detail_pages(body, [
+            return self._detail_pages(display_body, [
                 CardLine(
                     "处理状态",
                     "解析不完整，需人工确认\n停在解析，请核对申请正文或解析配置。未校验。",
@@ -302,10 +365,10 @@ class Pipeline:
 
         lines = [
             CardLine("处理状态", status, red=requires_full_review),
-            *(CardLine("没用上的原文段落", f"{display(item.text)}\n理由　{display(item.reason)}")
+            *(CardLine("没用上的原文段落", f"{redact.display(item.text)}\n理由　{redact.display(item.reason)}")
               for item in getattr(drafts, "unused_passages", ())),
-            *self._structure_reminders(body, getattr(drafts, "structure_issues", ()), sensitive_spans),
+            *self._structure_reminders(body, getattr(drafts, "structure_issues", ()), redact.spans, redact.display),
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
-            *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}")),
+            *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}", redact)),
         ]
-        return self._detail_pages(body, lines)
+        return self._detail_pages(display_body, lines)

@@ -2091,6 +2091,8 @@ def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, ca
     recording = repo / "run"
     manifest_path = recording / "recording.json"
     manifest = get_json(manifest_path)
+    assert main([*_replay_args(frozen, out=".private/current-structure"), "--legacy-recording"]) == 1
+    assert "指定的录制已使用当前回复结构" in capsys.readouterr().err
     manifest["configuration"].pop("reply_structure")
     names = {get_json(recording / name)["user_sha256"]: name for name in manifest["artifact_sha256"]}
     batch_name = names[digest(json.dumps({"application": BATCH}, ensure_ascii=False).encode())]
@@ -2136,6 +2138,12 @@ def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, ca
     assert get_json(diagnostic / second_name)["reason_code"] == "reply_document"
     assert batch_path.read_bytes() == source_bytes
     assert (repo / "frozen" / "denominators.json").read_bytes() == denominators
+
+    batch_path.write_bytes(source_bytes + b"\n")
+    assert main([*_replay_args(frozen, out=".private/changed-artifact"), "--legacy-recording"], model=forbidden) == 1
+    assert "录制的回复文件指纹不一致" in capsys.readouterr().err
+    batch_path.write_bytes(source_bytes)
+
     args = ["summarize", "--recording", ".private/replay", "--out", ".private/diagnostic"]
     assert main(args) == 1
     assert main([*args, "--diagnostic-replay"]) == 0

@@ -1,5 +1,6 @@
 """保存每篇申请的模型调用证据，并从私有录制重放。"""
 
+import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict
@@ -7,8 +8,10 @@ from pathlib import Path
 from re import fullmatch
 from uuid import uuid4
 
-from qianshu.parse.model import REPLY_FORMAT_ERRORS, CallResult, ModelError, ModelReplyError, ParseModel
-from qianshu.parse.protocol import PROTOCOL_VERSION, REPLY_STRUCTURE
+from qianshu.parse.model import (
+    REPLY_FORMAT_ERRORS, CallResult, ModelError, ModelReplyError, ParseModel, validate_reply_json,
+)
+from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE, PROTOCOL_VERSION, REPLY_STRUCTURE
 
 from .business import measure_fingerprint, pairing_fingerprint
 from .runner import RULES, IncompleteReply
@@ -77,8 +80,36 @@ def _call_data(result: CallResult) -> dict:
     return data
 
 
+def _items(value: object, key: str) -> list:
+    if isinstance(value, dict) and isinstance(items := value.get(key), list):
+        return items
+    return []
+
+
+def _project_legacy_reply(data: object) -> None:
+    if not isinstance(data, dict):
+        return
+    for key in ("clauses", "coverage", "pending", "document"):
+        data.pop(key, None)
+    for policy in _items(data, "policies"):
+        if not isinstance(policy, dict):
+            continue
+        policy.pop("shared_clause_ids", None)
+        fields = policy.get("fields")
+        if not isinstance(fields, dict):
+            continue
+        for statement in fields.values():
+            if not isinstance(statement, dict):
+                continue
+            statement.pop("checked", None)
+            for item in (statement, *_items(statement, "candidates")):
+                for quote in _items(item, "evidence"):
+                    if isinstance(quote, dict):
+                        quote.pop("clause_id", None)
+
+
 class SavedReplies:
-    def __init__(self, files: PrivateFiles, directory: Path):
+    def __init__(self, files: PrivateFiles, directory: Path, *, legacy_recording: bool = False):
         self.files = files
         self.directory = directory
         try:
@@ -87,10 +118,13 @@ class SavedReplies:
             raise RegressionError("找不到完整录制的清单。") from None
         if self.manifest["schema"] != 1:
             raise RegressionError("录制清单版本不受支持。")
+        config = self.manifest["configuration"]
+        self.reply_structure = config.get("source_reply_structure", config.get("reply_structure"))
+        if legacy_recording and self.reply_structure not in (None, LEGACY_REPLY_STRUCTURE):
+            raise RegressionError("指定的录制已使用当前回复结构。")
+        self.legacy_recording = legacy_recording
 
-    def for_attempts(
-        self, token: str, user_sha: str, system_sha: str, *, preserve_parse_failure: bool = False,
-    ) -> list[dict]:
+    def for_attempts(self, token: str, user_sha: str, system_sha: str) -> list[dict]:
         by_document = self.manifest["documents_by_user_sha256"].get(user_sha, {})
         name = by_document.get(digest(token.encode()))
         if not isinstance(name, str) or not fullmatch(r"document-[0-9]{5,}\.json", name):
@@ -105,7 +139,7 @@ class SavedReplies:
         if record["user_sha256"] != user_sha or record["system_sha256"] != system_sha:
             raise RegressionError("录制的用户消息或系统消息指纹与本次解析不一致。")
         attempts = record["attempts"]
-        if (preserve_parse_failure and record["failure_stage"] == "reply_parse" and attempts
+        if (self.legacy_recording and record["failure_stage"] == "reply_parse" and attempts
             and attempts[-1]["failure_stage"] is None):
             return [*attempts[:-1], {**attempts[-1], "prior_parse_failure": {
                 "code": record["reason_code"], "path": record["structure_path"],
@@ -133,7 +167,7 @@ def probe_replies(files: PrivateFiles, directory: Path, model_id: str) -> Callab
 class Recording:
     def __init__(
         self, output: Output, names: dict[str, str], config: dict, model_id: str, *,
-        model: ParseModel | None = None, source: Callable | None = None,
+        model: ParseModel | None = None, source: SavedReplies | Callable | None = None,
         origin: str = "live", origin_run_id: str | None = None,
         replaces_run_id: str | None = None,
     ):
@@ -164,7 +198,10 @@ class Recording:
         def call(*, system: str, user: str) -> str:
             user_sha, system_sha = digest(user.encode()), digest(system.encode())
             self.document.update(user_sha256=user_sha, system_sha256=system_sha)
-            if self.source is not None:
+            saved = self.source if isinstance(self.source, SavedReplies) else None
+            if saved is not None:
+                self.document["attempts"] = saved.for_attempts(token, user_sha, system_sha)
+            elif self.source is not None:
                 self.document["attempts"] = self.source(token, user_sha, system_sha)
             else:
                 for _ in range(self.config["retries"] + 1):
@@ -194,9 +231,18 @@ class Recording:
                 raise IncompleteReply(reason)
             if result["failure_stage"] is not None:
                 raise ModelError("回归模型调用失败。")
-            if not isinstance(result["reply"], str):
+            reply = result["reply"]
+            if not isinstance(reply, str):
                 raise RegressionError(f"录制缺少有效回复（用户消息指纹 {user_sha}）。")
-            return result["reply"]
+            if saved is not None and saved.legacy_recording:
+                # 仅为解析投影已核验的重放回复，录制继续使用原始调用尝试。
+                try:
+                    data = validate_reply_json(reply)
+                    _project_legacy_reply(data)
+                    return json.dumps(data, allow_nan=False)
+                except (ValueError, TypeError, RecursionError):
+                    raise ModelReplyError("reply_json", reply, "申请解析模型回复不是有效的政策 JSON。") from None
+            return reply
 
         return call
 

@@ -394,18 +394,16 @@ def test_attachment_coordinates_map_to_source_and_remain_exact(valid):
 
 
 @pytest.mark.parametrize("status", ["经检查无政策", "可能有政策但无法切分", "材料不足"])
-def test_legacy_document_finding_does_not_change_fields(status):
+def test_public_parse_rejects_legacy_document_finding(status):
     body = "合成申请材料"
     reply = fixed_reply(body, [{"user_scope": {"value": "占位", "evidence": [body]}}])
-    baseline = parse_fixed(body, reply)
     reply["document"] = {"status": status, "reason_code": "fixture"}
 
     with pytest.raises(ParseError) as exc:
         parse_fixed(body, reply)
     assert exc.value.code == "reply_schema"
-    projected = parse_fixed(body, reply, legacy_recording=True)
-    assert not projected.requires_full_review
-    assert projected[0].to_dict() == baseline[0].to_dict()
+    with pytest.raises(TypeError, match="legacy_recording"):
+        parse_fixed(body, reply, legacy_recording=True)
 
 
 def test_missing_image_only_marks_dependent_fields():

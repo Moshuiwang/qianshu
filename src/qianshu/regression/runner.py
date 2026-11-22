@@ -160,7 +160,7 @@ def _new_field_status(draft, name: str) -> str:
 
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
-    threshold: int = DEFAULT_THRESHOLD, recording=None, legacy_recording: bool = False,
+    threshold: int = DEFAULT_THRESHOLD, recording=None,
 ) -> tuple[dict, dict]:
     samples = frozen["samples"]
     pairs = defaultdict(list)
@@ -226,7 +226,6 @@ def evaluate(
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
-                legacy_recording=legacy_recording,
             )
         except IncompleteReply as error:
             received = True

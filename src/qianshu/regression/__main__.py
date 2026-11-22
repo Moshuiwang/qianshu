@@ -4,7 +4,6 @@ import argparse
 import logging
 import os
 import sys
-from functools import partial
 from pathlib import Path
 
 from qianshu.config import ConfigError
@@ -101,19 +100,16 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
     legacy_recording = getattr(args, "legacy_recording", False)
     settings = {}
     if args.command == "replay":
-        saved = SavedReplies(files, files.argument(args.recording))
+        saved = SavedReplies(files, files.argument(args.recording), legacy_recording=legacy_recording)
         manifest = saved.manifest
         prior = manifest["configuration"]
         if prior["freeze_sha256"] != snapshot["fingerprint"]:
             raise RegressionError("录制与本次重放的冻结指纹不一致。")
         model_id = manifest["model"]
         origin_run_id = manifest["origin_run_id"] or manifest["run_id"]
-        recorded_structure = prior.get("source_reply_structure", prior.get("reply_structure"))
-        if legacy_recording and recorded_structure not in (None, LEGACY_REPLY_STRUCTURE):
-            raise RegressionError("指定的录制已使用当前回复结构。")
-        if not legacy_recording and recorded_structure == LEGACY_REPLY_STRUCTURE:
+        if not legacy_recording and saved.reply_structure == LEGACY_REPLY_STRUCTURE:
             raise RegressionError("旧回复结构须显式指定 --legacy-recording。")
-        source = partial(saved.for_attempts, preserve_parse_failure=legacy_recording)
+        source = saved
         legacy = prior["legacy_companies"] if args.legacy_companies is None else args.legacy_companies
         threshold = manifest["threshold"] if args.threshold is None else args.threshold
         release, retries = prior["release"], prior["retries"]
@@ -170,7 +166,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         logging.disable(logging.CRITICAL)
         try:
             report, details = evaluate(snapshot, None, rules, legacy_companies=legacy, threshold=threshold,
-                                       recording=recording, legacy_recording=legacy_recording)
+                                       recording=recording)
         finally:
             logging.disable(previous)
         counts = report["business"]["counts"]

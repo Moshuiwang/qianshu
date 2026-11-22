@@ -107,11 +107,8 @@ def parse_application(
     on_reply: Callable[[str], None] | None = None,
     company_rules: CompanyRules | None = None,
     additional_blocks: Iterable[SourceBlock] = (),
-    legacy_recording: bool = False,
 ) -> ParseResult:
     """解析正文及已转成文本的附件。on_reply 收到私有重放所需的结构化回复。"""
-    if legacy_recording and model is None:
-        raise ParseError("旧回复投影须提供离线录制。")
     attachments = tuple(additional_blocks)
     if not body.strip() and not any(block.text.strip() for block in attachments):
         return ParseResult(structure_issues=(PolicyStructureIssue(None, "empty_material"),))
@@ -151,47 +148,16 @@ def parse_application(
         raise
     if on_reply is not None and isinstance(reply, str):
         on_reply(reply)
-    parsed = _decode(reply, legacy_recording=legacy_recording)
+    parsed = _decode(reply)
     review = EvidenceReview(parsed, sources)
     drafts = [_draft(policy, review, company_rules, options) for policy in parsed.policies]
     return ParseResult(drafts, structure_issues=review.structure_issues, evidence_locations=review.evidence_locations,
                        unused_passages=parsed.unused_passages or ())
 
 
-def _items(value: object, key: str) -> list:
-    if isinstance(value, dict) and isinstance(items := value.get(key), list):
-        return items
-    return []
-
-
-def _project_legacy_reply(data: object) -> None:
-    if not isinstance(data, dict):
-        return
-    for key in ("clauses", "coverage", "pending", "document"):
-        data.pop(key, None)
-    for policy in _items(data, "policies"):
-        if not isinstance(policy, dict):
-            continue
-        policy.pop("shared_clause_ids", None)
-        fields = policy.get("fields")
-        if not isinstance(fields, dict):
-            continue
-        for statement in fields.values():
-            if not isinstance(statement, dict):
-                continue
-            statement.pop("checked", None)
-            for item in (statement, *_items(statement, "candidates")):
-                for quote in _items(item, "evidence"):
-                    if isinstance(quote, dict):
-                        quote.pop("clause_id", None)
-
-
-def _decode(reply: str, *, legacy_recording: bool = False) -> ApplicationReply:
+def _decode(reply: str) -> ApplicationReply:
     try:
-        data = validate_reply_json(reply)
-        if legacy_recording:
-            _project_legacy_reply(data)
-            reply = json.dumps(data, allow_nan=False)
+        validate_reply_json(reply)
     except (ValueError, TypeError, RecursionError):
         raise ParseError("申请解析模型回复不是有效的政策 JSON。", code="reply_json") from None
     try:

@@ -27,7 +27,7 @@ from qianshu.feishu.sdk import _Transport
 from qianshu.parse.evidence import PolicyStructureIssue
 from qianshu.parse.protocol import Span
 from qianshu.pipeline import Pipeline
-from tests.protocol_fixtures import fixed_reply, policy, span, statement
+from tests.protocol_fixtures import fixed_reply, policy, quote, span, statement
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSE_FIXTURES = ROOT / "tests" / "parse" / "fixtures"
@@ -869,6 +869,51 @@ def test_application_source_and_advisories_are_redacted():
     assert all(text not in summary for text in ("申请原文", "没用上的原文段落", "合成说明", SECRET))
 
 
+@pytest.mark.parametrize("size", [1, 4])
+def test_partial_sensitive_value_is_redacted_before_paginating(size):
+    secret = "H2NF5U9J7X"
+    suffix = secret[-size:]
+    body = "甲" * 1499 + secret + "\n" + "乙" * 8100
+    explanation = "乙" * 1477 + f"；只引用末尾{suffix}，需核对。"
+    reason = f"摘录含末尾{suffix}，略去。"
+    p = policy("p1", span(0, len(body)), {"user_scope": {
+        **statement("缺证据", evidence=[quote(body, suffix)]), "explanation": explanation,
+    }})
+    reply = json.dumps({"policies": [p], "unused_passages": [{"text": suffix, "reason": reason}]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    pages = pipeline(_application(body))
+    lines = _contents(list(map(result_card, pages)))
+    assert len(pages) > 1
+    assert "原文出处　「[已脱敏]」" in "\n".join(lines)
+    assert f"没用上的原文段落\n[已脱敏]\n理由　{reason.replace(suffix, '[已脱敏]')}" in lines
+    for label, expected in (
+        ("申请原文", body.replace(secret, "[已脱敏]")),
+        ("政策 1 · 用户范围 · 待确认", "模型说明　" + explanation.replace(suffix, "[已脱敏]")),
+    ):
+        chunks = [line.split("\n", 1)[1] for line in lines if line.split("\n", 1)[0] in (label, label + "（续）")]
+        assert len(chunks) > 1
+        assert "".join(chunks).endswith(expected)
+    assert suffix not in "\n".join(lines)
+
+
+def test_command_shows_country_and_company_keyword_explanations(tmp_path, single_policy):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    fields = reply["policies"][0]["fields"]
+    for name, explanation in {
+        "country": "合成国家证据不足", "company_keyword": "合成关键词证据不足", "user_scope": "合成范围证据不足",
+    }.items():
+        fields[name] = {**statement("缺证据"), "explanation": explanation}
+
+    lines = _contents(_run(tmp_path, body, reply))
+    assert "政策 1 · 国家 · 模型说明\n合成国家证据不足" in lines
+    assert "政策 1 · 公司关键词 · 模型说明\n合成关键词证据不足" in lines
+    assert any(line.startswith("政策 1 · 用户范围 · 待确认\n") and "模型说明　合成范围证据不足" in line for line in lines)
+    assert any(line.startswith("政策 1 · 公司 · 待确认\n") for line in lines)
+
+
 def test_zero_drafts_keep_advisories_and_original_without_validating(monkeypatch):
     body = "合成原文"
     reply = json.dumps({"policies": [], "unused_passages": [{"text": body, "reason": "合成说明"}]})
@@ -900,9 +945,12 @@ def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy)
     evidence = "是否需要维护互斥组：否"
     body += "\n" + evidence
     rows[0]["maintain_mutual_exclusion_group"] = {"value": "否", "evidence": [evidence]}
-    content = "\n".join(_contents(_run(tmp_path, body, rows)))
+    content = "\n".join(_contents(_run(tmp_path, body, rows, tag_dates={"占位标签甲": "2099-02-15"})))
     assert "申请要求不维护互斥组，需人工确认" in content
+    assert "<font color='red'>政策 1 · 提醒项\n申请要求不维护互斥组，需人工确认</font>" in content
     assert "是否需要维护互斥组 · 候选 1\n值　否\n原文出处　「是否需要维护互斥组：否」" in content
+    assert "需追问 · 是否需要维护互斥组" in content
+    assert "停在校验，需人工确认或请申请人补充。" in content
     assert "待群卡片同意" not in content
 
 
