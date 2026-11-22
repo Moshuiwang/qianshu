@@ -250,3 +250,37 @@ def test_invalid_unwritten_statement_cannot_select_default(name):
     draft, = _parse(body, reply)
     assert draft.field_results["company"].needs_confirmation
     assert draft.company.value is None
+
+
+@pytest.mark.parametrize("mentions", [
+    [{"role": "适用地"}], [{"role": "适用地", "evidence": None}],
+    [{"evidence": None}], [None], {"role": "适用地"}, [{"role": "未知"}],
+])
+def test_incomplete_country_role_only_affects_its_country_and_company(mentions):
+    first = "贝宁，赠5天。"
+    body = first + "赞比亚，赠10天。"
+    reply = fixed_reply(body, [
+        {"country": _field("贝宁", "贝宁"), "gift_days": _field(5, "赠5天")},
+        {"country": _field("赞比亚", "赞比亚"), "gift_days": _field(10, "赠10天")},
+    ], policy_ranges=[(0, len(first)), (len(first), len(body))])
+    original_first, original_second = _parse(body, reply)
+    reply["policies"][0]["fields"]["country"]["mentions"] = mentions
+    changed, second = _parse(body, reply)
+    for name, result in changed.field_results.items():
+        if name in ("country", "company"):
+            assert result.needs_confirmation
+        else:
+            assert result == original_first.field_results[name]
+    assert second.field_results == original_second.field_results
+    assert second.company.value == "占位甲公司"
+
+
+@pytest.mark.parametrize("field_quotes", [("贝宁", "本条仅适用于贝宁"), ("本条仅适用于贝宁",)])
+def test_applicable_country_role_with_longer_field_evidence(field_quotes):
+    body = "本条仅适用于贝宁。"
+    reply = fixed_reply(body, [{"country": _field("贝宁", *field_quotes)}])
+    reply["policies"][0]["fields"]["country"]["mentions"] = [{"role": "适用地", "evidence": quote(body, "贝宁")}]
+    draft, = _parse(body, reply)
+    country = draft.field_results["country"]
+    assert country.value == "贝宁" and country.evidence_verified
+    assert draft.company.value == "占位乙公司" and draft.field_results["company"].evidence_verified

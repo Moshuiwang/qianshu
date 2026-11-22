@@ -16,12 +16,14 @@ def _verify_country(policy: Policy, country: FieldResult, review: EvidenceReview
     roles = {}
     supporting_locations = {review.sources.locate(q.span) for q in country.evidence}
     for mention in mentions or ():
+        if mention.role is None or mention.evidence is None:
+            return issue(country, "invalid_evidence")
         applies = mention.role == "适用地"
         quote = review.verified_quote(mention.evidence)
         if quote is None:
             return issue(country, "invalid_evidence")
         location = review.sources.locate(quote.span)
-        if certain and applies != (location in supporting_locations):
+        if certain and not applies and location in supporting_locations:
             return issue(country, "invalid_evidence")
         if roles.setdefault(location, mention.role) != mention.role:
             return issue(country, "country_role_conflict")
@@ -30,6 +32,8 @@ def _verify_country(policy: Policy, country: FieldResult, review: EvidenceReview
             if len(names) != 1:
                 return issue(country, "unknown_country")
             applicable.update(names)
+            if len(applicable) > 1:
+                return issue(country, "invalid_evidence")
         elif certain and mention.role == "排除对象":
             excluded.update(country_matches([quote.text], rules.countries, exact=True))
     if not certain:
@@ -37,9 +41,7 @@ def _verify_country(policy: Policy, country: FieldResult, review: EvidenceReview
     matches = country_matches([country.value], rules.countries, exact=True)
     if len(matches) != 1:
         return issue(country, "unknown_country")
-    if mentions is not None and (
-        applicable != matches or matches & excluded or not supporting_locations <= roles.keys()
-    ):
+    if mentions is not None and (applicable != matches or matches & excluded):
         return issue(country, "country_role_conflict")
     return accept(country, next(iter(matches)), ValueSource.LOOKUP, rule="R10")
 

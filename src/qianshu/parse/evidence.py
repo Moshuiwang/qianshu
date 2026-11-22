@@ -115,7 +115,8 @@ def _declared_quotes(reply: ApplicationReply) -> Iterable[tuple[Span, str]]:
             if span.text is not None:
                 yield span, span.text
         for mention in policy.fields.country.mentions or ():
-            yield mention.evidence.span, mention.evidence.text
+            if mention.evidence is not None:
+                yield mention.evidence.span, mention.evidence.text
         for name in policy.fields.__class__.model_fields:
             statement = getattr(policy.fields, name)
             for quote in _quotes(statement):

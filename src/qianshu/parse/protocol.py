@@ -69,8 +69,8 @@ class Finding[T](Declaration):
 
 
 class CountryMention(Declaration):
-    role: Literal["适用地", "比较或背景", "排除对象"]
-    evidence: Evidence
+    role: Literal["适用地", "比较或背景", "排除对象"] | None = None
+    evidence: Evidence | None = None
 
 
 class CountryFinding(Finding[str]):
@@ -78,6 +78,15 @@ class CountryFinding(Finding[str]):
         default=None, exclude_if=lambda value: value is None,
         description="逐个列出与本条相关的国家提及及角色。每段引文只摘录该国家名、别名或代码。",
     )
+
+    @field_validator("mentions", mode="wrap")
+    @classmethod
+    def _decode_mentions(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            # 保留一个缺证据项，让 R10 局部转人工，避免误走无角色列表的历史路径。
+            return [CountryMention()]
 
 
 class Duration(Declaration):
