@@ -1188,17 +1188,108 @@ def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, fro
     assert "同一冻结" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(("scores", "matches", "ties"), [
-    ([[9, 8], [7, None]], {0: 1, 1: 0}, set()),
-    ([[5, 5], [5, 5]], {0: 0, 1: 1}, {0, 1}),
-    ([[None, 5], [None, 5], [None, None]], {0: 1}, {0}),
-    ([[], []], {}, set()),
-    ([], {}, set()),
+@pytest.mark.parametrize(("scores", "matches", "ambiguous_policies", "ambiguous_drafts"), [
+    ([[9, 8], [7, None]], {0: 1, 1: 0}, set(), set()),
+    ([[5, 5, None], [5, 5, None], [None, None, 4]], {2: 2}, {0, 1}, {0, 1}),
+    ([[None, 5], [None, 5], [None, None]], {}, {0, 1}, {1}),
+    ([[5, 5, 5, None]], {}, {0}, {0, 1, 2}),
+    ([[5, 3], [2, None]], {}, {0, 1}, {0, 1}),
+    ([[], []], {}, set(), set()),
+    ([], {}, set(), set()),
 ])
-def test_business_pairing_maximizes_whole_assignment(scores, matches, ties):
+def test_business_pairing_maximizes_whole_assignment(scores, matches, ambiguous_policies, ambiguous_drafts):
     from qianshu.regression.business import optimal_pairs
 
-    assert optimal_pairs(scores) == (matches, ties)
+    assert optimal_pairs(scores) == (matches, ambiguous_policies, ambiguous_drafts)
+
+
+@pytest.mark.parametrize("name", ["packages", "user_tags"])
+@pytest.mark.parametrize("excluded", [False, True])
+def test_business_pairing_reliable_key_outweighs_other_matches(name, excluded):
+    from qianshu.draft import PackageRow
+    from qianshu.regression.business import BusinessScore, WEIGHTS
+
+    values = (
+        [[{"current_package": f"占位包{letter}", "gift_package": None}] for letter in ("甲", "乙")]
+        if name == "packages" else [[f"占位标签{letter}"] for letter in ("甲", "乙")]
+    )
+    pairs = []
+    drafts = []
+    for index, value in enumerate(values):
+        keys = {"recharge_days": 30 + index}
+        if name == "packages" or index == 1:
+            keys["gift_days"] = 15 + index
+        pairs.append({
+            "id": str(index),
+            "configuration": {
+                **{key: {"value": number} for key, number in keys.items()},
+                name: {"exclude": "insufficient_evidence"} if excluded else {"value": value},
+            },
+            **({"pairing": {name: value}} if excluded else {}),
+        })
+        opposite = values[1 - index]
+        derived = [PackageRow(**row) for row in opposite] if name == "packages" else opposite
+        drafts.append(SimpleNamespace(
+            to_dict=lambda: {},
+            **{key: DraftField(value=number) for key, number in keys.items()},
+            **{name: DraftField(value=derived)},
+        ))
+    frozen = {
+        "samples": {pair["id"]: {"country": "占位地区", "benefit_type": "赠送时长"} for pair in pairs},
+        "denominators": {"fields": {}},
+    }
+    score = BusinessScore(frozen, 2, {})
+
+    result = score.add({"body": "占位"}, pairs, drafts)
+
+    assert [row["draft"] for row in result["policies"]] == [1, 0]
+    old_weight = 4 if name == "packages" else 3
+    assert sum(row["positive_scores"][index]["score"] for index, row in enumerate(result["policies"])) == 2 * old_weight
+    assert all(row["positive_scores"][1 - index] == {"draft": 1 - index, "score": WEIGHTS[name], "keys": [name]}
+               for index, row in enumerate(result["policies"]))
+    assert result["ambiguous_drafts"] == []
+
+
+@pytest.mark.parametrize(("gold_tags", "draft_tags"), [
+    (["占位Beta", "占位Abc"], ["　占位ＡＢＣ＿ＩＭＡＧＥ ", "占位BETA"]),
+    (["　占位ＡＢＣ＿ＩＭＡＧＥ ", "占位beta"], ["占位Abc", "占位Beta"]),
+])
+def test_business_pairing_normalizes_tags_and_grades_original_values(gold_tags, draft_tags):
+    from qianshu.draft import SourceExcerpt
+    from qianshu.regression.business import BusinessScore, WEIGHTS
+
+    pair = {"id": "policy", "configuration": {"user_tags": {"value": sorted(gold_tags)}}}
+    frozen = {
+        "samples": {"policy": {"country": "占位地区", "benefit_type": "赠送时长"}},
+        "denominators": {"fields": {"user_tags": {"ids": ["policy"]}}},
+    }
+    body = "占位原文"
+    draft = SimpleNamespace(
+        user_tags=DraftField(value=draft_tags, evidence=[SourceExcerpt(text=body, start=0)]),
+        to_dict=lambda: {},
+    )
+
+    result = BusinessScore(frozen, 2, {}).add({"body": body}, [pair], [draft])
+
+    policy = result["policies"][0]
+    assert policy["draft"] == 0
+    assert policy["positive_scores"] == [{"draft": 0, "score": WEIGHTS["user_tags"], "keys": ["user_tags"]}]
+    assert policy["fields"] == {"user_tags": "false_determined"}
+    assert draft.user_tags.value == draft_tags
+
+
+def test_tag_pairing_key_removes_only_known_suffix_and_fingerprints_it(monkeypatch):
+    from qianshu.regression import business
+
+    assert business.key_value("user_tags", ["Abc", " ＡＢＣ＿ＩＭＡＧＥ "]) == ["abc"]
+    assert business.key_value("user_tags", ["Abc_image_other", "Abc_other"]) == ["abc_image_other", "abc_other"]
+    assert business.key_value("user_tags", ["Abc_image_image", "_image"]) == ["_image", "abc_image"]
+    assert business.key_value("user_tags", []) == []
+    assert business.key_value("user_tags", None) is None
+
+    fingerprint = business.pairing_fingerprint(2)
+    monkeypatch.setattr(business, "SHADOW_TAG_SUFFIXES", (*business.SHADOW_TAG_SUFFIXES, "_other"))
+    assert business.pairing_fingerprint(2) != fingerprint
 
 
 @pytest.mark.parametrize(("entry", "mark", "value", "confirmation", "start", "status"), [
@@ -1251,23 +1342,31 @@ def test_business_maps_included_gold_and_separates_extras_from_unknown():
     }
     score = BusinessScore(snapshot, 2, {})
     complete = score.add({"body": "占位 30 天", "complete": True}, pairs[:2],
-                         [draft("占位甲", 30), draft("占位甲", 30), draft("占位乙", 7)])
+                         [draft("占位甲", 30), draft("占位甲", 30), draft("占位乙", 7), draft("占位丁", 8)])
     partial = score.add({"body": "占位 30 天", "complete": False}, pairs[2:], [draft("占位丁", 8)])
     report = score.report(reply_parse_failed=1)
     assert report["counts"] == {
         "unknown_fields": 0, "missing_policies": 1, "extra_policies": 1, "unclassified_drafts": 1,
-        "tied_pairs": 1, "matched_policies": 2, "comparable_policies": 2, "reply_parse_failed": 1,
+        "tied_pairs": 1, "ambiguous_drafts": 2, "matched_policies": 1, "comparable_policies": 1, "reply_parse_failed": 1,
     }
-    assert (report["rates"]["all_correct"]["numerator"], report["rates"]["all_correct"]["denominator"]) == (1, 3)
-    assert report["rates"]["safe_confirmation"]["numerator"] == 1
+    assert (report["rates"]["all_correct"]["numerator"], report["rates"]["all_correct"]["denominator"]) == (0, 3)
+    assert report["rates"]["safe_confirmation"]["numerator"] == 0
     assert report["rates"]["false_determined"]["denominator"] == 3
     assert report["rates"]["overasked"]["denominator"] == 3
     assert report["rates"]["zero_edit"]["percent"] is None
     assert report["field_categories"] == {
-        "correct": 1, "false_determined": 1, "overasked": 0, "justified_confirmation": 0, "missing": 1, "unknown": 0,
+        "correct": 0, "false_determined": 1, "overasked": 0, "justified_confirmation": 0, "missing": 2, "unknown": 0,
     }
     audit = pairing_audit([{"token": "complete", **complete}, {"token": "partial", **partial}])
-    assert [len(audit[key]) for key in ("matched", "missing", "extra_or_unknown", "ties")] == [2, 1, 2, 1]
+    assert audit == {
+        "matched": [{"token": "complete", "id": "unknown", "draft": 2}],
+        "missing": [{"token": "partial", "id": "missing"}],
+        "extra_or_unknown": [
+            {"token": "complete", "draft": 3, "kind": "extra_policies"},
+            {"token": "partial", "draft": 0, "kind": "unclassified_drafts"},
+        ],
+        "ambiguous": [{"token": "complete", "policies": ["first"], "drafts": [0, 1]}],
+    }
 
 
 @pytest.mark.parametrize("dataset", ["exam", "blind", "packages"])
@@ -1567,8 +1666,8 @@ def test_freeze_packages_accepts_any_reviewed_subset_of_targeted_pool(repo, corp
     assert {sample["row_id"] for sample in frozen["samples"].values()} == {"policy-b"}
 
 
-@pytest.mark.parametrize("ambiguous_benefit", [False, True])
-def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch, ambiguous_benefit):
+@pytest.mark.parametrize(("ambiguous_benefit", "ambiguous_pairing"), [(False, False), (True, False), (True, True)])
+def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch, ambiguous_benefit, ambiguous_pairing):
     from qianshu.draft import SourceExcerpt
 
     review = {
@@ -1583,6 +1682,10 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
     }
     if ambiguous_benefit:
         review["items"]["policy-a"]["source_status"] = {"benefit_type": "歧义"}
+    use_reviewed_tags = ambiguous_benefit and not ambiguous_pairing
+    if use_reviewed_tags:
+        for item, tag in zip(review["items"].values(), ("占位标签甲", "占位标签乙"), strict=True):
+            item["pairing"] = {"user_tags": [tag]}
     put_json(repo / "package-review.json", review)
     args = ["freeze-packages", "--corpus", ".private/archive", "--plan", ".private/packages-plan/plan.json",
             "--reviews", ".private/package-review.json",
@@ -1629,9 +1732,10 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
             "company": DraftField(value=company),
             "benefit_type": DraftField(value="赠送时长"),
             "packages": field,
-        }) for company, field in (
-            ("占位默认公司", named_package),
-            ("占位默认公司", DraftField(uncertainty=Uncertainty(reason="占位仅档位"))),
+            "user_tags": DraftField(value=[tag] if use_reviewed_tags else None),
+        }) for company, field, tag in (
+            ("占位默认公司", named_package, "占位标签甲"),
+            ("占位默认公司", DraftField(uncertainty=Uncertainty(reason="占位仅档位")), "占位标签乙"),
         )]
 
     monkeypatch.setattr(runner, "parse_application", parsed)
@@ -1643,11 +1747,18 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
         "numerator": int(not ambiguous_benefit), "denominator": 1, "percent": 0.0 if ambiguous_benefit else 100.0,
     }
     assert report["business"]["rates"]["package_tier_confirmation"] == {
-        "numerator": 1, "denominator": 1, "percent": 100.0,
+        "numerator": int(not ambiguous_pairing), "denominator": 1, "percent": 0.0 if ambiguous_pairing else 100.0,
     }
     assert report["business"]["by_field"]["packages"]["correct"] == int(not ambiguous_benefit)
-    assert report["business"]["by_field"]["packages"]["justified_confirmation"] == 1 + ambiguous_benefit
+    assert report["business"]["by_field"]["packages"]["justified_confirmation"] == (
+        0 if ambiguous_pairing else 1 + ambiguous_benefit
+    )
     assert report["business"]["by_field"]["packages"]["overasked"] == 0
+    counts = report["business"]["counts"]
+    expected_ambiguity = 2 if ambiguous_pairing else 0
+    assert counts["tied_pairs"] == counts["ambiguous_drafts"] == expected_ambiguity
+    markdown = (repo / "package-replay" / "public-report.md").read_text()
+    assert f"配对歧义（政策数） {expected_ambiguity}" in markdown
 
 
 def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_documents(repo, corpus, capsys):
@@ -1705,18 +1816,37 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
     assert main(_replay_args(checksum)) == 0
     assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
 
-def test_amount_dates_and_candidates_only_count_derived_business_keys():
-    from qianshu.draft import Candidate
-    from qianshu.regression.business import _draft_keys, _score, pairing_fingerprint
+def test_amount_dates_and_candidates_only_count_derived_business_keys(monkeypatch):
+    from qianshu.draft import Candidate, PackageRow
+    from qianshu.regression.business import WEIGHTS, _draft_keys, _gold_keys, _score, pairing_fingerprint
 
-    gold = {
-        "country": "占位", "recharge_amount": "19.90", "gift_days": 30,
-        "start_date": "2099-01-01", "end_date": "2099-01-15",
-    }
+    packages = [PackageRow(current_package="占位包甲")]
+    gold = _gold_keys({
+        "configuration": {
+            "user_tags": {"value": ["占位标签乙", "占位标签甲"]},
+            "packages": {"exclude": "gold_missing"},
+            "benefit_type": {"exclude": "source_anomaly"},
+            "gift_days": {"value": 30},
+            "start_date": {"value": "2099-01-01"},
+            "end_date": {"value": "2099-01-15"},
+        },
+        "pairing": {
+            "user_tags": ["占位标签甲", "占位标签乙"],
+            "packages": [{"current_package": "占位包甲", "gift_package": None}],
+            "recharge_amount": "19.90",
+        },
+    }, {"country": "占位", "benefit_type": "赠送时长"})
+    assert gold["user_tags"] == ["占位标签乙", "占位标签甲"]
     draft = SimpleNamespace(
+        benefit_type=DraftField(value="赠送时长"),
         recharge_amount=DraftField(value=19.9),
         gift_days=DraftField(uncertainty=Uncertainty(reason="占位", candidates=[Candidate(value=30)])),
+        user_tags=DraftField(value=gold["user_tags"], uncertainty=Uncertainty(reason="占位")),
+        packages=DraftField(uncertainty=Uncertainty(reason="占位", candidates=[Candidate(value=packages)])),
         start_date=DraftField(value="2099-01-15"), end_date=DraftField(value="2099-02-01"),
     )
     assert _score(gold, _draft_keys(draft, {})) == ["recharge_amount", "date_overlap"]
-    assert pairing_fingerprint(2) != pairing_fingerprint(3)
+    fingerprint = pairing_fingerprint(2)
+    assert fingerprint != pairing_fingerprint(3)
+    monkeypatch.setitem(WEIGHTS, "packages", 4)
+    assert fingerprint != pairing_fingerprint(2)

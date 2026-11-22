@@ -3,6 +3,7 @@
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
 from re import Pattern
+from unicodedata import normalize as unicode_normalize
 
 from qianshu.parse.companies import CompanyTable
 from qianshu.parse.scope import country_matches
@@ -11,9 +12,11 @@ from .compare import compare_field, normalize
 from .storage import RegressionError, digest, json_bytes
 
 WEIGHTS = {
-    "country_or_company": 4, "benefit_type": 2, "packages": 4, "recharge_days": 2,
-    "gift_days": 2, "recharge_amount": 2, "user_tags": 3, "date_overlap": 2,
+    "country_or_company": 4, "benefit_type": 2, "packages": 8, "recharge_days": 2,
+    "gift_days": 2, "recharge_amount": 2, "user_tags": 7, "date_overlap": 2,
 }
+EMPTY_WEIGHTS = {"packages": 4, "user_tags": 3}
+SHADOW_TAG_SUFFIXES = ("_image",)
 DEFAULT_THRESHOLD = 2
 CATEGORIES = ("correct", "false_determined", "overasked", "justified_confirmation", "missing", "unknown")
 LEGACY_DEFAULTS = {
@@ -65,7 +68,7 @@ COUNT_LABELS = {
     "missing_policies": "漏条",
     "extra_policies": "多条",
     "unclassified_drafts": "额外草稿归属未知",
-    "tied_pairs": "同分配对",
+    "tied_pairs": "配对歧义（政策数）",
     "matched_policies": "业务配对成功",
     "comparable_policies": "配对成功且有可评分字段",
     "reply_parse_failed": "回复解析失败篇数",
@@ -78,8 +81,14 @@ def pairing_fingerprint(threshold: int) -> str:
     if not 1 <= threshold <= sum(WEIGHTS.values()):
         raise RegressionError("业务配对阈值超出支持范围。")
     return digest(json_bytes({
-        "version": 1, "weights": WEIGHTS, "threshold": threshold,
-        "tie_order": ["frozen_policy", "draft", "unmatched"],
+        "version": 3, "weights": WEIGHTS, "empty_weights": EMPTY_WEIGHTS, "threshold": threshold,
+        "gold_keys": ["included_gold", "reviewed_pairing", "unexcluded_sample_metadata"],
+        "draft_keys": "derived_without_confirmation",
+        "ties": "retain_only_pairs_common_to_all_optimal_assignments",
+        "user_tags": {
+            "normalization": ["NFKC", "casefold", "strip", "remove_one_shadow_suffix_with_nonempty_base", "sorted_set"],
+            "shadow_suffixes": SHADOW_TAG_SUFFIXES,
+        },
     }))
 
 
@@ -87,22 +96,22 @@ def measure_fingerprint(threshold: int) -> str:
     return digest(json_bytes({"pairing_sha256": pairing_fingerprint(threshold), "mapping": G285_MAPPING}))
 
 
-def _assignment(scores: list[list[int | None]], *, ordered: bool = False) -> dict[int, int]:
+def _assignment(
+    scores: list[list[int | None]], *, prefer_policy: int | None = None, prefer_draft: int | None = None,
+) -> dict[int, int]:
     """矩形 Hungarian。每条金标额外有一个零分的空位可供使用。"""
     rows = len(scores)
     if not rows or not scores[0]:
         return {}
     drafts = len(scores[0])
     columns = drafts + rows
-    base = drafts + 1
-    scale = base ** rows if ordered else 1
-    places = [base ** (rows - i - 1) if ordered else 0 for i in range(rows)]
 
     def cost(row: int, col: int) -> int:
         score = scores[row][col] if col < drafts else None
         if score is None:
             return 0
-        return -(score * scale + (drafts - col) * places[row])
+        # 指定的一条政策或草稿至多加 1 分，原始总分始终优先。
+        return -(2 * score + (row == prefer_policy or col == prefer_draft))
 
     row_potential = [0] * (rows + 1)
     column_potential = [0] * (columns + 1)
@@ -145,24 +154,50 @@ def _assignment(scores: list[list[int | None]], *, ordered: bool = False) -> dic
     }
 
 
-def optimal_pairs(scores: list[list[int | None]]) -> tuple[dict[int, int], set[int]]:
-    selected = _assignment(scores, ordered=True)
-    total = sum(scores[row][col] for row, col in selected.items())
-    tied = set()
+def optimal_pairs(scores: list[list[int | None]]) -> tuple[dict[int, int], set[int], set[int]]:
+    """返回所有最优解共有的配对及配对可能变化的政策、草稿。"""
+    def total(assignment: dict[int, int]) -> int:
+        return sum(scores[row][col] for row, col in assignment.items())
+
+    selected = _assignment(scores)
+    best = total(selected)
+    matches = {}
     for row, col in selected.items():
-        score = scores[row][col]
-        scores[row][col] = None
-        alternate = _assignment(scores)
-        if sum(scores[r][c] for r, c in alternate.items()) == total:
-            tied.add(row)
-        scores[row][col] = score
-    return selected, tied
+        without_pair = scores.copy()
+        without_pair[row] = scores[row].copy()
+        without_pair[row][col] = None
+        if total(_assignment(without_pair)) < best:
+            matches[row] = col
+
+    ambiguous_policies = selected.keys() - matches.keys()
+    ambiguous_drafts = set(selected.values()) - set(matches.values())
+    # 参考解未配上的条目也可能出现在另一份同分解中。
+    for row in set(range(len(scores))) - selected.keys():
+        if any(scores[row][col] is not None for col in ambiguous_drafts):
+            alternate = _assignment(scores, prefer_policy=row)
+            if row in alternate and total(alternate) == best:
+                ambiguous_policies.add(row)
+    if scores:
+        for col in set(range(len(scores[0]))) - set(selected.values()):
+            if any(scores[row][col] is not None for row in ambiguous_policies):
+                alternate = _assignment(scores, prefer_draft=col)
+                if col in alternate.values() and total(alternate) == best:
+                    ambiguous_drafts.add(col)
+    return matches, ambiguous_policies, ambiguous_drafts
 
 
 def needs_confirmation(field) -> bool:
     if field is None:
         return True
     return getattr(field, "needs_confirmation", getattr(field, "uncertainty", None) is not None or field.value is None)
+
+
+def _tag_key(tag: str) -> str:
+    tag = unicode_normalize("NFKC", tag).casefold().strip()
+    for suffix in SHADOW_TAG_SUFFIXES:
+        if tag.endswith(suffix):
+            return tag.removesuffix(suffix).rstrip() or tag
+    return tag
 
 
 def key_value(name: str, value):
@@ -174,7 +209,10 @@ def key_value(name: str, value):
                 return None
             amount = Decimal(str(value))
             return amount if amount.is_finite() else None
-        return normalize(name, value)
+        normalized = normalize(name, value)
+        if name == "user_tags":
+            return sorted({_tag_key(tag) for tag in normalized})
+        return normalized
     except (ValueError, InvalidOperation):
         return None
 
@@ -191,10 +229,12 @@ def _draft_keys(draft, countries: dict[str, str]) -> dict:
 
 
 def _gold_keys(pair: dict, sample: dict) -> dict:
+    configuration = pair["configuration"]
+    metadata = {"benefit_type": sample["benefit_type"]} if "benefit_type" not in configuration else {}
     return {
-        "country": sample["country"], "benefit_type": sample["benefit_type"],
-        **{name: entry["value"] for name, entry in pair["configuration"].items() if "value" in entry},
+        "country": sample["country"], **metadata,
         **pair.get("pairing", {}),
+        **{name: configuration[name]["value"] for name in PAIR_FIELDS if "value" in configuration.get(name, {})},
     }
 
 
@@ -371,14 +411,19 @@ class BusinessScore:
         draft_keys = [_draft_keys(draft, self.countries) for draft in drafts]
         gold_keys = [_gold_keys(pair, self.samples[pair["id"]]) for pair in pairs]
         all_hits = [[_score(gold, draft) for draft in draft_keys] for gold in gold_keys]
-        scores = [[sum(WEIGHTS[key] for key in hits) for hits in row] for row in all_hits]
-        matches, tied = optimal_pairs([
+        scores = [
+            [sum(EMPTY_WEIGHTS[key] if key in EMPTY_WEIGHTS and not draft[key] else WEIGHTS[key] for key in hits)
+             for draft, hits in zip(draft_keys, row, strict=True)]
+            for row in all_hits
+        ]
+        matches, ambiguous_policies, ambiguous_drafts = optimal_pairs([
             [score if score >= self.threshold else None for score in row] for row in scores
         ])
-        self.counts["tied_pairs"] += len(tied)
+        self.counts["tied_pairs"] += len(ambiguous_policies)
+        self.counts["ambiguous_drafts"] += len(ambiguous_drafts)
         self.counts["matched_policies"] += len(matches)
-        self.counts["missing_policies"] += len(pairs) - len(matches)
-        extras = [index for index in range(len(drafts)) if index not in matches.values()]
+        self.counts["missing_policies"] += len(pairs) - len(matches) - len(ambiguous_policies)
+        extras = sorted(set(range(len(drafts))) - set(matches.values()) - ambiguous_drafts)
         extra_kind = "extra_policies" if document.get("complete") is True else "unclassified_drafts"
         self.counts[extra_kind] += len(extras)
         audit = []
@@ -416,7 +461,7 @@ class BusinessScore:
                 self.package_denominators["package_tier_confirmation"] += 1
                 self.rates["package_tier_confirmation"] += draft is not None and needs_confirmation(packages)
             audit.append({
-                "id": sample_id, "draft": draft_index, "tie": index in tied, "fields": by_field,
+                "id": sample_id, "draft": draft_index, "tie": index in ambiguous_policies, "fields": by_field,
                 "positive_scores": [
                     {"draft": col, "score": score, "keys": all_hits[index][col]}
                     for col, score in enumerate(scores[index]) if score
@@ -426,6 +471,7 @@ class BusinessScore:
         return {
             "policies": audit,
             "unpaired_drafts": [{"draft": i, "kind": extra_kind, "parsed": drafts[i].to_dict()} for i in extras],
+            "ambiguous_drafts": [{"draft": i, "parsed": drafts[i].to_dict()} for i in sorted(ambiguous_drafts)],
         }
 
     def report(self, reply_parse_failed: int) -> dict:
@@ -453,7 +499,7 @@ class BusinessScore:
         return {
             "pairing_sha256": self.fingerprint,
             "measure_sha256": self.measure_fingerprint,
-            "rates": rates, "counts": {key: self.counts[key] for key in COUNT_LABELS},
+            "rates": rates, "counts": {key: self.counts[key] for key in (*COUNT_LABELS, "ambiguous_drafts")},
             "field_categories": {category: field_totals[category] for category in CATEGORIES},
             "by_field": {name: {category: counts[category] for category in CATEGORIES}
                          for name, counts in self.field_counts.items()},
@@ -461,17 +507,25 @@ class BusinessScore:
 
 def pairing_audit(documents: list[dict]) -> dict:
     """按冻结篇序及篇内草稿、金标顺序选出供独立抽核的编号。"""
-    limits = {"matched": 10, "missing": 5, "extra_or_unknown": 5, "ties": 5}
+    limits = {"matched": 10, "missing": 5, "extra_or_unknown": 5}
     cases = {key: [] for key in limits}
+    ambiguous = []
     for document in documents:
         token = document["token"]
         matched = sorted(
             (row for row in document["policies"] if row["draft"] is not None), key=lambda row: row["draft"],
         )
         cases["matched"].extend({"token": token, "id": row["id"], "draft": row["draft"]} for row in matched)
-        cases["ties"].extend({"token": token, "id": row["id"], "draft": row["draft"]} for row in matched if row["tie"])
-        cases["missing"].extend({"token": token, "id": row["id"]} for row in document["policies"] if row["draft"] is None)
+        cases["missing"].extend(
+            {"token": token, "id": row["id"]} for row in document["policies"] if row["draft"] is None and not row["tie"]
+        )
         cases["extra_or_unknown"].extend(
             {"token": token, "draft": row["draft"], "kind": row["kind"]} for row in document["unpaired_drafts"]
         )
-    return {key: cases[key][:limit] for key, limit in limits.items()}
+        if document["ambiguous_drafts"]:
+            ambiguous.append({
+                "token": token,
+                "policies": [row["id"] for row in document["policies"] if row["tie"]],
+                "drafts": [row["draft"] for row in document["ambiguous_drafts"]],
+            })
+    return {**{key: cases[key][:limit] for key, limit in limits.items()}, "ambiguous": ambiguous}
