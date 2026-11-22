@@ -7,6 +7,7 @@ import pytest
 from qianshu.feishu import Message
 from qianshu.feishu.entrance import Application
 from qianshu.parse import parse_application
+from qianshu.parse.package_levels import PackageLevels, load_package_levels
 from qianshu.pipeline import Pipeline
 from tests.mingdao.test_create_order import case
 from tests.protocol_fixtures import fixed_reply, statement
@@ -230,7 +231,9 @@ def test_offline_name_matches_card_and_keeps_existing_public_order_gate(case):
 
     body, fields = application()
     reply = fixed_reply(body, [fields])
-    draft = parse_one(body, reply)
+    levels = load_package_levels(COMPANIES.with_name("package-levels.csv"))
+    draft = parse_one(body, reply, package_levels=levels)
+    assert draft.packages.uncertainty is None
     offline_fields = asdict(draft)
     with pytest.raises(create_order.Stop, match="草稿字段无效"):
         create_order.draft_values(offline_fields)
@@ -243,6 +246,18 @@ def test_offline_name_matches_card_and_keeps_existing_public_order_gate(case):
     name, = [row["value"] for row in controls if row["controlId"] == case.control["policy_name"]]
     assert name == COMPOSED
     assert f"优惠政策名称 · 候选 1\n值　{name}" in card_text(body, model_reply(reply))
+
+
+def test_public_order_gate_blocks_pending_packages_with_confirmed_name():
+    from dataclasses import asdict
+    from qianshu.mingdao import create_order
+
+    body, fields = application("合成原名")
+    draft = parse_one(body, fixed_reply(body, [fields]), package_levels=PackageLevels())
+    assert draft.policy_name.value == "合成原名"
+    order_fields = {key: asdict(getattr(draft, key)) for key in create_order._DRAFT_FIELDS}
+    with pytest.raises(create_order.Stop, match="packages 待确认"):
+        create_order.draft_values(order_fields)
 
 
 @pytest.mark.parametrize("bad", [None, [], {"status": None}, {"value": 3}, {"evidence": [None]}])
