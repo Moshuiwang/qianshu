@@ -14,6 +14,7 @@ from . import parse, validate
 from .draft import Candidate, DraftField, PackageRow, PolicyDraft, SourceExcerpt, Uncertainty
 from .feishu.cards import CardLine, DetailPage, detail_pages
 from .feishu.entrance import Application
+from .parse.benefits import ADJUSTMENT_HINTS, OFFER_FIELD_LABELS, BenefitCatalog, benefit_applicability
 from .parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from .parse.evidence import STRUCTURE_REASONS, PolicyStructureIssue
 from .parse.model import ParseModel
@@ -38,13 +39,13 @@ _FIELD_LABELS = {
     "approval_url": "任务审批链接",
     "approval_attachments": "审批件附件",
     "user_count": "用户数",
+    **OFFER_FIELD_LABELS,
 }
 _DEFAULT_MUTEX = "互斥组按默认填是"
 _DEFAULT_HINTS = {
     _DEFAULT_MUTEX, "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1",
     parse._ATTACHMENTS_HINT, parse._POLICY_TYPE_HINT,
-    "充值 / 赠送天数按 1 月 = 30 天换算", "降包用户取消优惠按默认填是",
-    "降包用户取消优惠未写，请在卡片确认具体取值",
+    *ADJUSTMENT_HINTS,
 }
 _MUTEX_NO = "申请要求不维护互斥组，需人工确认"
 _BOUNDARY_HINT = "段落边界无法确定，需人工确认"
@@ -270,7 +271,15 @@ class _Policy:
                     yield CardLine(f"{prefix} · 自动调整 · {_FIELD_LABELS[item.field]}", item.reason)
             for item in result.warnings:
                 yield CardLine(f"{prefix} · 提醒项 · {_FIELD_LABELS[item.field]}", item.reason)
+        inactive, required = benefit_applicability(self.draft)
         for field in fields(self.draft):
+            value = getattr(self.draft, field.name)
+            if field.name in inactive or (
+                field.name in OFFER_FIELD_LABELS and field.name not in required
+                and value.value is None and value.uncertainty is None and not value.evidence
+                and not self.explanations.get(field.name)
+            ):
+                continue
             label = _FIELD_LABELS[field.name]
             title = f"{prefix} · {label}"
             explanation = self.explanations.get(field.name)
@@ -279,7 +288,7 @@ class _Policy:
                 if explanation:
                     yield _FreeTextLine(f"{title} · 模型说明", "", free_text=explanation)
             else:
-                yield from _field_lines(title, getattr(self.draft, field.name), explanation, redact)
+                yield from _field_lines(title, value, explanation, redact)
         for name, label in _INPUT_LABELS.items():
             if explanation := self.explanations.get(name):
                 yield _FreeTextLine(f"{prefix} · {label} · 模型说明", "", free_text=explanation)
@@ -295,6 +304,7 @@ class Pipeline:
         companies_file: Path | None = None,
         legacy_companies: bool = False,
         on_reply: Callable[[Application, str], None] | None = None,
+        benefit_catalog: BenefitCatalog | None = None,
     ) -> None:
         self.model = model
         self.tag_dates = tag_dates
@@ -302,6 +312,7 @@ class Pipeline:
         self.companies_file = companies_file
         self.legacy_companies = legacy_companies
         self._on_reply = on_reply
+        self.benefit_catalog = benefit_catalog
         registered = {value for value in sensitive_values if value}
         values = sorted({
             literal for value in registered
@@ -364,7 +375,11 @@ class Pipeline:
                 Path("rules"), self.companies_file or DEFAULT_COMPANIES_FILE, legacy=self.legacy_companies,
             )
             on_reply = None if self._on_reply is None else partial(self._on_reply, application)
-            drafts = parse.parse_application(body, model=self.model, on_reply=on_reply, company_rules=company_rules)
+            today = self.today()
+            drafts = parse.parse_application(
+                body, model=self.model, on_reply=on_reply, company_rules=company_rules,
+                benefit_catalog=self.benefit_catalog, today=today,
+            )
             policies = []
             for parsed in drafts:
                 draft = _review_mutex(parsed)
@@ -395,7 +410,7 @@ class Pipeline:
             try:
                 results = validate.validate_batch(
                     [(policy.draft, _facts(policy.draft, self.tag_dates)) for policy in policies],
-                    today=self.today(),
+                    today=today,
                 )
                 policies = [
                     replace(policy, draft=draft, validation=result)

@@ -78,6 +78,13 @@ class RequestedPackage(Declaration):
     gift_package: str | None
 
 
+class RequestedTariff(Declaration):
+    base_package: str
+    price_plan: str
+    unit: str
+    version: str | None
+
+
 class Findings(Declaration):
     policy_name: Finding[str]
     maintain_mutual_exclusion_group: Finding[YesNo]
@@ -99,6 +106,16 @@ class Findings(Declaration):
     user_scope: Finding[str]
     approval_url: Finding[str]
     approval_attachments: Finding[list[str]]
+    watch_days: Finding[Duration]
+    penalty_days: Finding[Duration]
+    amount_mode: Finding[Literal["自定义", "节目包资费"]]
+    recharge_amount: Finding[int | float]
+    tariff: Finding[RequestedTariff]
+    tariff_multiplier: Finding[int | float]
+    after_offer: Finding[Literal["恢复原包", "指定节目包"]]
+    after_offer_package: Finding[str]
+    forbid_package_change: Finding[YesNo]
+    first_recharge_day_only: Finding[Literal["是"]]
 
 
 class Policy(Declaration):

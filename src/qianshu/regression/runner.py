@@ -5,7 +5,7 @@ from dataclasses import fields
 from pathlib import Path
 from typing import get_origin
 
-from qianshu.draft import DraftField, PolicyDraft
+from qianshu.draft import DraftField, OfferPolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.evidence import STRUCTURE_REASONS
@@ -168,7 +168,7 @@ def evaluate(
         pairs[pair["token"]].append(pair)
     denominator = frozen["denominators"]
     eligible = {name: set(field["ids"]) for name, field in denominator["fields"].items()}
-    draft_fields = {field.name for field in fields(PolicyDraft) if get_origin(field.type) is DraftField}
+    draft_fields = {field.name for field in fields(OfferPolicyDraft) if get_origin(field.type) is DraftField}
     new_fields = sorted((draft_fields | FIELD_LABELS.keys()) - eligible.keys() - set(APPROVAL_FIELDS))
     new_field_counts = {name: Counter() for name in new_fields}
     full = set(denominator["whole_policy"])

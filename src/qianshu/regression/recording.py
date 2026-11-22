@@ -8,6 +8,7 @@ from pathlib import Path
 from re import fullmatch
 from uuid import uuid4
 
+from qianshu.parse.benefits import OFFER_FIELD_LABELS
 from qianshu.parse.model import (
     REPLY_FORMAT_ERRORS, CallResult, ModelError, ModelReplyError, ParseModel, validate_reply_json,
 )
@@ -98,6 +99,9 @@ def _project_legacy_reply(data: object) -> None:
         fields = policy.get("fields")
         if not isinstance(fields, dict):
             continue
+        for name in OFFER_FIELD_LABELS:
+            fields.setdefault(name, {"status": "缺证据", "reason_code": "field_not_reported",
+                                     "value": None, "candidates": [], "evidence": []})
         for statement in fields.values():
             if not isinstance(statement, dict):
                 continue

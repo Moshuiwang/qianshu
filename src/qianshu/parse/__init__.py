@@ -3,11 +3,12 @@
 import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, fields, replace
+from datetime import date
 from pathlib import Path
 
 from pydantic import ValidationError
 
-from qianshu.draft import Candidate, DraftField, PolicyDraft, SourceExcerpt, Uncertainty
+from qianshu.draft import Candidate, DraftField, OfferPolicyDraft, SourceExcerpt, Uncertainty
 
 from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
@@ -31,7 +32,7 @@ _CONFIRM = {
     "invalid_unwritten_shape": "「原文未写」须同时满足空值、无证据和无候选。",
     "manual_rule": other_fields.RULE_PENDING_REASON,
     "mutex_opt_out": other_fields.MUTEX_NO_HINT,
-    "downgrade_confirmation": benefits._DOWNGRADE_HINT,
+    **benefits.CONFIRMATION_REASONS,
     "policy_type_conflict": "原文政策类型与用户标签判定冲突。",
     "package_title_required": "缺少本条政策的标题，请补充标题并确认当前节目包（R5）。",
     "policy_name_conflict": "原文政策名称与唯一的用户标签冲突。",
@@ -51,7 +52,7 @@ class ParseError(ValueError):
         self.path = path
 
 
-class ParsedPolicyDraft(PolicyDraft):
+class ParsedPolicyDraft(OfferPolicyDraft):
     """草稿及其协议证据，供卡片、私有记录和回归入口使用。"""
 
     hints: list[str]
@@ -111,6 +112,8 @@ def parse_application(
     on_reply: Callable[[str], None] | None = None,
     company_rules: CompanyRules | None = None,
     additional_blocks: Iterable[SourceBlock] = (),
+    benefit_catalog: benefits.BenefitCatalog | None = None,
+    today: date | None = None,
 ) -> ParseResult:
     """解析正文及已转成文本的附件。on_reply 收到私有重放所需的结构化回复。"""
     attachments = tuple(additional_blocks)
@@ -154,7 +157,9 @@ def parse_application(
         on_reply(reply)
     parsed = _decode(reply)
     review = EvidenceReview(parsed, sources)
-    drafts = [_draft(policy, review, company_rules, options) for policy in parsed.policies]
+    if benefit_catalog is None:
+        benefit_catalog = benefits.load_benefit_catalog()
+    drafts = [_draft(policy, review, company_rules, options, benefit_catalog, today) for policy in parsed.policies]
     return ParseResult(drafts, structure_issues=review.structure_issues, evidence_locations=review.evidence_locations,
                        unused_passages=parsed.unused_passages or ())
 
@@ -193,8 +198,8 @@ def _normalized_value(name: str, value: object, options: dict[str, dict[str, str
         return benefits.benefit_option(value, options[name])
     if name == "policy_type":
         return names.policy_option(value, options[name])
-    if name in ("recharge_days", "gift_days"):
-        return benefits.duration_days(value)
+    if name in ("recharge_days", "gift_days") or name in benefits.OFFER_FIELD_LABELS:
+        return benefits.normalize_benefit_value(name, value)
     if name == "packages":
         return packages.package_rows(value)
     if name == "approval_url":
@@ -208,13 +213,14 @@ def _normalized_value(name: str, value: object, options: dict[str, dict[str, str
 
 def _draft(
     policy: Policy, review: EvidenceReview, rules: CompanyRules, options: dict[str, dict[str, str]],
+    benefit_catalog: benefits.BenefitCatalog, today: date | None,
 ) -> ParsedPolicyDraft:
     results = {name: review.field(policy, name) for name in policy.fields.__class__.model_fields}
     for name, result in results.items():
         if result.has_value and not result.needs_confirmation:
             value = _normalized_value(name, result.value, options)
-            explicit_empty_url = name == "approval_url" and result.value is None
-            if value is None and not explicit_empty_url:
+            explicit_empty = name in ("approval_url", "penalty_days", "first_recharge_day_only") and result.value is None
+            if value is None and not explicit_empty:
                 results[name] = issue(replace(result, value=None, has_value=False, source=None), "invalid_value_format")
             else:
                 results[name] = replace(result, value=value)
@@ -222,9 +228,10 @@ def _draft(
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
     country_company.resolve_country_company(results, rules)
     dates.verify_dates(results)
+    benefit_hints, inactive = benefits.apply_benefit_rules(results, benefit_catalog, today)
     hints = [
         *names.derive_names(results),
-        *benefits.apply_benefit_rules(results),
+        *benefit_hints,
         *other_fields.apply_defaults(results),
     ]
     packages.resolve_packages(results, has_title=policy.has_title)
@@ -232,8 +239,8 @@ def _draft(
         hints.append(_COMPANY_TABLE_HINT)
 
     draft = ParsedPolicyDraft(**{
-        field.name: _project(results, field.name, review, options)
-        for field in fields(PolicyDraft)
+        field.name: DraftField() if field.name in inactive else _project(results, field.name, review, options)
+        for field in fields(OfferPolicyDraft)
     })
     draft.policy_id = policy.id
     corrected = policy.model_copy(update={

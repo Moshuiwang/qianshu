@@ -818,7 +818,7 @@ def test_frozen_baseline_runs_with_an_expanded_parser_and_reports_new_field_coun
         return result
 
     monkeypatch.setattr(runner, "parse_application", expanded_parser)
-    monkeypatch.setattr(runner, "PolicyDraft", ExtendedDraft)
+    monkeypatch.setattr(runner, "OfferPolicyDraft", ExtendedDraft)
     monkeypatch.setitem(FIELD_LABELS, "synthetic_offer", ("占位新增字段", "Text"))
 
     assert main(run_args(frozen, ".private/expanded"), model=model) == 0
@@ -828,6 +828,7 @@ def test_frozen_baseline_runs_with_an_expanded_parser_and_reports_new_field_coun
         assert expanded[key] == original[key]
     assert denominators.read_bytes() == original_denominators
     assert expanded["new_field_counts"] == {
+        **original["new_field_counts"],
         "synthetic_offer": {"determined": 1, "uncertain": 1, "missing": 0, "unaligned": 1},
     }
     assert "| 占位新增字段 | 1 | 1 | 0 | 1 |" in (repo / "expanded" / "public-report.md").read_text()
