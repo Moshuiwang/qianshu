@@ -65,7 +65,7 @@ def test_batch_sdk_record_replay_and_resume(repo, frozen, monkeypatch):
     ledger_path = repo / "regression-ledger.json"
     assert manifest["ledger"] == {"path": str(ledger_path), "sha256": digest(ledger_path.read_bytes())}
     entry = get_json(ledger_path)["r1"]
-    assert entry["spent_usd"] == "0.0002" and entry["committed_usd"] == "2.6"
+    assert entry["spent_usd"] == "0.0002" and entry["committed_usd"] == "2.5998"
     assert entry["active"] is False
     assert main(["run", *subset, "--out", ".private/immediate", "--live", "--run-id", "r2",
                  "--estimate-usd", "2", "--release", "--mode", "instant"]) == 0
@@ -153,6 +153,10 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
         if request.url.path.endswith("/results"):
             rows = [json.dumps({"custom_id": item["custom_id"], "result": {"type": "expired"}}) + "\n"
                     for item in posts[0]]
+            if fault == "disconnect":
+                first = json.loads(rows[0])
+                first["result"]["usage"] = {"input_tokens": 8000000, "output_tokens": 0}
+                rows[0] = json.dumps(first) + "\n"
             if broken:
                 if fault == "missing":
                     rows.pop()
@@ -175,9 +179,33 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
     args = [*run_args(frozen), "--live", "--trial", "2", "--run-id", "r", "--estimate-usd", "1"]
+    ledger_path = Path("regression-ledger.json")
+    if fault == "disconnect":
+        with PrivateFiles(repo.parent).open() as files:
+            ledger = Ledger(files, ledger_path)
+            ledger.reserve("prior", "instant", "1", "prior")
+            ledger.settle("prior", Decimal(100), False)
+            for other in ("a", "b"):
+                ledger.reserve(other, "batch", "1", other)
     assert main(args) == 1
     assert not (repo / "run/recording.json").exists()
-    assert get_json(repo / "regression-ledger.json")["r"]["committed_usd"] == "1.3"
+    if fault == "disconnect":
+        # 断流后重取同一篇、再次断流，两次都只计首篇的 8 美元。
+        for attempt in range(2):
+            if attempt:
+                assert main([*args, "--resume"]) == 1
+            row = get_json(repo / ledger_path)["r"]
+            assert Decimal(row["spent_usd"]) == 8
+            assert Decimal(row["committed_usd"]) == 0
+            assert row["active"] is True
+            with PrivateFiles(repo.parent).open() as files:
+                ledger = Ledger(files, ledger_path)
+                # 再预占 1.30 会使总额达到 111.90。即时名额空闲也必须拒绝。
+                for mode in ("batch", "instant"):
+                    with pytest.raises(RegressionError, match="预算"):
+                        ledger.reserve("next", mode, "1", "next")
+    else:
+        assert get_json(repo / ledger_path)["r"]["committed_usd"] == "1.3"
     assert main(args) == 1
     broken = False
     if fault == "lost_create":
@@ -502,8 +530,9 @@ def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
         manifest = {"run_id": "history", "origin": "live", "source_code_measured": True}
         for _ in range(2):
             ledger.carry_recording(manifest, "history-sha", cost, "1")
-        for row in get_json(repo / ledger.path).values():
-            assert row["committed_usd"] == "1.3" and row["spent_usd"] == "0.25"
+        for key, row in get_json(repo / ledger.path).items():
+            remaining = "1.3" if key == "history" else "1.05"
+            assert row["committed_usd"] == remaining and row["spent_usd"] == "0.25"
             assert row["active"] is False
         for i in range(3):
             ledger.reserve(f"next-{i}", "batch", "1", str(i))

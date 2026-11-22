@@ -272,9 +272,6 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                     raise RegressionError("批次仍在途，可按原运行号续取。")
                 time.sleep(min(delay, max(0, deadline - time.time())))
                 delay = min(delay * 2, 60)
-            if bound:
-                with transaction(files, ledger.path) as runs:
-                    runs[run_id]["active"] = False
             with transaction(files, journal) as state:
                 state.setdefault("observed_seconds", time.time() - state["submitted"])
             seen = {}
@@ -286,20 +283,18 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                     with transaction(files, row_path(key)) as item:
                         conflict = bool(item) and item.get("raw") != line
                         if not conflict:
+                            checksum = digest(line.encode())
                             if key not in seen:
+                                ledger.record_batch_item(run_id, key, checksum, batch_cost([line], model_id))
                                 seen[key] = line
-                                if len(seen) == len(expected):
-                                    # 先记已取得的费用，再持久化最后一行，崩溃也不会少计。
-                                    cost = batch_cost(seen.values(), model_id)
-                                    ledger.settle(run_id, cost["known_usd"] or "0", True)
-                            item.update(raw=line, sha256=digest(line.encode()))
+                            item.update(raw=line, sha256=checksum)
                     if conflict:
                         with transaction(files, journal) as state:
                             state["conflict"] = True
                         raise RegressionError("同一批量结果的字节冲突。")
             if seen.keys() != expected.keys():
                 raise RegressionError("取回结果缺篇，请从原批次续取。")
-            ledger.record_cost(run_id, cost)
+            ledger.record_cost(run_id, batch_cost(seen.values(), model_id))
             with transaction(files, journal) as state:
                 if state.get("conflict"):
                     raise RegressionError("结果有冲突，须人工对账。")
