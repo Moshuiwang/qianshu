@@ -89,7 +89,7 @@ def pairing_fingerprint(threshold: int) -> str:
     return digest(json_bytes({
         "version": PAIRING_VERSION, "weights": WEIGHTS, "empty_weights": EMPTY_WEIGHTS, "threshold": threshold,
         "gold_keys": ["included_gold", "reviewed_pairing", "unexcluded_sample_metadata"],
-        "draft_keys": "v3_with_located_pending_field_fallback",
+        "draft_keys": "v3_then_located_pending_on_unmatched_unambiguous_remainder",
         "ties": "retain_only_pairs_common_to_all_optimal_assignments",
         "user_tags": {
             "normalization": ["NFKC", "casefold", "strip", "remove_one_shadow_suffix_with_nonempty_base", "sorted_set"],
@@ -223,7 +223,7 @@ def key_value(name: str, value):
         return None
 
 
-def _draft_keys(draft, countries: dict[str, str], sources: Sources, options: dict) -> dict:
+def _draft_keys(draft, countries: dict[str, str]) -> dict:
     # v3 先按卡片投影取键，包括已确认的 R10 公司和它唯一映射的国家。
     keys = {}
     for name in PAIR_FIELDS:
@@ -233,6 +233,11 @@ def _draft_keys(draft, countries: dict[str, str], sources: Sources, options: dic
     country = getattr(draft, "country", None)
     keys["country"] = country.value if not needs_confirmation(country) else countries.get(keys.get("company"))
 
+    return keys
+
+
+def _with_pending_keys(draft, confirmed: dict, sources: Sources, options: dict) -> dict:
+    keys = confirmed.copy()
     results = getattr(draft, "field_results", {})
     for name in ("country", *PAIR_FIELDS):
         field = getattr(draft, name, None)
@@ -511,6 +516,19 @@ def _review_name_grade(draft) -> str:
     return "justified_confirmation" if needs_confirmation(getattr(draft, "policy_name", None)) else "false_determined"
 
 
+def _pair_round(gold_keys: list, draft_keys: list, threshold: int):
+    all_hits = [[_score(gold, draft) for draft in draft_keys] for gold in gold_keys]
+    scores = [
+        [sum(EMPTY_WEIGHTS[key] if key in EMPTY_WEIGHTS and not draft[key] else WEIGHTS[key] for key in hits)
+         for draft, hits in zip(draft_keys, row, strict=True)]
+        for row in all_hits
+    ]
+    matches, ambiguous_policies, ambiguous_drafts = optimal_pairs([
+        [score if score >= threshold else None for score in row] for row in scores
+    ])
+    return matches, ambiguous_policies, ambiguous_drafts, all_hits, scores
+
+
 class BusinessScore:
     def __init__(
         self, frozen: dict, threshold: int, countries: dict[str, str], *,
@@ -541,18 +559,27 @@ class BusinessScore:
         self.package_denominators = Counter()
 
     def add(self, document: dict, pairs: list[dict], drafts: list) -> dict:
-        sources = Sources([SourceBlock("body", document["body"], "body")])
-        draft_keys = [_draft_keys(draft, self.countries, sources, self.options) for draft in drafts]
+        draft_keys = [_draft_keys(draft, self.countries) for draft in drafts]
         gold_keys = [_gold_keys(pair, self.samples[pair["id"]]) for pair in pairs]
-        all_hits = [[_score(gold, draft) for draft in draft_keys] for gold in gold_keys]
-        scores = [
-            [sum(EMPTY_WEIGHTS[key] if key in EMPTY_WEIGHTS and not draft[key] else WEIGHTS[key] for key in hits)
-             for draft, hits in zip(draft_keys, row, strict=True)]
-            for row in all_hits
-        ]
-        matches, ambiguous_policies, ambiguous_drafts = optimal_pairs([
-            [score if score >= self.threshold else None for score in row] for row in scores
-        ])
+        matches, ambiguous_policies, ambiguous_drafts, all_hits, scores = _pair_round(
+            gold_keys, draft_keys, self.threshold,
+        )
+        remaining_rows = sorted(set(range(len(pairs))) - matches.keys() - ambiguous_policies)
+        remaining_cols = sorted(set(range(len(drafts))) - set(matches.values()) - ambiguous_drafts)
+        if remaining_rows and remaining_cols:
+            sources = Sources([SourceBlock("body", document["body"], "body")])
+            added, tied_rows, tied_cols, hits, points = _pair_round(
+                [gold_keys[i] for i in remaining_rows],
+                [_with_pending_keys(drafts[j], draft_keys[j], sources, self.options) for j in remaining_cols],
+                self.threshold,
+            )
+            matches.update((remaining_rows[i], remaining_cols[j]) for i, j in added.items())
+            ambiguous_policies.update(remaining_rows[i] for i in tied_rows)
+            ambiguous_drafts.update(remaining_cols[j] for j in tied_cols)
+            for i, row in enumerate(remaining_rows):
+                for j, col in enumerate(remaining_cols):
+                    all_hits[row][col] = hits[i][j]
+                    scores[row][col] = points[i][j]
         self.counts["tied_pairs"] += len(ambiguous_policies)
         self.counts["ambiguous_drafts"] += len(ambiguous_drafts)
         self.counts["matched_policies"] += len(matches)

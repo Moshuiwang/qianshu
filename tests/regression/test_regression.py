@@ -1553,7 +1553,7 @@ def test_pairing_preserves_r10_company_and_its_country_mapping(explicit_company)
     assert policy["positive_scores"] == [{"draft": 0, "score": 4, "keys": ["country_or_company"]}]
 
 
-def test_v4_scores_at_least_v3_for_every_nonempty_subset_of_confirmed_keys():
+def test_first_round_preserves_v3_scores_for_every_nonempty_subset_of_confirmed_keys():
     from qianshu.regression.business import BusinessScore
 
     # 各组在 v3 中的独立贡献，覆盖复合日期键与两个空集合的权重。
@@ -1578,7 +1578,41 @@ def test_v4_scores_at_least_v3_for_every_nonempty_subset_of_confirmed_keys():
             draft = SimpleNamespace(**fields, to_dict=lambda: {})
             policy, = score.add({"body": "占位"}, [pair], [draft])["policies"]
             assert policy["draft"] == 0
-            assert policy["positive_scores"][0]["score"] == expected_v3 + (2 if pending_gift else 0)
+            assert policy["positive_scores"][0]["score"] == expected_v3
+
+
+@pytest.mark.parametrize("first_round_tie", [False, True])
+def test_second_round_only_pairs_remaining_policies_and_drafts(first_round_tie):
+    from qianshu.regression.business import BusinessScore
+
+    def pending(value):
+        field = located_field(value)
+        field.uncertainty = Uncertainty(reason="合成待确认")
+        return field
+
+    pairs = [
+        {"id": "remaining", "configuration": {"gift_days": {"value": 5}}},
+        {"id": "first", "configuration": {"recharge_days": {"value": 10}}},
+    ]
+    frozen = {
+        "samples": {p["id"]: {"country": "合成地区", "benefit_type": "赠送时长"} for p in pairs},
+        "denominators": {"fields": {}},
+    }
+    # 全表补分会使两个草稿对两条政策都得 2 分，抹掉首轮唯一配对。
+    drafts = [
+        SimpleNamespace(recharge_days=pending(10), gift_days=pending(5), to_dict=dict),
+        SimpleNamespace(recharge_days=located_field(10), gift_days=pending(5), to_dict=dict),
+    ]
+    if first_round_tie:
+        drafts.append(SimpleNamespace(recharge_days=located_field(10), to_dict=dict))
+    result = BusinessScore(frozen, 2, {}).add({"body": "占位"}, pairs, drafts)
+    remaining, first = result["policies"]
+    assert remaining["draft"] == 0 and not remaining["tie"]
+    assert remaining["positive_scores"] == [{"draft": 0, "score": 2, "keys": ["gift_days"]}]
+    assert first["tie"] == first_round_tie
+    assert first["draft"] == (None if first_round_tie else 1)
+    assert [row["draft"] for row in result["ambiguous_drafts"]] == ([1, 2] if first_round_tie else [])
+    assert result["unpaired_drafts"] == []
 
 
 def test_package_pairing_uses_model_rows_before_card_projection():
@@ -2193,7 +2227,7 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
 
 def test_confirmed_keys_include_derived_tags_and_pending_candidates_do_not_score(monkeypatch):
     from qianshu.draft import Candidate, PackageRow
-    from qianshu.regression.business import WEIGHTS, _draft_keys, _gold_keys, _score, pairing_fingerprint
+    from qianshu.regression.business import WEIGHTS, _draft_keys, _gold_keys, _score, _with_pending_keys, pairing_fingerprint
 
     packages = [PackageRow(current_package="占位包甲")]
     gold = _gold_keys({
@@ -2223,7 +2257,8 @@ def test_confirmed_keys_include_derived_tags_and_pending_candidates_do_not_score
         start_date=located_field("2099-01-15"), end_date=located_field("2099-02-01"),
     )
     sources = parse.Sources([parse.SourceBlock("body", "占位", "body")])
-    assert _score(gold, _draft_keys(draft, {}, sources, {})) == ["recharge_amount", "user_tags", "date_overlap"]
+    keys = _with_pending_keys(draft, _draft_keys(draft, {}), sources, {})
+    assert _score(gold, keys) == ["recharge_amount", "user_tags", "date_overlap"]
     fingerprint = pairing_fingerprint(2)
     assert fingerprint != pairing_fingerprint(3)
     monkeypatch.setitem(WEIGHTS, "packages", 4)
