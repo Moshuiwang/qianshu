@@ -33,6 +33,7 @@ jobs:
         run: |
           set -euo pipefail
           level="$(python3 scripts/ci_level.py "$BASE" "$HEAD")"
+          level="$(sh scripts/ci_guard.sh "$BASE" "$HEAD" "$level")"
           echo "level=$level" >> "$GITHUB_OUTPUT"
       - name: Docs-only change
         if: steps.level.outputs.level == 'docs'

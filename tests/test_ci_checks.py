@@ -67,6 +67,58 @@ def test_paths(repo, before, after, expected):
     assert result.stdout.strip() == expected
 
 
+def guard(base, proposed):
+    return subprocess.run(
+        ["sh", SCRIPTS / "ci_guard.sh", base, "HEAD", proposed],
+        capture_output=True, text=True,
+    )
+
+
+@pytest.mark.parametrize("path", [
+    "scripts/ci_level.py", "scripts/ci_guard.sh", ".github/pull_request_template.md",
+    ".github/workflows/checks.yml", "pyproject.toml", "uv.lock",
+])
+def test_guard_overrides_docs(repo, path):
+    write(repo / path)
+    base = commit()
+    (repo / "docs").mkdir()
+    (repo / path).rename(repo / "docs/moved.md")
+    commit()
+    result = guard(base, "docs")
+    result.check_returncode()
+    assert result.stdout == "full\n"
+
+
+@pytest.mark.parametrize("proposed", ["", "unknown", "docs\nfull"])
+def test_guard_rejects_invalid_level_even_for_protected_path(repo, proposed):
+    base = commit()
+    write(repo / "uv.lock")
+    commit()
+    assert guard(base, proposed).returncode != 0
+
+
+def test_guard_baselines(repo):
+    commit()
+    manual = guard("", "docs")
+    manual.check_returncode()
+    assert manual.stdout == "full\n"
+    assert guard("unknown-revision", "docs").returncode != 0
+
+
+def test_diverged_base_and_head(repo):
+    ancestor = commit()
+    write(repo / "scripts/ci_base_only.py")
+    base = commit()
+    subprocess.run(["git", "checkout", "-q", "--detach", ancestor], check=True)
+    write(repo / "docs/pr.md")
+    commit()
+
+    # A tip-to-tip diff also sees the base-only CI script as deleted.
+    for result in (level(base), guard(base, "docs")):
+        result.check_returncode()
+        assert result.stdout == "docs\n"
+
+
 def test_large_mixed_diff(repo):
     base = commit()
     write(repo / "code.py")

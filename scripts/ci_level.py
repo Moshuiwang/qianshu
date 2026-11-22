@@ -8,7 +8,6 @@ DOC_FILES = {
     b"CHANGELOG.md",
     b"AGENTS.md",
     b"CLAUDE.md",
-    b".github/pull_request_template.md",
 }
 
 
