@@ -66,6 +66,14 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
             if name.startswith("Finding_"):
                 assert set(finding["required"]) == {"status", "reason_code", "value", "candidates", "evidence"}
                 assert set(finding["properties"]) == {*finding["required"], "explanation"}
+        assert definitions["Findings"]["properties"]["country"] == {"$ref": "#/$defs/CountryFinding"}
+        country = definitions["CountryFinding"]
+        assert "mentions" in country["properties"] and "mentions" not in country["required"]
+        assert {"type": "array", "items": {"$ref": "#/$defs/CountryMention"}} in country["properties"]["mentions"]["anyOf"]
+        assert {"$ref": "#/$defs/MentionEvidence"} in definitions["CountryMention"]["properties"]["evidence"]["anyOf"]
+        for model, children in [("CountryMention", {"role", "evidence"}), ("MentionEvidence", {"source_id", "text"})]:
+            assert set(definitions[model]["properties"]) == children
+            assert not definitions[model].get("required")
         anchor = definitions["PolicyAnchor"]
         assert {"source_id", "start", "end", "text"} == set(anchor["properties"])
         assert "text" not in anchor["required"]

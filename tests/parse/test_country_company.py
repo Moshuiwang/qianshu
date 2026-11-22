@@ -162,3 +162,137 @@ def test_invalid_unwritten_statement_cannot_select_default(name):
     draft, = _parse(body, reply)
     assert draft.field_results["company"].needs_confirmation
     assert draft.company.value is None
+
+
+def mention(role, text, block="body"):
+    return {"role": role, "evidence": {"source_id": block, "text": text}}
+
+
+@pytest.mark.parametrize("role", ["比较或背景", "排除对象"])
+@pytest.mark.parametrize(("support", "pending"), [
+    ("贝宁比赞", True), ("贝宁比赞比亚", True), ("赞比亚", True),
+    ("贝宁比", False), ("贝宁", False),
+])
+def test_non_applicable_intersection_uses_text_even_with_wrong_coordinates(role, support, pending):
+    body = "贝宁比赞比亚"
+    reply = fixed_reply(body, [{"country": _field("贝宁", support)}])
+    country = reply["policies"][0]["fields"]["country"]
+    country["mentions"] = [mention("适用地", "贝宁"), mention(role, "赞比亚")]
+    # 把自报坐标移出真实相交处，或移入真实分离处。
+    start = 0 if pending else body.index("赞比亚")
+    country["evidence"][0]["span"].update(start=start, end=start + 1)
+    draft, = _parse(body, reply)
+    for name in ("country", "company"):
+        assert draft.field_results[name].needs_confirmation is pending
+
+
+@pytest.mark.parametrize("same_source", [False, True])
+def test_role_intersection_maps_block_offset_and_source(same_source):
+    from qianshu.parse.protocol import SourceBlock
+
+    body = "合成政策甲乙贝宁比赞比亚"
+    reply = fixed_reply(body, [{"country": _field("贝宁", "贝宁比赞")}])
+    country = reply["policies"][0]["fields"]["country"]
+    country["mentions"] = [mention("适用地", "贝宁"), mention("比较或背景", "赞比亚", "excerpt")]
+    block = SourceBlock("excerpt", "赞比亚", "body" if same_source else "other", body.index("赞比亚"))
+    draft, = parse_application(body, model=lambda **_: json.dumps(reply), companies_text=COMPANIES,
+                               additional_blocks=[block])
+    for name in ("country", "company"):
+        assert draft.field_results[name].needs_confirmation is same_source
+
+
+def test_equal_offsets_in_distinct_sources_do_not_conflict():
+    from qianshu.parse.protocol import SourceBlock
+
+    body = "贝宁"
+    reply = fixed_reply(body, [{"country": _field("贝宁", body)}])
+    reply["policies"][0]["fields"]["country"]["mentions"].append(mention("比较或背景", "南非", "attachment"))
+    draft, = parse_application(body, model=lambda **_: json.dumps(reply), companies_text=COMPANIES,
+                               additional_blocks=[SourceBlock("attachment", "南非", "attachment")])
+    assert draft.field_results["country"].value == body and not draft.field_results["country"].needs_confirmation
+    assert draft.company.value == "占位乙公司"
+
+
+@pytest.mark.parametrize(("support", "extra"), [
+    ("贝宁", mention("比较或背景", "赞比亚")),  # 重复的角色引文
+    ("赞比亚", mention("比较或背景", "参照")),  # 重复的国家支持引文
+    ("贝宁", mention("比较或背景", "无此国")),
+    ("贝宁", mention("适用地", "参照赞比亚")),
+    ("贝宁", mention("排除对象", "BJ")),
+    ("贝宁", mention("适用地", "参照赞比亚", "missing")),
+])
+def test_unresolved_or_contradictory_roles_need_confirmation(support, extra):
+    body = "贝宁 BJ 参照赞比亚，又提赞比亚"
+    reply = fixed_reply(body, [{"country": _field("贝宁", support)}])
+    reply["policies"][0]["fields"]["country"]["mentions"] = [mention("适用地", "贝宁"), extra]
+    draft, = _parse(body, reply)
+    assert all(draft.field_results[name].needs_confirmation for name in ("country", "company"))
+
+
+@pytest.mark.parametrize("conditional", ["country", "company"])
+def test_complete_roles_cannot_override_conditional_statement(conditional):
+    body = "贝宁，甲线，占位甲公司"
+    reply = fixed_reply(body, [dict(country=_field("贝宁", "贝宁"), company=_field("占位甲公司", "占位甲公司"),
+                                   company_keyword=_field(["甲线"], "甲线"))])
+    reply["policies"][0]["fields"][conditional]["status"] = "带条件"
+    draft, = _parse(body, reply, HEADER + "贝宁\t甲线\t01\t占位甲公司\n")
+    result = draft.field_results[conditional]
+    assert result.statement.status == "带条件" and result.needs_confirmation
+    assert draft.field_results["country"].needs_confirmation is (conditional == "country")
+    assert draft.field_results["company"].needs_confirmation
+
+
+@pytest.mark.parametrize("missing", ["mentions", "role", "evidence", "source_id", "text", "empty", "empty_item", "mixed"])
+def test_missing_role_evidence_changes_only_country_company_and_their_derivations(missing):
+    from unittest.mock import Mock
+
+    from qianshu.parse.package_levels import load_package_levels
+    from tests.parse.test_names import COMPOSED, COMPANIES as TABLE, TODAY, application
+
+    body, fields = application()
+    first_end = len(body)
+    body += "甲线。另一条适用贝宁。"
+    fields["company_keyword"] = _field(["甲线"], "甲线")
+    reply = fixed_reply(body, [fields, {"country": _field("贝宁", "贝宁")}],
+                        policy_ranges=[(0, first_end + 3), (first_end + 3, len(body))])
+    model = Mock(side_effect=lambda **_: json.dumps(reply))
+    options = dict(model=model, companies_text=HEADER + "赞比亚\t甲线\t0001\t占位公司甲\n贝宁\t\t0002\t占位乙公司\n",
+                   package_levels=load_package_levels(TABLE.with_name("package-levels.csv")), today=TODAY)
+    complete, other = parse_application(body, **options)
+    country = reply["policies"][0]["fields"]["country"]
+    item, = country["mentions"]
+    if missing == "mentions":
+        del country["mentions"]
+    elif missing == "empty":
+        country["mentions"] = []
+    elif missing == "empty_item":
+        country["mentions"] = [{}]
+    elif missing == "mixed":
+        country["mentions"].append({})
+    elif missing in item:
+        del item[missing]
+    else:
+        del item["evidence"][missing]
+
+    incomplete, other_after = parse_application(body, **options)
+    assert model.call_count == 2
+    assert other.field_results["country"].value == "贝宁" and not other.field_results["company"].needs_confirmation
+    assert other.field_results == other_after.field_results
+    before, after = complete.field_results, incomplete.field_results
+    assert before.keys() == after.keys()
+    for name in before.keys() - {"country", "company", "policy_name", "packages"}:
+        assert before[name] == after[name]
+    for name, value in [("country", "赞比亚"), ("company", "占位公司甲")]:
+        assert before[name].value == value and not before[name].needs_confirmation
+        assert after[name].needs_confirmation
+    name = before["policy_name"]
+    assert (name.value, name.needs_confirmation) == (COMPOSED, True)
+    assert [q.text for q in name.evidence] == ["面向全体且用户标签留空", "合成加赠：充30天送30天", "赞比亚", "起日2099-01-10"]
+    name = after["policy_name"]
+    assert (name.value, name.evidence, name.needs_confirmation) == (None, (), True)
+    packages = before["packages"]
+    row, = packages.value
+    assert (row.current_package, row.gift_package) == ("占位甲包", "占位甲包_copy")
+    assert not packages.needs_confirmation and [q.text for q in packages.evidence] == ["占位甲包"]
+    packages = after["packages"]
+    assert (packages.value, packages.evidence, packages.needs_confirmation) == (None, before["packages"].evidence, True)

@@ -269,7 +269,7 @@ def _resolve_fields(
                 results[name] = replace(result, value=value)
 
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
-    country_company.resolve_country_company(results, rules)
+    country_company.resolve_country_company(results, rules, review.sources)
     dates.verify_dates(results)
     benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, reference_date, policy.fields.model_fields_set)
     hints = [

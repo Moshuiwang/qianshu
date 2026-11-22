@@ -55,5 +55,9 @@ def fixed_reply(body, rows, *, policy_ranges=None):
             ]
             assertions[name] = statement("歧义" if candidates else "确定", value=value,
                                          evidence=items, candidates=candidates)
+            if name == "country" and items:
+                assertions[name]["mentions"] = [{"role": "适用地", "evidence": {
+                    "source_id": "body", "text": items[0]["text"],
+                }}]
         policies.append(policy(f"p{index}", span(start, end), assertions))
     return {"policies": policies}

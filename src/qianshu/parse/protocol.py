@@ -165,11 +165,33 @@ class ShortNameFinding(Finding[str]):
     evidence: list[ShortNameEvidence] = Field(default_factory=list)
 
 
+class MentionEvidence(Declaration):
+    source_id: Identifier | None = None
+    text: str | None = None
+
+
+class CountryMention(Declaration):
+    role: Literal["适用地", "比较或背景", "排除对象"] | None = None
+    evidence: MentionEvidence | None = None
+
+
+class CountryFinding(Finding[str]):
+    mentions: list[CountryMention] | None = None
+
+    @field_validator("mentions", mode="wrap")
+    @classmethod
+    def _optional_mentions(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            return None
+
+
 class Findings(Declaration):
     policy_name: Finding[str]
     policy_short_name: ShortNameFinding = Field(default_factory=ShortNameFinding)
     maintain_mutual_exclusion_group: Finding[YesNo]
-    country: Finding[str]
+    country: CountryFinding
     company: Finding[str]
     company_keyword: Finding[list[str]]
     policy_type: Finding[str]
