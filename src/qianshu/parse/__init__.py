@@ -99,7 +99,7 @@ class ParseResult(list[ParsedPolicyDraft]):
     def requires_full_review(self) -> bool:
         return (
             (self.document is not None and self.document.status is not DocumentStatus.NO_POLICY)
-            or any(not item.policy_ids for item in self.pending)
+            or any(item.requires_full_review for item in self.pending)
         )
 
 

@@ -752,18 +752,21 @@ def test_command_injection_still_enforces_approved_fingerprint(tmp_path, single_
 
 
 
-@pytest.mark.parametrize("case", ["材料不足", "可能有政策但无法切分", "gap", "unbound", "complete"])
+@pytest.mark.parametrize("case", ["材料不足", "可能有政策但无法切分", "gap", "policy_gap", "unbound", "complete"])
 def test_command_reports_full_review_without_downgrading_fields(tmp_path, single_policy, case):
     body, rows = single_policy
     rows[0]["country"] = rows[0].pop("company")
     reply = fixed_reply(" " + body, rows)
     if case in ("材料不足", "可能有政策但无法切分"):
         reply["document"] = {"status": case, "reason_code": "missing_image"}
-    elif case in ("gap", "unbound"):
+    elif case in ("gap", "policy_gap", "unbound"):
         tail = "\n合成新增段"
         uncovered = span(len(body) + 1, len(body) + len(tail) + 1)
         body += tail
-        if case == "unbound":
+        if case == "policy_gap":
+            reply = fixed_reply(" " + body, rows)
+            reply["coverage"][0]["span"]["end"] = uncovered["start"]
+        elif case == "unbound":
             reply["coverage"].append({"span": uncovered, "use": "待确认范围"})
             reply["pending"].append({"span": uncovered, "reason_code": "unassigned",
                                      "policy_ids": [], "fields_by_policy": []})
@@ -781,9 +784,9 @@ def test_command_reports_full_review_without_downgrading_fields(tmp_path, single
         assert "待确认范围 1" in content
         assert "未校验" in content
         assert "待群卡片同意" not in content
-        if case in ("gap", "unbound"):
+        if case in ("gap", "policy_gap", "unbound"):
             assert f"body [{uncovered['start']}, {uncovered['end']})" in content
-            reason_code = "coverage_gap" if case == "gap" else "unassigned"
+            reason_code = "unassigned" if case == "unbound" else "coverage_gap"
             assert reason_code in content
         else:
             assert f"文档判定\n{case}" in lines

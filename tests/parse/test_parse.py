@@ -505,25 +505,51 @@ def test_local_remark_overlap_includes_full_clause_of_each_reference():
     assert all(draft.repeat_bonus.value == "是" for draft in result)
 
 
-@pytest.mark.parametrize("coverage", ["gap", "bound", "unbound", "all"])
+@pytest.mark.parametrize("coverage", ["gap", "bound", "policy_only", "mixed", "unbound", "all"])
 def test_coverage_and_pending_ranges_use_structural_bindings(coverage):
     body = "甲主段乙主段其他"
     first, second, tail = span(0, 3), span(3, 6), span(6, 8)
     policies = [policy("p1", first), policy("p2", second)]
     covered = [{"span": span(0, 6), "use": "政策条款"}]
     pending = []
-    if coverage in ("bound", "unbound"):
+    if coverage in ("bound", "policy_only", "mixed", "unbound"):
         covered.append({"span": tail, "use": "待确认范围"})
+        policies_with_pending = {
+            "bound": ["p1"], "policy_only": ["p1"], "mixed": ["p1", "p2"], "unbound": [],
+        }
         pending.append({"span": tail, "reason_code": "fixture",
-                        "policy_ids": ["p1"] if coverage == "bound" else [],
+                        "policy_ids": policies_with_pending[coverage],
                         "fields_by_policy": [{"policy_id": "p1", "field_ids": ["repeat_bonus"]}]
-                        if coverage == "bound" else []})
+                        if coverage in ("bound", "mixed") else []})
     if coverage == "all":
         covered.append({"span": tail, "use": "其他文本"})
     result = parse_fixed(body, document(body, policies, coverage=covered, pending=pending))
     assert bool(result.pending) == (coverage != "all")
-    assert result.requires_full_review == (coverage in ("gap", "unbound"))
-    assert [draft.repeat_bonus.value for draft in result] == [None if coverage == "bound" else "是", "是"]
+    assert result.requires_full_review == (coverage in ("gap", "policy_only", "mixed", "unbound"))
+    assert [draft.repeat_bonus.value for draft in result] == [None if coverage in ("bound", "mixed") else "是", "是"]
+    assert [draft.trigger_once.value for draft in result] == ["否", "否"]
+
+
+@pytest.mark.parametrize(("use", "codes"), [
+    (None, ["coverage_gap"]),
+    ("备注", ["unsupported_coverage_use", "coverage_gap"]),
+    ("待确认范围", ["unbound_pending_coverage"]),
+])
+def test_coverage_ranges_bound_only_to_policy_require_full_review(use, codes):
+    body = "甲主段待核"
+    main, tail = span(0, 3), span(3, len(body))
+    policies = [policy("p1", main, continuations=[tail])]
+    covered = [{"span": main, "use": "政策条款"}]
+    baseline = parse_fixed(body, document(body, policies, coverage=[*covered, {"span": tail, "use": "续行"}]))
+    if use is not None:
+        covered.append({"span": tail, "use": use})
+
+    result = parse_fixed(body, document(body, policies, coverage=covered))
+
+    assert result.requires_full_review
+    assert [item.code for item in result.pending] == codes
+    assert all(item.policy_ids == ("p1",) and item.fields_by_policy == {"p1": set()} for item in result.pending)
+    assert result[0].field_results == baseline[0].field_results
 
 
 def test_overlapping_input_blocks_each_require_coverage_description():
@@ -538,8 +564,9 @@ def test_overlapping_input_blocks_each_require_coverage_description():
     pending, = result.pending
     assert pending.code == "missing_block_coverage"
     assert pending.block_id == "part-b"
-    assert not result.requires_full_review
-    assert result[0].maintain_mutual_exclusion_group.value is None
+    assert result.requires_full_review
+    assert pending.policy_ids == ("p1",)
+    assert result[0].maintain_mutual_exclusion_group.value == "是"
 
     reply["coverage"].append({"span": span(0, 3, "part-b"), "use": "其他文本"})
     result = parse_fixed(body, reply, additional_blocks=extra)

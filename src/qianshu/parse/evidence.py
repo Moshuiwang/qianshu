@@ -11,6 +11,10 @@ from .protocol import (
 )
 
 FIELD_IDS = frozenset(Findings.model_fields)
+_COVERAGE_REVIEW_CODES = frozenset({
+    "coverage_gap", "declared_pending", "invalid_coverage", "invalid_pending_reference",
+    "missing_block_coverage", "unbound_pending_coverage", "unsupported_coverage_use",
+})
 
 
 @dataclass(frozen=True, repr=False)
@@ -21,6 +25,22 @@ class ReviewRange:
     fields_by_policy: dict[str, frozenset[str]] | None = None
     block_id: str | None = None
     reason_code: str | None = None
+
+    @property
+    def requires_full_review(self) -> bool:
+        fields_by_policy = self.fields_by_policy or {}
+        return not self.policy_ids or (
+            self.code in _COVERAGE_REVIEW_CODES
+            and any(not fields_by_policy.get(policy_id) for policy_id in self.policy_ids)
+        )
+
+    def affects_field(self, policy_id: str, name: str) -> bool:
+        if policy_id not in self.policy_ids:
+            return False
+        names = (self.fields_by_policy or {}).get(policy_id)
+        if names:
+            return name in names
+        return self.code not in _COVERAGE_REVIEW_CODES and self.code != "invalid_clause"
 
 
 class Sources:
@@ -333,10 +353,8 @@ class EvidenceReview:
 
     def _pending_codes(self, policy: Policy, name: str) -> Iterable[str]:
         for pending in self.pending:
-            if policy.id in pending.policy_ids:
-                names = (pending.fields_by_policy or {}).get(policy.id)
-                if name in (names or ()) or (not names and pending.code != "invalid_clause"):
-                    yield pending.code
+            if pending.affects_field(policy.id, name):
+                yield pending.code
 
     def verified_quote(self, policy: Policy, name: str, quote: Evidence) -> Evidence | None:
         span = self._locations[quote.span, quote.text][0]
