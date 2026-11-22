@@ -2329,3 +2329,45 @@ def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen
             replay = get_json(repo / output / "public-report.json")
             assert replay["documents"] == report["documents"]
             assert replay["business"]["counts"]["reply_parse_failed"] == int(not repaired)
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+def test_regression_uses_only_the_supplied_package_snapshot(repo, frozen, supplied, monkeypatch):
+    from tests.parse.test_package_rows import COMPANIES
+
+    table = repo / "package-levels.csv"
+    shutil.copyfile(COMPANIES.with_name(table.name), table)
+    parse_application = runner.parse_application
+
+    def check_levels(*args, package_levels, **kwargs):
+        assert bool(package_levels.offers) is supplied
+        return parse_application(*args, package_levels=package_levels, **kwargs)
+
+    monkeypatch.setattr(runner, "parse_application", check_levels)
+    args = run_args(frozen)
+    if supplied:
+        args.extend(["--package-levels", ".private/package-levels.csv"])
+    assert main(args, model=no_policies) == 0
+    result = repo / "run"
+    assert get_json(result / "public-report.json")["package_levels_supplied"] is supplied
+    assert ("未提供销售品快照" in (result / "public-report.md").read_text()) is (not supplied)
+    assert get_json(result / "public-report.json")["documents"]["parsed"] == 2
+    assert (result / table.name).exists() is supplied
+    assert main(_replay_args(frozen)) == 0
+    assert get_json(repo / "replay/public-report.json")["package_levels_supplied"] is supplied
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_explicit_empty_or_invalid_package_snapshot(repo, frozen, corrupt):
+    from tests.parse.test_package_rows import details
+
+    table = repo / "supplied.csv"
+    with table.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=details()[0].keys())
+        writer.writeheader()
+        if corrupt:
+            writer.writerow(dict(details()[0], sale_start_date="错误日期"))
+    args = [*run_args(frozen), "--package-levels", ".private/supplied.csv"]
+    model = (lambda **_: pytest.fail("损坏快照应先于模型中止")) if corrupt else no_policies
+    assert main(args, model=model) == int(corrupt)
+    assert (repo / "run/recording.json").exists() is (not corrupt)
