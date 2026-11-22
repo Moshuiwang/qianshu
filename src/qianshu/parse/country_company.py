@@ -22,13 +22,16 @@ def resolve_country_company(results: dict[str, FieldResult], rules: CompanyRules
         results["company"] = issue(subject, "company_inputs_pending")
         return
     rows = (rules.table or {}).get(country.value, {})
-    if can_use_absence(clues):
-        row = rows.get("")
-        rule = "R10.default_company"
+    keywords = clues.value if verified_value(clues) else ()
+    matches = [row for keyword, row in rows.items()
+               if keyword and company_mentioned(keyword, keywords)]
+    if len(matches) == 1:
+        row, rule = matches[0], "R10.keyword"
+    elif can_use_absence(clues) and not verified_value(subject):
+        row, rule = rows.get(""), "R10.default_company"
     else:
-        matches = [row for keyword, row in rows.items() if keyword and company_mentioned(keyword, clues.value)]
-        row = matches[0] if len(matches) == 1 else None
-        rule = "R10.keyword"
+        results["company"] = issue(subject, "company_lookup_unresolved")
+        return
     if row is None:
         results["company"] = issue(subject, "company_lookup_unresolved")
     elif verified_value(subject) and subject.value.casefold() != row.display_name.casefold():
