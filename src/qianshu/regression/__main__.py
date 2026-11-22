@@ -296,7 +296,8 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
             params = read_json(wire.encode())
             saved.for_attempts(token, digest(params["messages"][0]["content"].encode()), digest(params["system"].encode()))
             expected = reconstruction["common_sha256"].get(token) if reconstruction else saved.request_sha256
-            if not expected or digest(common_body(wire).encode()) != expected:
+            actual = digest(common_body(wire).encode())
+            if expected != actual or saved.request_sha256 not in (None, actual):
                 raise RegressionError("标签请求与原录制或独立重建的业务字节不同。")
     names = doc_names(snapshot)
     mode = (manifest.get("mode", "instant") if origin == "replay" else "instant" if origin != "live" else
@@ -344,8 +345,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
                         or any(digest(files.read(out / name)) != sha for name, sha in
                                (done["artifact_sha256"] | done["extra_sha256"]).items())):
                         raise RegressionError("已发布批量录制校验失败。")
-                    cost = read_json(report_raw)["cost"]
-                    ledger.record_cost(args.run_id, cost)
+                    ledger.record_cost(args.run_id, read_json(report_raw)["cost"])
                     print("已核验原运行的完整批量录制。")
                     return
             wires = capture_requests(snapshot, rules, legacy, settings)
@@ -365,6 +365,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
         recording.tier = "quick" if args.selection else ("full" if snapshot["dataset"] == "exam" else "holdout")
         if origin == "live":
             recording.run_id = args.run_id
+            recording.ledger = ledger
             if mode == "instant":
                 recording.model = configured_model(settings, on_result=recording.on_result, max_retries=0)
                 ledger.reserve(args.run_id, mode, args.estimate_usd, digest(json_bytes(config)))
@@ -417,8 +418,6 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
         recording.extra_hashes = {name: digest(raw) for name, raw in extra.items()}
         output.write("public-report.json", public)
         recording.complete(digest(public), threshold, run_day=run_day.isoformat())
-    if origin == "live":
-        ledger.record_cost(args.run_id, report["cost"])
     print(f"已统计 {report['samples']} 条冻结样例，生成计数及私有明细。")
 
 

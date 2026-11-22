@@ -12,7 +12,7 @@ import pytest
 from qianshu.regression import batches, tiers
 from qianshu.regression.__main__ import main
 from qianshu.regression.ledger import Ledger
-from qianshu.regression.storage import PrivateFiles, RegressionError, json_bytes
+from qianshu.regression.storage import PrivateFiles, RegressionError, digest, json_bytes
 from tests.protocol_fixtures import serialized_empty
 from test_regression import corpus, frozen, get_json, repo, run_args
 
@@ -61,12 +61,12 @@ def test_batch_sdk_record_replay_and_resume(repo, frozen, monkeypatch):
     assert main(args) == 1
     assert main([*args, "--resume"]) == 0
     assert len(posts) == 1
-    from qianshu.regression.storage import digest
-    historical = ["account-recording", "--ledger", ".private/carry.json", "--recording", ".private/run",
-                  "--expect-sha256", digest((repo / "run/recording.json").read_bytes()), "--estimate-usd", "2"]
-    assert main(historical) == main(historical) == 0
-    entry = get_json(repo / "carry.json")["r1"]
+    manifest = get_json(repo / "resumed/recording.json")
+    ledger_path = repo / "regression-ledger.json"
+    assert manifest["ledger"] == {"path": str(ledger_path), "sha256": digest(ledger_path.read_bytes())}
+    entry = get_json(ledger_path)["r1"]
     assert entry["spent_usd"] == "0.0002" and entry["committed_usd"] == "2.6"
+    assert entry["active"] is False
     assert main(["run", *subset, "--out", ".private/immediate", "--live", "--run-id", "r2",
                  "--estimate-usd", "2", "--release", "--mode", "instant"]) == 0
     immediate = get_json(repo / "immediate/public-report.json")
@@ -301,6 +301,48 @@ def test_archive_reconstruction_requires_pinned_evidence(repo, frozen, monkeypat
     assert get_json(repo / "projected/recording.json")["request_set_sha256"]
     assert get_json(repo / "projected/public-report.json")["cost"]["new_known_usd"] == "0"
 
+    # 还原旧工具能盖过实录的情形。实录 100、重建 200，消息内容完全相同。
+    capture = batches.capture_requests
+    def capture_with_limit(snapshot, rules, legacy, settings):
+        wires = capture(snapshot, rules, legacy, settings)
+        for token, wire in wires.items():
+            params = json.loads(wire)
+            params["max_tokens"] = 100
+            recorded = json.dumps(params)
+            user_sha = digest(params["messages"][0]["content"].encode())
+            name = manifest["documents_by_user_sha256"][user_sha][digest(token.encode())]
+            path = repo / "run" / name
+            document = get_json(path)
+            document.update(request=recorded, request_sha256=digest(batches.common_body(recorded).encode()))
+            path.write_bytes(json_bytes(document))
+            manifest["artifact_sha256"][name] = digest(path.read_bytes())
+            params["max_tokens"] = 200
+            wires[token] = json.dumps(params)
+        return wires
+
+    from qianshu.regression.freeze import load_freeze
+    with PrivateFiles(repo.parent).open() as files:
+        snapshot = load_freeze(files, Path("frozen"))
+    wires = capture_with_limit(snapshot, repo.parent / "rules", False, {"ANTHROPIC_MODEL": manifest["model"]})
+    manifest_path.write_bytes(json_bytes(manifest))
+    checksum = digest(manifest_path.read_bytes())
+    archive = {**json.loads(evidence), "recording_sha256": checksum}
+    (repo / "evidence.json").write_bytes(json_bytes(archive))
+    monkeypatch.setattr(batches, "capture_requests", lambda *_: wires)
+    assert main(["rebuild-requests", "--frozen", ".private/frozen", "--expect-sha256", frozen,
+                 "--recording", ".private/run", "--benefit-catalog", ".private/run/benefit-catalog.json",
+                 "--evidence", ".private/evidence.json", "--expect-evidence-sha256", digest(json_bytes(archive)),
+                 "--out", ".private/conflict"]) == 1
+    assert "历史重建与实录请求" in capsys.readouterr().err
+    assert not (repo / "conflict").exists()
+    old_proof = {**json.loads(proof), "recording_sha256": checksum,
+                 "common_sha256": {k: digest(batches.common_body(v).encode()) for k, v in wires.items()}}
+    proof_path = repo / "proof/reconstruction.json"
+    proof_path.write_bytes(json_bytes(old_proof))
+    monkeypatch.setattr("qianshu.regression.__main__.capture_requests", lambda *_: wires)
+    assert main([*args, digest(proof_path.read_bytes())]) == 1
+    assert "标签请求与原录制" in capsys.readouterr().err
+
 
 def test_transport_slot_limits_and_exact_budget(repo):
     with PrivateFiles(repo.parent).open() as files:
@@ -367,3 +409,103 @@ def test_two_processes_resume_one_publication(repo, frozen, monkeypatch):
         assert worker.exitcode == 0
     assert downloads.value == 2
     assert len(get_json(repo / "run/recording.json")["artifact_sha256"]) == 2
+
+
+def test_fixed_trace_budget_and_prior_intent(repo):
+    from contextlib import ExitStack
+    from qianshu.regression.ledger import transaction
+
+    with ExitStack() as stack:
+        files = stack.enter_context(PrivateFiles(repo.parent).open())
+        ledger = Ledger.for_trace(files, ".private/regression-ledger.json", stack)
+        ledger.reserve("prior", "instant", "1", "prior")
+        ledger.settle("prior", Decimal(108), False)
+        ledger.reserve("same", "batch", "1", "first")
+        with pytest.raises(RegressionError):
+            Ledger.for_trace(files, ".private/other.json", stack)
+        with pytest.raises(RegressionError):
+            ledger.reserve("same", "instant", "1", "second")
+        with pytest.raises(RegressionError):
+            ledger.reserve("another", "batch", "1", "second")
+        (repo / "old").mkdir()
+        with transaction(files, Path("old") / ledger.journal("orphan")) as entry:
+            entry.update(run_id="orphan")
+        with pytest.raises(RegressionError, match="批次日志"):
+            ledger.reserve("orphan", "instant", "0.1", "retry")
+        with transaction(files, Path("old/legacy.json")) as runs:
+            runs["legacy"] = get_json(repo / ledger.path)["prior"]
+        with pytest.raises(RegressionError, match="旧位置"):
+            ledger.reserve("legacy", "instant", "0.1", "retry")
+
+
+def test_batch_cost_before_publication_failure(repo, frozen, monkeypatch):
+    from qianshu.regression.storage import Output
+
+    with PrivateFiles(repo.parent).open() as files:
+        ledger = Ledger(files, Path("regression-ledger.json"))
+        ledger.reserve("prior", "instant", "1", "prior")
+        ledger.settle("prior", Decimal(102), False)
+    posts = []
+    def transport(request):
+        if request.method == "POST":
+            posts.extend(json.loads(request.content)["requests"])
+            return httpx.Response(200, json={"id": "b"})
+        if request.url.path.endswith("/results"):
+            result = {"type": "expired", "usage": {"input_tokens": 8000000, "output_tokens": 0}}
+            return httpx.Response(200, content=json_bytes({"custom_id": posts[0]["custom_id"], "result": result}))
+        return httpx.Response(200, json={"id": "b", "processing_status": "ended",
+                                         "results_url": "https://fixture.invalid/results"})
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(transport), **kw))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
+    write = Output.write
+    def fail_report(self, name, raw):
+        if name == "public-report.json":
+            raise OSError("synthetic")
+        write(self, name, raw)
+    monkeypatch.setattr(Output, "write", fail_report)
+    assert main([*run_args(frozen), "--live", "--trial", "1", "--run-id", "batch", "--estimate-usd", "1"]) == 1
+    row = get_json(repo / "regression-ledger.json")["batch"]
+    assert Decimal(row["spent_usd"]) == 8 and row["committed_usd"] == "0" and not row["active"]
+    with PrivateFiles(repo.parent).open() as files, pytest.raises(RegressionError, match="预算"):
+        Ledger(files, Path("regression-ledger.json")).reserve("next", "batch", "1", "next")
+
+
+def test_instant_disconnect_after_start_keeps_reservation(repo, frozen, monkeypatch):
+    from test_regression import _stream_reply_events
+    class BrokenStream(httpx.SyncByteStream):
+        def __iter__(self):
+            yield next(iter(_stream_reply_events("")))
+            raise httpx.ReadError("synthetic")
+    def transport(request):
+        return httpx.Response(200, stream=BrokenStream(), headers={"content-type": "text/event-stream"})
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(transport), **kw))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--trial", "1", "--retries", "1",
+                 "--run-id", "broken", "--estimate-usd", "1"]) == 0
+    cost = get_json(repo / "run/public-report.json")["cost"]
+    assert cost["usage_status"] == "用量部分未知" and cost["missing_attempts"] == 2
+    row = get_json(repo / "regression-ledger.json")["broken"]
+    assert row["committed_usd"] == "1.3" and row["active"] is False
+
+
+def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
+    with PrivateFiles(repo.parent).open() as files:
+        ledger = Ledger(files, Path("regression-ledger.json"))
+        cost = {"mode": "batch", "known_usd": "0.25", "missing_attempts": 1}
+        for i in range(3):
+            ledger.reserve(str(i), "batch", "1", str(i))
+            ledger.record_cost(str(i), cost)
+        # 启用台账前的已结束录制也只占费用，重复接账幂等。
+        manifest = {"run_id": "history", "origin": "live", "source_code_measured": True}
+        for _ in range(2):
+            ledger.carry_recording(manifest, "history-sha", cost, "1")
+        for row in get_json(repo / ledger.path).values():
+            assert row["committed_usd"] == "1.3" and row["spent_usd"] == "0.25"
+            assert row["active"] is False
+        for i in range(3):
+            ledger.reserve(f"next-{i}", "batch", "1", str(i))
+        with pytest.raises(RegressionError, match="名额"):
+            ledger.reserve("fourth", "batch", "1", "fourth")

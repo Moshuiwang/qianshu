@@ -97,6 +97,8 @@ def rebuild(files, args, out):
     for token, wire in wires.items():
         params = read_json(wire.encode())
         saved.for_attempts(token, digest(params["messages"][0]["content"].encode()), digest(params["system"].encode()))
+        if saved.request_sha256 is not None and saved.request_sha256 != digest(common_body(wire).encode()):
+            raise RegressionError("历史重建与实录请求的业务字节不同。")
     result = json_bytes({"recording_sha256": checksum, "benefit_catalog_sha256": archive["benefit_catalog_sha256"],
                          "archive_sha256": args.expect_evidence_sha256, "versions": versions,
                          "common_sha256": {k: digest(common_body(v).encode()) for k, v in wires.items()}})

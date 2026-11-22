@@ -2,6 +2,7 @@
 
 import fcntl
 import os
+import re
 import stat
 import subprocess
 from contextlib import contextmanager
@@ -9,7 +10,7 @@ from decimal import Decimal
 from pathlib import Path
 from uuid import uuid4
 
-from .storage import RegressionError, json_bytes, read_json
+from .storage import RegressionError, digest, json_bytes, read_json
 
 
 @contextmanager
@@ -74,7 +75,42 @@ class Ledger:
             ["git", "-C", files.repo, "rev-parse", "--path-format=absolute", "--git-common-dir"],
             stderr=subprocess.DEVNULL).decode().strip()
         shared = stack.enter_context(type(files)(Path(git_dir).parent).open())
-        return cls(shared, shared.argument(argument))
+        canonical = Path("regression-ledger.json")
+        if shared.argument(argument) != canonical:
+            raise RegressionError("Trace 只使用主检出的固定台账。")
+        return cls(shared, canonical)
+
+    def journal(self, run_id):
+        return self.path.with_name("batch-" + digest(run_id.encode()) + ".json")
+
+    def evidence(self):
+        return {"path": str(self.files.repo / ".private" / self.path),
+                "sha256": digest(self.files.read(self.path))}
+
+    def check_prior_intents(self, run_id, runs):
+        # 旧版本可任选台账位置，每份事务文件都有同目录的永久锁。
+        journal = self.journal(run_id).name
+        known_batches = {self.journal(key).stem for key, row in runs.items() if row["mode"] == "batch"}
+        for directory, _, names, folder in os.fwalk(".", dir_fd=self.files.root):
+            if journal in names:
+                raise RegressionError("运行号已有批次日志，禁止再次提交。")
+            names = set(names)
+            for name in names:
+                if not name.endswith(".lock") or name[:-5] not in names:
+                    continue
+                candidate = Path(directory) / name[:-5]
+                if candidate == self.path:
+                    continue
+                batch_file = re.fullmatch(r"(batch-[a-f0-9]{64})(?:-[a-f0-9]{64})?\.json", candidate.name)
+                if candidate.parent == self.path.parent and batch_file and batch_file[1] in known_batches:
+                    continue
+                # 旧版未给自定义台账打标。只按旧事务的文件与锁元数据识别
+                # 候选后停下对账，避免为辨认台账而打开无关私有文件。
+                lock = os.stat(name, dir_fd=folder, follow_symlinks=False)
+                target = os.stat(name[:-5], dir_fd=folder, follow_symlinks=False)
+                if (stat.S_ISREG(lock.st_mode) and lock.st_size == 0 and lock.st_mode & 0o077 == 0
+                    and stat.S_ISREG(target.st_mode) and target.st_mode & 0o077 == 0):
+                    raise RegressionError("发现旧位置的事务文件，须先核对历史费用与提交意图。")
 
     def carry_recording(self, manifest, manifest_sha, usage, estimate):
         """登记启用台账前已发生的真跑，原录制及其重放不能重复核销。"""
@@ -88,11 +124,13 @@ class Ledger:
             if run_id in runs:
                 if runs[run_id].get("source_sha256") != manifest_sha:
                     raise RegressionError("运行号已有登记，请核对原始台账。")
+                runs[run_id]["active"] = False
                 return
+            self.check_prior_intents(run_id, runs)
             missing = usage["known_usd"] is None or bool(usage["missing_attempts"])
             runs[run_id] = {"source_sha256": manifest_sha, "identity": manifest_sha, "mode": usage["mode"],
                             "reserved_usd": str(amount), "spent_usd": usage["known_usd"] or "0",
-                            "committed_usd": str(amount) if missing else "0", "active": missing}
+                            "committed_usd": str(amount) if missing else "0", "active": False}
 
     def reserve(self, run_id, mode, estimate, identity, **context):
         amount = Decimal(estimate) * Decimal("1.3")
@@ -101,6 +139,7 @@ class Ledger:
         with transaction(self.files, self.path) as runs:
             if run_id in runs:
                 raise RegressionError("运行号已有提交意图，禁止再次提交。")
+            self.check_prior_intents(run_id, runs)
             committed = sum(Decimal(row["spent_usd"]) + Decimal(row["committed_usd"]) for row in runs.values())
             slots = sum(row["active"] and row["mode"] == mode for row in runs.values())
             if committed + amount > 110 or slots >= {"instant": 2, "batch": 3}[mode]:
@@ -117,4 +156,4 @@ class Ledger:
             row = runs[run_id]
             row["spent_usd"] = str(cost)
             row["committed_usd"] = row["reserved_usd"] if missing else "0"
-            row["active"] = bool(missing)
+            row["active"] = False

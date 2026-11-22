@@ -3,6 +3,7 @@
 import json
 from io import BytesIO
 import time
+from collections import Counter
 from contextlib import closing
 from unittest.mock import patch
 
@@ -15,6 +16,7 @@ from qianshu.parse.model import ModelError, _REPLY_TOOL, configured_model, valid
 from qianshu.parse.protocol import ApplicationReply
 
 from .ledger import transaction
+from .recording import reference_cost
 from .storage import RegressionError, digest, json_bytes, read_json
 
 
@@ -117,6 +119,19 @@ def verify_envelope(raw, expected):
         raise RegressionError("批量与即时业务请求字节不同。")
 
 
+def batch_cost(lines, model_id):
+    usage = Counter()
+    missing = 0
+    for line in lines:
+        result = json.loads(line)["result"]
+        counts = (result.get("message") or {}).get("usage") or result.get("usage") or {}
+        known = {k: counts[k] for k in ("input_tokens", "output_tokens")
+                 if type(counts.get(k)) is int and counts[k] >= 0}
+        missing += len(known) != 2
+        usage.update(known)
+    return reference_cost(model_id, "batch", usage, missing, live=True)
+
+
 def batch_attempt(line):
     raw_result = parts(line)["result"]
     result = json.loads(raw_result)
@@ -190,7 +205,7 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
     expected = {keys[token]: common_body(raw) for token, raw in wires.items()}
     requests = [{"custom_id": k, "params": json.loads(v)} for k, v in expected.items()]
     identity = digest(json_bytes([config, expected]))
-    journal = ledger.path.with_name("batch-" + digest(run_id.encode()) + ".json")
+    journal = ledger.journal(run_id)
     def verify(request):
         if (request.url.scheme, request.url.host, request.url.port) != origin:
             raise RegressionError("批量接口返回了不同来源的地址。")
@@ -246,6 +261,7 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                 raise RegressionError("批次受理未知，须只读对账。")
         def row_path(key):
             return journal.with_name(journal.stem + "-" + key + ".json")
+        model_id = json.loads(next(iter(wires.values())))["model"]
         if not finished:
             delay = 10
             while True:
@@ -256,25 +272,34 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                     raise RegressionError("批次仍在途，可按原运行号续取。")
                 time.sleep(min(delay, max(0, deadline - time.time())))
                 delay = min(delay * 2, 60)
+            if bound:
+                with transaction(files, ledger.path) as runs:
+                    runs[run_id]["active"] = False
             with transaction(files, journal) as state:
                 state.setdefault("observed_seconds", time.time() - state["submitted"])
-            seen = set()
+            seen = {}
             with closing(batches.results(batch_id)) as result:
                 for line in raw_lines(result.http_response):
                     key = json.loads(parts(line)["custom_id"])
                     if key not in expected:
                         raise RegressionError("结果含未登记关联键。")
-                    seen.add(key)
                     with transaction(files, row_path(key)) as item:
                         conflict = bool(item) and item.get("raw") != line
                         if not conflict:
+                            if key not in seen:
+                                seen[key] = line
+                                if len(seen) == len(expected):
+                                    # 先记已取得的费用，再持久化最后一行，崩溃也不会少计。
+                                    cost = batch_cost(seen.values(), model_id)
+                                    ledger.settle(run_id, cost["known_usd"] or "0", True)
                             item.update(raw=line, sha256=digest(line.encode()))
                     if conflict:
                         with transaction(files, journal) as state:
                             state["conflict"] = True
                         raise RegressionError("同一批量结果的字节冲突。")
-            if seen != expected.keys():
+            if seen.keys() != expected.keys():
                 raise RegressionError("取回结果缺篇，请从原批次续取。")
+            ledger.record_cost(run_id, cost)
             with transaction(files, journal) as state:
                 if state.get("conflict"):
                     raise RegressionError("结果有冲突，须人工对账。")
@@ -285,6 +310,9 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
             if digest(item["raw"].encode()) != item["sha256"]:
                 raise RegressionError("逐篇原始结果指纹不符。")
             rows[key] = item["raw"]
+        if finished:
+            # 兼容旧日志：结果可能已齐，但旧版本尚未结算就退出。
+            ledger.record_cost(run_id, batch_cost(rows.values(), model_id))
     def source(token, user_sha, system_sha):
         request = json.loads(wires[token])
         if (digest(request["system"].encode()) != system_sha

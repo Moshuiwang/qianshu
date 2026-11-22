@@ -195,6 +195,7 @@ class Recording:
         self.replaces_run_id = replaces_run_id
         self.run_id = uuid4().hex
         self.reconstruction_sha256 = None
+        self.ledger = None
         self.extra_hashes = {}
         self.batch_seconds = None
         self.requests = {}
@@ -334,6 +335,9 @@ class Recording:
                 if type(attempt.get(key)) is int:
                     self.usage_counts[key] += 1
                     self.usage_totals[key] += attempt[key]
+        if self.ledger and self.mode == "instant" and len(self.artifacts) == len(self.names):
+            self.ledger.record_cost(self.run_id, reference_cost(
+                self.model_id, self.mode, self.usage_totals, self.missing_usage, live=True))
         return bool(attempts and _interrupted_with_text(attempts[-1]))
 
     def complete(self, report_digest: str, threshold: int, *, run_day: str) -> None:
@@ -341,6 +345,7 @@ class Recording:
         if self.origin == "probe":
             origin_run_id = digest(json_bytes(sorted(self.probe_fingerprints)))
         self.output.write(MANIFEST, json_bytes({
+            **({"ledger": self.ledger.evidence()} if self.ledger else {}),
             "schema": 1, "mode": self.mode, "tier": self.tier, "run_id": self.run_id, "origin": self.origin, "origin_run_id": origin_run_id,
             "replaces_run_id": self.replaces_run_id,
             "source_code_measured": self.origin == "live", "model": self.model_id, "configuration": self.config,
@@ -378,7 +383,7 @@ def reference_cost(model_id, mode, usage, missing, *, live):
     known = str(cost) if cost is not None else None
     return {"mode": mode, "input_per_million": str(rate) if rate is not None else None,
             "output_per_million": str(rate * 5) if rate is not None else None,
-            "known_usd": known, "missing_attempts": missing,
+            "known_usd": known, "missing_attempts": missing, "usage_status": "用量部分未知" if missing else "用量完整",
             "new_known_usd": known if live else "0"}
 
 

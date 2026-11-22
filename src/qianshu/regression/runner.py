@@ -392,6 +392,8 @@ def markdown_report(report: dict) -> bytes:
                             f"{shown(usage['output_tokens']['total'])}，每百万单价 {shown(cost['input_per_million'])} / "
                             f"{shown(cost['output_per_million'])} 美元，已知费用 {shown(cost['known_usd'])} 美元，"
                             f"本次新增 {shown(cost['new_known_usd'])} 美元，待核 {cost['missing_attempts']} 次")
+        if cost["missing_attempts"]:
+            review_lines.append("- 用量部分未知，已知费用仅含已录得的用量。")
     if diagnostics := report.get("attempt_failures"):
         review_lines.append("- 全部尝试的失败诊断：" + "、".join(f"{k} {v} 次" for k, v in sorted(diagnostics.items())))
     if report.get("batch_seconds") is not None:
