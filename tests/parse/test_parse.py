@@ -428,6 +428,50 @@ def test_non_effective_or_uncertain_clause_keeps_field_pending(status, dispositi
     assert draft.field_results["repeat_bonus"].needs_confirmation
 
 
+@pytest.mark.parametrize("has_field_links", [True, False])
+def test_invalid_shared_clause_only_marks_declared_or_referencing_fields(has_field_links):
+    body = "甲不限次乙不限次丙不限次合成共享说明"
+    first, second, third = span(0, 4), span(4, 8), span(8, 12)
+    shared = span(12, len(body))
+    trigger_once = statement("确定", value="否", evidence=[quote(body, "甲不限次", "local")])
+    third_fields = {"user_scope": statement("确定", value="合成用户", evidence=[
+        quote(body, "合成共享说明", "shared"),
+    ])} if has_field_links else {}
+    policies = [
+        policy("p1", first, {"trigger_once": trigger_once}, shared=["shared"]),
+        policy("p2", second),
+        policy("p3", third, third_fields),
+    ]
+    clauses = [
+        clause("local", [first], ["trigger_once"], ["p1"]),
+        clause("shared", [shared], ["trigger_once"] if has_field_links else [], ["p1", "p2"],
+               kind="批次说明", scope="共享"),
+    ]
+    coverage = [{"span": span(0, third["end"]), "use": "政策条款"}, {"span": shared, "use": "批次说明"}]
+    drafts = parse_fixed(body, document(body, policies, clauses, coverage=coverage))
+    first_draft, second_draft, third_draft = drafts
+
+    pending, = drafts.pending
+    assert pending.code == "invalid_clause"
+    assert pending.span.model_dump(exclude_none=True) == shared
+    assert pending.policy_ids == ("p1", "p2")
+    expected_fields = {"trigger_once"} if has_field_links else set()
+    assert pending.fields_by_policy == {"p1": expected_fields, "p2": expected_fields}
+    assert all(draft.repeat_bonus.value == "是" for draft in drafts)
+    for draft in (first_draft, second_draft):
+        assert draft.field_results["trigger_once"].needs_confirmation is has_field_links
+        assert draft.trigger_once.value == (None if has_field_links else "否")
+    assert third_draft.trigger_once.value == "否"
+    if has_field_links:
+        assert third_draft.field_results["user_scope"].needs_confirmation
+        assert "invalid_evidence" in third_draft.field_results["user_scope"].issues
+    else:
+        policies[1]["shared_clause_ids"].append("shared")
+        baseline = parse_fixed(body, document(body, policies, clauses, coverage=coverage))
+        assert not baseline.pending
+        assert [draft.field_results for draft in drafts] == [draft.field_results for draft in baseline]
+
+
 def test_local_remark_overlap_marks_both_policies_and_keeps_other_fields():
     body = "甲主段乙主段备注"
     first, second, remark = span(0, 3), span(3, 6), span(6, 8)

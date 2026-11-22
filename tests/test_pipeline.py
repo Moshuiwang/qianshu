@@ -27,7 +27,7 @@ from qianshu.feishu.sdk import _Transport
 from qianshu.parse.evidence import ReviewRange
 from qianshu.parse.protocol import Span
 from qianshu.pipeline import Pipeline
-from tests.protocol_fixtures import fixed_reply, span
+from tests.protocol_fixtures import clause, fixed_reply, span
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSE_FIXTURES = ROOT / "tests" / "parse" / "fixtures"
@@ -788,6 +788,25 @@ def test_command_reports_full_review_without_downgrading_fields(tmp_path, single
         else:
             assert f"文档判定\n{case}" in lines
             assert "无可定位坐标\n理由码　document_pending（missing_image）" in content
+
+
+def test_command_reports_invalid_shared_clause_without_downgrading_unrelated_fields(tmp_path, single_policy):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    tail = "\n合成共享说明"
+    shared = span(len(body) + 1, len(body + tail) + 1)
+    reply["clauses"].append(clause("shared", [shared], [], ["p1"], kind="批次说明", scope="共享"))
+    reply["coverage"].append({"span": shared, "use": "批次说明"})
+
+    lines = _contents(_run(tmp_path, body + tail, reply))
+    content = "\n".join(lines)
+    assert "待确认范围 1" in content
+    assert f"body [{shared['start']}, {shared['end']})\n理由码　invalid_clause" in content
+    assert "解析不完整，需人工确认" in content
+    assert "待群卡片同意" not in content
+    assert "政策 1 · 用户范围\n值　占位休眠用户\n原文出处　「用户范围：占位休眠用户」" in lines
+    assert "政策 1 · 多买多送\n值　是\n原文出处　无原文摘录" in lines
 
 
 def test_pending_range_preview_redacts_secrets_at_range_edges():

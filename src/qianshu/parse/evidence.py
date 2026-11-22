@@ -242,7 +242,11 @@ class EvidenceReview:
                 if not invalid:
                     self._unlocated_clauses[clause.id] = clause
                 else:
-                    self.pending.append(ReviewRange(spans[0] if spans else None, "invalid_clause", bound))
+                    field_ids = FIELD_IDS.intersection(clause.field_ids)
+                    self.pending.append(ReviewRange(
+                        spans[0] if spans else None, "invalid_clause", bound,
+                        {policy_id: field_ids for policy_id in bound},
+                    ))
                 continue
             corrected = clause.model_copy(update={"spans": [self.corrected_span(span) for span in clause.spans]})
             for policy_id in clause.policy_ids:
@@ -282,9 +286,12 @@ class EvidenceReview:
                 support["政策条款"].append(self.main[policy.id])
             support["续行"].extend(self.continuations[policy.id])
         for clause in self.reply.clauses:
-            if clause.id not in self.invalid_clauses:
-                use = "政策条款" if clause.kind == "正文" else clause.kind
-                support[use].extend(self.clause_spans[clause.id])
+            if clause.id in self._unlocated_clauses:
+                continue
+            use = "政策条款" if clause.kind == "正文" else clause.kind
+            # 已列为待核的结构无效条款仍能说明已定位坐标的覆盖用途。
+            spans = self._locate_all(clause.spans) if clause.id in self.invalid_clauses else self.clause_spans[clause.id]
+            support[use].extend(spans)
 
         coverage = []
         described_blocks = set()
@@ -328,7 +335,7 @@ class EvidenceReview:
         for pending in self.pending:
             if policy.id in pending.policy_ids:
                 names = (pending.fields_by_policy or {}).get(policy.id)
-                if not names or name in names:
+                if name in (names or ()) or (not names and pending.code != "invalid_clause"):
                     yield pending.code
 
     def verified_quote(self, policy: Policy, name: str, quote: Evidence) -> Evidence | None:
