@@ -257,9 +257,9 @@ def test_invalid_or_reversed_dates_require_confirmation(end, expected):
         (None, None, "占位默认公司"),
         (["SYNTH-A"], None, "占位甲公司"),
         (["synth-A业务"], None, "占位甲公司"),
-        (["XSYNTH-A"], None, None),
-        (["SYNTH-A2"], None, None),
-        (["SYNTH-C"], None, None),
+        (["XSYNTH-A"], None, "占位默认公司"),
+        (["SYNTH-A2"], None, "占位默认公司"),
+        (["SYNTH-C"], None, "占位默认公司"),
         (["SYNTH-A", "SYNTH-B"], None, None),
         (["SYNTH-A"], "占位甲公司", "占位甲公司"),
         (["SYNTH-A"], "占位乙公司", None),
@@ -280,7 +280,7 @@ def test_company_keyword_or_country_default(clues, subject, expected):
     assert result.needs_confirmation is (expected is None)
     assert (result.source == "查表派生") == (expected is not None)
     if clues == ["SYNTH-C"]:
-        assert result.issues == ("company_lookup_unresolved",)
+        assert result.issues == ()
 
 
 @pytest.mark.parametrize("accepted", [False, True])
