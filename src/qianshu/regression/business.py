@@ -16,6 +16,27 @@ LEGACY_DEFAULTS = {
     "maintain_mutual_exclusion_group": "是", "trigger_once": "否",
     "repeat_bonus": "是", "effective_multiplier": 1,
 }
+G285_MAPPING = {
+    "version": "G285",
+    "datasets": ["exam", "blind", "packages"],
+    "inferable": "included_frozen_fields",
+    "excluded": "outside_denominator",
+    "confirmation": {
+        "source_statuses": ["歧义", "冲突", "带条件", "缺证据"],
+        "required_without_default": ["start_date", "end_date", "recharge_days", "gift_days", "packages", "user_scope"],
+        "directed_missing_tags": "定向政策",
+        "trigger_once": "是",
+        "effective_multiplier": {"only_automatic_value": 1},
+        "cancel_on_downgrade": {"benefit_type": "赠送时长", "source_status": "原文未写"},
+        "packages": "tier_only",
+    },
+    "defaults": {
+        **LEGACY_DEFAULTS,
+        "cancel_on_downgrade": {"升级权益": "是", "特价优惠": "是"},
+    },
+    "verified_matching_default": "correct",
+}
+SOURCE_STATUSES = frozenset((*G285_MAPPING["confirmation"]["source_statuses"], "确定", "原文未写"))
 METRIC_LABELS = {
     "all_correct": "可比字段全对率",
     "safe_confirmation": "安全可确认率",
@@ -46,6 +67,10 @@ def pairing_fingerprint(threshold: int) -> str:
         "version": 1, "weights": WEIGHTS, "threshold": threshold,
         "tie_order": ["frozen_policy", "draft", "unmatched"],
     }))
+
+
+def measure_fingerprint(threshold: int) -> str:
+    return digest(json_bytes({"pairing_sha256": pairing_fingerprint(threshold), "mapping": G285_MAPPING}))
 
 
 def _assignment(scores: list[list[int | None]], *, ordered: bool = False) -> dict[int, int]:
@@ -181,6 +206,15 @@ def _evidence_passes(name: str, field, mark: dict, body: str) -> bool:
     verified = getattr(field, "evidence_verified", None)
     if verified is False:
         return False
+    status = getattr(field, "source_status", None)
+    source = getattr(field, "value_source", None)
+    if status == "原文未写" or source == "默认规则":
+        return (
+            status == "原文未写" and source == "默认规则"
+            and verified is True and not field.evidence and field.value == mark.get("default")
+        )
+    if status not in (None, "确定"):
+        return False
     if field.evidence:
         return all(
             excerpt.text and (
@@ -191,7 +225,10 @@ def _evidence_passes(name: str, field, mark: dict, body: str) -> bool:
         )
     if verified is True:
         return True
-    return mark.get("default_allowed", True) and name in LEGACY_DEFAULTS and field.value == LEGACY_DEFAULTS[name]
+    return (
+        status is None and mark.get("default_allowed", True)
+        and name in LEGACY_DEFAULTS and field.value == LEGACY_DEFAULTS[name]
+    )
 
 
 def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
@@ -208,6 +245,32 @@ def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
     return "false_determined"
 
 
+def _g285_mark(name: str, pair: dict, sample: dict, package_style: str | None) -> dict:
+    """用冻结的取值与原文事实查 G285 规则表。"""
+    entry = pair["configuration"].get(name, {})
+    value = entry.get("value")
+    status = pair.get("source_status", {}).get(name)
+    benefit = sample["benefit_type"]
+    rules = G285_MAPPING["confirmation"]
+    needs_review = status in rules["source_statuses"]
+    if status == "原文未写":
+        needs_review |= name in rules["required_without_default"] or (
+            name == "user_tags" and sample["policy_type"] == rules["directed_missing_tags"]
+        )
+    if name == "trigger_once":
+        needs_review |= value == rules[name]
+    elif name == "effective_multiplier" and value is not None:
+        needs_review |= Decimal(value) != rules[name]["only_automatic_value"]
+    elif name == "cancel_on_downgrade":
+        needs_review |= {"benefit_type": benefit, "source_status": status} == rules[name]
+    elif name == "packages":
+        needs_review |= package_style == rules[name]
+    default = G285_MAPPING["defaults"].get(name)
+    if isinstance(default, dict):
+        default = default.get(benefit)
+    return {"inferable": "value" in entry, "auto_allowed": not needs_review, "default": default}
+
+
 def ratio(numerator: int, denominator: int | None) -> dict:
     return {
         "numerator": numerator, "denominator": denominator,
@@ -219,6 +282,7 @@ class BusinessScore:
     def __init__(self, frozen: dict, threshold: int, countries: dict[str, str]):
         self.threshold = threshold
         self.fingerprint = pairing_fingerprint(threshold)
+        self.measure_fingerprint = measure_fingerprint(threshold)
         self.countries = countries
         self.samples = frozen["samples"]
         self.dataset = frozen.get("dataset", "exam")
@@ -251,10 +315,11 @@ class BusinessScore:
             draft = drafts[draft_index] if draft_index is not None else None
             sample_id = pair["id"]
             configuration = pair["configuration"]
+            package_style = pair.get("package_style")
             by_field = {}
             for name in self.eligible[sample_id]:
-                status = grade(name, configuration.get(name, {}), pair.get("business", {}).get(name, {}),
-                               draft, document["body"])
+                mark = _g285_mark(name, pair, self.samples[sample_id], package_style or document.get("package_style"))
+                status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
                 self.field_counts[name][status] += 1
                 by_field[name] = status
             statuses = set(by_field.values())
@@ -266,7 +331,6 @@ class BusinessScore:
             self.rates["zero_edit"] += all_correct
             self.rates["card_reviewed"] += pair.get("card_complete") is True and has_comparable and "unknown" not in statuses
 
-            package_style = pair.get("package_style")
             packages = getattr(draft, "packages", None)
             if package_style in ("name_only", "both"):
                 self.package_denominators["package_rows_exact"] += 1
@@ -313,6 +377,7 @@ class BusinessScore:
         self.counts["reply_parse_failed"] = reply_parse_failed
         return {
             "pairing_sha256": self.fingerprint,
+            "measure_sha256": self.measure_fingerprint,
             "rates": rates, "counts": {key: self.counts[key] for key in COUNT_LABELS},
             "field_categories": {category: field_totals[category] for category in CATEGORIES},
             "by_field": {name: {category: counts[category] for category in CATEGORIES}

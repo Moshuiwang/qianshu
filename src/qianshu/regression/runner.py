@@ -24,6 +24,14 @@ APPROVAL_FIELDS = ("approval_url", "approval_attachments")
 NEW_FIELD_RESULTS = ("determined", "uncertain", "missing", "unaligned")
 
 
+class IncompleteReply(ParseError):
+    """已收到文本，回复未完整结束。"""
+
+    def __init__(self, reason: str):
+        self.reason = reason
+        super().__init__("回归模型回复不完整。")
+
+
 def _overlaps(left, right) -> bool:
     return left[0] < right[1] and right[0] < left[1]
 
@@ -179,7 +187,7 @@ def evaluate(
         name: next(iter(countries)) for name, countries in common_countries.items() if len(countries) == 1
     })
     business_details = []
-    reply_failures = 0
+    reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
 
     for token, document in frozen["documents"].items():
         call = recording.for_document(token) if recording is not None else model
@@ -190,11 +198,16 @@ def evaluate(
             received = True
 
         drafts = []
+        reply_failure = "reply_parse"
         try:
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
             )
+        except IncompleteReply as error:
+            received = True
+            status = "parse_failed"
+            reply_failure = error.reason
         except ModelError:
             status = "model_failed"
         except ParseError:
@@ -206,7 +219,7 @@ def evaluate(
         else:
             status = "parsed"
         if status == "parse_failed" and received:
-            reply_failures += 1
+            reply_failures[reply_failure] += 1
         if recording is not None:
             recording.finish(token, status, received)
         documents[status] += 1
@@ -292,20 +305,23 @@ def evaluate(
             for name, counts in availability.items()
         },
     }
-    report["business"] = business.report(reply_failures)
+    report["business"] = business.report(sum(reply_failures.values()))
+    report["business"]["reply_parse_failure_reasons"] = reply_failures
     details["business"] = business_details
     details["pairing_audit"] = pairing_audit(business_details)
     return report, details
 
 
 def markdown_report(report: dict) -> bytes:
+    failures = report["business"]["reply_parse_failure_reasons"]
+    breakdown = f"（截断 {failures['reply_truncated']}，其他未完整结束 {failures['reply_incomplete']}，解码或解析 {failures['reply_parse']}）"
     if report.get("void"):
         return (
             "# 解析回归计数\n\n"
             f"- 冻结指纹 `{report['freeze_sha256']}`\n"
             f"- 运行配置指纹 `{report['configuration_sha256']}`\n"
             f"- 模型调用失败 {report['documents']['model_failed']} 篇\n"
-            f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇\n\n"
+            f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}\n\n"
             "本次放行运行作废。\n"
         ).encode()
 
@@ -367,13 +383,15 @@ def markdown_report(report: dict) -> bytes:
             groups[label] = _rate_counts(counts)
         result.extend(lines(f"{title}（按字段项汇总）", groups))
     result.extend(["## 业务配对量尺", "", f"- 配对配置指纹 `{report['business']['pairing_sha256']}`"])
+    result.append(f"- 量尺指纹 `{report['business']['measure_sha256']}`")
     for key, metric in report["business"].get("rates", {}).items():
         numerator, denominator, percent = (metric[key] for key in ("numerator", "denominator", "percent"))
         fraction = f"{numerator}/{denominator}" if denominator is not None else "—"
         value = f"{percent:.2f}%" if percent is not None else "不可判定"
         result.append(f"- {METRIC_LABELS[key]} {fraction}（{value}）")
     for key, label in COUNT_LABELS.items():
-        result.append(f"- {label} {report['business']['counts'][key]}")
+        suffix = breakdown if key == "reply_parse_failed" else ""
+        result.append(f"- {label} {report['business']['counts'][key]}{suffix}")
     if "configuration_sha256" in report:
         result.extend(["", f"- 运行配置指纹 `{report['configuration_sha256']}`"])
         for key, label in (("input_tokens", "输入 token"), ("output_tokens", "输出 token"), ("elapsed_ms", "耗时毫秒")):

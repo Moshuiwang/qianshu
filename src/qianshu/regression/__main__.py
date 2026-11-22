@@ -11,11 +11,11 @@ from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_model
 
 from .business import DEFAULT_THRESHOLD
 from .corpus import make_plan
-from .freeze import body_fingerprint, freeze, load_freeze
+from .freeze import freeze, load_exclusions, load_freeze
 from .packages import freeze_packages
 from .recording import MANIFEST, Recording, SavedReplies, configuration, doc_names, probe_replies
 from .runner import RUN_FILES, evaluate, markdown_report
-from .storage import PrivateFiles, RegressionError, digest, json_bytes
+from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
 from .summary import summarize
 
 _MODEL_SETTINGS = ("AI_PLATFORM", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL")
@@ -45,14 +45,15 @@ def _arguments(argv: list[str] | None):
     build.add_argument("--companies", required=True)
     build.add_argument("--out", required=True)
     build.add_argument("--dataset", choices=("exam", "blind"), default="exam")
-    build.add_argument("--exclude-frozen", action="append", default=[])
 
     packages = commands.add_parser("freeze-packages", help="冻结私有节目包补充审定资料。")
     packages.add_argument("--corpus", required=True)
     packages.add_argument("--reviews", required=True)
     packages.add_argument("--companies", required=True)
     packages.add_argument("--out", required=True)
-    packages.add_argument("--exclude-frozen", action="append", default=[])
+    for command in (build, packages):
+        command.add_argument("--exclude-frozen", action="append", default=[])
+        command.add_argument("--exclude-holdout-list", help="首次冻结用的对方留集正文指纹清单。")
 
     verify = commands.add_parser("verify", help="核验冻结产物的指纹、引用和抽样分层。")
     verify.add_argument("--frozen", required=True)
@@ -60,6 +61,7 @@ def _arguments(argv: list[str] | None):
 
     run = commands.add_parser("run", help="运行冻结资料，录制回复并生成两把量尺。")
     run.add_argument("--live", action="store_true", help="显式允许调用现有模型接口。")
+    run.add_argument("--replaces-recording", help="本次放行运行替代的作废录制目录。")
     replay = commands.add_parser("replay", help="离线重放已录制回复。")
     replay.add_argument("--recording", required=True)
     imported = commands.add_parser("import", help="导入 probe 按用户消息指纹保存的回复。")
@@ -123,12 +125,26 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
 
     rules = files.repo / "rules"
     config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries)
+    replaces_run_id = None
+    if getattr(args, "replaces_recording", None):
+        prior_dir = files.argument(args.replaces_recording)
+        prior_manifest = SavedReplies(files, prior_dir).manifest
+        prior_report = files.read(prior_dir / "public-report.json")
+        if (
+            not release or prior_manifest["origin"] == "replay"
+            or prior_manifest["configuration"] != config
+            or digest(prior_report) != prior_manifest["public_report_sha256"]
+            or read_json(prior_report).get("void") is not True
+        ):
+            raise RegressionError("替代放行须引用相同配置下作废的原始录制。")
+        replaces_run_id = prior_manifest["run_id"]
     names = doc_names(snapshot)
     with files.new_output(out, (*RUN_FILES, MANIFEST, *names.values())) as output:
         recording = Recording(output, names, config, model_id, model=model, source=source,
-                              origin=origin, origin_run_id=origin_run_id)
+                              origin=origin, origin_run_id=origin_run_id, replaces_run_id=replaces_run_id)
         if origin == "live":
-            recording.model = configured_model(settings, on_result=recording.on_result)
+            model_options = {"max_retries": 0} if release else {}
+            recording.model = configured_model(settings, on_result=recording.on_result, **model_options)
         previous = logging.root.manager.disable
         logging.disable(logging.CRITICAL)
         try:
@@ -140,8 +156,12 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         documents = report["documents"]
         void = release and (documents["model_failed"] > 0 or documents["parse_failed"] > counts["reply_parse_failed"])
         if void:
+            reasons = report["business"]["reply_parse_failure_reasons"]
             report = {key: report[key] for key in ("freeze_sha256", "rules_sha256", "samples", "documents")}
-            report["business"] = {"counts": {"reply_parse_failed": counts["reply_parse_failed"]}}
+            report["business"] = {
+                "counts": {"reply_parse_failed": counts["reply_parse_failed"]},
+                "reply_parse_failure_reasons": reasons,
+            }
         report.update(configuration_sha256=digest(json_bytes(config)), void=void, usage=recording.public_usage())
         public = json_bytes(report)
         output.write("mismatches.json", json_bytes(details))
@@ -164,19 +184,17 @@ def main(argv: list[str] | None = None, *, model: ParseModel | None = None) -> i
                     output.write("plan.json", raw)
                 print(f"候选 {plan['candidate_count']} 条，目标 {plan['size']} 条。")
             elif args.command in ("freeze", "freeze-packages"):
-                excluded = {
-                    body_fingerprint(doc["body"])
-                    for directory in args.exclude_frozen
-                    for doc in load_freeze(files, files.argument(directory))["documents"].values()
-                }
+                dataset = args.dataset if args.command == "freeze" else "packages"
+                peer_list = files.argument(args.exclude_holdout_list) if args.exclude_holdout_list else None
+                exclusions = load_exclusions(files, dataset, [files.argument(path) for path in args.exclude_frozen], peer_list)
                 corpus = files.argument(args.corpus, allow_root=True)
                 reviews = files.argument(args.reviews)
                 companies = files.argument(args.companies)
                 if args.command == "freeze":
                     checksum = freeze(files, corpus, files.argument(args.plan), reviews, companies, out,
-                                      dataset=args.dataset, excluded_bodies=excluded)
+                                      dataset=dataset, exclusions=exclusions)
                 else:
-                    checksum = freeze_packages(files, corpus, reviews, companies, out, excluded_bodies=excluded)
+                    checksum = freeze_packages(files, corpus, reviews, companies, out, exclusions=exclusions)
                 print(checksum)
             elif args.command == "verify":
                 snapshot = load_freeze(files, files.argument(args.frozen), verify_plan=True, verify_sources=args.sources)

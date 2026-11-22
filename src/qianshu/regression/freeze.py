@@ -4,9 +4,10 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from re import fullmatch
 from unicodedata import normalize as unicode_normalize
 
-from .business import PAIR_FIELDS, key_value
+from .business import PAIR_FIELDS, SOURCE_STATUSES, key_value
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, normalize
 from .corpus import Corpus, make_plan, select
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
@@ -19,6 +20,7 @@ PACKAGE_STYLES = {
     "both": "两类并写",
     "neither_recognized": "两类都没认出",
 }
+HOLDOUT_PEERS = {"blind": "packages", "packages": "blind"}
 
 
 def _json_lines(items, key: str) -> bytes:
@@ -44,9 +46,59 @@ def body_fingerprint(body: str) -> str:
     return digest("".join(unicode_normalize("NFKC", body).split()).encode())
 
 
-def check_excluded(documents: list[dict], excluded_bodies: set[str]) -> None:
-    if any(body_fingerprint(doc["body"]) in excluded_bodies for doc in documents):
+def _body_hashes(body: str) -> tuple[str, str]:
+    return digest(body.encode()), body_fingerprint(body)
+
+
+def load_exclusions(
+    files: PrivateFiles, dataset: str, frozen_paths: list[Path], peer_list: Path | None,
+) -> dict:
+    exclusions = {}
+    for path in frozen_paths:
+        snapshot = load_freeze(files, path)
+        kind = snapshot["dataset"]
+        if kind in exclusions:
+            raise RegressionError("排除集的数据集类别重复。")
+        exclusions[kind] = (snapshot["fingerprint"], [_body_hashes(doc["body"]) for doc in snapshot["documents"].values()])
+    if peer_list is not None:
+        raw = files.read(peer_list)
+        data = read_json(raw)
+        kind = HOLDOUT_PEERS.get(dataset)
+        if kind is None or data.get("dataset") != kind or kind in exclusions:
+            raise RegressionError("对方留集的排除清单类别不符或重复。")
+        rows = data.get("documents")
+        if (
+            not isinstance(rows, list) or not rows
+            or any(not isinstance(row, list) or len(row) != 2 or any(
+                not isinstance(value, str) or not fullmatch(r"[a-f0-9]{64}", value) for value in row
+            ) for row in rows)
+        ):
+            raise RegressionError("对方留集排除清单为空或正文指纹格式无效。")
+        exclusions[kind] = (digest(raw), rows)
+    _require_exclusions(dataset, exclusions)
+    return exclusions
+
+
+def _require_exclusions(dataset: str, exclusions: dict) -> None:
+    peer = HOLDOUT_PEERS.get(dataset)
+    if peer is not None and (
+        exclusions.keys() != {"exam", peer} or any(not hashes for _, hashes in exclusions.values())
+    ):
+        raise RegressionError("冻结留集须提供冻结考题和对方留集的非空排除集。")
+
+
+def check_excluded(documents: list[dict], dataset: str, exclusions: dict) -> dict:
+    _require_exclusions(dataset, exclusions)
+    exact, normalized = set(), set()
+    for _, hashes in exclusions.values():
+        for raw, canonical in hashes:
+            exact.add(raw)
+            normalized.add(canonical)
+    if any(raw in exact or canonical in normalized for raw, canonical in (
+        _body_hashes(doc["body"]) for doc in documents
+    )):
         raise RegressionError("冻结资料与排除集存在相同或归一化后相同的申请。")
+    return {kind: fingerprint for kind, (fingerprint, _) in exclusions.items()}
 
 
 def _denominators(pairs: list[dict], fields: Iterable[str]) -> dict:
@@ -112,6 +164,12 @@ def _check_plan_strata(manifest: dict, plan: dict) -> None:
 
 
 def _check_business(pair: dict, frozen_fields) -> None:
+    statuses = pair.get("source_status", {})
+    if (
+        not isinstance(statuses, dict) or not statuses.keys() <= frozen_fields
+        or any(not isinstance(status, str) or status not in SOURCE_STATUSES for status in statuses.values())
+    ):
+        raise RegressionError("业务审定的原文状态无效。")
     business = pair.get("business", {})
     if not isinstance(business, dict) or not business.keys() <= frozen_fields:
         raise RegressionError("业务审定标记和冻结字段不一致。")
@@ -157,7 +215,9 @@ def write_snapshot(
 
 def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path: Path,
            companies_path: Path, destination: Path, *, dataset: str = "exam",
-           excluded_bodies: frozenset[str] | set[str] = frozenset()) -> str:
+           exclusions: dict | None = None) -> str:
+    exclusions = {} if exclusions is None else exclusions
+    _require_exclusions(dataset, exclusions)
     plan_raw = files.read(plan_path)
     plan = read_json(plan_raw)
     current = make_plan(files, corpus_root, None if plan["mode"] == "all" else plan["size"])
@@ -208,12 +268,12 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
             pair = {
                 "id": sample_id, "row_id": row_id, "token": token, "span": span, "basis": audit["basis"],
                 "materials": materials, "configuration": configuration,
-                **{key: audit[key] for key in ("business", "card_complete", "pairing") if key in audit},
+                **{key: audit[key] for key in ("business", "card_complete", "pairing", "source_status") if key in audit},
             }
             _check_business(pair, FIELD_LABELS.keys())
             pairs.append(pair)
 
-    check_excluded(documents, excluded_bodies)
+    excluded_set_hashes = check_excluded(documents, dataset, exclusions)
     source_hashes = {str(corpus_root / name): checksum for name, checksum in plan["source_hashes"].items()}
     source_hashes.update(corpus.read_hashes)
     source_hashes.update({
@@ -230,6 +290,8 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
         ],
         "rejected": rejected, "source_sha256": source_hashes,
     }
+    if excluded_set_hashes:
+        manifest["excluded_sets_sha256"] = excluded_set_hashes
     return write_snapshot(files, destination, manifest, samples, pairs, documents, companies, FIELD_LABELS)
 
 
@@ -250,6 +312,14 @@ def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = Fal
         or dataset not in ("exam", "blind", "packages") or json_bytes(manifest) != manifest_raw
     ):
         raise RegressionError("冻结清单版本或清单格式不受支持。")
+    if "excluded_sets_sha256" in manifest:
+        exclusions = manifest["excluded_sets_sha256"]
+        peer = HOLDOUT_PEERS.get(dataset)
+        if (
+            not isinstance(exclusions, dict) or (peer is not None and exclusions.keys() != {"exam", peer})
+            or any(not isinstance(value, str) or not fullmatch(r"[a-f0-9]{64}", value) for value in exclusions.values())
+        ):
+            raise RegressionError("冻结清单的排除集指纹无效。")
     raw = {name: files.read(directory / name) for name in ARTIFACTS}
     if {name: digest(data) for name, data in raw.items()} != manifest["artifact_sha256"]:
         raise RegressionError("冻结产物指纹校验失败。")

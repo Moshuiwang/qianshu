@@ -17,7 +17,7 @@ MENTIONS = {
 
 def freeze_packages(
     files: PrivateFiles, corpus: Path, review: Path, companies_path: Path, destination: Path,
-    *, excluded_bodies: set[str],
+    *, exclusions: dict,
 ) -> str:
     sources = {}
 
@@ -56,18 +56,14 @@ def freeze_packages(
             "id": sample_id, "row_id": row_id, "token": token, "country": country,
             "policy_type": policy, "benefit_type": benefit,
         })
-        pack_mark = {"inferable": False, "auto_allowed": False} if style == "tier_only" else {}
         pair = {
             "id": sample_id, "row_id": row_id, "token": token, "span": item["span"], "basis": item["basis"],
             "configuration": {"packages": {"value": rows}},
-            "business": item.get("business", {"packages": pack_mark}),
             "package_style": style,
             "pairing": item.get("pairing", {}),
+            **{key: item[key] for key in ("business", "source_status") if key in item},
         }
         _check_business(pair, {"packages"})
-        mark = pair["business"].get("packages", {})
-        if style == "tier_only" and (mark.get("inferable") is True or mark.get("auto_allowed") is True):
-            raise RegressionError("仅档位的节目包审定须归为人工确认。")
         pairs.append(pair)
         by_token[token].append((pair, item["complete"]))
 
@@ -83,7 +79,7 @@ def freeze_packages(
             "token": token, "body": body, "other_spans": [], "complete": complete.pop(),
             "package_style": styles.pop() if len(styles) == 1 else "both",
         })
-    check_excluded(documents, excluded_bodies)
+    excluded_set_hashes = check_excluded(documents, "packages", exclusions)
     companies = read(companies_path)
     if not companies.decode().strip():
         raise RegressionError("冻结所用的公司对照表为空。")
@@ -91,6 +87,7 @@ def freeze_packages(
     manifest = {
         "schema": 3, "comparison_version": 1, "dataset": "packages", "count": len(samples),
         "target": len(samples), "documents": len(documents), "source_sha256": sources,
+        "excluded_sets_sha256": excluded_set_hashes,
         "strata": [{"policy_type": policy, "benefit_type": benefit, "quota": count}
                    for (policy, benefit), count in sorted(counts.items())],
     }

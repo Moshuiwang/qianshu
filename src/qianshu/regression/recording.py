@@ -9,13 +9,22 @@ from uuid import uuid4
 
 from qianshu.parse.model import CallResult, ModelError, ParseModel
 
-from .business import pairing_fingerprint
-from .runner import RULES
+from .business import measure_fingerprint, pairing_fingerprint
+from .runner import RULES, IncompleteReply
 from .storage import Output, PrivateFiles, RegressionError, digest, json_bytes, read_json
 
 MANIFEST = "recording.json"
-FAILURES = {None, "model_call", "model_incomplete", "model_invalid"}
+FAILURES = {None, "model_call", "model_incomplete", "model_invalid", "reply_truncated"}
 USAGE_KEYS = ("input_tokens", "output_tokens", "elapsed_ms")
+
+
+def _reply_failure(attempt: dict) -> str | None:
+    stage = attempt["failure_stage"]
+    if stage == "reply_truncated":
+        return stage
+    if stage == "model_incomplete" and attempt["reply"]:
+        return "reply_truncated" if attempt["stop_reason"] in (None, "max_tokens") else "reply_incomplete"
+    return None
 
 
 def configuration(snapshot: dict, rules_dir: Path, model_id: str, threshold: int, legacy: bool,
@@ -31,6 +40,7 @@ def configuration(snapshot: dict, rules_dir: Path, model_id: str, threshold: int
         "prompt_sha256": rules["parse-prompt.md"],
         "model_sha256": digest(model_id.encode()),
         "pairing_sha256": pairing_fingerprint(threshold),
+        "measure_sha256": measure_fingerprint(threshold),
         "legacy_companies": legacy, "release": release, "retries": retries,
     }
 
@@ -102,6 +112,7 @@ class Recording:
         self, output: Output, names: dict[str, str], config: dict, model_id: str, *,
         model: ParseModel | None = None, source: Callable | None = None,
         origin: str = "live", origin_run_id: str | None = None,
+        replaces_run_id: str | None = None,
     ):
         self.output = output
         self.names = names
@@ -111,6 +122,7 @@ class Recording:
         self.source = source
         self.origin = origin
         self.origin_run_id = origin_run_id
+        self.replaces_run_id = replaces_run_id
         self.run_id = uuid4().hex
         self.by_user = {}
         self.artifacts = {}
@@ -140,6 +152,8 @@ class Recording:
             if not attempts or any(item["failure_stage"] not in FAILURES for item in attempts):
                 raise RegressionError("录制的调用尝试记录无效。")
             result = attempts[-1]
+            if reason := _reply_failure(result):
+                raise IncompleteReply(reason)
             if result["failure_stage"] is not None:
                 raise ModelError("回归模型调用失败。")
             if not isinstance(result["reply"], str):
@@ -166,7 +180,9 @@ class Recording:
         if status == "model_failed":
             failure = attempts[-1]["failure_stage"] if attempts else "model_call"
         elif status == "parse_failed":
-            failure = "reply_parse" if received else "parse_setup"
+            failure = "parse_setup"
+            if received:
+                failure = (_reply_failure(attempts[-1]) if attempts else None) or "reply_parse"
         else:
             failure = None
         record = {
@@ -197,6 +213,7 @@ class Recording:
             origin_run_id = digest(json_bytes(sorted(self.probe_fingerprints)))
         self.output.write(MANIFEST, json_bytes({
             "schema": 1, "run_id": self.run_id, "origin": self.origin, "origin_run_id": origin_run_id,
+            "replaces_run_id": self.replaces_run_id,
             "source_code_measured": self.origin == "live", "model": self.model_id, "configuration": self.config,
             "threshold": threshold,
             "artifact_sha256": self.artifacts, "documents_by_user_sha256": self.by_user,

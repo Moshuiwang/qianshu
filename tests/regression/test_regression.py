@@ -832,6 +832,83 @@ def _replay_args(fingerprint, source=".private/run", out=".private/replay"):
     return ["replay", "--recording", source, *run_args(fingerprint, out)[1:]]
 
 
+@pytest.mark.parametrize(("stop", "reason"), [
+    ("max_tokens", "reply_truncated"),
+    ("stop_sequence", "reply_incomplete"),
+])
+def test_incomplete_reply_is_counted_even_when_release_is_void(repo, frozen, monkeypatch, stop, reason):
+    from qianshu.parse.model import CallResult, ModelError
+
+    def configured(_settings, *, on_result, max_retries):
+        assert max_retries == 0
+
+        def model(*, system, user):
+            if json.loads(user)["application"] == BATCH:
+                on_result(CallResult(stop, (("text", 1),), 8, 1, 4, "placeholder-model", "[", "model_incomplete"))
+            else:
+                on_result(CallResult(None, (), None, None, 4, "placeholder-model", None, "model_call"))
+            raise ModelError("占位错误")
+        return model
+
+    monkeypatch.setattr("qianshu.regression.__main__.configured_model", configured)
+    assert main([*run_args(frozen), "--live", "--release"]) == 0
+    report = get_json(repo / "run/public-report.json")
+    assert report["void"] is True
+    assert report["documents"] == {"model_failed": 1, "parse_failed": 1, "parsed": 0}
+    assert report["business"]["counts"]["reply_parse_failed"] == 1
+    assert report["business"]["reply_parse_failure_reasons"][reason] == 1
+    record = get_json(repo / "run/document-00001.json")
+    assert record["failure_stage"] == reason
+    attempt, = record["attempts"]
+    assert (attempt["reply"], attempt["stop_reason"]) == ("[", stop)
+    assert main(_replay_args(frozen)) == 0
+    for name in runner.RUN_FILES:
+        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+
+
+@pytest.mark.parametrize("status", [503, 307])
+def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monkeypatch, status):
+    import anthropic
+    import httpx
+
+    requests = Counter()
+
+    def reply(request):
+        requests[json.loads(request.content)["messages"][0]["content"]] += 1
+        return httpx.Response(status, headers={"Location": "/redirected"})
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+        transport=httpx.MockTransport(reply), **kwargs,
+    ))
+    monkeypatch.setenv("AI_PLATFORM", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
+    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    report = get_json(repo / "run/public-report.json")
+    assert len(requests) == 2 and set(requests.values()) == {2}
+    assert report["usage"]["attempts"] == sum(requests.values())
+    assert report["void"] is True
+
+
+def test_valid_replacement_references_original_void_recording(repo, frozen):
+    def unavailable(**_):
+        raise RuntimeError("占位调用失败")
+
+    assert main([*run_args(frozen), "--release"], model=unavailable) == 0
+    original = (repo / "run/recording.json").read_bytes()
+    assert main([*run_args(frozen, ".private/replacement"), "--release", "--replaces-recording", ".private/run"],
+                model=lambda **_: "[]") == 0
+    replacement = get_json(repo / "replacement/recording.json")
+    original_id = json.loads(original)["run_id"]
+    assert replacement["replaces_run_id"] == original_id != replacement["run_id"]
+    assert (repo / "run/recording.json").read_bytes() == original
+    assert get_json(repo / "replacement/public-report.json")["void"] is False
+    assert "replaces_run_id" not in get_json(repo / "replacement/public-report.json")
+    assert main([*run_args(frozen, ".private/invalid"), "--release", "--replaces-recording", ".private/replacement"],
+                model=lambda **_: "[]") == 1
+    assert not (repo / "invalid").exists()
+
+
 def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, monkeypatch, capsys):
     from qianshu.parse.model import CallResult
     from qianshu.regression.__main__ import _MODEL_SETTINGS
@@ -845,7 +922,8 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         "占位单条原稿\n": "占位无效回包",
     }
 
-    def configured(_settings, *, on_result):
+    def configured(_settings, *, on_result, max_retries):
+        assert max_retries == 0
         def model(*, system, user):
             body = json.loads(user)["application"]
             attempts[body] += 1
@@ -871,7 +949,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         assert record["run_id"] == recording["run_id"]
         assert record["configuration"] == recording["configuration"]
         assert len(record["user_sha256"]) == len(record["system_sha256"]) == 64
-        for kind in ("freeze", "code", "rules", "companies", "prompt", "model", "pairing"):
+        for kind in ("freeze", "code", "rules", "companies", "prompt", "model", "pairing", "measure"):
             assert len(record["configuration"][f"{kind}_sha256"]) == 64
         failed, final = record["attempts"]
         assert failed["failure_stage"] == "model_call"
@@ -959,7 +1037,10 @@ def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, fro
     for name, model in (("first", no_policies), ("second", no_policies), ("void", one_failed_reply)):
         assert main([*run_args(frozen, f".private/{name}"), "--release"], model=model) == 0
     void = get_json(repo / "void" / "public-report.json")
-    assert void["void"] and void["business"] == {"counts": {"reply_parse_failed": 1}}
+    assert void["void"] and void["business"] == {
+        "counts": {"reply_parse_failed": 1},
+        "reply_parse_failure_reasons": {"reply_parse": 1, "reply_incomplete": 0, "reply_truncated": 0},
+    }
     assert "sample_alignment" not in void
     args = ["summarize", "--recording", ".private/first", "--recording", ".private/second",
             "--recording", ".private/void", "--out", ".private/summary"]
@@ -1018,7 +1099,7 @@ def test_business_grades_all_categories(entry, mark, value, confirmation, start,
     assert grade("recharge_days", entry, mark, draft, "占位 30 天") == status
 
 
-def test_business_counts_gold_only_and_separates_extras_from_unknown():
+def test_business_maps_included_gold_and_separates_extras_from_unknown():
     from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, grade, pairing_audit
 
@@ -1049,19 +1130,83 @@ def test_business_counts_gold_only_and_separates_extras_from_unknown():
     partial = score.add({"body": "占位 30 天", "complete": False}, pairs[2:], [draft("占位丁", 8)])
     report = score.report(reply_parse_failed=1)
     assert report["counts"] == {
-        "unknown_fields": 1, "missing_policies": 1, "extra_policies": 1, "unclassified_drafts": 1,
-        "tied_pairs": 1, "matched_policies": 2, "comparable_policies": 1, "reply_parse_failed": 1,
+        "unknown_fields": 0, "missing_policies": 1, "extra_policies": 1, "unclassified_drafts": 1,
+        "tied_pairs": 1, "matched_policies": 2, "comparable_policies": 2, "reply_parse_failed": 1,
     }
     assert (report["rates"]["all_correct"]["numerator"], report["rates"]["all_correct"]["denominator"]) == (1, 3)
-    assert report["rates"]["safe_confirmation"]["numerator"] == 2
-    assert report["rates"]["false_determined"]["denominator"] == 2
-    assert report["rates"]["overasked"]["denominator"] == 2
+    assert report["rates"]["safe_confirmation"]["numerator"] == 1
+    assert report["rates"]["false_determined"]["denominator"] == 3
+    assert report["rates"]["overasked"]["denominator"] == 3
     assert report["rates"]["zero_edit"]["percent"] is None
     assert report["field_categories"] == {
-        "correct": 1, "false_determined": 0, "overasked": 0, "justified_confirmation": 0, "missing": 1, "unknown": 1,
+        "correct": 1, "false_determined": 1, "overasked": 0, "justified_confirmation": 0, "missing": 1, "unknown": 0,
     }
     audit = pairing_audit([{"token": "complete", **complete}, {"token": "partial", **partial}])
     assert [len(audit[key]) for key in ("matched", "missing", "extra_or_unknown", "ties")] == [2, 1, 2, 1]
+
+
+@pytest.mark.parametrize("dataset", ["exam", "blind", "packages"])
+def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
+    from qianshu.draft import SourceExcerpt
+    from qianshu.regression.business import BusinessScore, G285_MAPPING, measure_fingerprint
+
+    values = {
+        "trigger_once": "是", "effective_multiplier": "2", "cancel_on_downgrade": "否",
+        "maintain_mutual_exclusion_group": "是", "repeat_bonus": "是", "recharge_days": 30, "user_scope": "占位",
+    }
+    names = [*values, "gift_days"]
+    pair = {
+        "id": "policy", "configuration": {name: {"value": value} for name, value in values.items()},
+        "source_status": {"cancel_on_downgrade": "原文未写", "maintain_mutual_exclusion_group": "歧义"},
+        "business": {"recharge_days": {"inferable": False, "auto_allowed": False}},
+    }
+    pair["configuration"]["gift_days"] = {"exclude": "historical_rule"}
+    frozen = {
+        "dataset": dataset,
+        "samples": {"policy": {"country": "占位地区", "benefit_type": "赠送时长"}},
+        "denominators": {"fields": {name: {"ids": ["policy"] if name != "gift_days" else []} for name in names}},
+    }
+    confirmed = DraftField(uncertainty=Uncertainty(reason="占位待确认"))
+    default = SimpleNamespace(value="是", evidence=[], uncertainty=None, source_status="原文未写",
+                              value_source="默认规则", evidence_verified=True)
+    draft = SimpleNamespace(
+        trigger_once=confirmed, effective_multiplier=DraftField(value=2), cancel_on_downgrade=confirmed,
+        maintain_mutual_exclusion_group=confirmed, repeat_bonus=default,
+        recharge_days=DraftField(value=30, evidence=[SourceExcerpt(text="占位", start=0)]),
+        user_scope=confirmed, gift_days=DraftField(value=90), benefit_type=DraftField(value="赠送时长"),
+        to_dict=lambda: {},
+    )
+    score = BusinessScore(frozen, 2, {})
+    result = score.add({"body": "占位"}, [pair], [draft])
+    assert result["policies"][0]["fields"] == {
+        "trigger_once": "justified_confirmation", "effective_multiplier": "false_determined",
+        "cancel_on_downgrade": "justified_confirmation", "maintain_mutual_exclusion_group": "justified_confirmation",
+        "repeat_bonus": "correct", "recharge_days": "correct", "user_scope": "overasked",
+    }
+    report = score.report(0)
+    assert report["rates"]["false_determined"]["denominator"] == len(values)
+    assert report["counts"]["unknown_fields"] == 0
+    assert report["measure_sha256"] == measure_fingerprint(2)
+    monkeypatch.setitem(G285_MAPPING, "version", "占位版本")
+    assert report["measure_sha256"] != measure_fingerprint(2)
+
+
+def freeze_disjoint_exam(corpus):
+    assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
+    originals = {file: get_json(file) for file in (corpus / "wiki-corpus/docs").glob("*.json")}
+    for path, document in originals.items():
+        put_json(path, {**document, "plain_text": document["plain_text"].replace("占位", "排除")})
+    assert main(["freeze", *FREEZE[:-1], ".private/exam"]) == 0
+    for path, document in originals.items():
+        put_json(path, document)
+
+
+def peer_list(repo, dataset, bodies):
+    put_json(repo / "peer.json", {
+        "dataset": dataset,
+        "documents": [[digest(body.encode()), freeze_module.body_fingerprint(body)] for body in bodies],
+    })
+    return ["--exclude-frozen", ".private/exam", "--exclude-holdout-list", ".private/peer.json"]
 
 
 def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch):
@@ -1080,8 +1225,22 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch)
     put_json(repo / "package-review.json", review)
     args = ["freeze-packages", "--corpus", ".private/archive", "--reviews", ".private/package-review.json",
             "--companies", ".private/companies.tsv", "--out", ".private/packages"]
-    assert main(args) == 0
+    freeze_disjoint_exam(corpus)
+    blind_exclusions = peer_list(repo, "packages", [BATCH])
+    review = get_json(repo / "review.json")
+    review["reviews"]["policy-a"] = review["reviews"]["policy-b"] = {"exclude": "source_anomaly"}
+    put_json(repo / "blind-review.json", review)
+    blind_inputs = [*FREEZE]
+    blind_inputs[blind_inputs.index(".private/review.json")] = ".private/blind-review.json"
+    blind_inputs[-1] = ".private/blind"
+    assert main(["freeze", *blind_inputs, "--dataset", "blind", *blind_exclusions]) == 0
+    blind_sha = capsys.readouterr().out.splitlines()[-1]
+    assert main(args) == 1
+    assert main([*args, *peer_list(repo, "blind", [])]) == 1
+    assert main([*args, "--exclude-frozen", ".private/exam", "--exclude-frozen", ".private/blind"]) == 0
     fingerprint = capsys.readouterr().out.strip()
+    manifest = get_json(repo / "packages/manifest.json")
+    assert manifest["excluded_sets_sha256"]["blind"] == blind_sha
 
     def parsed(body, *, model, on_reply, **kwargs):
         on_reply(model(system="占位提示", user=body))
@@ -1104,18 +1263,33 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch)
     report = get_json(repo / "package-replay" / "public-report.json")
     for key in ("package_rows_exact", "package_tier_confirmation"):
         assert report["business"]["rates"][key] == {"numerator": 1, "denominator": 1, "percent": 100.0}
+    assert report["business"]["by_field"]["packages"]["correct"] == 1
+    assert report["business"]["by_field"]["packages"]["justified_confirmation"] == 1
 
 
 def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_documents(repo, corpus, capsys):
-    assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
+    freeze_disjoint_exam(corpus)
     review = get_json(repo / "review.json")
     review["reviews"]["policy-a"].update(
         business={"recharge_days": {"inferable": True, "auto_allowed": False}},
         pairing={"recharge_amount": "19.90"},
         card_complete=False,
+        source_status={"effective_multiplier": "原文未写"},
     )
     put_json(repo / "review.json", review)
-    assert main(["freeze", *FREEZE, "--dataset", "blind"]) == 0
+    args = ["freeze", *FREEZE, "--dataset", "blind"]
+    assert main(args) == 1
+    assert main([*args, "--exclude-frozen", ".private/exam"]) == 1
+    assert main([*args, *peer_list(repo, "packages", [])]) == 1
+    exclusions = peer_list(repo, "packages", [BATCH])
+    listing = get_json(repo / "peer.json")
+    listing["documents"][0][1] = digest(b"synthetic nonmatching normalized hash")
+    put_json(repo / "peer.json", listing)
+    assert main([*args, *exclusions]) == 1
+    assert main([*args, *peer_list(repo, "packages", [BATCH + "　\n"])]) == 1
+    assert "归一化后相同" in capsys.readouterr().err
+    assert not (repo / "frozen").exists()
+    assert main([*args, *peer_list(repo, "packages", ["排除用占位正文"])]) == 0
     checksum = capsys.readouterr().out.splitlines()[-1]
     files = PrivateFiles(Path.cwd())
     with files.open():
@@ -1124,16 +1298,15 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
     pair = next(pair for pair in frozen["pairs"].values() if pair["row_id"] == "policy-a")
     assert pair["business"] == {"recharge_days": {"inferable": True, "auto_allowed": False}}
     assert pair["pairing"]["recharge_amount"] == "19.90" and not pair["card_complete"]
+    assert pair["source_status"] == {"effective_multiplier": "原文未写"}
+    assert get_json(repo / "frozen/manifest.json")["excluded_sets_sha256"] == {
+        "exam": digest((repo / "exam/manifest.json").read_bytes()),
+        "packages": digest((repo / "peer.json").read_bytes()),
+    }
 
     assert main(["run", *run_args(checksum)[1:]], model=lambda **_: "[]") == 0
     assert main(_replay_args(checksum)) == 0
     assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
-
-    inputs = [*FREEZE[:-1], ".private/second-freeze"]
-    assert main(["freeze", *inputs, "--dataset", "blind", "--exclude-frozen", ".private/frozen"]) == 1
-    assert "排除集" in capsys.readouterr().err
-    assert not (repo / "second-freeze").exists()
-
 
 def test_amount_dates_and_candidates_only_count_derived_business_keys():
     from qianshu.draft import Candidate

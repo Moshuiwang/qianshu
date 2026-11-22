@@ -228,8 +228,12 @@ def test_stream_interrupted_midway_is_sanitized(monkeypatch, error):
         lambda **kwargs: client_type(http_client=http_client, max_retries=0, **kwargs),
     )
     config = {"ANTHROPIC_API_KEY": "placeholder-key", "ANTHROPIC_BASE_URL": "https://model.example.invalid"}
+    captured = []
     with pytest.raises(ModelError) as exc:
-        configured_model(config)(system="", user="占位正文")
+        configured_model(config, on_result=captured.append)(system="", user="占位正文")
+    result, = captured
+    assert result.failure_stage == ("model_call" if error is None else "reply_truncated")
+    assert result.reply == (None if error is None else "占位回复")
     assert str(exc.value) == "申请解析模型调用失败。"
 
 
