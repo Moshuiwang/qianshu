@@ -164,7 +164,7 @@ def _new_field_status(draft, name: str) -> str:
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
     threshold: int = DEFAULT_THRESHOLD, recording=None, package_levels: PackageLevels | None = None,
-    today: date | None = None, package_run_day: date | None = None,
+    today: date | None = None, package_run_day: date | None = None, benefit_catalog=None,
 ) -> tuple[dict, dict]:
     if package_levels is None:
         package_levels = load_package_levels()
@@ -234,7 +234,7 @@ def evaluate(
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
-                package_levels=package_levels, package_run_day=package_run_day,
+                package_levels=package_levels, package_run_day=package_run_day, benefit_catalog=benefit_catalog,
                 today=today, country_codes=codes,
                 recorded_reply=getattr(recording, "origin", None) in ("replay", "probe"),
             )
@@ -384,6 +384,18 @@ def markdown_report(report: dict) -> bytes:
     review_line = f"- 需核对全文的卡片数 {review['cards']}（政策数 {review['policies']}），按政策结构与空材料计"
     reasons = report["full_document_review_reasons"]
     review_lines = [review_line, *(f"  - {label} {reasons[code]} 篇" for code, label in STRUCTURE_REASONS.items())]
+    if cost := report.get("cost"):
+        usage = report["usage"]
+        def shown(value):
+            return "未采集" if value is None else str(value)
+        review_lines.append(f"- {cost['mode']} 输入 / 输出 token {shown(usage['input_tokens']['total'])} / "
+                            f"{shown(usage['output_tokens']['total'])}，每百万单价 {shown(cost['input_per_million'])} / "
+                            f"{shown(cost['output_per_million'])} 美元，已知费用 {shown(cost['known_usd'])} 美元，"
+                            f"本次新增 {shown(cost['new_known_usd'])} 美元，待核 {cost['missing_attempts']} 次")
+    if diagnostics := report.get("attempt_failures"):
+        review_lines.append("- 全部尝试的失败诊断：" + "、".join(f"{k} {v} 次" for k, v in sorted(diagnostics.items())))
+    if report.get("batch_seconds") is not None:
+        review_lines.append(f"- 提交至首次观测批次结束 {report['batch_seconds']:.1f} 秒（含轮询间隔）")
     if diagnostic := report.get("diagnostic_replay"):
         review_lines.insert(0, f"- 离线诊断，源回复结构 `{diagnostic['source_reply_structure']}`，"
                                f"当前结构 `{diagnostic['reply_structure']}`。")
