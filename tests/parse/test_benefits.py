@@ -27,6 +27,12 @@ RATE = TariffRate(
 CATALOG = BenefitCatalog(tariffs=(RATE,), package_names=("占位丙包",))
 
 
+@pytest.fixture(autouse=True)
+def package_levels_snapshot(monkeypatch):
+    levels = parse.load_package_levels(COMPANIES.with_name("package-levels.csv"))
+    monkeypatch.setattr(parse, "load_package_levels", lambda: levels)
+
+
 def field(value, *evidence):
     return {"value": value, "evidence": evidence}
 

@@ -322,6 +322,8 @@ class _Policy:
     hints: tuple[str, ...]
     explanations: Mapping[str, str]
     validation: validate.ValidationResult | None = None
+    tier_candidates: tuple[str, ...] = ()
+    tier_evidence: tuple[str, ...] = ()
 
     @property
     def approval_url_deferred(self) -> bool:
@@ -372,6 +374,9 @@ class _Policy:
                     yield CardLine(f"{prefix} · 自动调整 · {_FIELD_LABELS[item.field]}", item.reason)
             for item in result.warnings:
                 yield CardLine(f"{prefix} · 提醒项 · {_FIELD_LABELS[item.field]}", item.reason)
+        if self.tier_evidence or self.tier_candidates:
+            yield CardLine(f"{prefix} · 节目包档位候选",
+                           "\n".join((*self.tier_candidates, "档位原文　" + "、".join(self.tier_evidence))))
         inactive, required = benefit_applicability(self.draft)
         for field in fields(self.draft):
             value = getattr(self.draft, field.name)
@@ -492,7 +497,11 @@ class Pipeline:
                     for name, result in getattr(parsed, "field_results", {}).items()
                     if (explanation := result.statement.explanation) and explanation.strip()
                 }
-                policies.append(_Policy(draft, hints, explanations))
+                tiers = getattr(parsed, "field_results", {}).get("package_tiers")
+                policies.append(_Policy(draft, hints, explanations,
+                                        tier_candidates=getattr(parsed, "package_tier_candidates", ()),
+                                        tier_evidence=tuple(redact.display(q.text, q.span.start)
+                                                            for q in tiers.evidence) if tiers else ()))
         except Exception:
             return self._detail_pages(display_body, [
                 CardLine(

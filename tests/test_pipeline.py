@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -131,8 +132,12 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None, sep
     if tag_dates is not None:
         dates_file = _write_json(tmp_path / "tag-dates.json", tag_dates)
         cmd.extend(("--tag-dates", str(dates_file)))
+    shutil.copytree(ROOT / "rules", tmp_path / "rules", dirs_exist_ok=True)
+    private = tmp_path / ".private"
+    private.mkdir(exist_ok=True)
+    shutil.copyfile(PARSE_FIXTURES / "package-levels.csv", private / "package-levels.csv")
     run = subprocess.run(
-        cmd, cwd=ROOT, capture_output=True, text=True, encoding="utf-8", timeout=45,
+        cmd, cwd=tmp_path, capture_output=True, text=True, encoding="utf-8", timeout=45,
         env={**os.environ, "PYTHONPATH": os.pathsep.join((str(tmp_path), str(ROOT / "src")))},
     )
     assert run.returncode == 0, run.stderr
