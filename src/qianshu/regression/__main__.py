@@ -153,8 +153,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         finally:
             logging.disable(previous)
         counts = report["business"]["counts"]
-        documents = report["documents"]
-        void = release and (documents["model_failed"] > 0 or documents["parse_failed"] > counts["reply_parse_failed"])
+        void = release and recording.unfinished_calls
         if void:
             reasons = report["business"]["reply_parse_failure_reasons"]
             report = {key: report[key] for key in ("freeze_sha256", "rules_sha256", "samples", "documents")}

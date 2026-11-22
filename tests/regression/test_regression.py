@@ -890,6 +890,85 @@ def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monk
     assert report["void"] is True
 
 
+@pytest.mark.parametrize(("interruption", "retry_reply"), [
+    ("timeout", None), ("disconnect", None), ("eof", None),
+    ("timeout", "[]"), ("timeout", "["),
+])
+def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, interruption, retry_reply):
+    import anthropic
+    import httpx
+
+    class ReplyStream(httpx.SyncByteStream):
+        def __init__(self, text, interrupted):
+            self.text = text
+            self.interrupted = interrupted
+
+        def __iter__(self):
+            events = [
+                {"type": "message_start", "message": {
+                    "id": "msg_placeholder", "role": "assistant", "type": "message", "model": "placeholder-model",
+                    "content": [], "stop_reason": None, "stop_sequence": None,
+                    "usage": {"input_tokens": 1, "output_tokens": 0},
+                }},
+                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": self.text}},
+            ]
+            if not self.interrupted:
+                events.extend([
+                    {"type": "content_block_stop", "index": 0},
+                    {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                     "usage": {"output_tokens": 1}},
+                    {"type": "message_stop"},
+                ])
+            for event in events:
+                yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+            if self.interrupted and interruption == "timeout":
+                raise httpx.ReadTimeout("占位超时")
+            if self.interrupted and interruption == "disconnect":
+                raise httpx.RemoteProtocolError("占位断线")
+
+    requests = Counter()
+
+    def reply(request):
+        user = json.loads(request.content)["messages"][0]["content"]
+        body = json.loads(user)["application"]
+        requests[body] += 1
+        text = (retry_reply if requests[body] > 1 else None) if body == BATCH else "[]"
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=ReplyStream("[" if text is None else text, text is None))
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+        transport=httpx.MockTransport(reply), **kwargs,
+    ))
+    monkeypatch.setenv("AI_PLATFORM", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
+    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert requests == {BATCH: 2, "占位单条原稿\n": 1}
+    report = get_json(repo / "run/public-report.json")
+    assert report["usage"]["attempts"] == 3
+    assert report["void"] is (retry_reply is None)
+    assert report["documents"] == {
+        "model_failed": int(retry_reply is None), "parse_failed": int(retry_reply == "["),
+        "parsed": 1 + int(retry_reply == "[]"),
+    }
+    assert report["business"]["counts"]["reply_parse_failed"] == 1
+    assert report["business"]["reply_parse_failure_reasons"] == {
+        "reply_truncated": 1, "reply_parse": int(retry_reply == "["), "reply_incomplete": 0,
+    }
+    record = get_json(repo / "run/document-00001.json")
+    first, second = record["attempts"]
+    partial_stage = "model_incomplete" if interruption == "eof" else "reply_truncated"
+    assert (first["failure_stage"], first["reply"]) == (partial_stage, "[")
+    assert (second["failure_stage"], second["reply"]) == (
+        (partial_stage, "[") if retry_reply is None else (None, retry_reply)
+    )
+    assert main(_replay_args(frozen)) == 0
+    assert requests == {BATCH: 2, "占位单条原稿\n": 1}
+    for name in runner.RUN_FILES:
+        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+
+
 def test_valid_replacement_references_original_void_recording(repo, frozen):
     def unavailable(**_):
         raise RuntimeError("占位调用失败")
@@ -1189,6 +1268,87 @@ def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
     assert report["measure_sha256"] == measure_fingerprint(2)
     monkeypatch.setitem(G285_MAPPING, "version", "占位版本")
     assert report["measure_sha256"] != measure_fingerprint(2)
+
+
+@pytest.mark.parametrize(("tags", "tag_status", "policy_type", "name_status", "name_review", "type_review"), [
+    (["占位标签甲", "占位标签乙"], "确定", "定向政策", None, True, False),
+    (["占位标签甲"], "歧义", "定向政策", None, True, True),
+    (["占位标签甲"], "确定", "定向政策", "冲突", True, False),
+    (["占位标签甲"], "确定", "定向政策", None, False, False),
+    (["占位标签乙"], "确定", "定向政策", None, True, False),
+    (["占位标签甲"], "确定", "公开政策", None, False, True),
+    ([], "确定", "公开政策", None, True, False),
+    ([], "原文未写", "公开政策", None, True, True),
+    ([], "原文未写", "定向政策", None, True, True),
+    (None, None, "定向政策", None, True, True),
+])
+def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, name_status, name_review, type_review):
+    from qianshu.draft import SourceExcerpt
+    from qianshu.regression.business import BusinessScore
+
+    values = {"policy_name": "占位标签甲", "policy_type": policy_type}
+    sample = {"country": "占位地区", "benefit_type": "赠送时长", "policy_type": policy_type}
+    pair = {
+        "id": "policy", "configuration": {name: {"value": value} for name, value in values.items()},
+        "source_status": {name: status for name, status in {"user_tags": tag_status, "policy_name": name_status}.items()
+                          if status is not None},
+    }
+    if tags is not None:
+        pair["configuration"]["user_tags"] = {"value": tags}
+    frozen = {
+        "samples": {"policy": sample},
+        "denominators": {"fields": {name: {"ids": ["policy"]} for name in values}},
+    }
+    document = {"body": "占位原文"}
+    score = BusinessScore(frozen, 2, {})
+    review = {"policy_name": name_review, "policy_type": type_review}
+    for confirmed in (False, True):
+        draft = SimpleNamespace(benefit_type=DraftField(value="赠送时长"), to_dict=lambda: {})
+        for name, value in values.items():
+            field = (DraftField(value=value, evidence=[SourceExcerpt(text=document["body"], start=0)]) if confirmed
+                     else DraftField(uncertainty=Uncertainty(reason="占位待确认")))
+            setattr(draft, name, field)
+        result = score.add(document, [pair], [draft])
+        expected = ({True: "false_determined", False: "correct"} if confirmed
+                    else {True: "justified_confirmation", False: "overasked"})
+        assert result["policies"][0]["fields"] == {name: expected[review[name]] for name in values}
+
+
+def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
+    from qianshu.regression.business import _g285_mark
+
+    sample = {"country": "占位地区", "benefit_type": "特价优惠"}
+    rows = [{"current_package": "占位包甲", "gift_package": "占位包乙"}]
+    values = {"company": "占位公司", "packages": rows, "cancel_on_downgrade": "是"}
+    pair = {
+        "configuration": {name: {"value": value} for name, value in values.items()},
+        "source_status": {"cancel_on_downgrade": "原文未写"},
+    }
+    company_names = {"占位地区": ["占位公司"]}
+    for name in values:
+        assert _g285_mark(name, pair, sample, "name_only", company_names)["auto_allowed"] is True
+    assert _g285_mark("company", pair, sample, "name_only", {})["auto_allowed"] is False
+    assert _g285_mark("packages", pair, sample, "tier_only", company_names)["auto_allowed"] is False
+    pair["configuration"]["packages"] = {"value": [{**rows[0], "gift_package": None}]}
+    assert _g285_mark("packages", pair, sample, "name_only", company_names)["auto_allowed"] is False
+    pair["configuration"]["packages"] = {"value": [*rows, {**rows[0], "current_package": "占位包丙"}]}
+    assert _g285_mark("packages", pair, sample, "name_only", company_names)["auto_allowed"] is False
+    pair["configuration"]["packages"] = {"value": rows}
+    pair["source_status"]["benefit_type"] = "冲突"
+    for name in ("packages", "cancel_on_downgrade"):
+        assert _g285_mark(name, pair, sample, "name_only", company_names)["auto_allowed"] is False
+
+
+@pytest.mark.parametrize("name", ["recharge_days", "gift_days"])
+def test_g285_duration_fields_require_applicable_benefit_type(name):
+    from qianshu.regression.business import _g285_mark
+
+    pair = {"configuration": {name: {"value": 30}}}
+    sample = {"benefit_type": "升级权益"}
+    assert _g285_mark(name, pair, sample, None, None)["auto_allowed"] is True
+    assert _g285_mark(name, pair, {"benefit_type": "特价优惠"}, None, None)["auto_allowed"] is False
+    pair["source_status"] = {"benefit_type": "歧义"}
+    assert _g285_mark(name, pair, sample, None, None)["auto_allowed"] is False
 
 
 def freeze_disjoint_exam(corpus):

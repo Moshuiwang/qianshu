@@ -23,12 +23,19 @@ G285_MAPPING = {
     "excluded": "outside_denominator",
     "confirmation": {
         "source_statuses": ["歧义", "冲突", "带条件", "缺证据"],
+        "unwritten_input_status": "原文未写",
         "required_without_default": ["start_date", "end_date", "recharge_days", "gift_days", "packages", "user_scope"],
         "directed_missing_tags": "定向政策",
+        "policy_name": {"input": "user_tags", "required_count": 1, "must_match_tag": True},
+        "policy_type": {"input": "user_tags", "empty": "公开政策", "nonempty": "定向政策"},
+        "company": {"table_key": "country"},
         "trigger_once": "是",
         "effective_multiplier": {"only_automatic_value": 1},
-        "cancel_on_downgrade": {"benefit_type": "赠送时长", "source_status": "原文未写"},
-        "packages": "tier_only",
+        "cancel_on_downgrade": {"input": "benefit_type", "benefit_type": "赠送时长", "source_status": "原文未写"},
+        "days_by_benefit": {
+            "input": "benefit_type", "fields": ["recharge_days", "gift_days"], "types": ["赠送时长", "升级权益"],
+        },
+        "packages": {"input": "benefit_type", "package_style": "tier_only", "required_rows": 1, "required_gift": True},
     },
     "defaults": {
         **LEGACY_DEFAULTS,
@@ -245,26 +252,53 @@ def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
     return "false_determined"
 
 
-def _g285_mark(name: str, pair: dict, sample: dict, package_style: str | None) -> dict:
+def _g285_mark(
+    name: str, pair: dict, sample: dict, package_style: str | None, company_names: dict[str, list[str]] | None,
+) -> dict:
     """用冻结的取值与原文事实查 G285 规则表。"""
-    entry = pair["configuration"].get(name, {})
+    configuration = pair["configuration"]
+    entry = configuration.get(name, {})
     value = entry.get("value")
-    status = pair.get("source_status", {}).get(name)
+    source_status = pair.get("source_status", {})
+    status = source_status.get(name)
     benefit = sample["benefit_type"]
     rules = G285_MAPPING["confirmation"]
-    needs_review = status in rules["source_statuses"]
+    rule = rules.get(name)
+    days_rule = rules["days_by_benefit"]
+    uncertain_statuses = rules["source_statuses"]
+    unresolved_inputs = (*uncertain_statuses, rules["unwritten_input_status"])
+    needs_review = status in uncertain_statuses
     if status == "原文未写":
         needs_review |= name in rules["required_without_default"] or (
             name == "user_tags" and sample["policy_type"] == rules["directed_missing_tags"]
         )
-    if name == "trigger_once":
-        needs_review |= value == rules[name]
+    if name in ("policy_name", "policy_type"):
+        tag_field = rule["input"]
+        tags = configuration.get(tag_field, {}).get("value", pair.get("pairing", {}).get(tag_field))
+        needs_review |= source_status.get(tag_field) in unresolved_inputs or tags is None
+        if name == "policy_name":
+            needs_review |= (
+                not tags or len(tags) != rule["required_count"]
+                or (rule["must_match_tag"] and value not in tags)
+            )
+        elif tags is not None:
+            expected = rule["nonempty"] if tags else rule["empty"]
+            needs_review |= value != expected
+    elif name == "company" and company_names is not None:
+        needs_review |= value not in company_names.get(sample[rule["table_key"]], ())
+    elif name == "trigger_once":
+        needs_review |= value == rule
     elif name == "effective_multiplier" and value is not None:
-        needs_review |= Decimal(value) != rules[name]["only_automatic_value"]
-    elif name == "cancel_on_downgrade":
-        needs_review |= {"benefit_type": benefit, "source_status": status} == rules[name]
-    elif name == "packages":
-        needs_review |= package_style == rules[name]
+        needs_review |= Decimal(value) != rule["only_automatic_value"]
+    elif name == "cancel_on_downgrade" and status == rule["source_status"]:
+        needs_review |= benefit == rule["benefit_type"] or source_status.get(rule["input"]) in unresolved_inputs
+    elif name in days_rule["fields"]:
+        needs_review |= benefit not in days_rule["types"] or source_status.get(days_rule["input"]) in unresolved_inputs
+    elif name == "packages" and value is not None:
+        needs_review |= (
+            package_style == rule["package_style"] or source_status.get(rule["input"]) in unresolved_inputs
+            or len(value) != rule["required_rows"] or (rule["required_gift"] and any(not row["gift_package"] for row in value))
+        )
     default = G285_MAPPING["defaults"].get(name)
     if isinstance(default, dict):
         default = default.get(benefit)
@@ -279,11 +313,15 @@ def ratio(numerator: int, denominator: int | None) -> dict:
 
 
 class BusinessScore:
-    def __init__(self, frozen: dict, threshold: int, countries: dict[str, str]):
+    def __init__(
+        self, frozen: dict, threshold: int, countries: dict[str, str], *,
+        company_names: dict[str, list[str]] | None = None,
+    ):
         self.threshold = threshold
         self.fingerprint = pairing_fingerprint(threshold)
         self.measure_fingerprint = measure_fingerprint(threshold)
         self.countries = countries
+        self.company_names = company_names
         self.samples = frozen["samples"]
         self.dataset = frozen.get("dataset", "exam")
         self.eligible = defaultdict(list)
@@ -318,7 +356,9 @@ class BusinessScore:
             package_style = pair.get("package_style")
             by_field = {}
             for name in self.eligible[sample_id]:
-                mark = _g285_mark(name, pair, self.samples[sample_id], package_style or document.get("package_style"))
+                mark = _g285_mark(
+                    name, pair, self.samples[sample_id], package_style or document.get("package_style"), self.company_names,
+                )
                 status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
                 self.field_counts[name][status] += 1
                 by_field[name] = status

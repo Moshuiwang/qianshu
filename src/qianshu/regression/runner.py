@@ -178,16 +178,17 @@ def evaluate(
         )
     except (OSError, UnicodeError, ValueError):
         company_rules = None
+    company_names = company_rules.names if company_rules is not None else {}
     common_countries = defaultdict(set)
-    if company_rules is not None:
-        for country, names in company_rules.names.items():
-            for name in names:
-                common_countries[name].add(country)
+    for country, names in company_names.items():
+        for name in names:
+            common_countries[name].add(country)
     business = BusinessScore(frozen, threshold, {
         name: next(iter(countries)) for name, countries in common_countries.items() if len(countries) == 1
-    })
+    }, company_names=company_names)
     business_details = []
     reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
+    reply_failed_documents = 0
 
     for token, document in frozen["documents"].items():
         call = recording.for_document(token) if recording is not None else model
@@ -218,10 +219,14 @@ def evaluate(
             raise
         else:
             status = "parsed"
+        failure_reasons = set()
         if status == "parse_failed" and received:
-            reply_failures[reply_failure] += 1
-        if recording is not None:
-            recording.finish(token, status, received)
+            failure_reasons.add(reply_failure)
+        if recording is not None and recording.finish(token, status, received):
+            failure_reasons.add("reply_truncated")
+        reply_failed_documents += bool(failure_reasons)
+        for reason in failure_reasons:
+            reply_failures[reason] += 1
         documents[status] += 1
         business_details.append({"token": token, **business.add(document, pairs[token], drafts)})
         if status == "parsed":
@@ -305,7 +310,7 @@ def evaluate(
             for name, counts in availability.items()
         },
     }
-    report["business"] = business.report(sum(reply_failures.values()))
+    report["business"] = business.report(reply_failed_documents)
     report["business"]["reply_parse_failure_reasons"] = reply_failures
     details["business"] = business_details
     details["pairing_audit"] = pairing_audit(business_details)

@@ -18,12 +18,19 @@ FAILURES = {None, "model_call", "model_incomplete", "model_invalid", "reply_trun
 USAGE_KEYS = ("input_tokens", "output_tokens", "elapsed_ms")
 
 
+def _interrupted_with_text(attempt: dict) -> bool:
+    return attempt["failure_stage"] == "reply_truncated" or (
+        attempt["failure_stage"] == "model_incomplete" and attempt["stop_reason"] is None and bool(attempt["reply"])
+    )
+
+
+def _retryable(attempt: dict) -> bool:
+    return attempt["failure_stage"] == "model_call" or _interrupted_with_text(attempt)
+
+
 def _reply_failure(attempt: dict) -> str | None:
-    stage = attempt["failure_stage"]
-    if stage == "reply_truncated":
-        return stage
-    if stage == "model_incomplete" and attempt["reply"]:
-        return "reply_truncated" if attempt["stop_reason"] in (None, "max_tokens") else "reply_incomplete"
+    if attempt["failure_stage"] == "model_incomplete" and attempt["reply"]:
+        return "reply_truncated" if attempt["stop_reason"] == "max_tokens" else "reply_incomplete"
     return None
 
 
@@ -126,6 +133,7 @@ class Recording:
         self.run_id = uuid4().hex
         self.by_user = {}
         self.artifacts = {}
+        self.unfinished_calls = False
         self.attempt_count = 0
         self.usage_counts = Counter()
         self.usage_totals = Counter()
@@ -146,12 +154,14 @@ class Recording:
                 for _ in range(self.config["retries"] + 1):
                     attempt = self._invoke(system=system, user=user)
                     self.document["attempts"].append(attempt)
-                    if attempt["failure_stage"] != "model_call":
+                    if not _retryable(attempt):
                         break
             attempts = self.document["attempts"]
             if not attempts or any(item["failure_stage"] not in FAILURES for item in attempts):
                 raise RegressionError("录制的调用尝试记录无效。")
             result = attempts[-1]
+            if _retryable(result):
+                raise ModelError("回归模型调用失败。")
             if reason := _reply_failure(result):
                 raise IncompleteReply(reason)
             if result["failure_stage"] is not None:
@@ -175,7 +185,8 @@ class Recording:
         data = self.call_result or _untimed_attempt(self.model_id, reply, None)
         return {**data, "reply": reply}
 
-    def finish(self, token: str, status: str, received: bool) -> None:
+    def finish(self, token: str, status: str, received: bool) -> bool:
+        """写入本篇录制，返回是否有传输中断造成的截断。"""
         attempts = self.document["attempts"]
         if status == "model_failed":
             failure = attempts[-1]["failure_stage"] if attempts else "model_call"
@@ -185,6 +196,7 @@ class Recording:
                 failure = (_reply_failure(attempts[-1]) if attempts else None) or "reply_parse"
         else:
             failure = None
+        self.unfinished_calls |= status == "model_failed" or failure == "parse_setup"
         record = {
             **self.document, "run_id": self.run_id, "configuration": self.config,
             "model": self.model_id, "failure_stage": failure,
@@ -206,6 +218,7 @@ class Recording:
                 if type(attempt[key]) is int:
                     self.usage_counts[key] += 1
                     self.usage_totals[key] += attempt[key]
+        return any(_interrupted_with_text(attempt) for attempt in attempts)
 
     def complete(self, report_digest: str, threshold: int) -> None:
         origin_run_id = self.origin_run_id
