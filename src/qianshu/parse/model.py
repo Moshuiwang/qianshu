@@ -8,11 +8,22 @@ from typing import Protocol, get_args
 
 from qianshu.config import ConfigError
 
+from .protocol import ApplicationReply
+
 DEFAULT_MODEL = "claude-sonnet-5-5"
 
 
 class ModelError(RuntimeError):
     """调用失败或模型回复不完整。"""
+
+
+class ModelReplyError(ModelError):
+    """已收到回复，但提供方未返回完整的结构化结果。"""
+
+    def __init__(self, code: str, reply: str | None, message: str):
+        super().__init__(message)
+        self.code = code
+        self.reply = reply
 
 
 class ParseModel(Protocol):
@@ -43,7 +54,7 @@ def configured_model(
     config: Mapping[str, str], *, on_result: Callable[[CallResult], None] | None = None,
     max_retries: int | None = None,
 ) -> ParseModel:
-    """用配置建立调用，调用方只接触系统消息、用户消息及文本回复。"""
+    """用配置建立调用，使用服务端 JSON Schema 约束模型回复。"""
     if config.get("AI_PLATFORM", "anthropic") != "anthropic":
         raise ConfigError("AI_PLATFORM 配置不受支持，申请解析目前只支持 Anthropic（anthropic）。")
     api_key = config.get("ANTHROPIC_API_KEY")
@@ -54,7 +65,7 @@ def configured_model(
 
     def complete(*, system: str, user: str) -> str:
         import httpx
-        from anthropic import Anthropic, AnthropicError, DefaultHttpxClient
+        from anthropic import Anthropic, AnthropicError, DefaultHttpxClient, transform_schema
         from anthropic.types import StopReason
 
         def record(reply, failure: str | None) -> None:
@@ -85,19 +96,24 @@ def configured_model(
                     system=system,
                     messages=[{"role": "user", "content": user}],
                     max_tokens=32000,
+                    output_config={"format": {"type": "json_schema", "schema": transform_schema(ApplicationReply)}},
                 ) as stream:
                     reply = stream.get_final_message()
         # 流式读取中途断开或超时时，SDK 不包装传输层异常；流在 message_start 前结束时 SDK 抛 AssertionError。
         except (AnthropicError, ValueError, httpx.HTTPError, AssertionError):
+            try:
+                partial = getattr(stream, "current_message_snapshot", None)
+            except AssertionError:
+                partial = None
+            blocks = getattr(partial, "content", None)
+            raw = "".join(block.text for block in blocks if block.type == "text") if isinstance(blocks, list) else ""
             if on_result is not None:
-                try:
-                    partial = getattr(stream, "current_message_snapshot", None)
-                except AssertionError:
-                    partial = None
-                if partial is not None and any(block.type == "text" and block.text for block in partial.content):
+                if raw:
                     record(partial, "reply_truncated")
                 else:
                     record(None, "model_call")
+            if raw:
+                raise ModelReplyError("reply_truncated", raw, "申请解析模型调用失败。") from None
             raise ModelError("申请解析模型调用失败。") from None
 
         if on_result is not None:
@@ -106,7 +122,10 @@ def configured_model(
             stop_reason = reply.stop_reason if reply.stop_reason in get_args(StopReason) else "unknown"
             output_tokens = getattr(getattr(reply, "usage", None), "output_tokens", None)
             token_count = output_tokens if type(output_tokens) is int and output_tokens >= 0 else "未知"
-            raise ModelError(f"申请解析模型回复不完整（stop_reason={stop_reason}，输出 {token_count} token）。")
+            code = {"max_tokens": "reply_truncated", "refusal": "reply_refused"}.get(stop_reason, "reply_incomplete")
+            raw = "".join(block.text for block in getattr(reply, "content", ()) if block.type == "text")
+            raise ModelReplyError(code, raw or None,
+                                  f"申请解析模型回复不完整（stop_reason={stop_reason}，输出 {token_count} token）。")
         return "".join(block.text for block in reply.content if block.type == "text")
 
     return complete

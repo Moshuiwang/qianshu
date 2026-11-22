@@ -17,6 +17,8 @@ from qianshu.config import ConfigError
 from qianshu.parse import ModelError, parse_application
 from qianshu.parse.__main__ import main
 from qianshu.parse.model import configured_model
+from qianshu.parse.protocol import ApplicationReply
+from tests.protocol_fixtures import fixed_reply, serialized_empty
 
 
 def test_service_help_describes_current_offline_input(capsys):
@@ -128,6 +130,7 @@ def test_stream_returns_all_text_blocks(stub_stream):
         system="占位规则",
         messages=[{"role": "user", "content": "占位正文"}],
         max_tokens=32000,
+        output_config={"format": {"type": "json_schema", "schema": anthropic.transform_schema(ApplicationReply)}},
     )
     get_final_message.assert_called_once_with()
 
@@ -242,7 +245,10 @@ def test_parse_entry_writes_only_to_a_new_private_file(monkeypatch, tmp_path, ca
 
     def recorded_model(config):
         assert config == {}
-        return lambda **_: '[{"company":{"value":"占位公司","evidence":["占位公司"]}}]'
+        body = "赞比亚占位申请"
+        return lambda **_: json.dumps(fixed_reply(body, [
+            {"country": {"value": "赞比亚", "evidence": [body]}},
+        ]))
 
     output = tmp_path / "drafts.json"
     monkeypatch.setattr(qianshu.parse, "configured_model", recorded_model)
@@ -276,7 +282,7 @@ def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp
     if env_file != ".env":
         Path(env_file).write_text("ANTHROPIC_MODEL=placeholder-custom\n", encoding="utf-8")
     Path(rules_dir).symlink_to(Path(__file__).resolve().parents[2] / "rules", target_is_directory=True)
-    configured = Mock(return_value=Mock(return_value="[]"))
+    configured = Mock(return_value=Mock(return_value=serialized_empty("占位正文")))
     monkeypatch.setattr("qianshu.parse.configured_model", configured)
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", "drafts.json", *flags])
     monkeypatch.setattr(sys, "stdin", io.StringIO("占位正文"))
@@ -297,7 +303,8 @@ def test_replay_entry_uses_explicit_company_table_instead_of_default(monkeypatch
     Path(".private/companies.tsv").write_text(header + "赞比亚\t\t0001\t占位默认公司\n", encoding="utf-8")
     selected = "赞比亚\t占位所选公司\n" if legacy else header + "赞比亚\t\t0002\t占位所选公司\n"
     Path("selected.tsv").write_text(selected, encoding="utf-8")
-    Path("model.json").write_text('[{"company":{"value":"占位模型公司","evidence":["赞比亚"]}}]', encoding="utf-8")
+    reply = fixed_reply("赞比亚占位申请", [{"country": {"value": "赞比亚", "evidence": ["赞比亚"]}}])
+    Path("model.json").write_text(json.dumps(reply), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [
         "qianshu.parse", "--output", "drafts.json", "--replay", "model.json",
         "--rules-dir", str(rules), "--companies-file", "selected.tsv",
@@ -311,7 +318,7 @@ def test_replay_entry_uses_explicit_company_table_instead_of_default(monkeypatch
 
 
 @pytest.mark.parametrize("reply", [
-    '  \r\n[{"company":{"value":"占位公司","evidence":["占位公司"]}}]\r\n',
+    "  \r\n" + json.dumps(fixed_reply("占位公司", [{}])) + "\r\n",
     "占位无效回复\r\n",
 ])
 def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_path, capsys, reply):
@@ -323,7 +330,7 @@ def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_
     monkeypatch.setattr("qianshu.parse.configured_model", lambda _: model)
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(output), "--raw-output", str(raw)])
     monkeypatch.setattr(sys, "stdin", io.StringIO(body))
-    exit_code = 0 if reply.lstrip().startswith("[") else 1
+    exit_code = 0 if reply.lstrip().startswith("{") else 1
     assert main() == exit_code
     assert raw.read_bytes() == reply.encode()
     assert raw.stat().st_mode & 0o777 == 0o600
@@ -331,7 +338,7 @@ def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_
     captured = capsys.readouterr()
     assert not captured.out
     if exit_code:
-        assert "不是有效的政策 JSON" in captured.err
+        assert "不是有效的结构化 JSON" in captured.err
         assert reply.strip() not in captured.err
 
 

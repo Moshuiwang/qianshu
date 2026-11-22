@@ -5,7 +5,7 @@ import os
 import shutil
 import subprocess
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +20,7 @@ from qianshu.regression.compare import FIELD_LABELS, compare_field, normalize
 from qianshu.regression.corpus import CANDIDATES, DOCUMENTS, FIELDS, PAIRS, SEED, body_hashes, make_plan, select
 from qianshu.regression.runner import align
 from qianshu.regression.storage import PrivateFiles, RegressionError, digest, json_bytes
+from tests.protocol_fixtures import fixed_reply, quote, serialized_empty
 
 RULES = Path(__file__).resolve().parents[2] / "rules"
 CORPUS = Path("archive")
@@ -32,6 +33,14 @@ FREEZE = [
     "--reviews", ".private/review.json", "--companies", ".private/companies.tsv",
     "--out", ".private/frozen",
 ]
+
+
+def no_policies(*, system, user):
+    return serialized_empty(json.loads(user)["application"])
+
+
+def shaped_reply(body, rows, **options):
+    return json.dumps(fixed_reply(body, rows, **options), ensure_ascii=False)
 
 
 def git(*args):
@@ -307,7 +316,7 @@ def test_sample_freeze_records_reviewed_stratum_shortfall(repo, corpus, capsys):
     assert main(["verify", "--frozen", ".private/frozen", "--sources"]) == 0
     assert capsys.readouterr().out.strip() == fingerprint
 
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
     report = get_json(repo / "run" / "public-report.json")
     assert report["strata"] == strata
     assert sum(layer["included_count"] for layer in report["strata"]) == report["samples"] == 2
@@ -381,7 +390,7 @@ def test_loads_previous_manifest_fingerprint_without_package_style(repo, frozen,
     fingerprint = digest(old_manifest)
     assert main(["verify", "--frozen", ".private/frozen"]) == 0
     assert capsys.readouterr().out.strip() == fingerprint
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
     report = get_json(repo / "run" / "public-report.json")
     assert [(layer["included_count"], layer["shortfall"]) for layer in report["strata"]] == [(1, 0), (2, 0)]
     assert report["package_writing_by_document"]["unreviewed"] == 2
@@ -525,7 +534,7 @@ def test_conflicting_company_id_case_marks_only_affected_company_uncertain(repo,
     assert pairs["policy-c"]["configuration"]["company"] == {"value": "占位公司甲"}
 
     fingerprint = digest((repo / "frozen/manifest.json").read_bytes())
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
     report = get_json(repo / "run/public-report.json")
     assert report["samples"] == 3
     assert report["by_field"]["company"]["denominator"] == 2
@@ -561,7 +570,7 @@ def test_counts_each_package_style_once_per_original(repo, corpus):
     assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
     assert main(["freeze", *FREEZE]) == 0
     fingerprint = digest((repo / "frozen" / "manifest.json").read_bytes())
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
 
     report = get_json(repo / "run" / "public-report.json")
     assert report["samples"] == 5
@@ -630,7 +639,7 @@ def test_broad_real_draft_needs_evidence_in_the_only_sampled_paragraph(quotes, e
     body = first + "第二次仅限占位用户乙，充值 20 天。\n"
     drafts = parse.parse_application(
         body, rules_dir=RULES, companies_text="",
-        model=lambda **kw: json.dumps([{"user_scope": {"value": "占位用户", "evidence": quotes}}]),
+        model=lambda **kw: shaped_reply(body, [{"user_scope": {"value": "占位用户", "evidence": quotes}}]),
     )
     assert drafts[0].source_span == (0, len(body))
     outcomes, diagnostics = align(
@@ -649,16 +658,18 @@ def test_broad_real_draft_needs_evidence_in_the_only_sampled_paragraph(quotes, e
 def test_broad_real_draft_checks_repeated_evidence_in_sampled_paragraph(first_duration, later_duration, expected):
     first = "占位甲申请为赠送时长，" + first_duration + "\n"
     body = first + f"占位乙申请，{later_duration}\n占位丙申请，{later_duration}\n"
-    drafts = parse.parse_application(
-        body, rules_dir=RULES, companies_text="",
-        model=lambda **kw: json.dumps([{
-            "benefit_type": {"value": "赠送时长", "evidence": ["赠送时长"]},
-            "recharge_days": {"value": 20, "evidence": ["充值 20 天"]},
-        }]),
-    )
+    reply = fixed_reply(body, [{
+        "benefit_type": {"value": "赠送时长", "evidence": ["赠送时长"]},
+        "recharge_days": {"value": 20, "evidence": ["充值 20 天"]},
+    }])
+    if first_duration == later_duration:
+        extra = quote(body, "充值 20 天", "p1-recharge_days", occurrence=1)
+        reply["policies"][0]["fields"]["recharge_days"]["evidence"].append(extra)
+        next(c for c in reply["clauses"] if c["id"] == "p1-recharge_days")["spans"].append(extra["span"])
+    drafts = parse.parse_application(body, rules_dir=RULES, companies_text="", model=lambda **_: json.dumps(reply))
     assert drafts[0].source_span == (0, len(body))
     assert drafts[0].recharge_days.value == 20
-    assert drafts[0].recharge_days.evidence[0].start is None
+    assert drafts[0].recharge_days.evidence[0].start == body.index("充值 20 天")
     outcomes, diagnostics = align(
         drafts, [{"id": "policy-a", "span": [0, len(first)]}],
         {"body": body, "other_spans": [], "complete": False},
@@ -691,10 +702,13 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
         if body != BATCH:
             logging.warning("占位单条原稿")
             raise RuntimeError("占位接口回包")
-        return json.dumps([
-            {"company": {"evidence": [SECOND]}, "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
-            {"company": {"evidence": [FIRST]}, "user_scope": {"value": "占位不同值", "evidence": ["占位正文甲"]}},
-        ], ensure_ascii=False)
+        split = BATCH.index(SECOND)
+        return shaped_reply(body, [
+            {"country": {"value": "莫桑比克", "evidence": [SECOND]},
+             "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
+            {"country": {"value": "赞比亚", "evidence": [FIRST]},
+             "user_scope": {"value": "占位不同值", "evidence": ["占位正文甲"]}},
+        ], policy_ranges=[(split, len(body)), (0, split)])
 
     args = run_args(frozen)
     if legacy:
@@ -740,15 +754,14 @@ def test_no_live_flag_never_constructs_a_model(repo, frozen, monkeypatch):
 
 def test_frozen_baseline_runs_with_an_expanded_parser_and_reports_new_field_counts(repo, frozen, monkeypatch):
     def model(*, system, user):
-        if json.loads(user)["application"] != BATCH:
-            return "[]"
-        data = [
-            {"company": {"evidence": [FIRST]}},
-            {"company": {"evidence": [SECOND]}},
-        ]
-        if "synthetic_offer" in parse._FIELD_NAMES:
-            data[0]["synthetic_offer"] = {"value": "占位正文甲", "evidence": ["占位正文甲"]}
-        return json.dumps(data)
+        body = json.loads(user)["application"]
+        if body != BATCH:
+            return serialized_empty(body)
+        return shaped_reply(body, [
+            {"country": {"value": "赞比亚", "evidence": [FIRST]}},
+            {"country": {"value": "莫桑比克", "evidence": [SECOND]}},
+        ], policy_ranges=[(0, BATCH.index(SECOND)), (BATCH.index(SECOND), len(BATCH))])
+
 
     assert main(run_args(frozen), model=model) == 0
     original = get_json(repo / "run" / "public-report.json")
@@ -759,8 +772,19 @@ def test_frozen_baseline_runs_with_an_expanded_parser_and_reports_new_field_coun
     class ExtendedDraft(parse.ParsedPolicyDraft):
         synthetic_offer: DraftField[str]
 
-    monkeypatch.setattr(parse, "ParsedPolicyDraft", ExtendedDraft)
-    monkeypatch.setattr(parse, "_FIELD_NAMES", parse._FIELD_NAMES | {"synthetic_offer"})
+    def expanded_parser(*args, **kwargs):
+        result = parse.parse_application(*args, **kwargs)
+        for index, draft in enumerate(result):
+            extended = ExtendedDraft(
+                **{field.name: getattr(draft, field.name) for field in fields(draft)},
+                synthetic_offer=DraftField(value="占位正文甲") if index == 0
+                else DraftField(uncertainty=Uncertainty(reason="占位待确认")),
+            )
+            extended.__dict__.update(draft.__dict__)
+            result[index] = extended
+        return result
+
+    monkeypatch.setattr(runner, "parse_application", expanded_parser)
     monkeypatch.setattr(runner, "PolicyDraft", ExtendedDraft)
     monkeypatch.setitem(FIELD_LABELS, "synthetic_offer", ("占位新增字段", "Text"))
 
@@ -789,8 +813,9 @@ def test_malformed_reply_and_duplicate_source_scopes_are_counted(repo, frozen):
     def model(*, system, user):
         if json.loads(user)["application"] != BATCH:
             return "占位原始回包，无法解析"
-        draft = {"company": {"evidence": [FIRST]}}
-        return json.dumps([draft, draft], ensure_ascii=False)
+        body = json.loads(user)["application"]
+        draft = {"country": {"value": "赞比亚", "evidence": [FIRST]}}
+        return shaped_reply(body, [draft, draft], policy_ranges=[(0, BATCH.index(SECOND))] * 2)
 
     assert main(run_args(frozen), model=model) == 0
     report = get_json(repo / "run" / "public-report.json")
@@ -866,7 +891,7 @@ def test_output_moved_during_model_run_is_not_written(repo, frozen):
         if not moved.exists():
             (repo / "run").rename(moved)
             (repo / "run").mkdir(mode=0o700)
-        return "[]"
+        return serialized_empty("占位正文")
 
     assert main(run_args(frozen), model=model) == 1
     assert moved.is_dir()
@@ -979,7 +1004,8 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         user = json.loads(request.content)["messages"][0]["content"]
         body = json.loads(user)["application"]
         requests[body] += 1
-        text = (retry_reply if requests[body] > 1 else None) if body == BATCH else "[]"
+        final_reply = serialized_empty(body) if retry_reply == "[]" else retry_reply
+        text = (final_reply if requests[body] > 1 else None) if body == BATCH else serialized_empty(body)
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=ReplyStream("[" if text is None else text, text is None))
 
@@ -1007,7 +1033,8 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
     partial_stage = "model_incomplete" if interruption == "eof" else "reply_truncated"
     assert (first["failure_stage"], first["reply"]) == (partial_stage, "[")
     assert (second["failure_stage"], second["reply"]) == (
-        (partial_stage, "[") if retry_reply is None else (None, retry_reply)
+        (partial_stage, "[") if retry_reply is None
+        else (None, serialized_empty(BATCH) if retry_reply == "[]" else retry_reply)
     )
     assert main(_replay_args(frozen)) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
@@ -1022,7 +1049,7 @@ def test_valid_replacement_references_original_void_recording(repo, frozen):
     assert main([*run_args(frozen), "--release"], model=unavailable) == 0
     original = (repo / "run/recording.json").read_bytes()
     assert main([*run_args(frozen, ".private/replacement"), "--release", "--replaces-recording", ".private/run"],
-                model=lambda **_: "[]") == 0
+                model=no_policies) == 0
     replacement = get_json(repo / "replacement/recording.json")
     original_id = json.loads(original)["run_id"]
     assert replacement["replaces_run_id"] == original_id != replacement["run_id"]
@@ -1030,7 +1057,7 @@ def test_valid_replacement_references_original_void_recording(repo, frozen):
     assert get_json(repo / "replacement/public-report.json")["void"] is False
     assert "replaces_run_id" not in get_json(repo / "replacement/public-report.json")
     assert main([*run_args(frozen, ".private/invalid"), "--release", "--replaces-recording", ".private/replacement"],
-                model=lambda **_: "[]") == 1
+                model=no_policies) == 1
     assert not (repo / "invalid").exists()
 
 
@@ -1043,7 +1070,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
 
     attempts = Counter()
     responses = {
-        BATCH: '[{"company":{"evidence":["' + FIRST + '"]}}]',
+        BATCH: shaped_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST]}}]),
         "占位单条原稿\n": "占位无效回包",
     }
 
@@ -1115,7 +1142,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
 def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     def probe(*, system, user):
         user_sha = digest(user.encode())
-        reply = "[]"
+        reply = serialized_empty(json.loads(user)["application"])
         put_json(repo / "probe" / f"{user_sha}.json", {
             "system_sha": digest(system.encode()), "user_sha": user_sha,
             "reply": reply, "error": None, "secs": 0.2,
@@ -1130,8 +1157,9 @@ def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     assert imported["origin"] == "probe" and imported["source_code_measured"] is False
     for name in imported["artifact_sha256"]:
         record = get_json(repo / "imported" / name)
+        body = BATCH if record["user_sha256"] == digest(json.dumps({"application": BATCH}, ensure_ascii=False).encode()) else "占位单条原稿\n"
         assert record["attempts"] == [{
-            "reply": "[]", "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
+            "reply": serialized_empty(body), "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
             "input_tokens": None, "output_tokens": None, "elapsed_ms": None,
         }]
     assert "未采集" in (repo / "imported" / "public-report.md").read_text()
@@ -1151,9 +1179,6 @@ def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
 
 
 def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, frozen, capsys):
-    def no_policies(**kwargs):
-        return "[]"
-
     def one_failed_reply(*, system, user):
         if json.loads(user)["application"] == BATCH:
             raise RuntimeError("占位失败")
@@ -1752,7 +1777,7 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
     assert frozen["denominators"]["fields"].keys() == {"packages"}
 
     def parsed(body, *, model, on_reply, **kwargs):
-        on_reply(model(system="占位提示", user=body))
+        on_reply(model(system="占位提示", user=json.dumps({"application": body})))
         base = {name: DraftField() for name in parse.ParsedPolicyDraft.__dataclass_fields__}
         named_package = DraftField(value=[PackageRow(current_package="占位包甲", gift_package="占位赠包甲")],
                                    evidence=[SourceExcerpt(text=FIRST, start=BATCH.index(FIRST))])
@@ -1771,7 +1796,7 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
 
     monkeypatch.setattr(runner, "parse_application", parsed)
     args = ["--frozen", ".private/packages", "--expect-sha256", fingerprint]
-    assert main(["run", *args, "--out", ".private/package-run"], model=lambda **_: "[]") == 0
+    assert main(["run", *args, "--out", ".private/package-run"], model=no_policies) == 0
     assert main(["replay", *args, "--recording", ".private/package-run", "--out", ".private/package-replay"]) == 0
     report = get_json(repo / "package-replay" / "public-report.json")
     assert report["business"]["rates"]["package_rows_exact"] == {
@@ -1843,7 +1868,7 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
         "packages": digest((repo / "peer.json").read_bytes()),
     }
 
-    assert main(["run", *run_args(checksum)[1:]], model=lambda **_: "[]") == 0
+    assert main(["run", *run_args(checksum)[1:]], model=no_policies) == 0
     assert main(_replay_args(checksum)) == 0
     assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
 

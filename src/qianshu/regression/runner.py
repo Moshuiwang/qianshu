@@ -8,7 +8,7 @@ from typing import get_origin
 from qianshu.draft import DraftField, PolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
-from qianshu.parse.model import ParseModel
+from qianshu.parse.model import ModelReplyError, ParseModel
 
 from .business import COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
@@ -201,6 +201,7 @@ def evaluate(
 
         drafts = []
         reply_failure = "reply_parse"
+        failure_code, failure_path = None, ()
         try:
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
@@ -210,10 +211,17 @@ def evaluate(
             received = True
             status = "parse_failed"
             reply_failure = error.reason
+            failure_code = error.reason
+        except ModelReplyError as error:
+            received = True
+            status = "parse_failed"
+            reply_failure = error.code
+            failure_code = error.code
         except ModelError:
             status = "model_failed"
-        except ParseError:
+        except ParseError as error:
             status = "parse_failed"
+            failure_code, failure_path = error.code, error.path
         except Exception:
             if recording is not None and received:
                 recording.finish(token, "parse_failed", received)
@@ -223,11 +231,13 @@ def evaluate(
         failure_reasons = set()
         if status == "parse_failed" and received:
             failure_reasons.add(reply_failure)
-        if recording is not None and recording.finish(token, status, received):
+        if recording is not None and recording.finish(
+            token, status, received, code=failure_code, path=failure_path,
+        ):
             failure_reasons.add("reply_truncated")
         reply_failed_documents += bool(failure_reasons)
         for reason in failure_reasons:
-            reply_failures[reason] += 1
+            reply_failures[reason] = reply_failures.get(reason, 0) + 1
         documents[status] += 1
         business_details.append({"token": token, **business.add(document, pairs[token], drafts)})
         if status == "parsed":

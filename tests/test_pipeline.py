@@ -24,7 +24,8 @@ from qianshu.feishu import Message, Window
 from qianshu.feishu.cards import CardLine, detail_pages, result_card
 from qianshu.feishu.entrance import Application, fingerprint
 from qianshu.feishu.sdk import _Transport
-from qianshu.pipeline import Pipeline, _policy_boundaries, _suspected_policy_count
+from qianshu.pipeline import Pipeline
+from tests.protocol_fixtures import fixed_reply, span
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSE_FIXTURES = ROOT / "tests" / "parse" / "fixtures"
@@ -50,7 +51,7 @@ def _write_json(path, data):
 
 
 @pytest.fixture
-def single_policy():
+def single_policy(request):
     body = (
         "赞比亚占位申请。\n"
         "以下各条均适用：申请开始日期 2099-01-10，申请结束日期 2099-02-15。\n"
@@ -59,21 +60,33 @@ def single_policy():
         "用户范围：占位休眠用户。不限制升降包。\n"
         "本批存档文档：https://archive.example.invalid/batch"
     )
-    reply, *_ = json.loads((PARSE_FIXTURES / "model-reply.json").read_text(encoding="utf-8"))
-    for name in ("policy_name", "trigger_once", "repeat_bonus", "effective_multiplier", "approval_attachments"):
-        del reply[name]
-    reply.update(
-        company={"value": None, "evidence": ["赞比亚占位申请。"]},
-        policy_type={"value": "定向政策", "evidence": ["政策类型：定向政策"]},
-        packages={
-            "value": [{"current_package": "占位甲", "gift_package": "占位甲_copy"}],
-            "evidence": ["占位甲包用户"],
-        },
-    )
+    reply = {
+        "company": {"value": "赞比亚", "evidence": [" 赞比亚占位申请。"]},
+        "policy_type": {"value": "定向政策", "evidence": ["政策类型：定向政策"]},
+        "benefit_type": {"value": "赠送时长", "evidence": ["充一送一"]},
+        "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+        "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+        "user_tags": {"value": ["占位标签甲"], "evidence": ["占位标签甲"]},
+        "approval_url": {"value": "https://archive.example.invalid/batch",
+                         "evidence": ["本批存档文档：https://archive.example.invalid/batch"]},
+        "cancel_on_downgrade": {"value": "否", "evidence": ["不限制升降包"]},
+        "recharge_days": {"value": 30, "evidence": ["充30天"]},
+        "gift_days": {"value": 30, "evidence": ["送30天"]},
+        "packages": {"value": [{"current_package": "占位甲", "gift_package": "占位甲_copy"}],
+                     "evidence": ["占位甲包用户"]},
+        "user_scope": {"value": "占位休眠用户", "evidence": ["用户范围：占位休眠用户"]},
+    }
+    if request.node.originalname in (
+        "test_resident_uses_company_path_and_only_saves_raw_when_enabled",
+        "test_pipeline_reads_one_company_table_per_application",
+    ):
+        reply["country"] = {"value": "赞比亚", "evidence": ["赞比亚占位申请。"]}
+        del reply["company"]
+        return body, fixed_reply(body, [reply])
     return body, [reply]
 
 
-def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None):
+def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None, separator=" "):
     now = datetime.now(UTC)
     placeholder = {name: f"<合成占位-{name}>" for name in ("app", "bot", "chat", "sender", "message")}
     mention = "@_user_1"
@@ -83,9 +96,17 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None):
         "sender_id": placeholder["sender"],
         "created_ms": int(now.timestamp() * 1000),
         "kind": "text",
-        "content": json.dumps({"text": f"{mention} {body}"}),
+        "content": json.dumps({"text": f"{mention}{separator}{body}"}),
         "bot_mention_keys": [mention],
     }
+    if isinstance(model_reply, list):
+        rows = []
+        for row in model_reply:
+            row = dict(row)
+            if country := row.pop("company", None):
+                row["country"] = country
+            rows.append(row)
+        model_reply = fixed_reply(separator + body, rows)
     injection = _write_json(tmp_path / "inject.json", {
         "message": message,
         "model_reply": model_reply if isinstance(model_reply, str) else json.dumps(model_reply, ensure_ascii=False),
@@ -272,29 +293,6 @@ def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path
     assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
 
 
-def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy):
-    body, model = single_policy
-    body += "\n是否需要维护互斥组：否"
-    cards = _run(
-        tmp_path, body, model,
-        tag_dates={"占位标签甲": "2099-02-15"},
-    )
-    content = "\n".join(_contents(cards))
-    assert "<font color='red'>政策 1 · 提醒项\n申请要求不维护互斥组，需人工确认</font>" in content
-    assert "是否需要维护互斥组 · 候选 1\n值　否\n原文出处　「是否需要维护互斥组：否」" in content
-    assert "需追问 · 是否需要维护互斥组" in content
-    assert "停在校验，需人工确认或请申请人补充。" in content
-
-
-def test_command_blocks_uncovered_heading_when_drafts_outnumber_segments(tmp_path, single_policy):
-    body, model = single_policy
-    cards = _run(tmp_path, body, model * 2)
-    content = "\n".join(_contents(cards))
-    assert "<font color='red'>处理状态\n解析不完整，需人工确认</font>" in content
-    assert "未确认覆盖的段落序号\n1" in content
-    assert "未校验" in content
-
-
 @pytest.mark.parametrize("missing_scope", [False, True])
 def test_command_defers_missing_approval_url_but_still_checks_other_fields(tmp_path, single_policy, missing_scope):
     body, model = single_policy
@@ -314,208 +312,13 @@ def test_command_defers_missing_approval_url_but_still_checks_other_fields(tmp_p
         assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
 
 
-@pytest.mark.parametrize(("missing", "numbered"), [
-    pytest.param(None, True, id="None"),
-    pytest.param(3, True, id="3"),
-    pytest.param(4, True, id="4"),
-    pytest.param(4, False, id="company-heading"),
-])
-def test_command_checks_coverage_before_validation(tmp_path, single_policy, missing, numbered):
-    body, model = single_policy
-    intro, local = body.split("①", 1)
-    policies = []
-    segments = []
-    tag_dates = {}
-    for index, (number, suffix) in enumerate(zip("①②③④⑤⑥", "甲乙丙丁戊己", strict=True), 1):
-        translation = str.maketrans({"①": number, "甲": suffix})
-        segment = ("①" + local) if numbered else "公司：占位公司甲\n" + local.partition("\n")[2]
-        segment = segment.translate(translation)
-        if index > 1:
-            segment = segment.split("\n本批存档文档", 1)[0]
-        segments.append(segment.strip())
-        if index != missing:
-            reply = json.dumps(model[0], ensure_ascii=False)
-            if not numbered:
-                reply = reply.replace('"赞比亚占位申请。"', '"公司：占位公司甲"')
-            policies.append(json.loads(reply.translate(translation)))
-        tag_dates[f"占位标签{suffix}"] = "2099-02-15"
-    body = intro + "\n".join(segments)
-    assert _suspected_policy_count(body) == (6 if numbered else 0)
-    cards = _run(tmp_path, body, policies, tag_dates=tag_dates)
-    content = "\n".join(_contents(cards))
-    assert "段落边界未确认" not in content
-    if missing is None:
-        assert "解析完成，共 6 条政策。" in content
-        assert content.count("解析完成，待群卡片同意") == 6
-    else:
-        status = "解析不完整，需人工确认"
-        if numbered:
-            status += "\n原文疑似 6 条，解析出 5 条"
-        assert f"<font color='red'>处理状态\n{status}</font>" in content
-        assert f"未确认覆盖的段落序号\n{missing}" in content
-        assert "未校验" in content
-        assert "待群卡片同意" not in content
-
-
-@pytest.mark.parametrize(("paragraph", "explicit"), [
-    ("另申请一条独立政策，面向占位用户。", True),
-    ("另外一条独立政策，面向占位用户。", True),
-    ("第二条政策，面向占位用户。", True),
-    ("再申请一条独立政策，面向占位用户。", True),
-    ("此外还有面向占位用户的政策待核对。", False),
-    ("新增一条政策：适用占位活跃用户，充60天送10天。", True),
-    ("我们另申请一条独立政策，面向占位用户。", True),
-    ("\n面向占位用户开放充一天送一天。", False),
-])
-def test_command_checks_untitled_paragraph_signals(tmp_path, single_policy, paragraph, explicit):
-    body, model = single_policy
-    cards = _run(tmp_path, body.rstrip() + "\n" + paragraph, model,
-                 tag_dates={"占位标签甲": "2099-02-15"})
-    content = "\n".join(_contents(cards))
-    if explicit:
-        assert "<font color='red'>处理状态\n解析不完整，需人工确认</font>" in content
-        assert "未确认覆盖的段落序号\n2" in content
-        assert "未校验" in content
-    else:
-        assert "处理状态\n解析完成，共 1 条政策。" in content
-        assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
-        assert f"提醒项\n段落 2：{paragraph.strip()[:12]}…，段落边界未确认，请审批人核对" in content
-        assert "<font color='red'>" not in content
-
-
-@pytest.mark.parametrize(("paragraph", "numbered"), [
-    pytest.param("  第二条 占位公司乙，买一赠一，用户标签：占位标签乙。", False, id="ordinal"),
-    pytest.param("  2. 另申请一条政策：占位公司乙，买一赠一，用户标签：占位标签乙。", False, id="numbered-explicit"),
-    pytest.param("  另申请一条占位公司乙政策：买一赠一，用户标签：占位标签乙。", False, id="untitled-explicit"),
-    pytest.param("　　② 占位公司乙，买一赠一，用户标签：占位标签乙。", True, id="fullwidth-spaces"),
-])
-def test_command_stops_when_an_indented_line_starts_another_policy(tmp_path, single_policy, paragraph, numbered):
-    body, model = single_policy
-    body = body.rstrip() + "\n" + paragraph
-    assert "标签名称" not in body
-    content = "\n".join(_contents(_run(
-        tmp_path, body, model,
-        tag_dates={"占位标签甲": "2099-02-15"},
-    )))
-    status = "解析不完整，需人工确认"
-    if numbered:
-        status += "\n原文疑似 2 条，解析出 1 条"
-    assert f"<font color='red'>处理状态\n{status}</font>" in content
-    assert "未确认覆盖的段落序号\n2" in content
-    assert "未校验" in content
-    assert "待群卡片同意" not in content
-
-
-def test_command_stops_when_a_heading_continues_with_another_policy(tmp_path, single_policy):
-    body, model = single_policy
-    body = body.replace(
-        "① 占位甲包用户", "① 占位甲包用户，充30天送30天，我们另申请一条独立政策。", 1,
-    ).replace("充30天送30天，充一送一", "充一送一")
-    model = [{name: model[0][name] for name in ("company", "recharge_days", "gift_days")}]
-    content = "\n".join(_contents(_run(
-        tmp_path, body, model,
-        tag_dates={"占位标签甲": "2099-02-15"},
-    )))
-    assert "<font color='red'>处理状态\n解析不完整，需人工确认</font>" in content
-    assert "未确认覆盖的段落序号\n2" in content
-    assert "未校验" in content
-
-
-def test_command_rejects_missing_draft_when_numbered_boundary_is_uncertain(tmp_path, single_policy):
-    body, model = single_policy
-    body += "\n② 面向占位用户"
-    drafts = parse.parse_application(
-        body, model=lambda **_: json.dumps(model, ensure_ascii=False), companies_file=COMPANIES_FIXTURE,
-    )
-    (draft,) = drafts
-    assert all(
-        (field := getattr(draft, item.name)).value is None and field.uncertainty is not None
-        for item in fields(draft)
-    )
-
-    rows = _contents(_run(tmp_path, body, model))
-    assert (
-        "<font color='red'>处理状态\n解析不完整，需人工确认\n原文疑似 2 条，解析出 1 条</font>"
-    ) in rows
-    assert "未确认覆盖的段落序号\n2" in rows
-    assert "后续处理\n请核对段落与草稿对应关系。未校验。" in rows
-    assert all(not row.startswith("政策 ") for row in rows)
-
-
-@pytest.mark.parametrize("parsed_count", [6, 5])
-def test_command_checks_suspected_count_with_indented_subitems(tmp_path, parsed_count):
-    body = (PARSE_FIXTURES / "application.txt").read_text(encoding="utf-8")
-    model_reply = (PARSE_FIXTURES / "model-reply.json").read_text(encoding="utf-8")
-    _, shared_fields, *policy_lines = body.splitlines()
-    table_headers = ("合成表头一：标签名称", "合成表头二：优惠类型", "合成表头三：政策类型")
-    numbered = {number: f"{index}." for index, number in enumerate("①②③④⑤⑥", 1)}
-    lines = [*table_headers, "", shared_fields]
-    lines.extend(f"{numbered[line[:1]]}{line[1:]}" if line[:1] in numbered else line for line in policy_lines)
-    for suffix in "庚辛壬":
-        lines.append(f"      1. 占位子项公司{suffix}：占位")
-    body = "\n".join(lines)
-    starts, required, uncertain, _ = _policy_boundaries(body, companies_file=COMPANIES_FIXTURE)
-    assert len(starts) == 10
-    assert list(required) == list(range(2, 8))
-    assert uncertain == {starts[index] for index in (0, 7, 8, 9)}
-    assert _suspected_policy_count(body) == 6
-    for number, replacement in numbered.items():
-        model_reply = model_reply.replace(number, replacement)
-    replies = json.loads(model_reply)
-    rows = _contents(_run(
-        tmp_path, body, replies[:parsed_count],
-        tag_dates={"占位标签甲": "2099-02-15"},
-    ))
-    reminders = next(row for row in rows if row.startswith("提醒项\n"))
-    header_preview = " ".join("\n".join(table_headers)[:12].splitlines()).strip()
-    previews = [header_preview, *(f"1. 占位子项公司{suffix}：占" for suffix in "庚辛壬")]
-    assert reminders.splitlines()[1:] == [
-        f"段落 {index}：{preview}…，段落边界未确认，请审批人核对"
-        for index, preview in zip((1, 8, 9, 10), previews, strict=True)
-    ]
-    assert all("合成表头" not in row and "占位子项公司" not in row for row in rows if row != reminders)
-    content = "\n".join(rows)
-    if parsed_count == 6:
-        assert "处理状态\n解析完成，共 6 条政策。" in rows
-        for index in range(1, 7):
-            assert f"政策 {index} · 公司\n值　未确定\n" in content
-            field_rows = [
-                row for row in rows if row.startswith(f"政策 {index} · ")
-                and "\n原文出处　" in row and " · 候选 " not in row.partition("\n")[0]
-            ]
-            assert len(field_rows) == len(fields(PolicyDraft))
-        assert "政策 1 · 处理状态\n停在校验，需人工确认或请申请人补充。" in content
-    else:
-        assert "<font color='red'>处理状态\n解析不完整，需人工确认" in content
-        assert "原文疑似 6 条，解析出 5 条</font>" in content
-        assert "未校验" in content
-
-
-def test_suspected_count_uses_only_unindented_numbered_lines():
-    body = "1.\n2、\n3)\n一、\n政策1\n政策一\n① 占位\n⑳ 占位\n      1.\n\t①\n　⑳\n　 ②\n　\t③\n"
-    assert _suspected_policy_count(body) == 9
-
-
 def test_command_accepts_existing_parse_fixture(tmp_path):
     body = (PARSE_FIXTURES / "application.txt").read_text(encoding="utf-8")
     replies = json.loads((PARSE_FIXTURES / "model-reply.json").read_text(encoding="utf-8"))
-    content = _contents(_run(tmp_path, body, replies))
+    # The transport removes the mention and retains the following space. Supply the
+    # exact input seen by the fixed reply instead of shifting its coordinates.
+    content = _contents(_run(tmp_path, body, replies, separator=""))
     assert "处理状态\n解析完成，共 6 条政策。" in content
-
-
-@pytest.mark.parametrize(("count_evidence", "suspected"), [
-    ("标签名称：占位；标签名称：占位", 2),
-    ("标签：占位\n标签: 占位", 2),
-    ("1. 开始日期：占位\n2) 结束日期：占位", 3),
-])
-def test_command_checks_count_independently_of_policy_boundaries(tmp_path, single_policy, count_evidence, suspected):
-    body, model = single_policy
-    content = "\n".join(_contents(_run(tmp_path, body.rstrip() + "\n" + count_evidence, model)))
-    assert (
-        "<font color='red'>处理状态\n解析不完整，需人工确认\n"
-        f"原文疑似 {suspected} 条，解析出 1 条</font>"
-    ) in content
-    assert "未校验" in content
 
 
 def test_pipeline_turns_confirmed_mutex_no_into_red_uncertainty(monkeypatch):
@@ -944,3 +747,40 @@ def test_command_preserves_long_evidence(tmp_path, single_policy):
 def test_command_injection_still_enforces_approved_fingerprint(tmp_path, single_policy):
     body, model = single_policy
     assert _run(tmp_path, body, model, approved_body="合成的另一条正文") == [{"notice": "概念验证期不处理"}]
+
+
+
+def test_command_displays_pending_range_and_keeps_partial_draft(tmp_path, single_policy):
+    body, rows = single_policy
+    reply = fixed_reply(" " + body, rows)
+    tail = "\n合成新增段"
+    cards = _run(tmp_path, body + tail, reply)
+    content = "\n".join(_contents(cards))
+    assert "解析不完整，需人工确认" in content
+    assert "待确认范围 1" in content
+    assert f"body [{len(body) + 1}, {len(body) + len(tail) + 1})" in content
+    assert "政策 1 · 用户范围" in content
+    assert "未校验" in content
+    assert "待群卡片同意" not in content
+
+
+def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy):
+    body, rows = single_policy
+    evidence = "是否需要维护互斥组：否"
+    body += "\n" + evidence
+    rows[0]["maintain_mutual_exclusion_group"] = {"value": "否", "evidence": [evidence]}
+    content = "\n".join(_contents(_run(tmp_path, body, rows)))
+    assert "申请要求不维护互斥组，需人工确认" in content
+    assert "是否需要维护互斥组 · 候选 1\n值　否\n原文出处　「是否需要维护互斥组：否」" in content
+    assert "待群卡片同意" not in content
+
+
+def test_command_blocks_overlapping_policy_anchors(tmp_path, single_policy):
+    body, rows = single_policy
+    reply = fixed_reply(" " + body, rows)
+    first = reply["policies"][0]
+    reply["policies"].append({**first, "id": "p2", "main": span(1, 5)})
+    content = "\n".join(_contents(_run(tmp_path, body, reply)))
+    assert "待确认范围" in content
+    assert "未校验" in content
+    assert "待群卡片同意" not in content

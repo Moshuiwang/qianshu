@@ -8,6 +8,7 @@ from re import fullmatch
 from uuid import uuid4
 
 from qianshu.parse.model import CallResult, ModelError, ParseModel
+from qianshu.parse.protocol import PROTOCOL_VERSION
 
 from .business import measure_fingerprint, pairing_fingerprint
 from .runner import RULES, IncompleteReply
@@ -29,8 +30,10 @@ def _retryable(attempt: dict) -> bool:
 
 
 def _reply_failure(attempt: dict) -> str | None:
-    if attempt["failure_stage"] == "model_incomplete" and attempt["reply"]:
-        return "reply_truncated" if attempt["stop_reason"] == "max_tokens" else "reply_incomplete"
+    if attempt["failure_stage"] == "model_incomplete":
+        return {"max_tokens": "reply_truncated", "refusal": "reply_refused"}.get(
+            attempt["stop_reason"], "reply_incomplete",
+        )
     return None
 
 
@@ -185,7 +188,10 @@ class Recording:
         data = self.call_result or _untimed_attempt(self.model_id, reply, None)
         return {**data, "reply": reply}
 
-    def finish(self, token: str, status: str, received: bool) -> bool:
+    def finish(
+        self, token: str, status: str, received: bool, *,
+        code: str | None = None, path: tuple = (),
+    ) -> bool:
         """写入本篇录制，返回是否有传输中断造成的截断。"""
         attempts = self.document["attempts"]
         if status == "model_failed":
@@ -199,7 +205,8 @@ class Recording:
         self.unfinished_calls |= status == "model_failed" or failure == "parse_setup"
         record = {
             **self.document, "run_id": self.run_id, "configuration": self.config,
-            "model": self.model_id, "failure_stage": failure,
+            "model": self.model_id, "failure_stage": failure, "protocol_version": PROTOCOL_VERSION,
+            "reason_code": code, "structure_path": path,
         }
         name = self.names[token]
         raw = json_bytes(record)

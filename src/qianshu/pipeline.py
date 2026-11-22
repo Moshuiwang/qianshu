@@ -2,7 +2,6 @@
 
 import json
 import re
-from bisect import bisect_right
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime
@@ -13,9 +12,9 @@ from . import parse, validate
 from .draft import Candidate, DraftField, PackageRow, PolicyDraft, SourceExcerpt, Uncertainty
 from .feishu.cards import CardLine, DetailPage, detail_pages
 from .feishu.entrance import Application
-from .parse.companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
+from .parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
+from .parse.evidence import ReviewRange
 from .parse.model import ParseModel
-from .parse.scope import Span, clause_spans, numbered_field, policy_layout, without_list_prefix
 
 _FIELD_LABELS = {
     "policy_name": "优惠政策名称",
@@ -42,6 +41,8 @@ _DEFAULT_MUTEX = "互斥组按默认填是"
 _DEFAULT_HINTS = {
     _DEFAULT_MUTEX, "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1",
     parse._ATTACHMENTS_HINT, parse._POLICY_TYPE_HINT,
+    "充值 / 赠送天数按 1 月 = 30 天换算", "降包用户取消优惠按默认填是",
+    "降包用户取消优惠未写，请在卡片确认具体取值",
 }
 _MUTEX_NO = "申请要求不维护互斥组，需人工确认"
 _BOUNDARY_HINT = "段落边界无法确定，需人工确认"
@@ -50,130 +51,11 @@ _RULE_PENDING_FIELDS = (
     "policy_name", "trigger_once", "repeat_bonus", "effective_multiplier",
 )
 _RULE_PENDING_REASON = "取值规则待确认。"
-_CHINESE_ORDINAL = r"[一二三四五六七八九十百两]+"
-_ORDINAL = rf"(?:\d+|{_CHINESE_ORDINAL})"
-_POLICY_ORDINAL = rf"政策[ \t]*{_ORDINAL}(?=$|[\s：:、.．)），,。！？；;])"
-_POLICY_START_RULES = (
-    r"另(?:外)?[，,、]?\s*(?:再)?(?:申请|(?:新增|追加|补充)\s*(?:一|1|壹)?\s*(?:条|项|份))",
-    r"(?:另(?:外)?|还有)\s*(?:一|1|壹)\s*(?:条|项)",
-    rf"第\s*{_ORDINAL}\s*条|第\s*{_ORDINAL}\s*项\s*(?:独立)?(?:政策|申请)",
-    _POLICY_ORDINAL,
-    r"(?:新增|追加|补充|额外|另需|另行|还想|也申请)[^，,：:\r\n]{0,16}?(?:一条|一项|政策)",
-    r"(?:再|还要|还需|同时)\s*申请",
-)
-_POLICY_START = re.compile("|".join(_POLICY_START_RULES))
-_POSSIBLE_POLICY_START = re.compile(
-    r"(?:另外|另有|此外|还有|其[二三四五六七八九十]|[一二三四五六七八九十]+[、.．])|"
-    r"(?:还(?:需|要)|再(?:加|提|补)|同时)[^\r\n]{0,24}?(?:政策|申请|一条|一项)|"
-    r"[^：:，,。！？；;]{1,40}政策申请\s*[:：]"
-)
-_PARAGRAPH = re.compile(r"(?:\r?\n[^\S\r\n]*){2,}(?=\S)")
-_FIELD_START = re.compile(rf"(?:{'|'.join(map(re.escape, _FIELD_LABELS.values()))})\s*[:：]")
-# 行首只有半角空格和 Tab 形成缩进，全角空格可出现在它们之前。
-_UNINDENTED_PREFIX = r"[^\S\r\n \t]*"
-_INDENTED_LINE = re.compile(rf"{_UNINDENTED_PREFIX}[ \t]")
-
-
-def _suspected_policy_count(body: str) -> int:
-    numbered_line = (
-        rf"^{_UNINDENTED_PREFIX}(?:[①-⑳]|\d+(?:[.．](?!\d)|[、)）])|{_CHINESE_ORDINAL}、|{_POLICY_ORDINAL})"
-    )
-    return max(
-        body.count("标签名称"),
-        len(re.findall(r"^标签[ \t]*[:：]", body, re.MULTILINE)),
-        len(re.findall(numbered_line, body, re.MULTILINE)),
-    )
 
 
 def _rule_pending(draft: PolicyDraft, name: str) -> bool:
     uncertainty = getattr(draft, name).uncertainty
     return name in _RULE_PENDING_FIELDS and uncertainty is not None and uncertainty.reason == _RULE_PENDING_REASON
-
-
-def _policy_boundaries(
-    body: str, *, companies_file: Path | None = None, company_rules: CompanyRules | None = None,
-) -> tuple[list[int], dict[int, Span], set[int], tuple[Span, ...]]:
-    if company_rules is None:
-        company_rules = load_company_rules(Path("rules"), companies_file or DEFAULT_COMPANIES_FILE)
-    configured_names = {name for names in company_rules.names.values() for name in names}
-    headings, excluded = policy_layout(body, company_rules.countries, configured_names)
-    heading_starts = {heading.start for heading in headings}
-    explicit = set()
-    uncertain = set()
-    for line in re.finditer(r"[^\r\n]+", body):
-        for left, right in clause_spans(line[0], punctuation="。！？；;"):
-            content = without_list_prefix(line[0][left:right].lstrip())
-            start = line.start() + left
-            if match := _POLICY_START.search(content):
-                prefix = content[:match.start()]
-                if "，" in prefix or "," in prefix:
-                    start = line.start() + right - len(content) + match.start()
-                explicit.add(start)
-            elif start not in heading_starts and _POSSIBLE_POLICY_START.match(content):
-                # 单换行也可能开始一段新政策。
-                uncertain.add(start)
-
-    paragraphs = list(_PARAGRAPH.finditer(body))
-    if paragraphs and heading_starts and paragraphs[0].start() < min(heading_starts):
-        first = len(body) - len(body.lstrip())
-        if first < paragraphs[0].start() and not any(left <= first < right for left, right in excluded):
-            uncertain.add(0)
-    for paragraph in paragraphs:
-        start = body.rfind("\n", 0, paragraph.end()) + 1
-        if start in heading_starts or start in explicit or any(left <= start < right for left, right in excluded):
-            continue
-        content = without_list_prefix(body[paragraph.end():].partition("\n")[0])
-        if not (numbered_field(content) or _FIELD_START.match(content)):
-            uncertain.add(start)
-
-    coverage_stops = sorted(heading_starts | explicit | {len(body)})
-    indented = {start for start in heading_starts if _INDENTED_LINE.match(body, start)}
-    required = (heading_starts - indented) | explicit
-    starts = heading_starts | explicit | uncertain
-    if starts and body[:min(starts)].strip() and min(starts) not in heading_starts:
-        # 「另申请」前没有可识别的标题时，前文仍可能包含第一条政策。
-        starts.add(0)
-    display_starts = sorted(starts or {0})
-    spans = {
-        index: (start, coverage_stops[bisect_right(coverage_stops, start)])
-        for index, start in enumerate(display_starts, 1) if start in required
-    }
-    return display_starts, spans, (uncertain | indented) - required, excluded
-
-
-def _exact_excerpt_span(body: str, excerpt: SourceExcerpt) -> Span | None:
-    if not excerpt.text.strip():
-        return None
-    start = excerpt.start
-    if start is None:
-        start = body.find(excerpt.text)
-        if start < 0 or body.find(excerpt.text, start + 1) >= 0:
-            return None
-    if start >= 0 and body.startswith(excerpt.text, start):
-        return start, start + len(excerpt.text)
-    return None
-
-
-def _uncovered_required_segments(
-    body: str, drafts: Sequence[PolicyDraft], required: Mapping[int, Span], excluded: tuple[Span, ...],
-) -> list[int]:
-    covered = set()
-    for draft in drafts:
-        local = []
-        for field in fields(draft):
-            for excerpt in getattr(draft, field.name).evidence:
-                if (span := _exact_excerpt_span(body, excerpt)) is not None:
-                    left, right = span
-                    if not any(left < stop and begin < right for begin, stop in excluded):
-                        local.append(span)
-        matches = {
-            index for index, (start, end) in required.items()
-            if any(start <= left and right <= end for left, right in local)
-        }
-        # 同一份草稿的摘录落入多个必核段时，无法确认其唯一归属。
-        if len(matches) == 1:
-            covered.update(matches)
-    return [index for index in required if index not in covered]
 
 
 def _utc_today() -> date:
@@ -316,51 +198,32 @@ class Pipeline:
         }, key=len, reverse=True)
         self._sensitive = re.compile("|".join(map(re.escape, values))) if values else None
 
-    def _boundary_reminders(self, body: str, starts: list[int], uncertain: set[int]) -> list[CardLine]:
+    def _boundary_reminders(self, body: str, pending: Iterable[ReviewRange]) -> list[CardLine]:
         reminders = []
-        for index, (start, end) in enumerate(zip(starts, [*starts[1:], len(body)], strict=True), 1):
-            if start not in uncertain:
-                continue
-            segment = body[start:end]
-            if self._sensitive:
-                segment = self._sensitive.sub("[已脱敏]", segment)
-            preview = " ".join(segment.lstrip()[:12].splitlines()).strip()
-            reminders.append(f"段落 {index}：{preview}…，段落边界未确认，请审批人核对")
-        return [CardLine("提醒项", "\n".join(reminders))] if reminders else []
+        sensitive_spans = [match.span() for match in self._sensitive.finditer(body)] if self._sensitive else []
+        for index, item in enumerate(pending, 1):
+            span = item.span
+            location = f"{span.source_id} [{span.start}, {span.end})" if span else "无可定位坐标"
+            if span and span.source_id == "body":
+                start, end = span.start, span.end
+                segment = body[start:end]
+                if self._sensitive:
+                    segment = self._sensitive.sub("[已脱敏]", segment)
+                crosses_edge = any(left < start < right or left < end < right for left, right in sensitive_spans)
+                if not crosses_edge and (preview := " ".join(segment.lstrip()[:12].splitlines()).strip()):
+                    location += f"\n「{preview}」"
+            reminders.append(CardLine(f"待确认范围 {index}", location, red=True))
+        return reminders
 
     def __call__(self, application: Application) -> tuple[DetailPage, ...]:
         source = "飞书群申请"
         try:
             body = application.text
-            suspected = _suspected_policy_count(body)
             company_rules = load_company_rules(
                 Path("rules"), self.companies_file or DEFAULT_COMPANIES_FILE, legacy=self.legacy_companies,
             )
-            starts, required, uncertain, excluded = _policy_boundaries(body, company_rules=company_rules)
-            reminders = self._boundary_reminders(body, starts, uncertain)
-            parse_failed = False
-            try:
-                on_reply = None if self._on_reply is None else partial(self._on_reply, application)
-                drafts = parse.parse_application(body, model=self.model, on_reply=on_reply, company_rules=company_rules)
-            except Exception:
-                if len(starts) == 1 and not uncertain and not suspected:
-                    raise
-                drafts = ()
-                parse_failed = True
-            parsed_count = len(drafts)
-            uncovered = _uncovered_required_segments(body, drafts, required, excluded)
-            if parsed_count < suspected or uncovered or parse_failed:
-                status = "解析不完整，需人工确认"
-                if parse_failed:
-                    status += "\n停在解析，请核对申请正文或解析配置。"
-                if parsed_count < suspected:
-                    status += f"\n原文疑似 {suspected} 条，解析出 {parsed_count} 条"
-                return detail_pages(source, [
-                    CardLine("处理状态", status, red=True),
-                    CardLine("未确认覆盖的段落序号", "、".join(map(str, uncovered)) or "无"),
-                    *reminders,
-                    CardLine("后续处理", "请核对段落与草稿对应关系。未校验。"),
-                ])
+            on_reply = None if self._on_reply is None else partial(self._on_reply, application)
+            drafts = parse.parse_application(body, model=self.model, on_reply=on_reply, company_rules=company_rules)
             policies = []
             for parsed in drafts:
                 draft = _review_mutex(parsed)
@@ -377,22 +240,34 @@ class Pipeline:
                 ),
             ])
 
-        try:
-            results = validate.validate_batch(
-                [(policy.draft, _facts(policy.draft, self.tag_dates)) for policy in policies],
-                today=self.today(),
-            )
-            policies = [
-                replace(policy, draft=draft, validation=result)
-                for policy, (draft, result) in zip(policies, results, strict=True)
-            ]
-        except Exception:
-            status = "解析完成，校验执行异常。"
+        pending = getattr(drafts, "pending", ())
+        document = getattr(drafts, "document", None)
+        reminders = []
+        if document:
+            reminders.append(CardLine("文档判定", document.status.value))
+        reminders.extend(self._boundary_reminders(body, pending))
+
+        if pending:
+            status = "解析不完整，需人工确认\n请核对待确认范围与已提取的草稿。未校验。"
+        elif document and not policies:
+            status = document.status.value
         else:
-            status = f"解析完成，共 {len(policies)} 条政策。"
+            try:
+                results = validate.validate_batch(
+                    [(policy.draft, _facts(policy.draft, self.tag_dates)) for policy in policies],
+                    today=self.today(),
+                )
+                policies = [
+                    replace(policy, draft=draft, validation=result)
+                    for policy, (draft, result) in zip(policies, results, strict=True)
+                ]
+            except Exception:
+                status = "解析完成，校验执行异常。"
+            else:
+                status = f"解析完成，共 {len(policies)} 条政策。"
 
         lines = [
-            CardLine("处理状态", status),
+            CardLine("处理状态", status, red=bool(pending)),
             *reminders,
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
             *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}")),
