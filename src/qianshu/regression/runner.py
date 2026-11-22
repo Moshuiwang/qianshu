@@ -185,7 +185,8 @@ def evaluate(
             common_countries[name].add(country)
     business = BusinessScore(frozen, threshold, {
         name: next(iter(countries)) for name, countries in common_countries.items() if len(countries) == 1
-    }, company_table=company_rules.table if company_rules is not None else None)
+    }, company_table=company_rules.table if company_rules is not None else None,
+        country_names=company_rules.countries if company_rules is not None else None)
     business_details = []
     reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
     reply_failed_documents = 0

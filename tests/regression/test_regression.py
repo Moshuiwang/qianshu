@@ -668,7 +668,15 @@ def test_broad_real_draft_checks_repeated_evidence_in_sampled_paragraph(first_du
 
 
 @pytest.mark.parametrize("legacy", [False, True], ids=["four-columns", "legacy"])
-def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denominators(repo, corpus, capsys, caplog, legacy):
+@pytest.mark.parametrize(("country", "grade"), [("ZM", "correct"), ("XX", "false_determined")])
+def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denominators(
+    repo, corpus, capsys, caplog, legacy, country, grade,
+):
+    catalogs(corpus, [
+        ("policy-a", "doc-batch", country, "定向政策", "赠送时长"),
+        ("policy-b", "doc-batch", "莫桑比克", "定向政策", "赠送时长"),
+        ("policy-c", "doc-single", country, "公开政策", "升级权益"),
+    ])
     if legacy:
         (repo / "companies.tsv").write_text("赞比亚\t占位公司甲\n莫桑比克\t占位公司乙\n", encoding="utf-8")
     assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
@@ -700,6 +708,8 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
     assert report["sample_alignment"]["matched"] == 2
     assert report["by_field"]["company"]["match"] == 1
     assert report["by_field"]["company"]["error"] == 1
+    assert report["business"]["by_field"]["company"]["correct"] == int(grade == "correct")
+    assert report["business"]["by_field"]["company"]["false_determined"] == 1 + (grade == "false_determined")
     assert report["by_field"]["user_scope"] == {
         "denominator": 3, "match": 1, "error": 1, "uncertain": 0,
         "missing": 0, "anomaly": 1, "match_percent": 33.33,
@@ -1317,6 +1327,11 @@ def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
     ([], "原文未写", "公开政策", None, True, True),
     ([], "原文未写", "定向政策", None, True, True),
     (None, None, "定向政策", None, True, True),
+    ("historical_rule", None, "定向政策", None, False, False),
+    ("source_anomaly", "确定", "公开政策", None, False, False),
+    ("historical_rule", "原文未写", "定向政策", None, True, True),
+    ("source_anomaly", "歧义", "定向政策", None, True, True),
+    ("historical_rule", "确定", "定向政策", "冲突", True, False),
 ])
 def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, name_status, name_review, type_review):
     from qianshu.draft import SourceExcerpt
@@ -1329,7 +1344,9 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
         "source_status": {name: status for name, status in {"user_tags": tag_status, "policy_name": name_status}.items()
                           if status is not None},
     }
-    if tags is not None:
+    if isinstance(tags, str):
+        pair["configuration"]["user_tags"] = {"exclude": tags}
+    elif tags is not None:
         pair["configuration"]["user_tags"] = {"value": tags}
     frozen = {
         "samples": {"policy": sample},
@@ -1348,6 +1365,47 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
         expected = ({True: "false_determined", False: "correct"} if confirmed
                     else {True: "justified_confirmation", False: "overasked"})
         assert result["policies"][0]["fields"] == {name: expected[review[name]] for name in values}
+
+
+@pytest.mark.parametrize(("confirm", "expected"), [
+    (False, "false_determined"),
+    (True, "justified_confirmation"),
+])
+def test_g285_uses_frozen_pairing_tags_when_tag_gold_is_excluded(confirm, expected):
+    from qianshu.draft import SourceExcerpt
+    from qianshu.regression.business import BusinessScore
+
+    tags = ["占位标签甲", "占位标签乙"]
+    configuration = {
+        "policy_name": {"value": tags[0]},
+        "policy_type": {"value": "公开政策"},
+        "user_tags": {"exclude": "historical_rule"},
+    }
+    pair = {
+        "id": "policy", "configuration": configuration,
+        "source_status": {"user_tags": "确定"},
+        "pairing": {"user_tags": tags},
+    }
+    sample = {"country": "占位地区", "benefit_type": "赠送时长", "policy_type": "公开政策"}
+    frozen = {
+        "samples": {"policy": sample},
+        "denominators": freeze_module._denominators([pair], configuration),
+    }
+    body = "占位原文"
+    uncertainty = Uncertainty(reason="占位待确认") if confirm else None
+    evidence = [SourceExcerpt(text=body, start=0)]
+    draft = SimpleNamespace(
+        benefit_type=DraftField(value=sample["benefit_type"]),
+        policy_name=DraftField(value=tags[0], evidence=evidence, uncertainty=uncertainty),
+        policy_type=DraftField(value="公开政策", evidence=evidence, uncertainty=uncertainty),
+        user_tags=DraftField(value=tags, evidence=evidence),
+        to_dict=lambda: {},
+    )
+
+    score = BusinessScore(frozen, 2, {})
+    result = score.add({"body": body}, [pair], [draft])
+    assert result["policies"][0]["fields"] == {"policy_name": expected, "policy_type": expected}
+    assert score.report(0)["rates"]["false_determined"]["denominator"] == 2
 
 
 def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
