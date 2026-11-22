@@ -293,7 +293,9 @@ class _ReportProcessor:
                 WHERE pages IS NOT NULL AND expires_at <= ?
             """, (self.clock(),))
 
-    def resume(self, *, mail_only: bool = False) -> None:
+    def resume(
+        self, *, mail_only: bool = False, managed: Callable[[str], bool] | None = None,
+    ) -> None:
         self.expire()
         if not self.window.contains(self.clock()):
             return
@@ -307,9 +309,74 @@ class _ReportProcessor:
             is_mail = digest.startswith(_MAIL_PREFIX)
             if is_mail:
                 self._deliver(digest)
-            elif not mail_only:
+            elif not mail_only and not (managed and managed(digest)):
                 self._send_notice(digest)
                 self._deliver(digest)
+
+    def snapshot_status(self, digest: str) -> str | None:
+        with closing(self._connect()) as db:
+            row = db.execute("""
+                SELECT binding, manual_page, sent_pages, total_pages, pages, notice,
+                       page_first_attempt, notice_first_attempt, notice_confirmed
+                FROM reports WHERE digest = ?
+            """, (digest,)).fetchone()
+        if row is None:
+            return None
+        if row["binding"] != self.binding or row["manual_page"] is not None:
+            return "listed"
+        if row["total_pages"] > 0 and row["sent_pages"] == row["total_pages"]:
+            return "done"
+        if not 0 <= row["sent_pages"] < row["total_pages"] or row["pages"] is None:
+            return "manual_pending"
+        attempts = [row["page_first_attempt"]]
+        if not row["notice_confirmed"]:
+            attempts.append(row["notice_first_attempt"])
+        if any(t is not None and not 0 <= self.clock() - t <= _REPORT_RETRY_SECONDS for t in attempts):
+            return "listed"
+        pages = json.loads(row["pages"])
+        if not isinstance(pages, list) or len(pages) != row["total_pages"]:
+            return "manual_pending"
+        payloads = list(enumerate(pages, 1))
+        if row["notice"] is not None:
+            payloads.append(("stopped", json.loads(row["notice"])))
+        for suffix, payload in payloads:
+            if not isinstance(payload, list) or len(payload) != 2 or not isinstance(payload[1], dict):
+                return "manual_pending"
+            if self._payload(digest, suffix, payload[1])[0] != payload[0]:
+                return "manual_pending"
+        return "report_saved"
+
+    def recover_snapshot(self, digest: str) -> str | None:
+        status = self.snapshot_status(digest)
+        if status == "report_saved":
+            self._send_notice(digest)
+            self._deliver(digest)
+            status = self.snapshot_status(digest)
+            if status == "report_saved":
+                return "manual_pending"
+        return status
+
+    def attach(self, entrance: Entrance, transport: Transport) -> None:
+        # 旧快照没有入口阶段，沿用原续发路径。新版只在原认领锁下对账、续发。
+        def managed(digest: str) -> bool:
+            row = entrance.state.message_record(digest)
+            return row is not None and row["stage"] is not None
+
+        entrance.snapshot_status = self.snapshot_status
+        entrance.recover_snapshot = self.recover_snapshot
+        entrance.manual_send = self.send_manual
+        entrance.transport = _EntranceTransport(transport, partial(self.resume, managed=managed))
+
+    def send_manual(self, card: dict, digest: str, first: float) -> None:
+        request_id, _ = self._payload(digest, "entrance-recovery", card)
+
+        def check() -> None:
+            now = self.clock()
+            if not self.window.contains(now) or not first <= now < first + _REPORT_RETRY_SECONDS:
+                raise RuntimeError("人工待办自动发送期限已结束。")
+
+        check()
+        self.send(card, request_id, True, check)
 
     def __call__(self, application: Application) -> Report:
         digest = sha256(application.message.message_id.encode()).hexdigest()
@@ -397,11 +464,12 @@ def _inject(
     with tempfile.TemporaryDirectory(prefix="qianshu-inject-") as directory:
         state = State(Path(directory) / "state.sqlite", settings)
         try:
+            processor = _processor(pipeline, transport.send_report_card, window, Path(directory) / "reports.sqlite")
             entrance = Entrance(
-                settings, window, state, _EntranceTransport(transport),
-                _processor(pipeline, transport.send_report_card, window, Path(directory) / "reports.sqlite"),
+                settings, window, state, transport, processor,
             )
             try:
+                processor.attach(entrance, transport)
                 receipt = entrance.inject_message(message)
                 if receipt is not None and (processing := receipt.result()) is not None:
                     processing.result()
@@ -586,9 +654,11 @@ def _serve(
     processor = _processor(pipeline, send, window, report_state, scope=scope, mail_stop=stop, mail_scope=mail_scope)
     processor.expire()
     if not window.contains(time.time()):
+        if args.state.exists():
+            _LOG.warning("feishu_recovery_unfinished count=%d", len(State.recovery_list(args.state)))
         raise ValueError("当前不在验收窗口内。")
     service = FeishuService(settings, window, args.state, processor)
-    service.entrance.transport = _EntranceTransport(service.transport, processor.resume)
+    processor.attach(service.entrance, service.transport)
 
     def process_mail(body: str, approved: bool, fingerprint: str) -> None:
         digest = _MAIL_PREFIX + fingerprint
@@ -641,7 +711,19 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--handoff-only", action="store_true", help="只把飞书群 @ 转交守望者。")
     parser.add_argument("--business-env-file", type=Path, help="仅转交监听器用于出站比对的业务私有配置。")
     parser.add_argument("--mingdao-config", type=Path, help="仅转交监听器用于定位官方接口令牌键名的明道云 JSON 配置。")
+    parser.add_argument("--list-recovery", action="store_true", help="只读列出私有入口库未完成事项，供守望者上报。")
     args = parser.parse_args(argv)
+    if args.list_recovery:
+        if args.state is None or any((args.inject, args.handoff_only, args.mail)):
+            parser.error("--list-recovery 需要 --state，并须独立于发送入口运行。")
+        try:
+            rows = State.recovery_list(args.state)
+        except (OSError, ValueError, sqlite3.Error):
+            print("恢复清单读取失败，请核对私有入口库。", file=sys.stderr)
+            return 1
+        print(json.dumps(rows, ensure_ascii=False))
+        print(f"未完成记录数 {len(rows)}", file=sys.stderr)
+        return 0
     if args.handoff_only:
         if any((args.window_start, args.window_end, args.state, args.inject, args.mail,
                 args.tag_dates, args.companies_file, args.legacy_companies, args.raw_output_dir)):

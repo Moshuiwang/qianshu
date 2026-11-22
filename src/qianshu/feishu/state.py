@@ -1,13 +1,16 @@
 """工作区外的私有 SQLite 状态。"""
 
+import fcntl
 import hashlib
 import math
+import os
 import sqlite3
 import time
 from collections.abc import Callable
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from threading import Lock
+from typing import BinaryIO
 
 from .settings import Settings
 
@@ -73,8 +76,97 @@ class State:
                 INSERT OR IGNORE INTO feishu_callback_events (scope, event_id)
                 SELECT scope, event_id FROM feishu_approvals WHERE event_id IS NOT NULL
             """)
-            if not any(column[1] == "status" for column in db.execute("PRAGMA table_info(feishu_messages)")):
+            columns = {column[1] for column in db.execute("PRAGMA table_info(feishu_messages)")}
+            if "status" not in columns:
                 db.execute("ALTER TABLE feishu_messages ADD COLUMN status TEXT NOT NULL DEFAULT 'done'")
+            # 旧入口只读 status；新版已认领的行对旧入口始终显示 done。
+            for name, declaration in (
+                ("stage", "TEXT"), ("binding", "TEXT"), ("created_ms", "INTEGER"),
+                ("expires", "REAL"), ("manual_since", "REAL"),
+                ("manual_attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE feishu_messages ADD COLUMN {name} {declaration}")
+
+    def message_lease(self, digest: str) -> BinaryIO | None:
+        """每条消息只允许一个执行者，崩溃后由内核释放。"""
+        directory = self.path.with_name(self.path.name + ".leases")
+        directory.mkdir(mode=0o700, exist_ok=True)
+        name = hashlib.sha256(f"{self.scope}\0{digest}".encode()).hexdigest()
+        fd = os.open(directory / name, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        lease = os.fdopen(fd, "rb")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lease.close()
+            return None
+        return lease
+
+    def receive(self, digest: str, binding: str, created_ms: int, expires: float) -> None:
+        with self._write() as db:
+            db.execute("""
+                INSERT OR IGNORE INTO feishu_messages
+                    (scope, digest, status, stage, binding, created_ms, expires)
+                VALUES (?, ?, 'done', 'received', ?, ?, ?)
+            """, (self.scope, digest, binding, created_ms, expires))
+
+    def message_record(self, digest: str) -> sqlite3.Row | None:
+        with self.connection() as db:
+            db.row_factory = sqlite3.Row
+            return db.execute("SELECT * FROM feishu_messages WHERE scope = ? AND digest = ?",
+                              (self.scope, digest)).fetchone()
+
+    def unfinished(self) -> list[sqlite3.Row]:
+        with self.connection() as db:
+            db.row_factory = sqlite3.Row
+            return db.execute("""
+                SELECT * FROM feishu_messages WHERE scope = ? AND stage IS NOT NULL
+                    AND stage NOT IN ('done', 'manual_notified')
+            """, (self.scope,)).fetchall()
+
+    @staticmethod
+    def recovery_list(path: Path) -> list[dict]:
+        """只读打开，即使服务窗口已关闭，也能从私有库交接。"""
+        if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
+            raise ValueError("须指定私有入口状态文件。")
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
+            db.row_factory = sqlite3.Row
+            columns = {c[1] for c in db.execute("PRAGMA table_info(feishu_messages)")}
+            if "digest" not in columns:
+                raise ValueError("入口状态表不存在。")
+            if "stage" not in columns:
+                if "status" not in columns:
+                    return []
+                return [dict(row) for row in db.execute("""
+                    SELECT scope, digest, NULL AS created_ms, NULL AS expires,
+                           CASE WHEN status = 'notice_pending' THEN status ELSE 'legacy_unknown' END AS stage
+                    FROM feishu_messages WHERE status != 'done' ORDER BY scope, digest
+                """)]
+            return [dict(row) for row in db.execute("""
+                SELECT scope, digest, created_ms, expires, COALESCE(stage, CASE WHEN status = 'notice_pending' THEN status ELSE 'legacy_unknown' END) AS stage
+                FROM feishu_messages
+                WHERE stage NOT IN ('done', 'manual_notified')
+                   OR (stage IS NULL AND status != 'done')
+                ORDER BY scope, created_ms, digest
+            """)]
+
+    def advance_message(self, digest: str, previous: str, stage: str) -> None:
+        with self._write() as db:
+            changed = db.execute("""
+                UPDATE feishu_messages SET stage = ? WHERE scope = ? AND digest = ? AND stage = ?
+            """, (stage, self.scope, digest, previous)).rowcount
+            if changed != 1:
+                raise RuntimeError("入口状态已变化。")
+
+    def start_manual_notice(self, digest: str, stage: str, now: float) -> None:
+        with self._write() as db:
+            changed = db.execute("""
+                UPDATE feishu_messages SET manual_since = COALESCE(manual_since, ?),
+                    manual_attempts = manual_attempts + 1, stage = 'manual_notice_unknown'
+                WHERE scope = ? AND digest = ? AND stage = ?
+            """, (now, self.scope, digest, stage)).rowcount
+            if changed != 1:
+                raise RuntimeError("入口状态已变化。")
 
     def _connect(self, *, check_same_thread: bool = True) -> sqlite3.Connection:
         db = sqlite3.connect(self.path, autocommit=True, check_same_thread=check_same_thread)
@@ -145,7 +237,7 @@ class State:
         digest = hashlib.sha256(message_id.encode()).hexdigest()
         with self.connection() as db:
             row = db.execute(
-                "SELECT status FROM feishu_messages WHERE scope = ? AND digest = ?", (self.scope, digest),
+                "SELECT COALESCE(stage, status) FROM feishu_messages WHERE scope = ? AND digest = ?", (self.scope, digest),
             ).fetchone()
             return row[0] if row else None
 

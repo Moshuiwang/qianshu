@@ -1142,3 +1142,41 @@ def test_stalled_endpoint_does_not_prevent_window_cleanup(connected, monkeypatch
     if reconnect:
         assert first.close_code == 1000
     assert service._client._conn is service._origin is None
+
+
+def test_acked_application_reaction_failure_delivers_manual_task(connected, monkeypatch):
+    service, socket, _ = connected
+    settings = service.settings
+    acked, notified = Event(), Event()
+    attempts, reactions = [], []
+
+    def react(mid):
+        reactions.append(mid)
+        assert acked.wait(2)
+        raise TimeoutError
+
+    def manual(card, digest, first):
+        assert "人工核对" in str(card) and digest in str(card)
+        attempts.append((digest, first))
+        if len(attempts) < 3:
+            raise OSError("合成请求未发出")
+        notified.set()
+
+    monkeypatch.setattr(service.transport, "react", react)
+    service.entrance.manual_send = manual
+    dispatch(service, {
+        "schema": "2.0",
+        "header": {"app_id": settings.app_id, "event_type": "im.message.receive_v1"},
+        "event": {
+            "sender": {"sender_type": "user", "sender_id": {"open_id": next(iter(settings.allowed_senders))}},
+            "message": {
+                "message_id": "合成回执失败", "chat_id": settings.chat_id, "chat_type": "group",
+                "create_time": "120000", "message_type": "text", "content": '{"text":"@_user_1 合成样例 ABC"}',
+                "mentions": [{"key": "@_user_1", "id": {"open_id": settings.bot_open_id}}],
+            },
+        },
+    })
+    assert socket.responses == ["event_ack"]
+    acked.set()
+    assert notified.wait(4)
+    assert len(reactions) == 1 and len(attempts) == 3 and len(set(attempts)) == 1
