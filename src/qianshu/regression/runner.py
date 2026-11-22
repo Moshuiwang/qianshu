@@ -2,16 +2,18 @@
 
 from collections import Counter, defaultdict
 from dataclasses import fields
+from datetime import date
 from pathlib import Path
 from typing import get_origin
 
-from qianshu.draft import DraftField, PolicyDraft
+from qianshu.draft import DraftField, OfferPolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
+from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
 from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
 
-from .business import COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
+from .business import CATEGORIES, COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
 from .freeze import PACKAGE_STYLES
 from .storage import RegressionError, digest, json_bytes
@@ -160,7 +162,7 @@ def _new_field_status(draft, name: str) -> str:
 
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
-    threshold: int = DEFAULT_THRESHOLD, recording=None,
+    threshold: int = DEFAULT_THRESHOLD, recording=None, today: date | None = None,
 ) -> tuple[dict, dict]:
     samples = frozen["samples"]
     pairs = defaultdict(list)
@@ -168,7 +170,7 @@ def evaluate(
         pairs[pair["token"]].append(pair)
     denominator = frozen["denominators"]
     eligible = {name: set(field["ids"]) for name, field in denominator["fields"].items()}
-    draft_fields = {field.name for field in fields(PolicyDraft) if get_origin(field.type) is DraftField}
+    draft_fields = {field.name for field in fields(OfferPolicyDraft) if get_origin(field.type) is DraftField}
     new_fields = sorted((draft_fields | FIELD_LABELS.keys()) - eligible.keys() - set(APPROVAL_FIELDS))
     new_field_counts = {name: Counter() for name in new_fields}
     full = set(denominator["whole_policy"])
@@ -200,10 +202,12 @@ def evaluate(
     for country, names in company_names.items():
         for name in names:
             common_countries[name].add(country)
+    codes = country_codes((rules_dir / "countries.txt").read_text(encoding="utf-8"))
     business = BusinessScore(frozen, threshold, {
         name: next(iter(countries)) for name, countries in common_countries.items() if len(countries) == 1
     }, company_table=company_rules.table if company_rules is not None else None,
-        country_names=company_rules.countries if company_rules is not None else None)
+        country_names=company_rules.countries if company_rules is not None else None,
+        country_codes=codes, today=today)
     business_details = []
     evidence_locations = Counter()
     full_review_cards = full_review_policies = 0
@@ -226,6 +230,8 @@ def evaluate(
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
+                today=today, country_codes=codes,
+                recorded_reply=getattr(recording, "origin", None) in ("replay", "probe"),
             )
         except IncompleteReply as error:
             received = True
@@ -454,6 +460,21 @@ def markdown_report(report: dict) -> bytes:
     for key, label in COUNT_LABELS.items():
         suffix = breakdown if key == "reply_parse_failed" else ""
         result.append(f"- {label} {report['business']['counts'][key]}{suffix}")
+    result.extend(["", "| 优惠类型 | 业务字段 | 正确确定 | 错判确定 | 多问 | 合理需确认 | 缺失 | 未知 |",
+                   "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"])
+    for kind, field_counts in report["business"]["by_benefit_type"].items():
+        for name, counts in field_counts.items():
+            label = FIELD_LABELS[name][0] if name in FIELD_LABELS else name
+            result.append("| " + " | ".join([kind, label, *(str(counts[key]) for key in CATEGORIES)]) + " |")
+    if name_counts := report["business"].get("policy_names"):
+        result.extend(["", "## #58 政策名称计数", ""])
+        for policy_type, counts in (name_counts | report["business"].get("public_name_sources", {})).items():
+            result.append(
+                f"- {policy_type} 可比 {counts['comparable']}，正确建议 {counts['correct_proposal']}，"
+                f"错误建议 {counts['incorrect_proposal']}，正确确定 {counts['correct']}，错判确定 {counts['false_determined']}，"
+                f"多问 {counts['overasked']}，合理需确认 {counts['justified_confirmation']}，"
+                f"缺草稿 {counts['missing']}，未知 {counts['unknown']}"
+            )
     if "configuration_sha256" in report:
         result.extend(["", f"- 运行配置指纹 `{report['configuration_sha256']}`"])
         for key, label in (("input_tokens", "输入 token"), ("output_tokens", "输出 token"), ("elapsed_ms", "耗时毫秒")):

@@ -57,6 +57,11 @@ def _date(value: str | None) -> date | None:
     return parsed if parsed.isoformat() == value else None
 
 
+def effective_start_date(start: date, today: date) -> date:
+    """按 R1 取当前可执行的生效日。"""
+    return max(start, today)
+
+
 def _is_web_url(value: str) -> bool:
     if "\\" in value or any(ch.isspace() or ord(ch) < 32 or ord(ch) == 127 for ch in value):
         return False
@@ -74,10 +79,17 @@ def _is_web_url(value: str) -> bool:
 
 
 def _required_fields(draft: PolicyDraft, errors: list[Finding]) -> None:
+    from qianshu.parse.benefits import OFFER_FIELD_LABELS, benefit_applicability, benefit_field_format
+
+    inactive_benefits, required_benefits = benefit_applicability(draft)
     for item in fields(draft):
         field = getattr(draft, item.name)
         if field.uncertainty is not None:
             errors.append(Finding("R5", item.name, "字段尚未确认，请申请人确认。"))
+        elif item.name in inactive_benefits:
+            continue
+        elif item.name in OFFER_FIELD_LABELS and item.name not in required_benefits and field.value is None:
+            continue
         elif item.name not in {
             "maintain_mutual_exclusion_group", "company", "approval_url",
             "user_scope", "approval_attachments", "user_tags",
@@ -85,6 +97,11 @@ def _required_fields(draft: PolicyDraft, errors: list[Finding]) -> None:
             value = field.value
             if value is None or (isinstance(value, str) and not value.strip()):
                 errors.append(Finding("R5", item.name, "必填字段缺失，请申请人补充。"))
+            elif not benefit_field_format(item.name, value):
+                errors.append(Finding("R5", item.name, "优惠字段格式无效，请申请人核对。"))
+    for name in sorted(required_benefits):
+        if not hasattr(draft, name):
+            errors.append(Finding("R5", name, "必填字段缺失，请申请人补充。"))
 
     packages = _value(draft.packages)
     if packages is not None and (
@@ -146,9 +163,10 @@ def validate_draft(
         errors.append(Finding("R1", "start_date", "请申请人提供 YYYY-MM-DD 格式的有效开始日期。"))
     if end is None and end_value and end_value.strip():
         errors.append(Finding("R8", "end_date", "请申请人提供 YYYY-MM-DD 格式的有效结束日期。"))
-    if start is not None and start < today:
-        start = today
-        draft = replace(draft, start_date=replace(draft.start_date, value=today.isoformat()))
+    effective = effective_start_date(start, today) if start is not None else None
+    if effective is not None and effective != start:
+        start = effective
+        draft = replace(draft, start_date=replace(draft.start_date, value=start.isoformat()))
         adjustments.append(Finding("R1", "start_date", "开始日期早于今天，已调整为今天。"))
     if start == today:
         warnings.append(Finding("R1", "start_date", "BOSS 配置截止时间尚未确认，生效日期暂不顺延。"))

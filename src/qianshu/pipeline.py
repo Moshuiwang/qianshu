@@ -14,9 +14,11 @@ from . import parse, validate
 from .draft import Candidate, DraftField, PackageRow, PolicyDraft, SourceExcerpt, Uncertainty
 from .feishu.cards import CardLine, DetailPage, detail_pages
 from .feishu.entrance import Application
+from .parse.benefits import ADJUSTMENT_HINTS, OFFER_FIELD_LABELS, BenefitCatalog, benefit_applicability
 from .parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from .parse.evidence import STRUCTURE_REASONS, PolicyStructureIssue
 from .parse.model import ParseModel
+from .parse.names import PROPOSED_NAME_LABEL
 
 _FIELD_LABELS = {
     "policy_name": "优惠政策名称",
@@ -38,13 +40,13 @@ _FIELD_LABELS = {
     "approval_url": "任务审批链接",
     "approval_attachments": "审批件附件",
     "user_count": "用户数",
+    **OFFER_FIELD_LABELS,
 }
 _DEFAULT_MUTEX = "互斥组按默认填是"
 _DEFAULT_HINTS = {
     _DEFAULT_MUTEX, "是否只触发一次按默认填否", "多买多送按默认填是", "生效倍数按默认填 1",
     parse._ATTACHMENTS_HINT, parse._POLICY_TYPE_HINT,
-    "充值 / 赠送天数按 1 月 = 30 天换算", "降包用户取消优惠按默认填是",
-    "降包用户取消优惠未写，请在卡片确认具体取值",
+    *ADJUSTMENT_HINTS,
 }
 _MUTEX_NO = "申请要求不维护互斥组，需人工确认"
 _BOUNDARY_HINT = "段落边界无法确定，需人工确认"
@@ -53,7 +55,7 @@ _RULE_PENDING_FIELDS = (
     "policy_name", "trigger_once", "repeat_bonus", "effective_multiplier",
 )
 _RULE_PENDING_REASON = "取值规则待确认。"
-_INPUT_LABELS = {"country": "国家", "company_keyword": "公司关键词"}
+_INPUT_LABELS = {"country": "国家", "company_keyword": "公司关键词", "policy_short_name": "政策短名"}
 
 
 def _mask_spans(text: str, spans: Iterable[tuple[int, int]]) -> str:
@@ -69,6 +71,19 @@ def _mask_spans(text: str, spans: Iterable[tuple[int, int]]) -> str:
         parts.extend((text[offset:start], "[已脱敏]"))
         offset = end
     return "".join((*parts, text[offset:]))
+
+
+@dataclass(frozen=True, repr=False)
+class _ModelText:
+    text: str
+    role: str
+    quoted: bool = False
+    start: int | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class _ModelLine(CardLine):
+    parts: tuple[str | _ModelText, ...] = field(kw_only=True, repr=False)
 
 
 class _CardRedaction:
@@ -194,10 +209,15 @@ class _FreeTextLine(CardLine):
 
 
 def _field_lines(
-    prefix: str, field: DraftField, explanation: str | None, redact: _CardRedaction,
+    prefix: str, field: DraftField, explanation: str | None, redact: _CardRedaction, *, offer: bool = False,
 ) -> Iterable[CardLine]:
-    value = "未确定" if field.value is None else redact.display(_value(field.value))
-    yield CardLine(prefix, f"值　{value}\n原文出处　{_evidence(field.evidence, redact)}")
+    def value_line(label, value, evidence):
+        if offer:
+            empty = "留空（确定）" if field.uncertainty is None and evidence else "未确定"
+            return _value_line(label, value, evidence, empty=empty)
+        return CardLine(label, f"值　{redact.display(_value(value))}\n原文出处　{_evidence(evidence, redact)}")
+
+    yield value_line(prefix, field.value, field.evidence)
     if uncertainty := field.uncertainty:
         if explanation:
             yield _FreeTextLine(f"{prefix} · 待确认", f"{uncertainty.reason}\n模型说明　", free_text=explanation)
@@ -206,12 +226,97 @@ def _field_lines(
         if not uncertainty.candidates:
             yield CardLine(f"{prefix} · 候选", "无")
         for index, candidate in enumerate(uncertainty.candidates, 1):
-            yield CardLine(
-                f"{prefix} · 候选 {index}",
-                f"值　{redact.display(_value(candidate.value))}\n原文出处　{_evidence(candidate.evidence, redact)}",
-            )
+            yield value_line(f"{prefix} · 候选 {index}", candidate.value, candidate.evidence)
     elif explanation:
         yield _FreeTextLine(f"{prefix} · 模型说明", "", free_text=explanation)
+
+
+def _value_parts(value: object, *, nested: bool = False) -> Iterator[str | _ModelText]:
+    if isinstance(value, (dict, list)):
+        mapping = isinstance(value, dict)
+        yield "{" if mapping else "["
+        for index, (key, item) in enumerate(value.items() if mapping else enumerate(value)):
+            if index:
+                yield ", "
+            if mapping:
+                yield json.dumps(key, ensure_ascii=False) + ": "
+            yield from _value_parts(item, nested=True)
+        yield "}" if mapping else "]"
+    elif isinstance(value, str):
+        yield _ModelText(value, "value", quoted=nested)
+    else:
+        yield _ModelText(json.dumps(value, ensure_ascii=False), "value")
+
+
+def _value_line(label: str, value: object, evidence: list[SourceExcerpt], *, empty: str = "未确定") -> CardLine:
+    parts = [empty] if value is None else list(_value_parts(value))
+    parts.append("\n原文出处　")
+    for index, excerpt in enumerate(evidence):
+        parts.extend(("\n「" if index else "「", _ModelText(excerpt.text, "evidence", start=excerpt.start), "」"))
+    if not evidence:
+        parts.append("无原文摘录")
+    return _ModelLine(label, "值　", parts=tuple(parts))
+
+
+def _redact_card_lines(lines: Sequence[CardLine], redact: _CardRedaction) -> list[CardLine]:
+    """统一遮蔽优惠字段、政策名称和说明，覆盖整卡及连续摘出的值与引文。"""
+    parts = []
+    for line in lines:
+        if isinstance(line, _ModelLine):
+            parts.extend(part for part in line.parts if isinstance(part, _ModelText))
+        elif isinstance(line, _FreeTextLine):
+            parts.append(_ModelText(line.free_text, "advisory"))
+
+    # 每个投影使用原始片段。一个投影先遮掉的字符可能也属于另一个投影的命中。
+    groups = [range(len(parts))]
+    for roles in (
+        {"value", "name_value"}, {"evidence", "name_evidence"},
+        {"value"}, {"evidence"}, {"name_value"}, {"name_evidence"}, {"advisory"},
+        {"value", "advisory"}, {"value", "name_value", "advisory"},
+        {"advisory", "name_value", "name_evidence"},
+    ):
+        groups.append([i for i, part in enumerate(parts) if part.role in roles])
+
+    def visible(part, text):
+        return json.dumps(text, ensure_ascii=False)[1:-1] if part.quoted else text
+
+    raw = [part.text for part in parts]
+    rendered = [visible(part, part.text) for part in parts]
+    alternatives = [set() for _ in parts]
+    representations = (raw,) if raw == rendered else (raw, rendered)
+    for group in groups:
+        for texts in representations:
+            checked = redact.free_texts([texts[i] for i in group])
+            for i, text in zip(group, checked, strict=True):
+                if text != texts[i]:
+                    alternatives[i].add(visible(parts[i], text) if texts is raw else text)
+
+    for i, part in enumerate(parts):
+        if part.role != "advisory":
+            text = redact.display(part.text, part.start)
+            if text != part.text:
+                alternatives[i].add(visible(part, text))
+    # 多次核对给出不同展示结果时，整段留给人工对照已脱敏的申请原文。
+    for i, choices in enumerate(alternatives):
+        if choices:
+            rendered[i] = choices.pop() if len(choices) == 1 else "[已脱敏]"
+    displayed = iter(rendered)
+    result = []
+    for line in lines:
+        if isinstance(line, _FreeTextLine):
+            line = CardLine(line.label, line.text + next(displayed), line.red)
+        elif isinstance(line, _ModelLine):
+            pieces = [line.text]
+            for part in line.parts:
+                if isinstance(part, str):
+                    pieces.append(part)
+                else:
+                    text = next(displayed)
+                    pieces.append(f'"{text}"' if part.quoted else text)
+            text = redact.display("".join(pieces))
+            line = CardLine(line.label, text, line.red)
+        result.append(line)
+    return result
 
 
 @dataclass(frozen=True)
@@ -220,6 +325,7 @@ class _Policy:
     hints: tuple[str, ...]
     explanations: Mapping[str, str]
     validation: validate.ValidationResult | None = None
+    policy_name_source: str | None = None
 
     @property
     def approval_url_deferred(self) -> bool:
@@ -262,6 +368,10 @@ class _Policy:
             yield CardLine(f"{prefix} · {section}", hint, red=hint in _RED_HINTS)
         if result:
             for item in self.parsing_errors():
+                if (item.rule == "R5" and item.field == "policy_name"
+                        and self.policy_name_source == PROPOSED_NAME_LABEL):
+                    yield CardLine(f"{prefix} · 需同意 · 优惠政策名称", "请产品负责人核对卡片上的名称建议。")
+                    continue
                 if item.rule == "R5" and _rule_pending(self.draft, item.field):
                     continue
                 yield CardLine(f"{prefix} · 需追问 · {_FIELD_LABELS[item.field]}", item.reason)
@@ -270,7 +380,15 @@ class _Policy:
                     yield CardLine(f"{prefix} · 自动调整 · {_FIELD_LABELS[item.field]}", item.reason)
             for item in result.warnings:
                 yield CardLine(f"{prefix} · 提醒项 · {_FIELD_LABELS[item.field]}", item.reason)
+        inactive, required = benefit_applicability(self.draft)
         for field in fields(self.draft):
+            value = getattr(self.draft, field.name)
+            if (field.name in inactive and value.uncertainty is None) or (
+                field.name in OFFER_FIELD_LABELS and field.name not in required
+                and value.value is None and value.uncertainty is None and not value.evidence
+                and not self.explanations.get(field.name)
+            ):
+                continue
             label = _FIELD_LABELS[field.name]
             title = f"{prefix} · {label}"
             explanation = self.explanations.get(field.name)
@@ -278,11 +396,32 @@ class _Policy:
                 yield CardLine(title, "建单时填写")
                 if explanation:
                     yield _FreeTextLine(f"{title} · 模型说明", "", free_text=explanation)
+            elif field.name == "policy_name":
+                name = self.draft.policy_name
+                if pending := name.uncertainty:
+                    if explanation:
+                        yield _FreeTextLine(f"{title} · 待确认", f"{pending.reason}\n模型说明　", free_text=explanation)
+                    else:
+                        yield CardLine(f"{title} · 待确认", pending.reason)
+                    if not pending.candidates:
+                        yield CardLine(f"{title} · 候选", "无")
+                elif explanation:
+                    yield _FreeTextLine(f"{title} · 模型说明", "", free_text=explanation)
+                if self.policy_name_source:
+                    yield CardLine(f"{title} · 名称来源", self.policy_name_source)
             else:
-                yield from _field_lines(title, getattr(self.draft, field.name), explanation, redact)
+                yield from _field_lines(title, value, explanation, redact, offer=field.name in OFFER_FIELD_LABELS)
         for name, label in _INPUT_LABELS.items():
             if explanation := self.explanations.get(name):
                 yield _FreeTextLine(f"{prefix} · {label} · 模型说明", "", free_text=explanation)
+
+    def name_entries(self, prefix: str) -> Iterable[tuple[str, DraftField | Candidate]]:
+        title = f"{prefix} · 优惠政策名称"
+        name = self.draft.policy_name
+        yield title, name
+        if name.uncertainty:
+            for index, candidate in enumerate(name.uncertainty.candidates, 1):
+                yield f"{title} · 候选 {index}", candidate
 
 
 class Pipeline:
@@ -295,6 +434,7 @@ class Pipeline:
         companies_file: Path | None = None,
         legacy_companies: bool = False,
         on_reply: Callable[[Application, str], None] | None = None,
+        benefit_catalog: BenefitCatalog | None = None,
     ) -> None:
         self.model = model
         self.tag_dates = tag_dates
@@ -302,6 +442,7 @@ class Pipeline:
         self.companies_file = companies_file
         self.legacy_companies = legacy_companies
         self._on_reply = on_reply
+        self.benefit_catalog = benefit_catalog
         registered = {value for value in sensitive_values if value}
         values = sorted({
             literal for value in registered
@@ -344,11 +485,7 @@ class Pipeline:
             yield CardLine(f"政策结构问题 {index}", location, red=True)
 
     def _detail_pages(self, body: str, lines: Sequence[CardLine], redact: _CardRedaction) -> tuple[DetailPage, ...]:
-        free_texts = redact.free_texts([line.free_text for line in lines if isinstance(line, _FreeTextLine)])
-        sections = [
-            CardLine(line.label, line.text + next(free_texts), line.red) if isinstance(line, _FreeTextLine) else line
-            for line in lines
-        ]
+        sections = _redact_card_lines(lines, redact)
         sections.append(CardLine("申请原文", body))
         if self._sensitive:
             sections = [replace(line, text=self._sensitive.sub("[已脱敏]", line.text)) for line in sections]
@@ -364,7 +501,11 @@ class Pipeline:
                 Path("rules"), self.companies_file or DEFAULT_COMPANIES_FILE, legacy=self.legacy_companies,
             )
             on_reply = None if self._on_reply is None else partial(self._on_reply, application)
-            drafts = parse.parse_application(body, model=self.model, on_reply=on_reply, company_rules=company_rules)
+            today = self.today()
+            drafts = parse.parse_application(
+                body, model=self.model, on_reply=on_reply, company_rules=company_rules,
+                benefit_catalog=self.benefit_catalog, today=today,
+            )
             policies = []
             for parsed in drafts:
                 draft = _review_mutex(parsed)
@@ -376,7 +517,8 @@ class Pipeline:
                     for name, result in getattr(parsed, "field_results", {}).items()
                     if (explanation := result.statement.explanation) and explanation.strip()
                 }
-                policies.append(_Policy(draft, hints, explanations))
+                policies.append(_Policy(draft, hints, explanations,
+                                        policy_name_source=getattr(parsed, "policy_name_source", None)))
         except Exception:
             return self._detail_pages(display_body, [
                 CardLine(
@@ -395,7 +537,7 @@ class Pipeline:
             try:
                 results = validate.validate_batch(
                     [(policy.draft, _facts(policy.draft, self.tag_dates)) for policy in policies],
-                    today=self.today(),
+                    today=today,
                 )
                 policies = [
                     replace(policy, draft=draft, validation=result)
@@ -414,4 +556,17 @@ class Pipeline:
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
             *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}", redact)),
         ]
+        # 说明、名称取值、引文各自连续展示，每段单独交给 W1 的整卡自由文本入口。
+        names = [entry for index, policy in enumerate(policies, 1) for entry in policy.name_entries(f"政策 {index}")]
+        for title, entry in names:
+            if entry.value is None:
+                lines.append(CardLine(title, "值　未确定"))
+            else:
+                lines.append(_ModelLine(title, "值　", parts=(_ModelText(entry.value, "name_value"),)))
+        for title, entry in names:
+            if not entry.evidence:
+                lines.append(CardLine(f"{title} · 原文出处", "无原文摘录"))
+            for index, excerpt in enumerate(entry.evidence, 1):
+                lines.append(_ModelLine(f"{title} · 原文出处 {index}", "",
+                                        parts=(_ModelText(excerpt.text, "name_evidence", start=excerpt.start),)))
         return self._detail_pages(display_body, lines, redact)

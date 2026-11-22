@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, WrapValidator, field_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from qianshu.draft import YesNo
@@ -89,6 +89,44 @@ class CountryFinding(Finding[str]):
             return [CountryMention()]
 
 
+class OfferFinding[T](Finding[T]):
+    status: StatementStatus = StatementStatus.UNSUPPORTED
+    reason_code: Identifier = "field_not_reported"
+    value: T | None = None
+    candidates: list[ProposedValue[T]] = Field(default_factory=list)
+    evidence: list[Evidence] = Field(default_factory=list)
+
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema, handler):
+        # 缺项由本字段的 WrapValidator 接住。只展开优惠字段的引用，保留旧协议的必填项。
+        def optional_children(node):
+            if isinstance(node, list):
+                return [optional_children(item) for item in node]
+            if isinstance(node, dict):
+                resolved = handler.resolve_ref_schema(node)
+                return {key: optional_children(value) for key, value in resolved.items() if key != "required"}
+            return node
+
+        return optional_children(handler(core_schema))
+
+
+def _decode_offer_finding(value, handler):
+    try:
+        finding = handler(value)
+    except ValidationError:
+        return OfferFinding()
+    if finding is None:
+        return OfferFinding()
+    if finding.status is StatementStatus.UNWRITTEN and not {"value", "evidence", "candidates"} <= finding.model_fields_set:
+        return OfferFinding()
+    if finding.status is StatementStatus.CERTAIN and "value" not in finding.model_fields_set:
+        return OfferFinding()
+    return finding
+
+
+type OptionalOffer[T] = Annotated[OfferFinding[T] | None, WrapValidator(_decode_offer_finding)]
+
+
 class Duration(Declaration):
     quantity: int
     unit: Literal["天", "月"]
@@ -99,8 +137,44 @@ class RequestedPackage(Declaration):
     gift_package: str | None
 
 
+class RequestedTariff(Declaration):
+    base_package: str
+    price_plan: str
+    unit: str
+    version: str | None
+
+
+# 缺少完整候选或坐标时，Findings 将短名降为缺证据。
+# 工具允许模型省略这些子项，其他字段仍使用原有的必填证据结构。
+def _optional_properties(schema: dict) -> None:
+    schema.pop("required", None)
+
+
+class ShortNameSpan(Span):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+
+
+class ShortNameEvidence(Evidence):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+    span: ShortNameSpan
+
+
+class ShortNameCandidate(ProposedValue[str]):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+    evidence: list[ShortNameEvidence]
+
+
+class ShortNameFinding(Finding[str]):
+    status: StatementStatus = StatementStatus.UNSUPPORTED
+    reason_code: Identifier = "short_name"
+    value: str | None = None
+    candidates: list[ShortNameCandidate] = Field(default_factory=list)
+    evidence: list[ShortNameEvidence] = Field(default_factory=list)
+
+
 class Findings(Declaration):
     policy_name: Finding[str]
+    policy_short_name: ShortNameFinding = Field(default_factory=ShortNameFinding)
     maintain_mutual_exclusion_group: Finding[YesNo]
     country: CountryFinding
     company: Finding[str]
@@ -120,6 +194,24 @@ class Findings(Declaration):
     user_scope: Finding[str]
     approval_url: Finding[str]
     approval_attachments: Finding[list[str]]
+    watch_days: OptionalOffer[Duration] = Field(default_factory=OfferFinding)
+    penalty_days: OptionalOffer[Duration] = Field(default_factory=OfferFinding)
+    amount_mode: OptionalOffer[Literal["自定义", "节目包资费"]] = Field(default_factory=OfferFinding)
+    recharge_amount: OptionalOffer[int | float] = Field(default_factory=OfferFinding)
+    tariff: OptionalOffer[RequestedTariff] = Field(default_factory=OfferFinding)
+    tariff_multiplier: OptionalOffer[int | float] = Field(default_factory=OfferFinding)
+    after_offer: OptionalOffer[Literal["恢复原包", "指定节目包"]] = Field(default_factory=OfferFinding)
+    after_offer_package: OptionalOffer[str] = Field(default_factory=OfferFinding)
+    forbid_package_change: OptionalOffer[YesNo] = Field(default_factory=OfferFinding)
+    first_recharge_day_only: OptionalOffer[Literal["是"]] = Field(default_factory=OfferFinding)
+
+    @field_validator("policy_short_name", mode="wrap")
+    @classmethod
+    def _optional_short_name(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            return ShortNameFinding()
 
 
 class Policy(Declaration):

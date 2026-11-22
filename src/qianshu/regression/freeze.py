@@ -193,6 +193,10 @@ def _check_business(pair: dict, frozen_fields) -> None:
             raise RegressionError("业务审定须使用独立审定的布尔标记。")
     if "card_complete" in pair and type(pair["card_complete"]) is not bool:
         raise RegressionError("整卡完整性须使用布尔标记。")
+    short_name = pair.get("policy_short_name")
+    if short_name is not None and (not isinstance(short_name, str) or not short_name.strip()
+                                   or short_name != short_name.strip()):
+        raise RegressionError("独立审定的活动或优惠短名格式无效。")
     pairing = pair.get("pairing", {})
     if not isinstance(pairing, dict) or not pairing.keys() <= set(PAIR_FIELDS):
         raise RegressionError("独立审定的业务配对键无效。")
@@ -297,7 +301,8 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
             pair = {
                 "id": sample_id, "row_id": row_id, "token": token, "span": span, "basis": audit["basis"],
                 "materials": materials, "configuration": configuration,
-                **{key: audit[key] for key in ("business", "card_complete", "pairing", "source_status", "company_keywords")
+                **{key: audit[key] for key in ("business", "card_complete", "pairing", "source_status",
+                                                "company_keywords", "policy_short_name")
                    if key in audit},
             }
             _check_business(pair, FIELD_LABELS.keys())

@@ -1,7 +1,7 @@
 """政策草稿接口，字段对应产品文档 6.2。"""
 
 from dataclasses import asdict, dataclass, field, fields
-from typing import Literal
+from typing import Literal, TypedDict
 
 type YesNo = Literal["是", "否"]
 
@@ -113,3 +113,26 @@ class PolicyDraft:
     def to_dict(self) -> dict[str, object]:
         """生成可交给 json.dumps 的字典，包含原文摘录，供私有比对报告使用。"""
         return asdict(self)
+
+
+class TariffReference(TypedDict):
+    base_package: str
+    price_plan: str
+    unit: str
+    version: str | None
+
+
+@dataclass(kw_only=True, repr=False)
+class OfferPolicyDraft(PolicyDraft):
+    """含 0.3.0 优惠字段的解析草稿，供卡片及离线组装使用。"""
+
+    watch_days: DraftField[int] = field(default_factory=DraftField)
+    penalty_days: DraftField[int] = field(default_factory=DraftField)
+    amount_mode: DraftField[Literal["自定义", "节目包资费"]] = field(default_factory=DraftField)
+    recharge_amount: DraftField[int | float] = field(default_factory=DraftField)
+    tariff: DraftField[TariffReference] = field(default_factory=DraftField)
+    tariff_multiplier: DraftField[int | float] = field(default_factory=DraftField)
+    after_offer: DraftField[Literal["恢复原包", "指定节目包"]] = field(default_factory=DraftField)
+    after_offer_package: DraftField[str] = field(default_factory=DraftField)
+    forbid_package_change: DraftField[YesNo] = field(default_factory=DraftField)
+    first_recharge_day_only: DraftField[Literal["是"]] = field(default_factory=DraftField)

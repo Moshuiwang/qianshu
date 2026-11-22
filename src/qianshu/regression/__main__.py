@@ -5,6 +5,7 @@ import logging
 import os
 import subprocess
 import sys
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from qianshu.config import ConfigError
@@ -84,6 +85,7 @@ def _arguments(argv: list[str] | None):
         command.add_argument("--legacy-companies", action="store_true", default=None,
                              help="按无表头两列或三列 TSV 读取冻结的公司对照表。")
     for command in (run, imported):
+        command.add_argument("--today", type=date.fromisoformat, help="R1 使用的 UTC 日期（YYYY-MM-DD）。")
         command.add_argument("--release", action="store_true", help="有未完成调用时作废本次放行运行。")
         command.add_argument("--retries", type=int, help="调用补试上限，放行默认 1，诊断默认 0。")
 
@@ -135,8 +137,12 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         threshold = manifest["threshold"] if args.threshold is None else args.threshold
         release, retries = prior["release"], prior["retries"]
         effort = prior.get("effort")
+        today = date.fromisoformat(prior["today"]) if prior.get("today") else None
         origin = "replay"
     else:
+        today = args.today
+        if today is None and args.command == "run":
+            today = datetime.now(UTC).date()
         legacy = bool(args.legacy_companies)
         threshold = DEFAULT_THRESHOLD if args.threshold is None else args.threshold
         release = args.release
@@ -159,6 +165,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
 
     rules = files.repo / "rules"
     config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries, effort=effort)
+    config["today"] = today.isoformat() if today else None
     if legacy_recording:
         source_rules_sha, source_system_sha = _legacy_fingerprints(files.repo)
         if prior.get("source_rules_sha256", prior["rules_sha256"]) != source_rules_sha:
@@ -170,6 +177,9 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         prior_dir = files.argument(args.replaces_recording)
         prior_manifest = SavedReplies(files, prior_dir).manifest
         prior_report = files.read(prior_dir / "public-report.json")
+        if args.today is None and prior_manifest["configuration"].get("today"):
+            today = date.fromisoformat(prior_manifest["configuration"]["today"])
+            config["today"] = today.isoformat()
         if (
             not release or prior_manifest["origin"] == "replay"
             or prior_manifest["configuration"] != config
@@ -190,7 +200,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         logging.disable(logging.CRITICAL)
         try:
             report, details = evaluate(snapshot, None, rules, legacy_companies=legacy, threshold=threshold,
-                                       recording=recording)
+                                       recording=recording, today=today)
         finally:
             logging.disable(previous)
         counts = report["business"]["counts"]
