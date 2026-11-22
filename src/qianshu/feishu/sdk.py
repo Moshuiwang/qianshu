@@ -8,7 +8,7 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import ContextVar
 from http import HTTPStatus
 from pathlib import Path
@@ -38,18 +38,25 @@ from lark_oapi.ws import client as ws
 from .cards import Report, approval_card, decided_approval_card
 from .entrance import Application, Attachment, Entrance, Message
 from .settings import Settings, Window
-from .state import State
+from .state import CALLBACK_BUDGET as _CALLBACK_BUDGET, CALLBACK_RESPONSE_MARGIN as _CALLBACK_RESPONSE_MARGIN
+from .state import ProofReceipt, State, callback_receipt
 
 _LOG = logging.getLogger(__name__)
 _HTTP_TIMEOUT = 2
-_CALLBACK_BUDGET = 3
-_CALLBACK_RESPONSE_MARGIN = 0.5
 _CALLBACK_TIMEOUT_NOTICE = "处理超时，请重新点击"
 _CREATE_SEND_MARGIN = 10
 
 
 class ApprovalClosed(RuntimeError):
     """审批无法再用于建单。"""
+
+
+class _DecisionRecorded(Exception):
+    """证明已落盘，等待方尚未取得资格状态更新的结果。"""
+
+
+class _UnconfirmedDecision(Exception):
+    """候选已持久化，原回调无法确认决定。"""
 
 
 class _EndpointUnavailable(ws.ServerException):
@@ -245,13 +252,13 @@ class _Transport:
         request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
         _checked(self.im.message.create(request))
 
-    async def notify_callback_timeout(self) -> None:
+    async def notify_callback_timeout(self, notice=_CALLBACK_TIMEOUT_NOTICE) -> None:
         async with asyncio.timeout(_HTTP_TIMEOUT):
             self._require_window()
             option = lark.RequestOption.builder().tenant_access_token(await self._tenant_token()).build()
             body = CreateMessageRequestBody.builder().receive_id(self.settings.chat_id).msg_type(
                 "text",
-            ).content(json.dumps({"text": _CALLBACK_TIMEOUT_NOTICE}, ensure_ascii=False)).build()
+            ).content(json.dumps({"text": notice}, ensure_ascii=False)).build()
             request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
             self._require_window()
             _checked(await self.im.message.acreate(request, option))
@@ -586,6 +593,14 @@ class _Connection(ws.Client):
         origin, _, deadline = self._dispatch.get()
         try:
             return await self.service._record_action(data, origin, deadline)
+        except _DecisionRecorded:
+            return P2CardActionTriggerResponse({
+                "toast": {"type": "info", "content": "审批决定已记录，处理结果请稍后核对"},
+            })
+        except _UnconfirmedDecision:
+            notice = "审批决定未确认，请人工核对"
+            self.service._notify_callback_timeout(notice)
+            return _approval_warning(notice)
         except TimeoutError:
             self.service._notify_callback_timeout()
             return _approval_warning(_CALLBACK_TIMEOUT_NOTICE)
@@ -618,6 +633,7 @@ class FeishuService:
         self._callback_notice_failures = 0
         self._state = State(state_path, settings)
         self._state.close_approvals()
+        self._callback_claim_lock = asyncio.Lock()
         self._callback_writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="feishu-callback")
         # SDK 和 HTTP 请求日志可能包含响应原文或消息标识。
         logging.getLogger("Lark").disabled = True
@@ -750,11 +766,13 @@ class FeishuService:
         ]
         created_at = candidates[0] if len(candidates) == 1 else None
         connected_at = self._connected_at
+        generation = self._approval_generation
 
         def current_time() -> float | None:
             now = self.clock()
             if (
                 origin is not None and origin is self._origin and origin.close_code is None
+                and generation == self._approval_generation
                 and connected_at is not None and connected_at == self._connected_at
                 and created_at is not None and self.window.contains(now) and self.window.contains(created_at)
                 and connected_at <= created_at <= now
@@ -767,7 +785,11 @@ class FeishuService:
             if origin is self._origin and not self.window.contains(self.clock()):
                 await self._write_callback(deadline, self._state.close_approvals)
             return _approval_warning("审批回调已过期或与当前连接时间不符")
-        if not await self._write_callback(deadline, self._state.claim_callback, event_id):
+        # 等候去重的帧留在事件循环。已核实成员的决定无需排在整批去重写入之后。
+        async with asyncio.timeout(max(0, deadline - time.monotonic())):
+            async with self._callback_claim_lock:
+                claimed = await self._write_callback(deadline, self._state.claim_callback, event_id)
+        if not claimed:
             return _approval_warning("该审批回调已处理")
         remaining = min(
             _HTTP_TIMEOUT, deadline - time.monotonic(),
@@ -805,29 +827,49 @@ class FeishuService:
     async def _write_callback(self, deadline, operation, *args):
         if time.monotonic() >= deadline:
             raise TimeoutError
-        commit = Future()
+        # 两笔决定提交共用处理截止；只有均及时才可借用一半回包余量保存证明。
+        receipt = ProofReceipt(deadline + self._callback_response_margin / 2)
 
         def before_commit():
-            if not commit.set_running_or_notify_cancel():
+            if time.monotonic() >= deadline:
                 raise TimeoutError
 
-        write = asyncio.wrap_future(self._callback_writer.submit(
-            operation, *args, deadline=deadline, before_commit=before_commit,
-        ))
+        def record():
+            token = callback_receipt.set(receipt)
+            try:
+                return operation(*args, deadline=deadline, before_commit=before_commit)
+            finally:
+                callback_receipt.reset(token)
+
+        write = asyncio.wrap_future(self._callback_writer.submit(record))
         try:
             done, _ = await asyncio.wait((write,), timeout=max(0, deadline - time.monotonic()))
-            # 先取消提交资格才能拒绝。已进入提交阶段时，以 SQLite 的实际结果为准。
-            if not done and commit.cancel():
-                raise TimeoutError
-            return await write
+            if not done:
+                if not receipt.allow_proof_wait():
+                    raise TimeoutError
+                remaining = max(0, receipt.proof_deadline - time.monotonic())
+                done, _ = await asyncio.wait((write,), timeout=remaining)
+                if not done:
+                    if receipt.end_wait():
+                        raise _DecisionRecorded
+                    raise TimeoutError
+            result = write.result()
+            if not result and receipt.review_required:
+                raise _UnconfirmedDecision
+            return result
+        except TimeoutError:
+            if receipt.review_required:
+                raise _UnconfirmedDecision from None
+            raise
         finally:
-            if not write.done() and commit.cancel():
+            receipt.end_wait()
+            if not write.done():
                 write.cancel()
 
-    def _notify_callback_timeout(self) -> None:
+    def _notify_callback_timeout(self, *notice: str) -> None:
         async def notify():
             try:
-                await self.transport.notify_callback_timeout()
+                await self.transport.notify_callback_timeout(*notice)
             except Exception:
                 self._callback_notice_failures += 1
 
