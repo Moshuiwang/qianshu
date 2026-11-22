@@ -75,15 +75,19 @@ def parsed(body, reply, *, catalog=CATALOG, today=TODAY):
     return draft
 
 
-def card_text(body, reply, *, sensitive_values=()):
+def card_pages(body, reply, *, sensitive_values=()):
     pipeline = Pipeline(
         model=lambda **_: json.dumps(reply), today=lambda: TODAY, tag_dates={"占位标签": TAG_END},
         companies_file=COMPANIES, benefit_catalog=CATALOG, sensitive_values=sensitive_values,
     )
     message = Message("占位消息", "占位群", "占位发送者", 0, "text", "")
+    return pipeline(Application(message, body, ()))
+
+
+def card_text(body, reply, *, sensitive_values=()):
     return "\n".join(
         element["text"]["content"] if element["tag"] == "div" else element["content"]
-        for page in pipeline(Application(message, body, ())) for element in page.elements
+        for page in card_pages(body, reply, sensitive_values=sensitive_values) for element in page.elements
     )
 
 
@@ -513,8 +517,9 @@ def test_tool_schema_optional_through_all_offer_descendants():
                 check(child)
 
     findings = definitions["Findings"]
-    assert set(OFFER_FIELD_LABELS).isdisjoint(findings["required"])
-    for name in OFFER_FIELD_LABELS:
+    optional = {*OFFER_FIELD_LABELS, "package_tiers"}
+    assert optional.isdisjoint(findings["required"])
+    for name in optional:
         check(findings["properties"][name])
 
 

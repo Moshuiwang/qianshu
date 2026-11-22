@@ -344,7 +344,7 @@ class _Policy:
         draft = self.draft
         if self.validation is None:
             status = "停在校验。"
-        elif ((self.tier_field and self.tier_field.uncertainty) or any(self.parsing_errors()) or draft.uncertain_fields()
+        elif (any(self.parsing_errors()) or draft.uncertain_fields()
               or draft.maintain_mutual_exclusion_group.value != "是"):
             pending = [_FIELD_LABELS[name] for name in _RULE_PENDING_FIELDS if _rule_pending(draft, name)]
             if pending:

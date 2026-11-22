@@ -7,11 +7,12 @@ from dataclasses import asdict
 import pytest
 
 from qianshu import parse
+from qianshu.__main__ import _mail_summary
 from qianshu.mingdao.create_order import Stop, select_package_rows
 from qianshu.mingdao.offer_fields import assemble_offer_fields
 from qianshu.parse.package_levels import load_package_levels
 from qianshu.regression.business import grade
-from tests.parse.test_benefits import CATALOG, COMPANIES, FACTS, TODAY, card_text, field, scenario
+from tests.parse.test_benefits import CATALOG, COMPANIES, FACTS, TODAY, card_pages, card_text, field, scenario
 from tests.protocol_fixtures import quote, statement
 
 KINDS = ("赠送时长", "升级权益", "特价优惠")
@@ -38,11 +39,11 @@ def load(path, rows):
     return load_package_levels(path)
 
 
-def example(kind, pairs):
+def example(kind, pairs, **fields):
     return scenario(kind, packages=field(
         [dict(current_package=current, gift_package=gift) for current, gift in pairs],
         "政策标题", *[f"当前{current}，受赠{gift or current}" for current, gift in pairs],
-    ))
+    ), **fields)
 
 
 def parse_one(body, reply, levels):
@@ -219,17 +220,24 @@ def test_tier_optional_parts_only_affect_tier(tmp_path, missing):
 @pytest.mark.parametrize("status", ["歧义", "冲突", "带条件", "缺证据", "确定"])
 def test_unverified_tier_does_not_clear_verified_rows(tmp_path, monkeypatch, status):
     pairs = [(name, None) for name in NAMES[:2]]
-    body, reply = example("赠送时长", pairs)
+    body, reply = example("赠送时长", pairs, cancel_on_downgrade=field("是", "降包取消"))
+    levels = load(tmp_path / "levels.csv", details())
+    monkeypatch.setattr(parse, "load_package_levels", lambda: levels)
+    del reply["policies"][0]["fields"]["package_tiers"]
+    assert "解析完成，待群卡片同意" in card_text(body, reply)
     reply["policies"][0]["fields"]["package_tiers"] = statement(
         status, value=[dict(role="当前包", tier="高")],
         evidence=[quote(body, "错误摘录" if status == "确定" else "政策标题")],
     )
-    levels = load(tmp_path / "levels.csv", details())
     draft = parse_one(body, reply, levels)
     assert [row.current_package for row in draft.packages.value] == list(NAMES[:2])
     assert draft.packages.uncertainty is None and draft.tier_field.uncertainty
-    monkeypatch.setattr(parse, "load_package_levels", lambda: levels)
-    text = card_text(body, reply)
+    pages = card_pages(body, reply)
+    text = "\n".join(element.get("text", {}).get("content", "") for page in pages for element in page.elements)
+    assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in text
+    summary, = _mail_summary(pages, approved=True)
+    assert any("通过校验 1 条，需人工核对 0 条" in element.get("text", {}).get("content", "")
+               for element in summary.elements)
     assert "节目包档位 · 待确认" in text
     assert ("缺证据" if status == "确定" else status) in text
 
