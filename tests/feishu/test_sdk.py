@@ -1180,3 +1180,264 @@ def test_acked_application_reaction_failure_delivers_manual_task(connected, monk
     acked.set()
     assert notified.wait(4)
     assert len(reactions) == 1 and len(attempts) == 3 and len(set(attempts)) == 1
+
+
+@pytest.fixture
+def ticking_socket_loop(connected):
+    # 合成连接没有可读网络帧，沙箱也可能禁止 self-pipe 写入。定时唤醒真实循环，
+    # 让写线程已投递的完成回调得到调度，保留真实单调时钟和原发送路径。
+    def tick():
+        nonlocal timer
+        timer = ws.loop.call_later(0.01, tick)
+
+    timer = ws.loop.call_soon(tick)
+    try:
+        yield
+    finally:
+        timer.cancel()
+
+
+@pytest.mark.parametrize(("phase", "release_after"), [
+    ("candidate", 0.55), ("confirming", 0.55), ("confirming", 3.05), ("proof", 3.05),
+])
+def test_blocked_commit_warns_once_on_original_socket_without_a_grant(
+    connected, monkeypatch, ticking_socket_loop, phase, release_after,
+):
+    from qianshu.feishu import State
+
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    value = data["event"]["action"]["value"]
+    key = (value["approval_id"], value["record_id"])
+    entered = asyncio.Event()
+    release = Event()
+    match = {
+        "candidate": "SET status = 'candidate_approve'",
+        "confirming": "SET status = 'confirming_approve'",
+        "proof": "INSERT INTO feishu_decision_proofs",
+    }[phase]
+    armed = False
+
+    def block_one_commit(sql):
+        nonlocal armed
+        if match in sql:
+            armed = True
+        if armed and sql == "COMMIT":
+            armed = False
+            ws.loop.call_soon_threadsafe(entered.set)
+            release.wait(5)
+
+    async def quiet_notice(*notice):
+        pass
+
+    async def run_frame(reader):
+        timing = service._client._frame_timing(socket)
+        task = asyncio.create_task(service._client._handle_message(encoded_frame(data, ws.MessageType.CARD), timing))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.wait_for(task, 2.5)
+            assert time.monotonic() - timing[1] < 3
+            notice = "处理超时，请重新点击" if phase == "candidate" else "审批决定未确认，请人工核对"
+            assert socket.callback_responses == [
+                {"toast": {"type": "warning", "content": notice}},
+            ]
+            assert reader.approval_status(*key) == "pending"
+            await asyncio.sleep(max(0, timing[1] + release_after - time.monotonic()))
+        finally:
+            release.set()
+            await task
+
+    monkeypatch.setattr(service, "_callback_response_margin", 2.6)
+    monkeypatch.setattr(service.transport, "notify_callback_timeout", quiet_notice)
+    with closing(State(service._state.path, service.settings)) as reader:
+        service._state._writer.set_trace_callback(block_one_commit)
+        try:
+            ws.loop.run_until_complete(run_frame(reader))
+            service._callback_writer.submit(lambda: None).result(timeout=2)
+        finally:
+            service._state._writer.set_trace_callback(None)
+        assert reader.claim_create(*key) is None
+        assert not reader.dispatch_create(*key, pytest.fail)
+    with closing(State(service._state.path, service.settings)) as reopened:
+        assert reopened.claim_create(*key) is None
+        assert not reopened.dispatch_create(*key, pytest.fail)
+    assert socket.responses == ["warning"]
+    assert not service.send_first_create(*key, pytest.fail, pytest.fail, pytest.fail)
+    dispatch(service, data)
+    assert socket.responses == ["warning", "warning"]
+    if phase == "candidate":
+        data["header"]["event_id"] = "<新的点击>"
+        dispatch(service, data)
+        assert socket.responses[-1] == "success"
+        assert service._state.claim_create(*key) == service.window.end.timestamp()
+
+
+def test_durable_proof_independent_of_socket_delivery(connected, monkeypatch, ticking_socket_loop):
+    from qianshu.feishu import State
+
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    value = data["event"]["action"]["value"]
+    key = (value["approval_id"], value["record_id"])
+    handoffs = []
+
+    async def drop_reply(raw):
+        with closing(State(service._state.path, service.settings)) as reader:
+            assert reader.approval_status(*key) == "approve"
+        # 测试连接在交付前丢包。
+        return
+
+    monkeypatch.setattr(socket, "send", drop_reply)
+    dispatch(service, data)
+    assert socket.responses == []
+    with closing(State(service._state.path, service.settings)) as reader:
+        def handoff(check):
+            check()
+            handoffs.append("sent")
+
+        assert service.send_first_create(*key, lambda: None, lambda: None, handoff)
+        assert reader.claim_create(*key) is None
+        assert not reader.dispatch_create(*key, pytest.fail)
+    assert handoffs == ["sent"]
+
+
+def test_recorded_proof_has_bounded_reply_while_publishing_claim(connected, monkeypatch, ticking_socket_loop):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    key = (data["event"]["action"]["value"]["approval_id"], data["event"]["action"]["value"]["record_id"])
+    entered, release = asyncio.Event(), Event()
+    publishing = False
+
+    def stall_publication(sql):
+        nonlocal publishing
+        if "SET status = 'approve'" in sql:
+            publishing = True
+        if publishing and sql == "COMMIT":
+            publishing = False
+            ws.loop.call_soon_threadsafe(entered.set)
+            release.wait(5)
+
+    async def run_frame():
+        timing = service._client._frame_timing(socket)
+        task = asyncio.create_task(service._client._handle_message(encoded_frame(data, ws.MessageType.CARD), timing))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            with service._state.connection() as reader:
+                assert reader.execute("SELECT count(*) FROM feishu_decision_proofs").fetchone() == (1,)
+            await asyncio.wait_for(task, 2.5)
+            assert time.monotonic() - timing[1] < 3
+            assert socket.callback_responses == [
+                {"toast": {"type": "info", "content": "审批决定已记录，处理结果请稍后核对"}},
+            ]
+        finally:
+            release.set()
+            await task
+
+    monkeypatch.setattr(service, "_callback_response_margin", 2.4)
+    service._state._writer.set_trace_callback(stall_publication)
+    try:
+        ws.loop.run_until_complete(run_frame())
+        service._callback_writer.submit(lambda: None).result(timeout=2)
+    finally:
+        service._state._writer.set_trace_callback(None)
+    assert service._state.claim_create(*key) == service.window.end.timestamp()
+    assert service._state.claim_create(*key) is None
+
+
+def test_timely_decision_can_finish_proof_in_reserved_time(connected, monkeypatch, ticking_socket_loop):
+    service, socket, _ = connected
+    data = publish(connected, monkeypatch)
+    value = data["event"]["action"]["value"]
+    monkeypatch.setattr(service, "_callback_response_margin", 2.3)
+    timing = service._client._frame_timing(socket)
+    proof = False
+    entered = asyncio.Event()
+    release = Event()
+
+    def pause_proof(sql):
+        nonlocal proof
+        if "INSERT INTO feishu_decision_proofs" in sql:
+            proof = True
+        if proof and sql == "COMMIT":
+            proof = False
+            ws.loop.call_soon_threadsafe(entered.set)
+            release.wait(4)
+
+    async def run_frame():
+        task = asyncio.create_task(service._client._handle_message(encoded_frame(data, ws.MessageType.CARD), timing))
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            await asyncio.sleep(max(0, timing[2] + 0.1 - time.monotonic()))
+            assert not socket.responses
+        finally:
+            release.set()
+            await task
+        assert time.monotonic() - timing[1] < 3
+
+    service._state._writer.set_trace_callback(pause_proof)
+    try:
+        ws.loop.run_until_complete(run_frame())
+    finally:
+        service._state._writer.set_trace_callback(None)
+    assert socket.responses == ["success"]
+    assert service._state.claim_create(value["approval_id"], value["record_id"]) == service.window.end.timestamp()
+
+
+def test_run_create_window_expiry_during_proof_warns_on_original_socket(
+    connected, monkeypatch, ticking_socket_loop,
+):
+    from qianshu.feishu import State
+
+    service, socket, _ = connected
+    expires = time.monotonic() + 1
+    monkeypatch.setattr(service, "clock", lambda: service.window.end.timestamp() + time.monotonic() - expires)
+    data = publish(connected, monkeypatch)
+    value = data["event"]["action"]["value"]
+    key = value["approval_id"], value["record_id"]
+    received = []
+    sent = []
+    proof_commits = []
+    proof = False
+    original_send = socket.send
+
+    def stall_proof(sql):
+        nonlocal proof
+        if "INSERT INTO feishu_decision_proofs" in sql:
+            proof = True
+        if proof and sql == "COMMIT":
+            proof = False
+            proof_commits.append(time.monotonic())
+            time.sleep(max(0, received[0] + 3.1 - time.monotonic()))
+
+    async def connect():
+        timing = service._client._frame_timing(socket)
+        received.append(timing[1])
+        asyncio.create_task(service._client._handle_message(encoded_frame(data, ws.MessageType.CARD), timing))
+
+    async def send(raw):
+        assert socket.close_code is None
+        await original_send(raw)
+        sent.append(time.monotonic())
+
+    async def quiet_notice(*notice):
+        pass
+
+    def work(stop):
+        time.sleep(max(0, expires - time.monotonic()) + 0.1)
+
+    monkeypatch.setattr(service._client, "_connect", connect)
+    monkeypatch.setattr(socket, "send", send)
+    monkeypatch.setattr(service.transport, "notify_callback_timeout", quiet_notice)
+    monkeypatch.setattr(service._client, "_ping_loop", socket.recv)
+    service._state._writer.set_trace_callback(stall_proof)
+    service.run_create(work)
+
+    assert len(proof_commits) == 1 and received[0] <= proof_commits[0] < expires, socket.callback_responses
+    assert len(sent) == 1 and expires <= sent[0] < received[0] + 3
+    assert socket.callback_responses == [
+        {"toast": {"type": "warning", "content": "审批决定未确认，请人工核对"}},
+    ]
+    with closing(State(service._state.path, service.settings)) as reader:
+        assert reader.approval_status(*key) == "closed"
+        assert reader.claim_create(*key) is None
+        assert not reader.dispatch_create(*key, pytest.fail)

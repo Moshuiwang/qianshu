@@ -37,6 +37,7 @@ def summarize(files: PrivateFiles, directories: list[Path], out: Path, *, diagno
     reports = []
     config = None
     seen = set()
+    fingerprints = set()
     for directory in directories:
         manifest = SavedReplies(files, directory).manifest
         run_id = manifest["origin_run_id"] or manifest["run_id"]
@@ -46,13 +47,18 @@ def summarize(files: PrivateFiles, directories: list[Path], out: Path, *, diagno
         raw = files.read(directory / "public-report.json")
         report = read_json(raw)
         legacy_replay = manifest["origin"] == "replay" and "source_reply_structure" in manifest["configuration"]
-        if legacy_replay != diagnostic_replay:
-            raise RegressionError("旧结构离线诊断须使用 --diagnostic-replay 单独汇总。")
+        if (legacy_replay or bool(manifest["configuration"].get("historical_catalog_unverified"))) != diagnostic_replay:
+            raise RegressionError("历史诊断须使用 --diagnostic-replay 单独汇总。")
         config_sha = digest(json_bytes(manifest["configuration"]))
         if digest(raw) != manifest["public_report_sha256"] or config_sha != report["configuration_sha256"]:
             raise RegressionError("汇总输入的报告指纹不一致。")
         if config is not None and config_sha != config:
             raise RegressionError("只能汇总同一冻结、代码、模型和配对配置的运行。")
+        if report.get("request_set_sha256") != manifest.get("request_set_sha256"):
+            raise RegressionError("报告与录制的请求指纹不同。")
+        fingerprints.add((manifest.get("request_set_sha256"), report.get("package_run_day")))
+        if len(fingerprints) != 1:
+            raise RegressionError("各次录制的业务请求指纹不一致。")
         config = config_sha
         reports.append(report)
 
@@ -70,7 +76,7 @@ def summarize(files: PrivateFiles, directories: list[Path], out: Path, *, diagno
         key: _series([report["business"]["counts"][key] for report in valid])
         for key in COUNT_LABELS if key != "reply_parse_failed" and valid
     }
-    counts["reply_parse_failed"] = _series([report["business"]["counts"]["reply_parse_failed"] for report in reports])
+    counts["reply_parse_failed"] = _series([report["business"]["counts"]["reply_parse_failed"] for report in valid])
     data = {
         "configuration_sha256": config, "runs": len(reports), "valid_runs": len(valid), "void_runs": len(reports) - len(valid),
         "diagnostic_replay": diagnostic_replay,

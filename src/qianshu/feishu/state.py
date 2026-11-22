@@ -8,11 +8,67 @@ import sqlite3
 import time
 from collections.abc import Callable
 from contextlib import closing, contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 from threading import Lock
 from typing import BinaryIO
 
 from .settings import Settings
+
+
+CALLBACK_BUDGET = 3
+CALLBACK_RESPONSE_MARGIN = 0.5
+
+
+class ProofReceipt:
+    """只在证明事务返回后裁决。锁内不得等待数据库或连接。"""
+
+    def __init__(self, proof_deadline: float):
+        self.proof_deadline = proof_deadline
+        self._lock = Lock()
+        self.review_required = False
+        self._timely = False
+        self._confirmed = False
+        self._expired = False
+
+    def sample_second_commit(self, deadline, business, expires):
+        with self._lock:
+            sample = time.monotonic()
+            self._timely = not self._expired and business is not None and business < expires and sample < deadline
+            return sample if self._timely else None
+
+    def allow_proof_wait(self):
+        with self._lock:
+            if not self._timely:
+                self._expired = True
+            return self._timely
+
+    def confirm(self):
+        with self._lock:
+            self._confirmed = self._timely and not self._expired and time.monotonic() < self.proof_deadline
+            return self._confirmed
+
+    def end_wait(self):
+        with self._lock:
+            self._expired = True
+            return self._confirmed
+
+
+callback_receipt: ContextVar[ProofReceipt | None] = ContextVar("callback_receipt", default=None)
+
+# 读取、认领和传输交接使用同一绑定及严格截止条件。历史单调时刻只与同次截止比较。
+_PROVEN = """
+    EXISTS (SELECT 1 FROM feishu_decision_proofs p
+            WHERE p.scope = feishu_approvals.scope AND p.event_id = feishu_approvals.event_id
+              AND p.approval_id = feishu_approvals.approval_id
+              AND p.message_id = feishu_approvals.message_id
+              AND p.record_id = feishu_approvals.record_id
+              AND p.operator_id = feishu_approvals.operator_id
+              AND p.expires = feishu_approvals.expires
+              AND p.decision = CASE WHEN feishu_approvals.status = 'reject' THEN 'reject' ELSE 'approve' END
+              AND p.first_mono < p.deadline AND p.second_mono < p.deadline
+              AND p.first_business < p.expires AND p.second_business < p.expires)
+"""
 
 
 class State:
@@ -34,6 +90,7 @@ class State:
             journal = self._writer.execute("PRAGMA journal_mode=WAL").fetchone()
             if journal != ("wal",):
                 raise RuntimeError("飞书状态库无法开启 WAL。")
+            self._writer.execute("PRAGMA synchronous=FULL")
             self._initialize()
         except BaseException:
             self._writer.close()
@@ -73,8 +130,21 @@ class State:
                 )
             """)
             db.execute("""
-                INSERT OR IGNORE INTO feishu_callback_events (scope, event_id)
-                SELECT scope, event_id FROM feishu_approvals WHERE event_id IS NOT NULL
+                CREATE TABLE IF NOT EXISTS feishu_decision_proofs (
+                    scope TEXT NOT NULL, event_id TEXT NOT NULL,
+                    approval_id TEXT NOT NULL, message_id TEXT NOT NULL, record_id TEXT NOT NULL,
+                    operator_id TEXT NOT NULL, decision TEXT NOT NULL, expires REAL NOT NULL,
+                    first_mono REAL NOT NULL, first_business REAL NOT NULL,
+                    second_mono REAL NOT NULL, second_business REAL NOT NULL, deadline REAL NOT NULL,
+                    PRIMARY KEY (scope, event_id)
+                )
+            """)
+            if "attempted" not in {c[1] for c in db.execute("PRAGMA table_info(feishu_callback_events)")}:
+                db.execute("ALTER TABLE feishu_callback_events ADD COLUMN attempted INTEGER NOT NULL DEFAULT 0")
+                db.execute("UPDATE feishu_callback_events SET attempted = 1")
+            db.execute("""
+                INSERT OR IGNORE INTO feishu_callback_events (scope, event_id, attempted)
+                SELECT scope, event_id, 1 FROM feishu_approvals WHERE event_id IS NOT NULL
             """)
             columns = {column[1] for column in db.execute("PRAGMA table_info(feishu_messages)")}
             if "status" not in columns:
@@ -271,20 +341,69 @@ class State:
         event_id: str, operator_id: str, current_time: Callable[[], float | None],
         *, deadline: float | None = None, before_commit: Callable[[], None] | None = None,
     ) -> bool:
+        if decision not in ("approve", "reject"):
+            return False
+        if deadline is None:
+            deadline = time.monotonic() + CALLBACK_BUDGET - CALLBACK_RESPONSE_MARGIN
+        receipt = callback_receipt.get() or ProofReceipt(deadline)
+        candidate = "candidate_" + decision
+        binding = (self.scope, approval_id, message_id, record_id, event_id)
         with self._write(deadline=deadline, before_commit=before_commit) as db:
             now = current_time()
-            if now is None:
+            if now is None or not db.execute("""
+                UPDATE feishu_callback_events SET attempted = 1
+                WHERE scope = ? AND event_id = ? AND attempted = 0
+            """, (self.scope, event_id)).rowcount:
                 return False
-            return db.execute("""
-                UPDATE OR IGNORE feishu_approvals
-                SET status = ?, event_id = ?, operator_id = ?, decided_at = ?
+            row = db.execute("""
+                UPDATE feishu_approvals SET status = ?, event_id = ?, operator_id = ?, decided_at = ?
                 WHERE scope = ? AND approval_id = ? AND message_id = ? AND record_id = ?
                   AND status = 'pending' AND expires > ?
-                  AND EXISTS (
-                    SELECT 1 FROM feishu_callback_events WHERE scope = ? AND event_id = ?
-                  )
-            """, (decision, event_id, operator_id, now, self.scope,
-                  approval_id, message_id, record_id, now, self.scope, event_id)).rowcount == 1
+                RETURNING expires
+            """, (candidate, event_id, operator_id, now, *binding[:4], now)).fetchone()
+        if row is None:
+            return False
+        expires, = row
+        first_business, first_mono = current_time(), time.monotonic()
+        match = "scope = ? AND approval_id = ? AND message_id = ? AND record_id = ? AND event_id = ?"
+        if first_business is None or first_business >= expires or first_mono >= deadline:
+            with self._write() as db:
+                retry = first_business is not None and first_business < expires
+                db.execute(f"""
+                    UPDATE feishu_approvals SET status = ?, event_id = NULL, operator_id = NULL, decided_at = NULL
+                    WHERE {match} AND status = ?
+                """, ("pending" if retry else "closed", *binding, candidate))
+            return False
+
+        receipt.review_required = True
+        fixed = "confirming_" + decision
+        with self._write(deadline=deadline) as db:
+            if not db.execute(f"UPDATE feishu_approvals SET status = ? WHERE {match} AND status = ?",
+                              (fixed, *binding, candidate)).rowcount:
+                return False
+        second_business = current_time()
+        second_mono = receipt.sample_second_commit(deadline, second_business, expires)
+        if second_mono is None:
+            return False
+
+        with self._write(deadline=receipt.proof_deadline) as db:
+            if not db.execute(f"""
+                INSERT INTO feishu_decision_proofs (
+                    scope, event_id, approval_id, message_id, record_id, operator_id, decision, expires,
+                    first_mono, first_business, second_mono, second_business, deadline
+                )
+                SELECT scope, event_id, approval_id, message_id, record_id, operator_id, ?, expires, ?, ?, ?, ?, ?
+                FROM feishu_approvals WHERE {match} AND status = ?
+            """, (decision, first_mono, first_business, second_mono, second_business, deadline,
+                  *binding, fixed)).rowcount:
+                return False
+        # 此时证明才已同步落盘。等待方已判超时或提交迟到时，绝不发布，也不在恢复时补签。
+        business = current_time()
+        if business is None or business >= expires or not receipt.confirm():
+            return False
+        with self._write() as db:
+            return db.execute(f"UPDATE feishu_approvals SET status = ? WHERE {match} AND status = ?",
+                              (decision, *binding, fixed)).rowcount == 1
 
     def close_approvals(
         self, *, deadline: float | None = None, before_commit: Callable[[], None] | None = None,
@@ -292,13 +411,16 @@ class State:
         with self._write(deadline=deadline, before_commit=before_commit) as db:
             db.execute("""
                 UPDATE feishu_approvals SET status = 'closed'
-                WHERE scope = ? AND status IN ('pending', 'approve', 'claimed')
+                WHERE scope = ? AND status IN ('pending', 'candidate_approve', 'candidate_reject', 'confirming_approve', 'confirming_reject', 'approve', 'claimed')
             """, (self.scope,))
 
     def approval_status(self, approval_id: str, record_id: str) -> str:
         with self.connection() as db:
-            row = db.execute("""
-                SELECT status FROM feishu_approvals
+            row = db.execute(f"""
+                SELECT CASE
+                    WHEN status IN ('approve', 'claimed') AND NOT {_PROVEN} THEN 'closed'
+                    WHEN status IN ('candidate_approve', 'candidate_reject', 'confirming_approve', 'confirming_reject') THEN 'pending'
+                    ELSE status END FROM feishu_approvals
                 WHERE scope = ? AND approval_id = ? AND record_id = ?
             """, (self.scope, approval_id, record_id)).fetchone()
             return row[0] if row else "closed"
@@ -308,14 +430,14 @@ class State:
             db.execute("""
                 UPDATE feishu_approvals SET status = 'closed'
                 WHERE scope = ? AND approval_id = ? AND record_id = ?
-                  AND status IN ('pending', 'approve', 'claimed')
+                  AND status IN ('pending', 'candidate_approve', 'candidate_reject', 'confirming_approve', 'confirming_reject', 'approve', 'claimed')
             """, (self.scope, approval_id, record_id))
 
     def claim_create(self, approval_id, record_id):
         with self._write() as db:
-            row = db.execute("""
+            row = db.execute(f"""
                 UPDATE feishu_approvals SET status = 'claimed'
-                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'approve'
+                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'approve' AND {_PROVEN}
                 RETURNING expires
             """, (self.scope, approval_id, record_id)).fetchone()
             return row[0] if row is not None else None
@@ -324,9 +446,9 @@ class State:
         # 关闭或认领同一卡片的其他进程与传输交接串行。
         # 即使这里回滚，入口也会依据已落盘的尝试记录冻结 Trace 资格。
         with self._write() as db:
-            row = db.execute("""
+            row = db.execute(f"""
                 UPDATE feishu_approvals SET status = 'used'
-                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'claimed'
+                WHERE scope = ? AND approval_id = ? AND record_id = ? AND status = 'claimed' AND {_PROVEN}
                 RETURNING expires
             """, (self.scope, approval_id, record_id)).fetchone()
             if row is None:
