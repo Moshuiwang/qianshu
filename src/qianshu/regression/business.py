@@ -507,9 +507,8 @@ class BusinessScore:
 
 def pairing_audit(documents: list[dict]) -> dict:
     """按冻结篇序及篇内草稿、金标顺序选出供独立抽核的编号。"""
-    limits = {"matched": 10, "missing": 5, "extra_or_unknown": 5}
+    limits = {"matched": 10, "missing": 5, "extra_or_unknown": 5, "ambiguous": 5}
     cases = {key: [] for key in limits}
-    ambiguous = []
     for document in documents:
         token = document["token"]
         matched = sorted(
@@ -523,9 +522,9 @@ def pairing_audit(documents: list[dict]) -> dict:
             {"token": token, "draft": row["draft"], "kind": row["kind"]} for row in document["unpaired_drafts"]
         )
         if document["ambiguous_drafts"]:
-            ambiguous.append({
+            cases["ambiguous"].append({
                 "token": token,
                 "policies": [row["id"] for row in document["policies"] if row["tie"]],
                 "drafts": [row["draft"] for row in document["ambiguous_drafts"]],
             })
-    return {**{key: cases[key][:limit] for key, limit in limits.items()}, "ambiguous": ambiguous}
+    return {key: cases[key][:limit] for key, limit in limits.items()}

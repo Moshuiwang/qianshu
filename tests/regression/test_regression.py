@@ -1369,6 +1369,37 @@ def test_business_maps_included_gold_and_separates_extras_from_unknown():
     }
 
 
+def test_pairing_audit_caps_ambiguous_groups_in_frozen_order():
+    from qianshu.regression.business import BusinessScore, pairing_audit
+
+    tokens = ["f", "e", "d", "c", "b", "a"]
+    ids_by_token = {token: [f"{token}-2", f"{token}-1"] for token in tokens}
+    snapshot = {
+        "samples": {
+            policy_id: {"country": "占位地区", "benefit_type": "赠送时长"}
+            for ids in ids_by_token.values() for policy_id in ids
+        },
+        "denominators": {"fields": {}},
+    }
+    score = BusinessScore(snapshot, 2, {})
+    draft = SimpleNamespace(recharge_days=DraftField(value=30), to_dict=lambda: {})
+    documents = []
+    for token in tokens:
+        pairs = [
+            {"id": policy_id, "configuration": {"recharge_days": {"value": 30}}}
+            for policy_id in ids_by_token[token]
+        ]
+        documents.append({"token": token, **score.add({"body": "占位"}, pairs, [draft, draft])})
+
+    assert pairing_audit(documents)["ambiguous"] == [
+        {"token": token, "policies": ids_by_token[token], "drafts": [0, 1]}
+        for token in tokens[:5]
+    ]
+    report = score.report(reply_parse_failed=0)
+    assert report["counts"]["tied_pairs"] == 12
+    assert report["rates"]["all_correct"] == {"numerator": 0, "denominator": 12, "percent": 0.0}
+
+
 @pytest.mark.parametrize("dataset", ["exam", "blind", "packages"])
 def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
     from qianshu.draft import SourceExcerpt
