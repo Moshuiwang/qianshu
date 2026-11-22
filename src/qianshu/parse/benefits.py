@@ -199,19 +199,24 @@ def _checked_value(results: dict[str, FieldResult], name: str) -> object:
     return result.value if result.has_value and not result.needs_confirmation else None
 
 
-def _resolve_tariff(results: dict[str, FieldResult], catalog: BenefitCatalog, today: date | None) -> None:
+def _lookup_tariff(results: dict[str, FieldResult], catalog: BenefitCatalog, today: date | None) -> TariffRate | None:
     tariff = results["tariff"]
-    amount = results["recharge_amount"]
     start = date.fromisoformat(results["start_date"].value) if verified_value(results["start_date"]) else None
     on = max(start, today) if start is not None and today is not None else start
     rate = catalog.rate(tariff.value, on) if verified_value(tariff) else None
     if rate is not None:
         results["tariff"] = accept(
             tariff, {**tariff.value, "version": rate.version}, ValueSource.LOOKUP,
-            inputs=("start_date", "amount_mode", "tariff"),
+            inputs=("start_date", "tariff"),
         )
     elif verified_value(tariff):
         results["tariff"] = issue(tariff, "tariff_lookup_unresolved")
+    return rate
+
+
+def _resolve_amount(results: dict[str, FieldResult], rate: TariffRate | None) -> None:
+    amount = results["recharge_amount"]
+    tariff = results["tariff"]
     multiplier = results["tariff_multiplier"]
     if rate is None or not verified_value(multiplier):
         if verified_value(amount) or can_use_absence(amount):
@@ -229,7 +234,7 @@ def _resolve_tariff(results: dict[str, FieldResult], catalog: BenefitCatalog, to
 
 
 def apply_benefit_rules(
-    results: dict[str, FieldResult], catalog: BenefitCatalog, today: date | None,
+    results: dict[str, FieldResult], catalog: BenefitCatalog, today: date | None, reported: set[str],
 ) -> list[str]:
     hints = []
     benefit = results["benefit_type"]
@@ -250,20 +255,22 @@ def apply_benefit_rules(
     after_offer = _checked_value(results, "after_offer")
     inactive = _inactive_fields(kind, amount_mode, after_offer)
     required = _required_fields(kind, amount_mode, after_offer)
-    if kind == "特价优惠" and amount_mode == "节目包资费":
-        _resolve_tariff(results, catalog, today)
-    if kind in ("升级权益", "特价优惠") and after_offer == "指定节目包":
+    if "tariff" not in inactive:
+        rate = _lookup_tariff(results, catalog, today)
+        if kind == "特价优惠" and amount_mode == "节目包资费":
+            _resolve_amount(results, rate)
+    if "after_offer_package" not in inactive:
         target = results["after_offer_package"]
         if verified_value(target):
             results["after_offer_package"] = (
-                accept(target, target.value, ValueSource.LOOKUP, inputs=("after_offer", "after_offer_package"))
+                accept(target, target.value, ValueSource.LOOKUP, inputs=("after_offer_package",))
                 if catalog.package_names.count(target.value) == 1
                 else issue(target, "after_offer_package_lookup_unresolved")
             )
 
     for name in inactive:
         result = results[name]
-        if verified_value(result) or can_use_absence(result):
+        if name not in reported or verified_value(result) or can_use_absence(result):
             results[name] = replace(result, value=None, has_value=False, source=None, needs_confirmation=False)
     for name in OFFER_FIELD_LABELS.keys() - required - inactive:
         if can_use_absence(results[name]):

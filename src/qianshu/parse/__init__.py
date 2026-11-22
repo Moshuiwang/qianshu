@@ -228,7 +228,7 @@ def _draft(
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
     country_company.resolve_country_company(results, rules)
     dates.verify_dates(results)
-    benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, today)
+    benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, today, policy.fields.model_fields_set)
     hints = [
         *names.derive_names(results),
         *benefit_hints,

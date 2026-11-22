@@ -75,6 +75,19 @@ class OfferFinding[T](Finding[T]):
     candidates: list[ProposedValue[T]] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
 
+    @classmethod
+    def __get_pydantic_json_schema__(cls, core_schema, handler):
+        # 缺项由本字段的 WrapValidator 接住。只展开优惠字段的引用，保留旧协议的必填项。
+        def optional_children(node):
+            if isinstance(node, list):
+                return [optional_children(item) for item in node]
+            if isinstance(node, dict):
+                resolved = handler.resolve_ref_schema(node)
+                return {key: optional_children(value) for key, value in resolved.items() if key != "required"}
+            return node
+
+        return optional_children(handler(core_schema))
+
 
 def _decode_offer_finding(value, handler):
     try:

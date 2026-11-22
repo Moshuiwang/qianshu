@@ -362,7 +362,9 @@ def test_optional_offer_field_failure_stays_local(name, shape):
     else:
         fields[name]["evidence"] = [None] if shape == "invalid_subfield" else None
     draft = parsed(body, reply)
-    assert set(draft.uncertain_fields()) == {name}
+    applicable = {"after_offer", "forbid_package_change", "penalty_days"}
+    expected = set() if shape == "missing" and name not in applicable else {name}
+    assert set(draft.uncertain_fields()) == expected
     assert draft.field_results[name].statement.status is StatementStatus.UNSUPPORTED
     assert draft.gift_days.value == 7
 
@@ -435,3 +437,85 @@ def test_tariff_candidate_redacts_across_structured_values():
                    evidence=[])
     content = card_text(body, reply, sensitive_values=["xABCDy"])
     assert '"base_package": "[已脱敏]", "price_plan": "[已脱敏]"' in content
+
+
+def test_nested_tariff_candidate_checks_json_escaped_display():
+    reference = {**TARIFF, "base_package": "甲\nAB乙"}
+    body, reply = tariff_scenario(tariff=field(reference, "合成资费"))
+    finding = reply["policies"][0]["fields"]["tariff"]
+    finding.update(status="歧义", value=None, candidates=[{"value": reference, "evidence": finding["evidence"]}],
+                   evidence=[])
+    content = card_text(body, reply, sensitive_values=["占位\\nAB登记\n末尾"])
+    assert '"base_package": "甲[已脱敏]乙"' in content
+    assert r"\nAB" not in content
+
+
+@pytest.mark.parametrize(("branch", "dependent", "invalid"), [
+    ("after_offer", "after_offer_package", field("未登记目标包", "到期转入未登记目标包")),
+    ("amount_mode", "tariff", field({**TARIFF, "version": "未登记版本"}, "按未登记版本资费")),
+])
+@pytest.mark.parametrize("matches", [False, True])
+def test_omitting_branch_still_checks_trusted_catalog(branch, dependent, invalid, matches):
+    body, reply = tariff_scenario(**({} if matches else {dependent: invalid}))
+    before = parsed(body, reply)
+    del reply["policies"][0]["fields"][branch]
+    draft = parsed(body, reply)
+    assert getattr(draft, dependent) == getattr(before, dependent)
+    assert getattr(draft, branch).uncertainty is not None
+    result = draft.field_results[dependent]
+    if matches:
+        assert result.source is ValueSource.LOOKUP
+    else:
+        assert result.needs_confirmation
+        assert OFFER_FIELD_LABELS[dependent] + " · 待确认" in card_text(body, reply)
+    if branch == "amount_mode":
+        assert draft.recharge_amount.value is None
+
+
+@pytest.mark.parametrize(("kind", "inactive", "active"), [
+    ("赠送时长", "after_offer", "penalty_days"),
+    ("升级权益", "watch_days", "after_offer"),
+    ("特价优惠", "tariff", "watch_days"),
+])
+def test_omission_uses_offer_matrix_for_validation_and_card(kind, inactive, active):
+    body, reply = scenario(kind, cancel_on_downgrade=field("是", "降包取消"))
+    fields = reply["policies"][0]["fields"]
+    del fields[inactive]
+    draft = parsed(body, reply)
+    assert validate_draft(draft, today=TODAY, facts=FACTS)[1].can_create
+    assert OFFER_FIELD_LABELS[inactive] not in card_text(body, reply)
+    del fields[active]
+    draft = parsed(body, reply)
+    assert {error.field for error in validate_draft(draft, today=TODAY, facts=FACTS)[1].errors} == {active}
+    assert OFFER_FIELD_LABELS[active] + " · 待确认" in card_text(body, reply)
+
+
+def test_tool_schema_optional_through_all_offer_descendants():
+    from qianshu.parse.protocol import ApplicationReply
+
+    definitions = ApplicationReply.model_json_schema()["$defs"]
+
+    def check(node):
+        if isinstance(node, list):
+            for child in node:
+                check(child)
+        if isinstance(node, dict):
+            assert "required" not in node
+            if "$ref" in node:
+                check(definitions[node["$ref"].split("/")[-1]])
+            for child in node.values():
+                check(child)
+
+    findings = definitions["Findings"]
+    assert set(OFFER_FIELD_LABELS).isdisjoint(findings["required"])
+    for name in OFFER_FIELD_LABELS:
+        check(findings["properties"][name])
+
+
+def test_candidate_and_quote_check_original_text_even_if_value_already_masked():
+    body, reply = scenario("升级权益", after_offer_package=field("合成目标", "CD"))
+    finding = reply["policies"][0]["fields"]["after_offer_package"]
+    finding.update(status="歧义", value=None, candidates=[{"value": "AB", "evidence": finding["evidence"]}],
+                   evidence=[])
+    content = card_text(body, reply, sensitive_values=["ABCD", "AB"])
+    assert "优惠到期目标包 · 候选 1\n值　[已脱敏]\n原文出处　「[已脱敏]」" in content
