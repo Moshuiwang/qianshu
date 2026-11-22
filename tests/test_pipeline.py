@@ -752,18 +752,42 @@ def test_command_injection_still_enforces_approved_fingerprint(tmp_path, single_
 
 
 
-def test_command_displays_pending_range_and_keeps_partial_draft(tmp_path, single_policy):
+@pytest.mark.parametrize("case", ["材料不足", "可能有政策但无法切分", "gap", "unbound", "complete"])
+def test_command_reports_full_review_without_downgrading_fields(tmp_path, single_policy, case):
     body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
     reply = fixed_reply(" " + body, rows)
-    tail = "\n合成新增段"
-    cards = _run(tmp_path, body + tail, reply)
-    content = "\n".join(_contents(cards))
-    assert "解析不完整，需人工确认" in content
-    assert "待确认范围 1" in content
-    assert f"body [{len(body) + 1}, {len(body) + len(tail) + 1})" in content
-    assert "政策 1 · 用户范围" in content
-    assert "未校验" in content
-    assert "待群卡片同意" not in content
+    if case in ("材料不足", "可能有政策但无法切分"):
+        reply["document"] = {"status": case, "reason_code": "missing_image"}
+    elif case in ("gap", "unbound"):
+        tail = "\n合成新增段"
+        uncovered = span(len(body) + 1, len(body) + len(tail) + 1)
+        body += tail
+        if case == "unbound":
+            reply["coverage"].append({"span": uncovered, "use": "待确认范围"})
+            reply["pending"].append({"span": uncovered, "reason_code": "unassigned",
+                                     "policy_ids": [], "fields_by_policy": []})
+    cards = _run(tmp_path, body, reply, tag_dates={"占位标签甲": "2099-02-15"})
+    lines = _contents(cards)
+    content = "\n".join(lines)
+    assert "政策 1 · 用户范围\n值　占位休眠用户\n原文出处　「用户范围：占位休眠用户」" in lines
+    assert "政策 1 · 用户范围 · 待确认" not in content
+    assert "政策 1 · 多买多送\n值　是\n原文出处　无原文摘录" in lines
+    if case == "complete":
+        assert "需人工核对全文" not in content
+        assert "解析完成，待群卡片同意" in content
+    else:
+        assert lines[1].startswith("<font color='red'>处理状态\n需人工核对全文\n停在校验。")
+        assert "待确认范围 1" in content
+        assert "未校验" in content
+        assert "待群卡片同意" not in content
+        if case in ("gap", "unbound"):
+            assert f"body [{uncovered['start']}, {uncovered['end']})" in content
+            reason_code = "coverage_gap" if case == "gap" else "unassigned"
+            assert reason_code in content
+        else:
+            assert f"文档判定\n{case}" in lines
+            assert "无可定位坐标\n理由码　document_pending（missing_image）" in content
 
 
 def test_pending_range_preview_redacts_secrets_at_range_edges():
@@ -778,8 +802,8 @@ def test_pending_range_preview_redacts_secrets_at_range_edges():
 
     assert "[已脱敏]" in whole.text
     assert SECRET not in whole.text
-    assert clipped_end.text == "body [0, 5)"
-    assert clipped_start.text == f"body [5, {len(body)})"
+    assert clipped_end.text == "body [0, 5)\n理由码　declared_pending"
+    assert clipped_start.text == f"body [5, {len(body)})\n理由码　declared_pending"
 
 
 @pytest.mark.parametrize("has_title", [True, False])

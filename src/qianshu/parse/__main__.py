@@ -1,6 +1,6 @@
 """从标准输入读取申请，将草稿写入仅当前用户可读的新文件。
 
-通常输出草稿列表。有文档级判定时输出包含 document 和 drafts 的对象。
+通常输出草稿列表。有文档级判定或需人工核对全文时输出包含 document 和 drafts 的对象。
 """
 
 import argparse
@@ -70,10 +70,23 @@ def main() -> int:
             on_reply=save_reply if args.raw_output is not None else None,
         )
         drafts = [draft.to_dict() for draft in parsed]
-        payload = drafts if parsed.document is None else {
-            "document": parsed.document.model_dump(mode="json"),
-            "drafts": drafts,
-        }
+        payload = drafts
+        if parsed.document is not None or parsed.requires_full_review:
+            payload = {
+                "document": parsed.document.model_dump(mode="json") if parsed.document is not None else None,
+                "drafts": drafts,
+            }
+            if parsed.requires_full_review:
+                payload["requires_full_review"] = True
+                payload["pending"] = [
+                    {
+                        "span": item.span.model_dump(mode="json") if item.span is not None else None,
+                        "code": item.code,
+                        "reason_code": item.reason_code or item.code,
+                        "block_id": item.block_id,
+                    }
+                    for item in parsed.pending
+                ]
         result = json.dumps(payload, ensure_ascii=False, indent=2)
         _write_private(args.output, result + "\n")
     except (ConfigError, ModelError, ParseError) as error:

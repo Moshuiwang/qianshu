@@ -420,22 +420,25 @@ def test_local_remark_overlap_includes_full_clause_of_each_reference():
     assert all(draft.repeat_bonus.value == "是" for draft in result)
 
 
-@pytest.mark.parametrize("coverage,field", [("gap", None), ("pending", "user_scope"), ("all", None)])
-def test_coverage_and_pending_ranges_use_structural_bindings(coverage, field):
+@pytest.mark.parametrize("coverage", ["gap", "bound", "unbound", "all"])
+def test_coverage_and_pending_ranges_use_structural_bindings(coverage):
     body = "甲主段乙主段其他"
     first, second, tail = span(0, 3), span(3, 6), span(6, 8)
     policies = [policy("p1", first), policy("p2", second)]
     covered = [{"span": span(0, 6), "use": "政策条款"}]
     pending = []
-    if coverage == "pending":
+    if coverage in ("bound", "unbound"):
         covered.append({"span": tail, "use": "待确认范围"})
-        pending.append({"span": tail, "reason_code": "fixture", "policy_ids": ["p1"],
-                        "fields_by_policy": [{"policy_id": "p1", "field_ids": [field]}]})
+        pending.append({"span": tail, "reason_code": "fixture",
+                        "policy_ids": ["p1"] if coverage == "bound" else [],
+                        "fields_by_policy": [{"policy_id": "p1", "field_ids": ["repeat_bonus"]}]
+                        if coverage == "bound" else []})
     if coverage == "all":
         covered.append({"span": tail, "use": "其他文本"})
     result = parse_fixed(body, document(body, policies, coverage=covered, pending=pending))
     assert bool(result.pending) == (coverage != "all")
-    assert [draft.repeat_bonus.value for draft in result] == ([None, None] if coverage == "gap" else ["是", "是"])
+    assert result.requires_full_review == (coverage in ("gap", "unbound"))
+    assert [draft.repeat_bonus.value for draft in result] == [None if coverage == "bound" else "是", "是"]
 
 
 def test_overlapping_input_blocks_each_require_coverage_description():
@@ -450,6 +453,7 @@ def test_overlapping_input_blocks_each_require_coverage_description():
     pending, = result.pending
     assert pending.code == "missing_block_coverage"
     assert pending.block_id == "part-b"
+    assert not result.requires_full_review
     assert result[0].maintain_mutual_exclusion_group.value is None
 
     reply["coverage"].append({"span": span(0, 3, "part-b"), "use": "其他文本"})
@@ -516,6 +520,7 @@ def test_empty_documents_distinguish_classification_from_parse_failure(status):
     assert not result
     assert result.document.status == status
     assert bool(result.pending) == (status != "经检查无政策")
+    assert result.requires_full_review == (status != "经检查无政策")
     with pytest.raises(ParseError) as exc:
         parse_fixed(body, document(body))
     assert exc.value.code == "reply_document"

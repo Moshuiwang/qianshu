@@ -21,7 +21,7 @@ from qianshu.regression.compare import FIELD_LABELS, compare_field, normalize
 from qianshu.regression.corpus import CANDIDATES, DOCUMENTS, FIELDS, PAIRS, SEED, body_hashes, make_plan, select
 from qianshu.regression.runner import align
 from qianshu.regression.storage import PrivateFiles, RegressionError, digest, json_bytes
-from tests.protocol_fixtures import fixed_reply, quote, serialized_empty
+from tests.protocol_fixtures import document, fixed_reply, quote, serialized_empty
 
 RULES = Path(__file__).resolve().parents[2] / "rules"
 CORPUS = Path("archive")
@@ -743,6 +743,39 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
         assert secret not in public + capture.out + capture.err + caplog.text
     assert output.stat().st_mode & 0o777 == 0o700
     assert all(file.stat().st_mode & 0o777 == 0o600 for file in output.iterdir())
+
+
+def test_full_document_review_counts_cards_and_keeps_field_scores(repo, corpus, capsys):
+    catalogs(corpus, [
+        ("policy-a", "doc-batch", "赞比亚", "定向政策", "赠送时长"),
+        ("policy-b", "doc-batch", "莫桑比克", "定向政策", "赠送时长"),
+        ("policy-c", "doc-single", "赞比亚", "公开政策", "升级权益"),
+    ])
+    assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
+    assert main(["freeze", *FREEZE]) == 0
+    frozen = capsys.readouterr().out.splitlines()[-1]
+
+    def model(*, system, user):
+        body = json.loads(user)["application"]
+        if body != BATCH:
+            return json.dumps(document(body, status="材料不足"), ensure_ascii=False)
+        reply = fixed_reply(body, [
+            {"country": {"value": "赞比亚", "evidence": [FIRST]},
+             "user_scope": {"value": "占位金标甲", "evidence": ["占位正文甲"]}},
+            {"country": {"value": "莫桑比克", "evidence": [SECOND]},
+             "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
+        ], policy_ranges=[(0, BATCH.index(SECOND)), (BATCH.index(SECOND), len(body))])
+        reply["document"] = {"status": "材料不足", "reason_code": "missing_image"}
+        return json.dumps(reply, ensure_ascii=False)
+
+    assert main(run_args(frozen), model=model) == 0
+    report = get_json(repo / "run/public-report.json")
+    assert report["full_document_review"] == {"cards": 2, "policies": 2}
+    assert report["by_field"]["user_scope"]["match"] == 2
+    assert report["business"]["by_field"]["user_scope"]["correct"] == 2
+    markdown = (repo / "run/public-report.md").read_text()
+    assert "需核对全文的卡片数 2（政策数 2）" in markdown
+    assert "missing_image" not in markdown
 
 
 def test_no_live_flag_never_constructs_a_model(repo, frozen, monkeypatch):

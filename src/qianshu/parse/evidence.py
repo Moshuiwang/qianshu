@@ -20,6 +20,7 @@ class ReviewRange:
     policy_ids: tuple[str, ...] = ()
     fields_by_policy: dict[str, frozenset[str]] | None = None
     block_id: str | None = None
+    reason_code: str | None = None
 
 
 class Sources:
@@ -174,19 +175,21 @@ class EvidenceReview:
                 or len(by_policy) != len(pending.fields_by_policy) or set(by_policy) - set(pending.policy_ids)
                 or any(ids - FIELD_IDS for ids in by_policy.values())
                 or (span is None and pending.span.text is None)):
-                self.pending.append(ReviewRange(span, "invalid_pending_reference"))
+                self.pending.append(ReviewRange(span, "invalid_pending_reference", reason_code=pending.reason_code))
             else:
                 code = "declared_pending" if span is not None else "invalid_pending_reference"
-                self.pending.append(ReviewRange(span, code, tuple(pending.policy_ids), by_policy))
+                self.pending.append(ReviewRange(span, code, tuple(pending.policy_ids), by_policy,
+                                                reason_code=pending.reason_code))
         if reply.document and reply.document.status is not DocumentStatus.NO_POLICY:
-            self.pending.append(ReviewRange(None, "document_pending"))
+            self.pending.append(ReviewRange(None, "document_pending", reason_code=reply.document.reason_code))
         unique = dict.fromkeys(
-            (item.span, item.code, item.policy_ids, tuple(sorted((item.fields_by_policy or {}).items())), item.block_id)
+            (item.span, item.code, item.policy_ids, tuple(sorted((item.fields_by_policy or {}).items())),
+             item.block_id, item.reason_code)
             for item in self.pending
         )
         self.pending = [
-            ReviewRange(span, code, ids, dict(by_policy), block_id)
-            for span, code, ids, by_policy, block_id in unique
+            ReviewRange(span, code, ids, dict(by_policy), block_id, reason_code)
+            for span, code, ids, by_policy, block_id, reason_code in unique
         ]
 
     def corrected_span(self, span: Span) -> Span | None:
@@ -325,9 +328,7 @@ class EvidenceReview:
 
     def _pending_codes(self, policy: Policy, name: str) -> Iterable[str]:
         for pending in self.pending:
-            if not pending.policy_ids:
-                yield pending.code
-            elif policy.id in pending.policy_ids:
+            if policy.id in pending.policy_ids:
                 names = (pending.fields_by_policy or {}).get(policy.id)
                 if not names or name in names:
                     yield pending.code

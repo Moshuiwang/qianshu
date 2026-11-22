@@ -218,6 +218,9 @@ class Pipeline:
             location = f"{span.source_id} [{span.start}, {span.end})" if span else "无可定位坐标"
             if item.block_id is not None:
                 location += f"（输入块 {item.block_id} 缺少覆盖说明）"
+            location += f"\n理由码　{item.code}"
+            if item.reason_code:
+                location += f"（{item.reason_code}）"
             if span and span.source_id == "body" and span.end <= len(body):
                 start, end = span.start, span.end
                 crosses_edge = any(left < start < right or left < end < right for left, right in sensitive_spans)
@@ -254,12 +257,15 @@ class Pipeline:
 
         pending = getattr(drafts, "pending", ())
         document = getattr(drafts, "document", None)
+        requires_full_review = getattr(drafts, "requires_full_review", False)
         reminders = []
         if document:
             reminders.append(CardLine("文档判定", document.status.value))
         reminders.extend(self._pending_range_reminders(body, pending))
 
-        if pending:
+        if requires_full_review:
+            status = "需人工核对全文\n停在校验。请核对申请全文、待确认范围和已提取的草稿。未校验。"
+        elif pending:
             status = "解析不完整，需人工确认\n请核对待确认范围与已提取的草稿。未校验。"
         elif document and not policies:
             status = document.status.value
@@ -279,7 +285,7 @@ class Pipeline:
                 status = f"解析完成，共 {len(policies)} 条政策。"
 
         lines = [
-            CardLine("处理状态", status, red=bool(pending)),
+            CardLine("处理状态", status, red=requires_full_review or bool(pending)),
             *reminders,
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
             *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}")),

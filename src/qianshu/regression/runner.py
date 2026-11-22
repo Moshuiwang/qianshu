@@ -205,6 +205,7 @@ def evaluate(
         country_names=company_rules.countries if company_rules is not None else None)
     business_details = []
     evidence_locations = Counter()
+    full_review_cards = full_review_policies = 0
     reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
     reply_failed_documents = 0
 
@@ -246,6 +247,9 @@ def evaluate(
             raise
         else:
             status = "parsed"
+            if getattr(drafts, "requires_full_review", False):
+                full_review_cards += 1
+                full_review_policies += len(drafts)
         location_counts = Counter(getattr(drafts, "evidence_locations", {}))
         evidence_locations.update(location_counts)
         failure_reasons = set()
@@ -316,6 +320,7 @@ def evaluate(
         "samples": len(samples),
         "strata": frozen["strata"],
         "documents": {key: documents[key] for key in DOCUMENT_RESULTS},
+        "full_document_review": {"cards": full_review_cards, "policies": full_review_policies},
         "evidence_location": _evidence_location_report(evidence_locations),
         "sample_alignment": {key: alignments[key] for key in ALIGNMENTS},
         "draft_alignment": {key: draft_counts[key] for key in DRAFT_RESULTS},
@@ -360,6 +365,8 @@ def markdown_report(report: dict) -> bytes:
         f"- 证据定位成功率 {locations['numerator']}/{locations['denominator']}（{rate}）",
         *(f"- {label} {locations['counts'][key]}" for key, label in EVIDENCE_LOCATION_LABELS.items()),
     ]
+    review = report["full_document_review"]
+    review_line = f"- 需核对全文的卡片数 {review['cards']}（政策数 {review['policies']}）"
     if report.get("void"):
         return "\n".join([
             "# 解析回归计数", "",
@@ -367,7 +374,7 @@ def markdown_report(report: dict) -> bytes:
             f"- 运行配置指纹 `{report['configuration_sha256']}`",
             f"- 模型调用失败 {report['documents']['model_failed']} 篇",
             f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}",
-            *location_lines, "", "本次放行运行作废。", "",
+            review_line, *location_lines, "", "本次放行运行作废。", "",
         ]).encode()
 
     def lines(title, data):
@@ -389,7 +396,7 @@ def markdown_report(report: dict) -> bytes:
         f"- 样例 {report['samples']} 条",
         f"- 原稿解析完成 {report['documents']['parsed']} 篇，模型调用失败 {report['documents']['model_failed']} 篇，"
         f"回复解析失败 {report['documents']['parse_failed']} 篇",
-        *location_lines,
+        review_line, *location_lines,
         f"- 唯一对齐 {report['sample_alignment']['matched']} 条，未对齐 {report['sample_alignment']['unmatched']} 条，"
         f"歧义 {report['sample_alignment']['ambiguous']} 条", "",
         "## 分层配额与缺口", "",

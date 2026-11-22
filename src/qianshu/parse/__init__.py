@@ -95,6 +95,13 @@ class ParseResult(list[ParsedPolicyDraft]):
         self.declaration = declaration
         self.evidence_locations = dict(evidence_locations or {})
 
+    @property
+    def requires_full_review(self) -> bool:
+        return (
+            (self.document is not None and self.document.status is not DocumentStatus.NO_POLICY)
+            or any(not item.policy_ids for item in self.pending)
+        )
+
 
 def parse_application(
     body: str,
@@ -112,9 +119,11 @@ def parse_application(
     """解析正文及已转成文本的附件。on_reply 收到私有重放所需的结构化回复。"""
     attachments = tuple(additional_blocks)
     if not body.strip() and not any(block.text.strip() for block in attachments):
-        return ParseResult(pending=(ReviewRange(None, "document_pending"),), document=DocumentFinding(
-            status=DocumentStatus.INSUFFICIENT, reason_code="empty_material",
-        ))
+        document = DocumentFinding(status=DocumentStatus.INSUFFICIENT, reason_code="empty_material")
+        return ParseResult(
+            pending=(ReviewRange(None, "document_pending", reason_code=document.reason_code),),
+            document=document,
+        )
 
     try:
         prompt = (rules_dir / "parse-prompt.md").read_text(encoding="utf-8")

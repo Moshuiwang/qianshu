@@ -19,7 +19,7 @@ from qianshu.parse import ModelError, parse_application
 from qianshu.parse.__main__ import main
 from qianshu.parse.model import ModelReplyError, configured_model, load_model_config
 from qianshu.parse.protocol import ApplicationReply
-from tests.protocol_fixtures import document, fixed_reply, serialized_empty
+from tests.protocol_fixtures import document, fixed_reply, serialized_empty, span
 
 
 def test_service_help_describes_current_offline_input(capsys):
@@ -536,13 +536,38 @@ def test_replay_writes_document_finding(monkeypatch, tmp_path, capsys, status):
     monkeypatch.setattr(sys, "stdin", io.StringIO(body))
 
     assert main() == 0
-    assert json.loads(output.read_text(encoding="utf-8")) == {
+    expected = {
         "document": {"status": status, "reason_code": "fixture"},
         "drafts": [],
     }
+    if status != "经检查无政策":
+        expected.update(requires_full_review=True, pending=[
+            {"span": None, "code": "document_pending", "reason_code": "fixture", "block_id": None},
+        ])
+    assert json.loads(output.read_text(encoding="utf-8")) == expected
     assert raw.read_bytes() == reply.encode()
     assert raw.stat().st_mode & 0o777 == 0o600
     assert capsys.readouterr() == ("", "")
+
+
+def test_replay_writes_full_review_for_unbound_coverage_gap(monkeypatch, tmp_path):
+    covered, tail = "合成申请", "其余材料"
+    body = covered + tail
+    reply = fixed_reply(covered, [{}])
+    replay = tmp_path / "reply.json"
+    output = tmp_path / "drafts.json"
+    replay.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--replay", str(replay), "--output", str(output)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(body))
+
+    assert main() == 0
+    parsed = json.loads(output.read_text(encoding="utf-8"))
+    assert parsed["document"] is None
+    assert parsed["requires_full_review"] is True
+    assert [(item["span"], item["reason_code"]) for item in parsed["pending"]] == [
+        (span(len(covered), len(body)), "coverage_gap"),
+    ]
+    assert parsed["drafts"][0]["repeat_bonus"]["value"] == "是"
 
 
 @pytest.fixture
