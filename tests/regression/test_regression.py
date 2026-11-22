@@ -5,7 +5,8 @@ import os
 import shutil
 import subprocess
 from collections import Counter
-from dataclasses import dataclass
+from contextlib import nullcontext
+from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from qianshu.regression.compare import FIELD_LABELS, compare_field, normalize
 from qianshu.regression.corpus import CANDIDATES, DOCUMENTS, FIELDS, PAIRS, SEED, body_hashes, make_plan, select
 from qianshu.regression.runner import align
 from qianshu.regression.storage import PrivateFiles, RegressionError, digest, json_bytes
+from tests.protocol_fixtures import fixed_reply, quote, serialized_empty
 
 RULES = Path(__file__).resolve().parents[2] / "rules"
 CORPUS = Path("archive")
@@ -32,6 +34,14 @@ FREEZE = [
     "--reviews", ".private/review.json", "--companies", ".private/companies.tsv",
     "--out", ".private/frozen",
 ]
+
+
+def no_policies(*, system, user):
+    return serialized_empty()
+
+
+def shaped_reply(body, rows, **options):
+    return json.dumps(fixed_reply(body, rows, **options), ensure_ascii=False)
 
 
 def git(*args):
@@ -307,7 +317,7 @@ def test_sample_freeze_records_reviewed_stratum_shortfall(repo, corpus, capsys):
     assert main(["verify", "--frozen", ".private/frozen", "--sources"]) == 0
     assert capsys.readouterr().out.strip() == fingerprint
 
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
     report = get_json(repo / "run" / "public-report.json")
     assert report["strata"] == strata
     assert sum(layer["included_count"] for layer in report["strata"]) == report["samples"] == 2
@@ -381,7 +391,7 @@ def test_loads_previous_manifest_fingerprint_without_package_style(repo, frozen,
     fingerprint = digest(old_manifest)
     assert main(["verify", "--frozen", ".private/frozen"]) == 0
     assert capsys.readouterr().out.strip() == fingerprint
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
     report = get_json(repo / "run" / "public-report.json")
     assert [(layer["included_count"], layer["shortfall"]) for layer in report["strata"]] == [(1, 0), (2, 0)]
     assert report["package_writing_by_document"]["unreviewed"] == 2
@@ -525,7 +535,7 @@ def test_conflicting_company_id_case_marks_only_affected_company_uncertain(repo,
     assert pairs["policy-c"]["configuration"]["company"] == {"value": "占位公司甲"}
 
     fingerprint = digest((repo / "frozen/manifest.json").read_bytes())
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
     report = get_json(repo / "run/public-report.json")
     assert report["samples"] == 3
     assert report["by_field"]["company"]["denominator"] == 2
@@ -561,7 +571,7 @@ def test_counts_each_package_style_once_per_original(repo, corpus):
     assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
     assert main(["freeze", *FREEZE]) == 0
     fingerprint = digest((repo / "frozen" / "manifest.json").read_bytes())
-    assert main(run_args(fingerprint), model=lambda **kw: "[]") == 0
+    assert main(run_args(fingerprint), model=no_policies) == 0
 
     report = get_json(repo / "run" / "public-report.json")
     assert report["samples"] == 5
@@ -630,7 +640,7 @@ def test_broad_real_draft_needs_evidence_in_the_only_sampled_paragraph(quotes, e
     body = first + "第二次仅限占位用户乙，充值 20 天。\n"
     drafts = parse.parse_application(
         body, rules_dir=RULES, companies_text="",
-        model=lambda **kw: json.dumps([{"user_scope": {"value": "占位用户", "evidence": quotes}}]),
+        model=lambda **kw: shaped_reply(body, [{"user_scope": {"value": "占位用户", "evidence": quotes}}]),
     )
     assert drafts[0].source_span == (0, len(body))
     outcomes, diagnostics = align(
@@ -649,16 +659,17 @@ def test_broad_real_draft_needs_evidence_in_the_only_sampled_paragraph(quotes, e
 def test_broad_real_draft_checks_repeated_evidence_in_sampled_paragraph(first_duration, later_duration, expected):
     first = "占位甲申请为赠送时长，" + first_duration + "\n"
     body = first + f"占位乙申请，{later_duration}\n占位丙申请，{later_duration}\n"
-    drafts = parse.parse_application(
-        body, rules_dir=RULES, companies_text="",
-        model=lambda **kw: json.dumps([{
-            "benefit_type": {"value": "赠送时长", "evidence": ["赠送时长"]},
-            "recharge_days": {"value": 20, "evidence": ["充值 20 天"]},
-        }]),
-    )
+    reply = fixed_reply(body, [{
+        "benefit_type": {"value": "赠送时长", "evidence": ["赠送时长"]},
+        "recharge_days": {"value": 20, "evidence": ["充值 20 天"]},
+    }])
+    if first_duration == later_duration:
+        extra = quote(body, "充值 20 天", occurrence=1)
+        reply["policies"][0]["fields"]["recharge_days"]["evidence"].append(extra)
+    drafts = parse.parse_application(body, rules_dir=RULES, companies_text="", model=lambda **_: json.dumps(reply))
     assert drafts[0].source_span == (0, len(body))
     assert drafts[0].recharge_days.value == 20
-    assert drafts[0].recharge_days.evidence[0].start is None
+    assert drafts[0].recharge_days.evidence[0].start == body.index("充值 20 天")
     outcomes, diagnostics = align(
         drafts, [{"id": "policy-a", "span": [0, len(first)]}],
         {"body": body, "other_spans": [], "complete": False},
@@ -691,10 +702,13 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
         if body != BATCH:
             logging.warning("占位单条原稿")
             raise RuntimeError("占位接口回包")
-        return json.dumps([
-            {"company": {"evidence": [SECOND]}, "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
-            {"company": {"evidence": [FIRST]}, "user_scope": {"value": "占位不同值", "evidence": ["占位正文甲"]}},
-        ], ensure_ascii=False)
+        split = BATCH.index(SECOND)
+        return shaped_reply(body, [
+            {"country": {"value": "莫桑比克", "evidence": [SECOND]},
+             "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
+            {"country": {"value": "赞比亚", "evidence": [FIRST]},
+             "user_scope": {"value": "占位不同值", "evidence": ["占位正文甲"]}},
+        ], policy_ranges=[(split, len(body)), (0, split)])
 
     args = run_args(frozen)
     if legacy:
@@ -730,6 +744,39 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
     assert all(file.stat().st_mode & 0o777 == 0o600 for file in output.iterdir())
 
 
+def test_full_document_review_counts_cards_and_keeps_field_scores(repo, corpus, capsys):
+    catalogs(corpus, [
+        ("policy-a", "doc-batch", "赞比亚", "定向政策", "赠送时长"),
+        ("policy-b", "doc-batch", "莫桑比克", "定向政策", "赠送时长"),
+        ("policy-c", "doc-single", "赞比亚", "公开政策", "升级权益"),
+    ])
+    assert main(["plan", "--corpus", *PLAN, "--all"]) == 0
+    assert main(["freeze", *FREEZE]) == 0
+    frozen = capsys.readouterr().out.splitlines()[-1]
+
+    def model(*, system, user):
+        body = json.loads(user)["application"]
+        if body != BATCH:
+            return serialized_empty()
+        reply = fixed_reply(body, [
+            {"country": {"value": "赞比亚", "evidence": [FIRST]},
+             "user_scope": {"value": "占位金标甲", "evidence": ["占位正文甲"]}},
+            {"country": {"value": "莫桑比克", "evidence": [SECOND]},
+             "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
+        ], policy_ranges=[(0, BATCH.index(SECOND)), (BATCH.index(SECOND), len(body))])
+        reply["policies"][0]["continuations"] = [{"source_id": "body", "start": len(body), "end": len(body) + 1}]
+        return json.dumps(reply, ensure_ascii=False)
+
+    assert main(run_args(frozen), model=model) == 0
+    report = get_json(repo / "run/public-report.json")
+    assert report["full_document_review"] == {"cards": 1, "policies": 2}
+    assert report["by_field"]["user_scope"]["match"] == 2
+    assert report["business"]["by_field"]["user_scope"]["correct"] == 2
+    markdown = (repo / "run/public-report.md").read_text()
+    assert "需核对全文的卡片数 1（政策数 2）" in markdown
+    assert report["full_document_review_reasons"]["unlocated_policy_continuation"] == 1
+
+
 def test_no_live_flag_never_constructs_a_model(repo, frozen, monkeypatch):
     def fail(*args):
         pytest.fail("unexpected model construction")
@@ -740,15 +787,14 @@ def test_no_live_flag_never_constructs_a_model(repo, frozen, monkeypatch):
 
 def test_frozen_baseline_runs_with_an_expanded_parser_and_reports_new_field_counts(repo, frozen, monkeypatch):
     def model(*, system, user):
-        if json.loads(user)["application"] != BATCH:
-            return "[]"
-        data = [
-            {"company": {"evidence": [FIRST]}},
-            {"company": {"evidence": [SECOND]}},
-        ]
-        if "synthetic_offer" in parse._FIELD_NAMES:
-            data[0]["synthetic_offer"] = {"value": "占位正文甲", "evidence": ["占位正文甲"]}
-        return json.dumps(data)
+        body = json.loads(user)["application"]
+        if body != BATCH:
+            return serialized_empty()
+        return shaped_reply(body, [
+            {"country": {"value": "赞比亚", "evidence": [FIRST]}},
+            {"country": {"value": "莫桑比克", "evidence": [SECOND]}},
+        ], policy_ranges=[(0, BATCH.index(SECOND)), (BATCH.index(SECOND), len(BATCH))])
+
 
     assert main(run_args(frozen), model=model) == 0
     original = get_json(repo / "run" / "public-report.json")
@@ -759,8 +805,19 @@ def test_frozen_baseline_runs_with_an_expanded_parser_and_reports_new_field_coun
     class ExtendedDraft(parse.ParsedPolicyDraft):
         synthetic_offer: DraftField[str]
 
-    monkeypatch.setattr(parse, "ParsedPolicyDraft", ExtendedDraft)
-    monkeypatch.setattr(parse, "_FIELD_NAMES", parse._FIELD_NAMES | {"synthetic_offer"})
+    def expanded_parser(*args, **kwargs):
+        result = parse.parse_application(*args, **kwargs)
+        for index, draft in enumerate(result):
+            extended = ExtendedDraft(
+                **{field.name: getattr(draft, field.name) for field in fields(draft)},
+                synthetic_offer=DraftField(value="占位正文甲") if index == 0
+                else DraftField(uncertainty=Uncertainty(reason="占位待确认")),
+            )
+            extended.__dict__.update(draft.__dict__)
+            result[index] = extended
+        return result
+
+    monkeypatch.setattr(runner, "parse_application", expanded_parser)
     monkeypatch.setattr(runner, "PolicyDraft", ExtendedDraft)
     monkeypatch.setitem(FIELD_LABELS, "synthetic_offer", ("占位新增字段", "Text"))
 
@@ -789,8 +846,9 @@ def test_malformed_reply_and_duplicate_source_scopes_are_counted(repo, frozen):
     def model(*, system, user):
         if json.loads(user)["application"] != BATCH:
             return "占位原始回包，无法解析"
-        draft = {"company": {"evidence": [FIRST]}}
-        return json.dumps([draft, draft], ensure_ascii=False)
+        body = json.loads(user)["application"]
+        draft = {"country": {"value": "赞比亚", "evidence": [FIRST]}}
+        return shaped_reply(body, [draft, draft], policy_ranges=[(0, BATCH.index(SECOND))] * 2)
 
     assert main(run_args(frozen), model=model) == 0
     report = get_json(repo / "run" / "public-report.json")
@@ -866,7 +924,7 @@ def test_output_moved_during_model_run_is_not_written(repo, frozen):
         if not moved.exists():
             (repo / "run").rename(moved)
             (repo / "run").mkdir(mode=0o700)
-        return "[]"
+        return serialized_empty()
 
     assert main(run_args(frozen), model=model) == 1
     assert moved.is_dir()
@@ -876,6 +934,57 @@ def test_output_moved_during_model_run_is_not_written(repo, frozen):
 
 def _replay_args(fingerprint, source=".private/run", out=".private/replay"):
     return ["replay", "--recording", source, *run_args(fingerprint, out)[1:]]
+
+
+def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkeypatch):
+    import anthropic
+    from anthropic.types import TextBlock, ThinkingBlock
+
+    blocks = [
+        ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
+        TextBlock(type="text", text=serialized_empty()),
+    ]
+    reply = SimpleNamespace(stop_reason="end_turn", content=blocks)
+
+    efforts = []
+
+    def stream(**payload):
+        efforts.append(payload["output_config"]["effort"])
+        assert "tool_choice" not in payload
+        assert "必须调用 `submit_application_reply` 一次" in payload["system"]
+        assert "不要用文字回答" in payload["system"]
+        return nullcontext([SimpleNamespace(type="message_start", message=reply)])
+
+    client = SimpleNamespace(messages=SimpleNamespace(create=stream))
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
+    monkeypatch.setenv("AI_PLATFORM", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
+    monkeypatch.delenv("ANTHROPIC_EFFORT", raising=False)
+    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert efforts == ["medium", "medium"]
+    report = get_json(repo / "run/public-report.json")
+    assert report["documents"] == {"model_failed": 0, "parse_failed": 2, "parsed": 0}
+    assert report["business"]["counts"]["reply_parse_failed"] == 2
+    record = get_json(repo / "run/document-00001.json")
+    attempt, = record["attempts"]
+    assert attempt["effort"] == record["configuration"]["effort"] == "medium"
+    assert attempt["failure_stage"] == record["reason_code"] == "reply_tool_missing"
+    assert json.loads(attempt["reply"]) == [block.model_dump(exclude_unset=True) for block in blocks]
+    monkeypatch.setenv("ANTHROPIC_EFFORT", "high")
+    assert main([*run_args(frozen, ".private/high"), "--live", "--release", "--retries", "1"]) == 0
+    assert efforts == ["medium", "medium", "high", "high"]
+    high_record = get_json(repo / "high/document-00001.json")
+    assert high_record["attempts"][0]["effort"] == high_record["configuration"]["effort"] == "high"
+    high_report = get_json(repo / "high/public-report.json")
+    assert high_report["configuration_sha256"] != report["configuration_sha256"]
+
+    monkeypatch.setenv("ANTHROPIC_EFFORT", "unsupported")
+    assert main([*run_args(frozen, ".private/invalid"), "--live", "--release"]) == 1
+    assert not (repo / "invalid").exists()
+    assert main(_replay_args(frozen)) == 0
+    assert efforts == ["medium", "medium", "high", "high"]
+    for name in runner.RUN_FILES:
+        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
 
 
 @pytest.mark.parametrize(("stop", "reason"), [
@@ -936,9 +1045,83 @@ def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monk
     assert report["void"] is True
 
 
+def _stream_reply_events(text, *, interrupted=False):
+    events = [
+        {"type": "message_start", "message": {
+            "id": "msg_placeholder", "role": "assistant", "type": "message", "model": "placeholder-model",
+            "content": [], "stop_reason": None, "stop_sequence": None,
+            "usage": {"input_tokens": 1, "output_tokens": 0},
+        }},
+    ]
+    if interrupted:
+        events.extend([
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}},
+        ])
+    else:
+        events.append({"type": "content_block_start", "index": 0, "content_block": {
+            "type": "tool_use", "id": "toolu_placeholder", "name": "submit_application_reply", "input": {},
+        }})
+        split = len(text) // 2
+        events.extend(
+            {"type": "content_block_delta", "index": 0,
+             "delta": {"type": "input_json_delta", "partial_json": chunk}}
+            for chunk in (text[:split], text[split:])
+        )
+        events.extend([
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+             "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        ])
+    for event in events:
+        yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+
+
+@pytest.mark.parametrize("damage", ["missing_brace", "duplicate_key", "nonfinite", "invalid_character"])
+def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, frozen, monkeypatch, damage):
+    import anthropic
+    import httpx
+
+    valid = serialized_empty()
+    invalid = {
+        "missing_brace": valid.removesuffix("}"),
+        "duplicate_key": valid.removesuffix("}") + ', "policies": []}',
+        "nonfinite": valid.removesuffix("}") + ', "nonfinite": NaN}',
+        "invalid_character": valid + "!",
+    }[damage]
+
+    def reply(request):
+        user = json.loads(request.content)["messages"][0]["content"]
+        body = json.loads(user)["application"]
+        text = invalid if body == BATCH else serialized_empty()
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content=b"".join(_stream_reply_events(text)))
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+        transport=httpx.MockTransport(reply), **kwargs,
+    ))
+    monkeypatch.setenv("AI_PLATFORM", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
+    assert main([*run_args(frozen), "--live", "--release"]) == 0
+    report = get_json(repo / "run/public-report.json")
+    assert report["void"] is False
+    assert report["documents"] == {"model_failed": 0, "parse_failed": 1, "parsed": 1}
+    assert report["business"]["counts"]["reply_parse_failed"] == 1
+    assert report["business"]["reply_parse_failure_reasons"]["reply_parse"] == 1
+    record = get_json(repo / "run/document-00001.json")
+    attempt, = record["attempts"]
+    assert attempt["failure_stage"] == record["reason_code"] == "tool_input_json"
+    assert (attempt["reply"], attempt["stop_reason"]) == (invalid, "tool_use")
+    assert main(_replay_args(frozen)) == 0
+    for name in runner.RUN_FILES:
+        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+
+
 @pytest.mark.parametrize(("interruption", "retry_reply"), [
     ("timeout", None), ("disconnect", None), ("eof", None),
-    ("timeout", "[]"), ("timeout", "["),
+    ("timeout", "valid"), ("timeout", "invalid"),
 ])
 def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, interruption, retry_reply):
     import anthropic
@@ -950,24 +1133,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
             self.interrupted = interrupted
 
         def __iter__(self):
-            events = [
-                {"type": "message_start", "message": {
-                    "id": "msg_placeholder", "role": "assistant", "type": "message", "model": "placeholder-model",
-                    "content": [], "stop_reason": None, "stop_sequence": None,
-                    "usage": {"input_tokens": 1, "output_tokens": 0},
-                }},
-                {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-                {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": self.text}},
-            ]
-            if not self.interrupted:
-                events.extend([
-                    {"type": "content_block_stop", "index": 0},
-                    {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                     "usage": {"output_tokens": 1}},
-                    {"type": "message_stop"},
-                ])
-            for event in events:
-                yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
+            yield from _stream_reply_events(self.text, interrupted=self.interrupted)
             if self.interrupted and interruption == "timeout":
                 raise httpx.ReadTimeout("占位超时")
             if self.interrupted and interruption == "disconnect":
@@ -979,7 +1145,8 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         user = json.loads(request.content)["messages"][0]["content"]
         body = json.loads(user)["application"]
         requests[body] += 1
-        text = (retry_reply if requests[body] > 1 else None) if body == BATCH else "[]"
+        final_reply = {None: None, "valid": serialized_empty(), "invalid": "{}"}[retry_reply]
+        text = (final_reply if requests[body] > 1 else None) if body == BATCH else serialized_empty()
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=ReplyStream("[" if text is None else text, text is None))
 
@@ -995,20 +1162,26 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
     assert report["usage"]["attempts"] == 3
     assert report["void"] is (retry_reply is None)
     assert report["documents"] == {
-        "model_failed": int(retry_reply is None), "parse_failed": int(retry_reply == "["),
-        "parsed": 1 + int(retry_reply == "[]"),
+        "model_failed": int(retry_reply is None), "parse_failed": int(retry_reply == "invalid"),
+        "parsed": 1 + int(retry_reply == "valid"),
     }
     assert report["business"]["counts"]["reply_parse_failed"] == 1
     assert report["business"]["reply_parse_failure_reasons"] == {
-        "reply_truncated": 1, "reply_parse": int(retry_reply == "["), "reply_incomplete": 0,
+        "reply_truncated": 1, "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0,
     }
     record = get_json(repo / "run/document-00001.json")
     first, second = record["attempts"]
     partial_stage = "model_incomplete" if interruption == "eof" else "reply_truncated"
     assert (first["failure_stage"], first["reply"]) == (partial_stage, "[")
-    assert (second["failure_stage"], second["reply"]) == (
-        (partial_stage, "[") if retry_reply is None else (None, retry_reply)
-    )
+    if retry_reply is None:
+        assert (second["failure_stage"], second["reply"]) == (partial_stage, "[")
+    elif retry_reply == "valid":
+        assert second["failure_stage"] is None
+        assert json.loads(second["reply"]) == json.loads(serialized_empty())
+    else:
+        assert second["failure_stage"] == record["reason_code"] == "reply_schema"
+        assert record["structure_path"] == ["policies"]
+        assert second["reply"] == "{}"
     assert main(_replay_args(frozen)) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
     for name in runner.RUN_FILES:
@@ -1022,7 +1195,7 @@ def test_valid_replacement_references_original_void_recording(repo, frozen):
     assert main([*run_args(frozen), "--release"], model=unavailable) == 0
     original = (repo / "run/recording.json").read_bytes()
     assert main([*run_args(frozen, ".private/replacement"), "--release", "--replaces-recording", ".private/run"],
-                model=lambda **_: "[]") == 0
+                model=no_policies) == 0
     replacement = get_json(repo / "replacement/recording.json")
     original_id = json.loads(original)["run_id"]
     assert replacement["replaces_run_id"] == original_id != replacement["run_id"]
@@ -1030,7 +1203,7 @@ def test_valid_replacement_references_original_void_recording(repo, frozen):
     assert get_json(repo / "replacement/public-report.json")["void"] is False
     assert "replaces_run_id" not in get_json(repo / "replacement/public-report.json")
     assert main([*run_args(frozen, ".private/invalid"), "--release", "--replaces-recording", ".private/replacement"],
-                model=lambda **_: "[]") == 1
+                model=no_policies) == 1
     assert not (repo / "invalid").exists()
 
 
@@ -1042,8 +1215,16 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         monkeypatch.delenv(key, raising=False)
 
     attempts = Counter()
+    batch = fixed_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST, "占位正文甲", "包", "占位缺失引文"]}}])
+    _, shifted, tied, _ = batch["policies"][0]["fields"]["country"]["evidence"]
+    shifted["span"]["start"] += 1
+    tied["span"]["start"] = (BATCH.index("包") + BATCH.rindex("包")) // 2
+    expected_locations = {
+        "numerator": 2, "denominator": 4, "percent": 50.0,
+        "counts": {"exact": 1, "relocated": 1, "ambiguous": 1, "not_found": 1},
+    }
     responses = {
-        BATCH: '[{"company":{"evidence":["' + FIRST + '"]}}]',
+        BATCH: json.dumps(batch, ensure_ascii=False),
         "占位单条原稿\n": "占位无效回包",
     }
 
@@ -1053,11 +1234,11 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
             body = json.loads(user)["application"]
             attempts[body] += 1
             if attempts[body] == 1:
-                on_result(CallResult(None, (), None, None, 7, "synthetic-model", None, "model_call"))
+                on_result(CallResult(None, (), None, None, 7, "synthetic-model", None, "model_call", effort="medium"))
                 raise RuntimeError("占位保密失败详情")
             reply = responses[body]
             on_result(CallResult("end_turn", (("thinking", 5), ("text", len(reply))),
-                                 12, 3, 20, "synthetic-model", reply))
+                                 12, 3, 20, "synthetic-model", reply, effort="medium"))
             return reply
         return model
 
@@ -1078,14 +1259,20 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
             assert len(record["configuration"][f"{kind}_sha256"]) == 64
         failed, final = record["attempts"]
         assert failed["failure_stage"] == "model_call"
+        assert failed["effort"] == "medium"
         assert final == {
             "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
                                                  {"type": "text", "length": len(final["reply"])}],
             "input_tokens": 12, "output_tokens": 3, "elapsed_ms": 20,
-            "model": "synthetic-model", "reply": final["reply"], "failure_stage": None,
+            "model": "synthetic-model", "reply": final["reply"], "failure_stage": None, "effort": "medium",
         }
         assert final["reply"] in responses.values()
         assert record["failure_stage"] == ("reply_parse" if final["reply"] == responses["占位单条原稿\n"] else None)
+        if record["failure_stage"] == "reply_parse":
+            assert record["evidence_location"]["denominator"] == 0
+            assert record["evidence_location"]["percent"] is None
+        else:
+            assert record["evidence_location"] == expected_locations
         assert "占位保密失败详情" not in path.read_text()
         assert path.stat().st_mode & 0o777 == 0o600
 
@@ -1097,13 +1284,18 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
     for name in runner.RUN_FILES:
         assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
     report = get_json(repo / "run" / "public-report.json")
+    assert report["evidence_location"] == expected_locations
     assert report["business"]["counts"]["reply_parse_failed"] == 1
     assert report["documents"]["parse_failed"] == 1 and report["void"] is False
     assert report["usage"]["input_tokens"] == {"captured_attempts": 2, "total": 24}
     assert report["usage"]["elapsed_ms"] == {"captured_attempts": 4, "total": 54}
     public = (repo / "run" / "public-report.md").read_text() + (repo / "run" / "public-report.json").read_text()
     assert "唯一对齐" in public and "可比字段全对率" in public
-    for private in ("占位无效回包", "占位保密失败详情", "synthetic-model"):
+    assert "证据定位成功率 2/4（50.00%），计字段、候选及带引文的政策锚点" in public
+    assert "程序重新定位 1" in public
+    for label in ("模型坐标原样正确", "多处不可分", "引文不存在"):
+        assert f"{label} 1" in public
+    for private in ("占位无效回包", "占位保密失败详情", "占位缺失引文", FIRST, "synthetic-model"):
         assert private not in public + capsys.readouterr().err
 
     name = next(iter(recording["artifact_sha256"]))
@@ -1115,7 +1307,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
 def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     def probe(*, system, user):
         user_sha = digest(user.encode())
-        reply = "[]"
+        reply = serialized_empty()
         put_json(repo / "probe" / f"{user_sha}.json", {
             "system_sha": digest(system.encode()), "user_sha": user_sha,
             "reply": reply, "error": None, "secs": 0.2,
@@ -1131,7 +1323,7 @@ def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     for name in imported["artifact_sha256"]:
         record = get_json(repo / "imported" / name)
         assert record["attempts"] == [{
-            "reply": "[]", "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
+            "reply": serialized_empty(), "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
             "input_tokens": None, "output_tokens": None, "elapsed_ms": None,
         }]
     assert "未采集" in (repo / "imported" / "public-report.md").read_text()
@@ -1151,9 +1343,6 @@ def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
 
 
 def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, frozen, capsys):
-    def no_policies(**kwargs):
-        return "[]"
-
     def one_failed_reply(*, system, user):
         if json.loads(user)["application"] == BATCH:
             raise RuntimeError("占位失败")
@@ -1313,6 +1502,38 @@ def test_business_grades_all_categories(entry, mark, value, confirmation, start,
                        uncertainty=Uncertainty(reason="占位待确认") if confirmation else None)
     draft = SimpleNamespace(recharge_days=field) if confirmation is not None else None
     assert grade("recharge_days", entry, mark, draft, "占位 30 天") == status
+
+
+@pytest.mark.parametrize(("status", "gold", "issues", "expected"), [
+    ("原文未写", "是", (), "correct"),
+    ("原文未写", "否", (), "false_determined"),
+    ("确定", "是", (), "false_determined"),
+    ("原文未写", "是", ("invalid_unwritten_shape",), "false_determined"),
+])
+def test_business_grades_thin_default(status, gold, issues, expected):
+    from qianshu.parse.protocol import FieldResult, Finding, StatementStatus, ValueSource
+    from qianshu.regression.business import grade
+
+    finding = Finding(status=StatementStatus(status), reason_code="synthetic", value=None,
+                      candidates=[], evidence=[])
+    result = FieldResult(finding, value="是", has_value=True, source=ValueSource.DEFAULT,
+                         needs_confirmation=False, issues=issues)
+    name = "cancel_on_downgrade"
+    draft = SimpleNamespace(cancel_on_downgrade=DraftField(value="是"), field_results={name: result})
+    mark = {"inferable": True, "auto_allowed": True, "default": "是"}
+    assert grade(name, {"value": gold}, mark, draft, "") == expected
+
+
+def test_business_keeps_legacy_default_score_without_verification_metadata():
+    from qianshu.regression.business import grade
+
+    name = "cancel_on_downgrade"
+    draft = SimpleNamespace(cancel_on_downgrade=DraftField(value="是"))
+    mark = {"inferable": True, "auto_allowed": True, "default": "是"}
+    assert grade(name, {"value": "是"}, mark, draft, "") == "false_determined"
+    draft.field_results = {name: SimpleNamespace(statement=SimpleNamespace(status="原文未写"),
+                                                source="默认规则", needs_confirmation=False, issues=())}
+    assert grade(name, {"value": "是"}, mark, draft, "") == "false_determined"
 
 
 def test_business_maps_included_gold_and_separates_extras_from_unknown():
@@ -1752,7 +1973,7 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
     assert frozen["denominators"]["fields"].keys() == {"packages"}
 
     def parsed(body, *, model, on_reply, **kwargs):
-        on_reply(model(system="占位提示", user=body))
+        on_reply(model(system="占位提示", user=json.dumps({"application": body})))
         base = {name: DraftField() for name in parse.ParsedPolicyDraft.__dataclass_fields__}
         named_package = DraftField(value=[PackageRow(current_package="占位包甲", gift_package="占位赠包甲")],
                                    evidence=[SourceExcerpt(text=FIRST, start=BATCH.index(FIRST))])
@@ -1771,7 +1992,7 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
 
     monkeypatch.setattr(runner, "parse_application", parsed)
     args = ["--frozen", ".private/packages", "--expect-sha256", fingerprint]
-    assert main(["run", *args, "--out", ".private/package-run"], model=lambda **_: "[]") == 0
+    assert main(["run", *args, "--out", ".private/package-run"], model=no_policies) == 0
     assert main(["replay", *args, "--recording", ".private/package-run", "--out", ".private/package-replay"]) == 0
     report = get_json(repo / "package-replay" / "public-report.json")
     assert report["business"]["rates"]["package_rows_exact"] == {
@@ -1843,7 +2064,7 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
         "packages": digest((repo / "peer.json").read_bytes()),
     }
 
-    assert main(["run", *run_args(checksum)[1:]], model=lambda **_: "[]") == 0
+    assert main(["run", *run_args(checksum)[1:]], model=no_policies) == 0
     assert main(_replay_args(checksum)) == 0
     assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
 
@@ -1881,3 +2102,107 @@ def test_amount_dates_and_candidates_only_count_derived_business_keys(monkeypatc
     assert fingerprint != pairing_fingerprint(3)
     monkeypatch.setitem(WEIGHTS, "packages", 4)
     assert fingerprint != pairing_fingerprint(2)
+
+
+def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, capsys):
+    reply = fixed_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST]}}])
+    fields = reply["policies"][0]["fields"]
+    source_quote = fields["country"]["evidence"][0]
+    source_quote["clause_id"] = "legacy"
+    fields["user_scope"].update(status="歧义", candidates=[{
+        "value": "合成范围", "evidence": [{**source_quote}],
+    }], checked=[])
+    reply["policies"][0]["shared_clause_ids"] = ["legacy"]
+    reply.update(clauses=[], coverage=[], pending=[], document={"status": "材料不足", "reason_code": "fixture"})
+    raw = json.dumps(reply, ensure_ascii=False)
+
+    def model(*, system, user):
+        return raw if json.loads(user)["application"] == BATCH else json.dumps({"policies": [], "document": None})
+
+    prompt = repo.parent / "rules" / "parse-prompt.md"
+    current_prompt = prompt.read_bytes()
+    prompt.write_text("合成旧提示词")
+    git("add", "rules")
+    monkeypatch.setattr("qianshu.regression.__main__._LEGACY_REVISION", git("write-tree").stdout.decode().strip())
+    assert main(run_args(frozen), model=model) == 0
+    recording = repo / "run"
+    manifest_path = recording / "recording.json"
+    manifest = get_json(manifest_path)
+    assert main([*_replay_args(frozen, out=".private/current-structure"), "--legacy-recording"]) == 1
+    assert "指定的录制已使用当前回复结构" in capsys.readouterr().err
+    manifest["configuration"].pop("reply_structure")
+    names = {get_json(recording / name)["user_sha256"]: name for name in manifest["artifact_sha256"]}
+    batch_name = names[digest(json.dumps({"application": BATCH}, ensure_ascii=False).encode())]
+    batch_path = recording / batch_name
+    batch = get_json(batch_path)
+    second_name, = set(manifest["artifact_sha256"]) - {batch_name}
+    second_path = recording / second_name
+    second = get_json(second_path)
+    second.update(reason_code="reply_document", structure_path=["document"])
+
+    def save(path, record, source):
+        record["attempts"][-1]["reply"] = source
+        record["configuration"] = manifest["configuration"]
+        put_json(path, record)
+        manifest["artifact_sha256"][path.name] = digest(path.read_bytes())
+        put_json(manifest_path, manifest)
+
+    batch.update(failure_stage=None, reason_code=None, structure_path=[])
+    save(batch_path, batch, raw)
+    save(second_path, second, second["attempts"][-1]["reply"])
+    source_bytes = batch_path.read_bytes()
+    denominators = (repo / "frozen" / "denominators.json").read_bytes()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline replay attempted model access")
+
+    monkeypatch.setattr("qianshu.regression.__main__.configured_model", forbidden)
+    assert main(_replay_args(frozen, out=".private/strict"), model=forbidden) == 0
+    assert get_json(repo / "strict" / "public-report.json")["documents"]["parse_failed"] == 2
+
+    prompt.write_bytes(current_prompt)
+    assert main(_replay_args(frozen, out=".private/strict-new"), model=forbidden) == 1
+    assert "系统消息指纹" in capsys.readouterr().err
+    assert main([*_replay_args(frozen), "--legacy-recording"], model=forbidden) == 0
+    diagnostic = repo / "replay"
+    report = get_json(diagnostic / "public-report.json")
+    assert report["documents"] == {"parsed": 1, "parse_failed": 1, "model_failed": 0}
+    assert report["samples"] == 3
+    assert report["diagnostic_replay"] == {
+        "reply_structure": "thin", "source_reply_structure": "w1d",
+        "source_configuration_sha256": digest(json_bytes(manifest["configuration"])),
+    }
+    replay_manifest = get_json(diagnostic / "recording.json")
+    assert replay_manifest["origin"] == "replay" and replay_manifest["origin_run_id"] == manifest["run_id"]
+    assert get_json(diagnostic / batch_name)["attempts"][-1]["reply"] == raw
+    assert get_json(diagnostic / second_name)["reason_code"] == "reply_document"
+    assert batch_path.read_bytes() == source_bytes
+    assert (repo / "frozen" / "denominators.json").read_bytes() == denominators
+
+    batch_path.write_bytes(source_bytes + b"\n")
+    assert main([*_replay_args(frozen, out=".private/changed-artifact"), "--legacy-recording"], model=forbidden) == 1
+    assert "录制的回复文件指纹不一致" in capsys.readouterr().err
+    batch_path.write_bytes(source_bytes)
+
+    args = ["summarize", "--recording", ".private/replay", "--out", ".private/diagnostic"]
+    assert main(args) == 1
+    assert main([*args, "--diagnostic-replay"]) == 0
+    assert get_json(repo / "diagnostic" / "public-summary.json")["diagnostic_replay"] is True
+
+    wrong_core = json.loads(raw)
+    wrong_core["policies"][0]["fields"]["country"]["value"] = 42
+    for index, (response, code) in enumerate([
+        (raw.removesuffix("}") + ', "extra": 1}', "reply_schema"),
+        (raw.replace('"checked": []', '"checked": [], "checked": []'), "reply_json"),
+        (raw.replace('"checked": []', '"checked": [1e999]'), "reply_json"),
+        (json.dumps(wrong_core), "reply_schema"),
+    ]):
+        save(batch_path, batch, response)
+        output = f"malformed-{index}"
+        assert main([*_replay_args(frozen, out=f".private/{output}"), "--legacy-recording"], model=forbidden) == 0
+        assert get_json(repo / output / batch_name)["reason_code"] == code
+
+    manifest["configuration"]["rules_sha256"] = "0" * 64
+    put_json(manifest_path, manifest)
+    assert main([*_replay_args(frozen, out=".private/changed-rules"), "--legacy-recording"], model=forbidden) == 1
+    assert "录制时的规则文件" in capsys.readouterr().err

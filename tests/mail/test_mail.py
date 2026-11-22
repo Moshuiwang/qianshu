@@ -18,6 +18,7 @@ from qianshu.mail import ApprovalDecision, _private_dir, poll_once, run_polling
 from qianshu.mail.history import export_history, main
 from qianshu.mail.imap import SUMMARY, MailError, ReadOnlyMailbox, connect
 from qianshu.mail.message import authored_reply, headers, message_id
+from tests.protocol_fixtures import policy as declared_policy, span
 
 
 PLAIN = b'("TEXT" "PLAIN" NIL NIL NIL "8BIT" 20 1)'
@@ -1043,7 +1044,10 @@ def test_resident_mail_read_only_handoff(resident, monkeypatch, capsys, qualifie
     fake.add("INBOX", 2, mail(wrong_sender, config["MAIL_TEST_MARKER"], "合成占位正文乙"))
     if qualified:
         fake.add("INBOX", 3, mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], body))
-        resident.model_reply = json.dumps([{"company": {"value": None, "evidence": [body]}}])
+        resident.model_reply = json.dumps({
+            "policies": [declared_policy("p1", span(0, len(body)))],
+            "unused_passages": [{"text": body, "reason": body}],
+        })
         resident.unconfirmed = 2
     results = []
     done = Event()

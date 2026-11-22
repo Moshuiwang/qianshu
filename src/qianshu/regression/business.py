@@ -255,16 +255,28 @@ def _score(gold: dict, draft: dict) -> list[str]:
     return hits
 
 
-def _evidence_passes(name: str, field, mark: dict, body: str) -> bool:
-    # 旧草稿接口在返回确定值前已校验作用域。这里只核对可见的结构证据。
-    verified = getattr(field, "evidence_verified", None)
+def _evidence_passes(name: str, draft, mark: dict, body: str) -> bool:
+    # 4fb3cb5 也有 field_results，但没有薄版的只读核对结果，沿用旧投影。
+    field = getattr(draft, name)
+    result = getattr(draft, "field_results", {}).get(name)
+    thin_result = hasattr(result, "evidence_verified")
+    if thin_result:
+        verified = result.evidence_verified
+        status = result.statement.status
+        source = result.source
+    else:
+        verified = getattr(field, "evidence_verified", None)
+        status = getattr(field, "source_status", None)
+        source = getattr(field, "value_source", None)
     if verified is False:
         return False
-    status = getattr(field, "source_status", None)
-    source = getattr(field, "value_source", None)
-    company_default_source = G285_MAPPING["confirmation"]["company"]["default_source"]
-    if name == "company" and status == "原文未写":
-        if source != company_default_source or verified is not True or field.value != mark.get("default"):
+    lookup_source = G285_MAPPING["confirmation"]["company"]["default_source"]
+    if thin_result and status == "原文未写" and source == lookup_source:
+        # 查表派生可使用输入字段的证据；冻结记录明确给出默认公司时仍须一致。
+        if name == "company" and mark.get("default") is not None and field.value != mark["default"]:
+            return False
+    elif name == "company" and status == "原文未写":
+        if source != lookup_source or verified is not True or field.value != mark.get("default"):
             return False
     elif status == "原文未写" or source == "默认规则":
         return (
@@ -299,7 +311,7 @@ def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
     can_decide = mark["inferable"] and mark["auto_allowed"]
     if needs_confirmation(field):
         return "overasked" if can_decide else "justified_confirmation"
-    if can_decide and compare_field(name, entry["value"], field) == "match" and _evidence_passes(name, field, mark, body):
+    if can_decide and compare_field(name, entry["value"], field) == "match" and _evidence_passes(name, draft, mark, body):
         return "correct"
     return "false_determined"
 

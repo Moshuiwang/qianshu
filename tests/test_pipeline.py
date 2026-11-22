@@ -12,6 +12,7 @@ from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from lark_oapi.core.http import Transport as SDKTransport
@@ -24,7 +25,10 @@ from qianshu.feishu import Message, Window
 from qianshu.feishu.cards import CardLine, detail_pages, result_card
 from qianshu.feishu.entrance import Application, fingerprint
 from qianshu.feishu.sdk import _Transport
-from qianshu.pipeline import Pipeline, _policy_boundaries, _suspected_policy_count
+from qianshu.parse.evidence import PolicyStructureIssue
+from qianshu.parse.protocol import Span
+from qianshu.pipeline import Pipeline
+from tests.protocol_fixtures import fixed_reply, policy, quote, span, statement
 
 ROOT = Path(__file__).resolve().parents[1]
 PARSE_FIXTURES = ROOT / "tests" / "parse" / "fixtures"
@@ -50,7 +54,7 @@ def _write_json(path, data):
 
 
 @pytest.fixture
-def single_policy():
+def single_policy(request):
     body = (
         "赞比亚占位申请。\n"
         "以下各条均适用：申请开始日期 2099-01-10，申请结束日期 2099-02-15。\n"
@@ -59,21 +63,33 @@ def single_policy():
         "用户范围：占位休眠用户。不限制升降包。\n"
         "本批存档文档：https://archive.example.invalid/batch"
     )
-    reply, *_ = json.loads((PARSE_FIXTURES / "model-reply.json").read_text(encoding="utf-8"))
-    for name in ("policy_name", "trigger_once", "repeat_bonus", "effective_multiplier", "approval_attachments"):
-        del reply[name]
-    reply.update(
-        company={"value": None, "evidence": ["赞比亚占位申请。"]},
-        policy_type={"value": "定向政策", "evidence": ["政策类型：定向政策"]},
-        packages={
-            "value": [{"current_package": "占位甲", "gift_package": "占位甲_copy"}],
-            "evidence": ["占位甲包用户"],
-        },
-    )
+    reply = {
+        "company": {"value": "赞比亚", "evidence": [" 赞比亚占位申请。"]},
+        "policy_type": {"value": "定向政策", "evidence": ["政策类型：定向政策"]},
+        "benefit_type": {"value": "赠送时长", "evidence": ["充一送一"]},
+        "start_date": {"value": "2099-01-10", "evidence": ["申请开始日期 2099-01-10"]},
+        "end_date": {"value": "2099-02-15", "evidence": ["申请结束日期 2099-02-15"]},
+        "user_tags": {"value": ["占位标签甲"], "evidence": ["占位标签甲"]},
+        "approval_url": {"value": "https://archive.example.invalid/batch",
+                         "evidence": ["本批存档文档：https://archive.example.invalid/batch"]},
+        "cancel_on_downgrade": {"value": "否", "evidence": ["不限制升降包"]},
+        "recharge_days": {"value": 30, "evidence": ["充30天"]},
+        "gift_days": {"value": 30, "evidence": ["送30天"]},
+        "packages": {"value": [{"current_package": "占位甲", "gift_package": "占位甲_copy"}],
+                     "evidence": ["占位甲包用户"]},
+        "user_scope": {"value": "占位休眠用户", "evidence": ["用户范围：占位休眠用户"]},
+    }
+    if request.node.originalname in (
+        "test_resident_uses_company_path_and_only_saves_raw_when_enabled",
+        "test_pipeline_reads_one_company_table_per_application",
+    ):
+        reply["country"] = {"value": "赞比亚", "evidence": ["赞比亚占位申请。"]}
+        del reply["company"]
+        return body, fixed_reply(body, [reply])
     return body, [reply]
 
 
-def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None):
+def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None, separator=" "):
     now = datetime.now(UTC)
     placeholder = {name: f"<合成占位-{name}>" for name in ("app", "bot", "chat", "sender", "message")}
     mention = "@_user_1"
@@ -83,9 +99,17 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None):
         "sender_id": placeholder["sender"],
         "created_ms": int(now.timestamp() * 1000),
         "kind": "text",
-        "content": json.dumps({"text": f"{mention} {body}"}),
+        "content": json.dumps({"text": f"{mention}{separator}{body}"}),
         "bot_mention_keys": [mention],
     }
+    if isinstance(model_reply, list):
+        rows = []
+        for row in model_reply:
+            row = dict(row)
+            if country := row.pop("company", None):
+                row["country"] = country
+            rows.append(row)
+        model_reply = fixed_reply(separator + body, rows)
     injection = _write_json(tmp_path / "inject.json", {
         "message": message,
         "model_reply": model_reply if isinstance(model_reply, str) else json.dumps(model_reply, ensure_ascii=False),
@@ -174,6 +198,33 @@ def test_resident_rejects_invalid_raw_reply_directory(tmp_path, monkeypatch, cap
     assert capsys.readouterr() == ("", "原始回复目录须为可访问的 0700 目录，请检查 --raw-output-dir。\n")
 
 
+def _resident_cards(monkeypatch, body, model, *, message_count=1):
+    settings = SimpleNamespace(
+        app_id="<占位应用>", tenant_key="<占位租户>", chat_id="<占位群>",
+        bot_open_id="<占位机器人>", allowed_senders=("<占位申请人>",), approved_fingerprint=fingerprint(body),
+    )
+    cards = []
+
+    def fake_service(settings, window, state_path, processor):
+        def run():
+            for index in range(message_count):
+                message = Message(f"<占位消息-{index}>", settings.chat_id, "<占位申请人>", 0, "text", "")
+                processor(Application(message, body, ()))
+
+        return SimpleNamespace(run=run, entrance=SimpleNamespace(), transport=SimpleNamespace(
+            react=None, reply=None, download=None,
+        ))
+
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(service_entry, "load_settings", lambda _: settings)
+    monkeypatch.setattr(service_entry, "setup_logging", lambda _: None)
+    monkeypatch.setattr(service_entry, "configured_model", lambda _: model)
+    monkeypatch.setattr(service_entry, "FeishuService", fake_service)
+    monkeypatch.setattr(service_entry, "_send_report_card", lambda _, card, *args: cards.append(card))
+    return cards
+
+
 @pytest.mark.parametrize("save_raw", [False, True], ids=["disabled", "enabled"])
 def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
     tmp_path, single_policy, monkeypatch, capsys, caplog, save_raw,
@@ -201,30 +252,8 @@ def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
     if save_raw:
         args.extend(("--raw-output-dir", str(output)))
 
-    settings = SimpleNamespace(
-        app_id="<占位应用>", tenant_key="<占位租户>", chat_id="<占位群>",
-        bot_open_id="<占位机器人>", allowed_senders=("<占位申请人>",), approved_fingerprint=fingerprint(body),
-    )
-    cards = []
     pending = iter(replies)
-
-    def fake_service(settings, window, state_path, processor):
-        def run():
-            for index in range(len(replies)):
-                message = Message(f"<占位消息-{index}>", settings.chat_id, "<占位申请人>", 0, "text", "")
-                processor(Application(message, body, ()))
-
-        return SimpleNamespace(run=run, entrance=SimpleNamespace(), transport=SimpleNamespace(
-            react=None, reply=None, download=None,
-        ))
-
-    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.setattr(service_entry, "load_settings", lambda _: settings)
-    monkeypatch.setattr(service_entry, "setup_logging", lambda _: None)
-    monkeypatch.setattr(service_entry, "configured_model", lambda _: lambda **kwargs: next(pending))
-    monkeypatch.setattr(service_entry, "FeishuService", fake_service)
-    monkeypatch.setattr(service_entry, "_send_report_card", lambda _, card, *args: cards.append(card))
+    cards = _resident_cards(monkeypatch, body, lambda **kwargs: next(pending), message_count=len(replies))
     monkeypatch.setattr(service_entry.time, "time_ns", lambda: 1_900_000_000_000_000_000)
 
     assert service_entry.main(args) == 0
@@ -272,29 +301,6 @@ def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path
     assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
 
 
-def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy):
-    body, model = single_policy
-    body += "\n是否需要维护互斥组：否"
-    cards = _run(
-        tmp_path, body, model,
-        tag_dates={"占位标签甲": "2099-02-15"},
-    )
-    content = "\n".join(_contents(cards))
-    assert "<font color='red'>政策 1 · 提醒项\n申请要求不维护互斥组，需人工确认</font>" in content
-    assert "是否需要维护互斥组 · 候选 1\n值　否\n原文出处　「是否需要维护互斥组：否」" in content
-    assert "需追问 · 是否需要维护互斥组" in content
-    assert "停在校验，需人工确认或请申请人补充。" in content
-
-
-def test_command_blocks_uncovered_heading_when_drafts_outnumber_segments(tmp_path, single_policy):
-    body, model = single_policy
-    cards = _run(tmp_path, body, model * 2)
-    content = "\n".join(_contents(cards))
-    assert "<font color='red'>处理状态\n解析不完整，需人工确认</font>" in content
-    assert "未确认覆盖的段落序号\n1" in content
-    assert "未校验" in content
-
-
 @pytest.mark.parametrize("missing_scope", [False, True])
 def test_command_defers_missing_approval_url_but_still_checks_other_fields(tmp_path, single_policy, missing_scope):
     body, model = single_policy
@@ -314,208 +320,13 @@ def test_command_defers_missing_approval_url_but_still_checks_other_fields(tmp_p
         assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
 
 
-@pytest.mark.parametrize(("missing", "numbered"), [
-    pytest.param(None, True, id="None"),
-    pytest.param(3, True, id="3"),
-    pytest.param(4, True, id="4"),
-    pytest.param(4, False, id="company-heading"),
-])
-def test_command_checks_coverage_before_validation(tmp_path, single_policy, missing, numbered):
-    body, model = single_policy
-    intro, local = body.split("①", 1)
-    policies = []
-    segments = []
-    tag_dates = {}
-    for index, (number, suffix) in enumerate(zip("①②③④⑤⑥", "甲乙丙丁戊己", strict=True), 1):
-        translation = str.maketrans({"①": number, "甲": suffix})
-        segment = ("①" + local) if numbered else "公司：占位公司甲\n" + local.partition("\n")[2]
-        segment = segment.translate(translation)
-        if index > 1:
-            segment = segment.split("\n本批存档文档", 1)[0]
-        segments.append(segment.strip())
-        if index != missing:
-            reply = json.dumps(model[0], ensure_ascii=False)
-            if not numbered:
-                reply = reply.replace('"赞比亚占位申请。"', '"公司：占位公司甲"')
-            policies.append(json.loads(reply.translate(translation)))
-        tag_dates[f"占位标签{suffix}"] = "2099-02-15"
-    body = intro + "\n".join(segments)
-    assert _suspected_policy_count(body) == (6 if numbered else 0)
-    cards = _run(tmp_path, body, policies, tag_dates=tag_dates)
-    content = "\n".join(_contents(cards))
-    assert "段落边界未确认" not in content
-    if missing is None:
-        assert "解析完成，共 6 条政策。" in content
-        assert content.count("解析完成，待群卡片同意") == 6
-    else:
-        status = "解析不完整，需人工确认"
-        if numbered:
-            status += "\n原文疑似 6 条，解析出 5 条"
-        assert f"<font color='red'>处理状态\n{status}</font>" in content
-        assert f"未确认覆盖的段落序号\n{missing}" in content
-        assert "未校验" in content
-        assert "待群卡片同意" not in content
-
-
-@pytest.mark.parametrize(("paragraph", "explicit"), [
-    ("另申请一条独立政策，面向占位用户。", True),
-    ("另外一条独立政策，面向占位用户。", True),
-    ("第二条政策，面向占位用户。", True),
-    ("再申请一条独立政策，面向占位用户。", True),
-    ("此外还有面向占位用户的政策待核对。", False),
-    ("新增一条政策：适用占位活跃用户，充60天送10天。", True),
-    ("我们另申请一条独立政策，面向占位用户。", True),
-    ("\n面向占位用户开放充一天送一天。", False),
-])
-def test_command_checks_untitled_paragraph_signals(tmp_path, single_policy, paragraph, explicit):
-    body, model = single_policy
-    cards = _run(tmp_path, body.rstrip() + "\n" + paragraph, model,
-                 tag_dates={"占位标签甲": "2099-02-15"})
-    content = "\n".join(_contents(cards))
-    if explicit:
-        assert "<font color='red'>处理状态\n解析不完整，需人工确认</font>" in content
-        assert "未确认覆盖的段落序号\n2" in content
-        assert "未校验" in content
-    else:
-        assert "处理状态\n解析完成，共 1 条政策。" in content
-        assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in content
-        assert f"提醒项\n段落 2：{paragraph.strip()[:12]}…，段落边界未确认，请审批人核对" in content
-        assert "<font color='red'>" not in content
-
-
-@pytest.mark.parametrize(("paragraph", "numbered"), [
-    pytest.param("  第二条 占位公司乙，买一赠一，用户标签：占位标签乙。", False, id="ordinal"),
-    pytest.param("  2. 另申请一条政策：占位公司乙，买一赠一，用户标签：占位标签乙。", False, id="numbered-explicit"),
-    pytest.param("  另申请一条占位公司乙政策：买一赠一，用户标签：占位标签乙。", False, id="untitled-explicit"),
-    pytest.param("　　② 占位公司乙，买一赠一，用户标签：占位标签乙。", True, id="fullwidth-spaces"),
-])
-def test_command_stops_when_an_indented_line_starts_another_policy(tmp_path, single_policy, paragraph, numbered):
-    body, model = single_policy
-    body = body.rstrip() + "\n" + paragraph
-    assert "标签名称" not in body
-    content = "\n".join(_contents(_run(
-        tmp_path, body, model,
-        tag_dates={"占位标签甲": "2099-02-15"},
-    )))
-    status = "解析不完整，需人工确认"
-    if numbered:
-        status += "\n原文疑似 2 条，解析出 1 条"
-    assert f"<font color='red'>处理状态\n{status}</font>" in content
-    assert "未确认覆盖的段落序号\n2" in content
-    assert "未校验" in content
-    assert "待群卡片同意" not in content
-
-
-def test_command_stops_when_a_heading_continues_with_another_policy(tmp_path, single_policy):
-    body, model = single_policy
-    body = body.replace(
-        "① 占位甲包用户", "① 占位甲包用户，充30天送30天，我们另申请一条独立政策。", 1,
-    ).replace("充30天送30天，充一送一", "充一送一")
-    model = [{name: model[0][name] for name in ("company", "recharge_days", "gift_days")}]
-    content = "\n".join(_contents(_run(
-        tmp_path, body, model,
-        tag_dates={"占位标签甲": "2099-02-15"},
-    )))
-    assert "<font color='red'>处理状态\n解析不完整，需人工确认</font>" in content
-    assert "未确认覆盖的段落序号\n2" in content
-    assert "未校验" in content
-
-
-def test_command_rejects_missing_draft_when_numbered_boundary_is_uncertain(tmp_path, single_policy):
-    body, model = single_policy
-    body += "\n② 面向占位用户"
-    drafts = parse.parse_application(
-        body, model=lambda **_: json.dumps(model, ensure_ascii=False), companies_file=COMPANIES_FIXTURE,
-    )
-    (draft,) = drafts
-    assert all(
-        (field := getattr(draft, item.name)).value is None and field.uncertainty is not None
-        for item in fields(draft)
-    )
-
-    rows = _contents(_run(tmp_path, body, model))
-    assert (
-        "<font color='red'>处理状态\n解析不完整，需人工确认\n原文疑似 2 条，解析出 1 条</font>"
-    ) in rows
-    assert "未确认覆盖的段落序号\n2" in rows
-    assert "后续处理\n请核对段落与草稿对应关系。未校验。" in rows
-    assert all(not row.startswith("政策 ") for row in rows)
-
-
-@pytest.mark.parametrize("parsed_count", [6, 5])
-def test_command_checks_suspected_count_with_indented_subitems(tmp_path, parsed_count):
-    body = (PARSE_FIXTURES / "application.txt").read_text(encoding="utf-8")
-    model_reply = (PARSE_FIXTURES / "model-reply.json").read_text(encoding="utf-8")
-    _, shared_fields, *policy_lines = body.splitlines()
-    table_headers = ("合成表头一：标签名称", "合成表头二：优惠类型", "合成表头三：政策类型")
-    numbered = {number: f"{index}." for index, number in enumerate("①②③④⑤⑥", 1)}
-    lines = [*table_headers, "", shared_fields]
-    lines.extend(f"{numbered[line[:1]]}{line[1:]}" if line[:1] in numbered else line for line in policy_lines)
-    for suffix in "庚辛壬":
-        lines.append(f"      1. 占位子项公司{suffix}：占位")
-    body = "\n".join(lines)
-    starts, required, uncertain, _ = _policy_boundaries(body, companies_file=COMPANIES_FIXTURE)
-    assert len(starts) == 10
-    assert list(required) == list(range(2, 8))
-    assert uncertain == {starts[index] for index in (0, 7, 8, 9)}
-    assert _suspected_policy_count(body) == 6
-    for number, replacement in numbered.items():
-        model_reply = model_reply.replace(number, replacement)
-    replies = json.loads(model_reply)
-    rows = _contents(_run(
-        tmp_path, body, replies[:parsed_count],
-        tag_dates={"占位标签甲": "2099-02-15"},
-    ))
-    reminders = next(row for row in rows if row.startswith("提醒项\n"))
-    header_preview = " ".join("\n".join(table_headers)[:12].splitlines()).strip()
-    previews = [header_preview, *(f"1. 占位子项公司{suffix}：占" for suffix in "庚辛壬")]
-    assert reminders.splitlines()[1:] == [
-        f"段落 {index}：{preview}…，段落边界未确认，请审批人核对"
-        for index, preview in zip((1, 8, 9, 10), previews, strict=True)
-    ]
-    assert all("合成表头" not in row and "占位子项公司" not in row for row in rows if row != reminders)
-    content = "\n".join(rows)
-    if parsed_count == 6:
-        assert "处理状态\n解析完成，共 6 条政策。" in rows
-        for index in range(1, 7):
-            assert f"政策 {index} · 公司\n值　未确定\n" in content
-            field_rows = [
-                row for row in rows if row.startswith(f"政策 {index} · ")
-                and "\n原文出处　" in row and " · 候选 " not in row.partition("\n")[0]
-            ]
-            assert len(field_rows) == len(fields(PolicyDraft))
-        assert "政策 1 · 处理状态\n停在校验，需人工确认或请申请人补充。" in content
-    else:
-        assert "<font color='red'>处理状态\n解析不完整，需人工确认" in content
-        assert "原文疑似 6 条，解析出 5 条</font>" in content
-        assert "未校验" in content
-
-
-def test_suspected_count_uses_only_unindented_numbered_lines():
-    body = "1.\n2、\n3)\n一、\n政策1\n政策一\n① 占位\n⑳ 占位\n      1.\n\t①\n　⑳\n　 ②\n　\t③\n"
-    assert _suspected_policy_count(body) == 9
-
-
 def test_command_accepts_existing_parse_fixture(tmp_path):
     body = (PARSE_FIXTURES / "application.txt").read_text(encoding="utf-8")
     replies = json.loads((PARSE_FIXTURES / "model-reply.json").read_text(encoding="utf-8"))
-    content = _contents(_run(tmp_path, body, replies))
+    # The transport removes the mention and retains the following space. Supply the
+    # exact input seen by the fixed reply instead of shifting its coordinates.
+    content = _contents(_run(tmp_path, body, replies, separator=""))
     assert "处理状态\n解析完成，共 6 条政策。" in content
-
-
-@pytest.mark.parametrize(("count_evidence", "suspected"), [
-    ("标签名称：占位；标签名称：占位", 2),
-    ("标签：占位\n标签: 占位", 2),
-    ("1. 开始日期：占位\n2) 结束日期：占位", 3),
-])
-def test_command_checks_count_independently_of_policy_boundaries(tmp_path, single_policy, count_evidence, suspected):
-    body, model = single_policy
-    content = "\n".join(_contents(_run(tmp_path, body.rstrip() + "\n" + count_evidence, model)))
-    assert (
-        "<font color='red'>处理状态\n解析不完整，需人工确认\n"
-        f"原文疑似 {suspected} 条，解析出 1 条</font>"
-    ) in content
-    assert "未校验" in content
 
 
 def test_pipeline_turns_confirmed_mutex_no_into_red_uncertainty(monkeypatch):
@@ -922,6 +733,43 @@ def test_command_reports_parse_failure(tmp_path, single_policy):
     assert "待群卡片同意" not in content
 
 
+def _assert_manual_review_without_draft(cards):
+    content = "\n".join(_contents(cards))
+    assert "解析不完整，需人工确认" in content
+    assert "未校验" in content
+    assert "待群卡片同意" not in content
+    assert "政策 1" not in content
+
+
+@pytest.mark.parametrize("missing_key", ["text", "evidence"])
+def test_shape_error_reply_goes_to_manual_review(tmp_path, single_policy, missing_key):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    field = reply["policies"][0]["fields"]["user_scope"]
+    if missing_key == "text":
+        del field["evidence"][0]["text"]
+    else:
+        del field["evidence"]
+
+    _assert_manual_review_without_draft(_run(tmp_path, body, reply))
+
+
+def test_multiple_tool_calls_go_to_manual_review(tmp_path, single_policy, monkeypatch):
+    body, _ = single_policy
+
+    multiple_tool_calls = Mock(side_effect=parse.ModelReplyError(
+        "reply_tool_multiple", None, "合成回复重复调用提交工具",
+    ))
+
+    cards = _resident_cards(monkeypatch, body, multiple_tool_calls)
+    args = [*_resident_args(tmp_path), "--companies-file", str(COMPANIES_FIXTURE),
+            "--env-file", str(tmp_path / ".env")]
+    assert service_entry.main(args) == 0
+    multiple_tool_calls.assert_called_once()
+    _assert_manual_review_without_draft(cards)
+
+
 def test_command_preserves_long_evidence(tmp_path, single_policy):
     body, model = single_policy
     scope = "合成范围" * 3000 + "合成范围结束"
@@ -944,3 +792,314 @@ def test_command_preserves_long_evidence(tmp_path, single_policy):
 def test_command_injection_still_enforces_approved_fingerprint(tmp_path, single_policy):
     body, model = single_policy
     assert _run(tmp_path, body, model, approved_body="合成的另一条正文") == [{"notice": "概念验证期不处理"}]
+
+
+
+@pytest.mark.parametrize("case", ["unlocated_policy_main", "unlocated_policy_continuation", "complete"])
+def test_command_reports_full_review_without_downgrading_fields(tmp_path, single_policy, case):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    if case == "unlocated_policy_main":
+        reply["policies"][0]["main"]["text"] = "合成正文中不存在的主段"
+    elif case == "unlocated_policy_continuation":
+        reply["policies"][0]["continuations"] = [span(len(body) + 1, len(body) + 2)]
+    cards = _run(tmp_path, body, reply, tag_dates={"占位标签甲": "2099-02-15"})
+    lines = _contents(cards)
+    content = "\n".join(lines)
+    assert "政策 1 · 用户范围\n值　占位休眠用户\n原文出处　「用户范围：占位休眠用户」" in lines
+    assert "政策 1 · 用户范围 · 待确认" not in content
+    assert "政策 1 · 多买多送\n值　是\n原文出处　无原文摘录" in lines
+    if case == "complete":
+        assert "需人工核对全文" not in content
+        assert "解析完成，待群卡片同意" in content
+    else:
+        assert lines[1].startswith("<font color='red'>处理状态\n需人工核对全文\n停在校验。")
+        assert "政策结构问题 1" in content
+        assert "未校验" in content
+        assert "待群卡片同意" not in content
+        assert case in content
+
+
+def test_command_validates_other_policies_when_a_field_is_uncertain(tmp_path, single_policy):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    tail = "\n合成第二条"
+    reply["policies"].append(policy("p2", span(len(body) + 1, len(body + tail) + 1), {
+        "repeat_bonus": statement("缺证据"),
+    }))
+
+    lines = _contents(_run(tmp_path, body + tail, reply, tag_dates={"占位标签甲": "2099-02-15"}))
+    content = "\n".join(lines)
+    assert "需人工核对全文" not in content
+    assert "未校验" not in content
+    assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in lines
+    assert "政策 2 · 处理状态\n停在校验" in content
+    assert "政策 2 · 多买多送 · 待确认" in content
+    assert "政策 2 · 是否只触发一次\n值　否" in content
+
+
+def test_pending_range_preview_redacts_secrets_at_range_edges():
+    pipeline = Pipeline(model=lambda **_: pytest.fail("不应调用模型"), tag_dates={}, sensitive_values=[SECRET])
+    body = f"甲{SECRET}乙"
+    issues = [
+        PolicyStructureIssue(Span(source_id="body", start=start, end=end), "overlapping_policy_mains")
+        for start, end in [(1, len(body) - 1), (0, 5), (5, len(body))]
+    ]
+
+    whole, clipped_end, clipped_start = pipeline._structure_reminders(body, issues, [(1, len(body) - 1)])
+
+    assert "[已脱敏]" in whole.text
+    assert SECRET not in whole.text
+    assert clipped_end.text == "body [0, 5)\n政策主段相交（overlapping_policy_mains）"
+    assert clipped_start.text == f"body [5, {len(body)})\n政策主段相交（overlapping_policy_mains）"
+
+
+@pytest.mark.parametrize("passages", [None, [], {}, [None, {"text": "坏项"}]])
+def test_unused_passages_are_display_only(tmp_path, single_policy, passages):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    tag_dates = {"占位标签甲": "2099-02-15"}
+    baseline = _contents(_run(tmp_path, body, reply, tag_dates=tag_dates))
+    reply["unused_passages"] = passages
+    assert _contents(_run(tmp_path, body, reply, tag_dates=tag_dates)) == baseline
+
+    long_text = "合成占位摘录\n" * 1800
+    long_reason = "分页理由\n" * 1800
+    reply["unused_passages"] = [
+        {"text": long_text, "reason": long_reason + "合成理由甲"},
+        {"text": {"bad": True}, "reason": "坏项"},
+        {"text": "额外键坏项", "reason": "无", "extra": True},
+        {"text": "合成段落乙", "reason": "合成理由乙"},
+    ]
+    lines = _contents(_run(tmp_path, body, reply, tag_dates=tag_dates))
+    advisory = "没用上的原文段落（对照下方申请原文）"
+    assert lines[2].startswith(advisory + "\n")
+    assert any(line.startswith(advisory + "（续）") for line in lines)
+    assert [line for line in lines if line.startswith("政策 ")] == [
+        line for line in baseline if line.startswith("政策 ")
+    ]
+    chunks = "".join(line.split("\n", 1)[1] for line in lines if line.startswith(advisory))
+    assert chunks == "理由　" + long_reason + "合成理由甲理由　合成理由乙"
+    assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in lines
+
+
+def test_application_source_and_advisories_are_redacted():
+    from qianshu.__main__ import _mail_summary
+
+    body = "甲" * 1499 + SECRET + "\n合成原文尾"
+    p = policy("p1", span(0, len(body)), {"user_scope": {
+        **statement("缺证据"), "explanation": "合成说明 " + SECRET,
+    }})
+    reply = json.dumps({"policies": [p], "unused_passages": [
+        {"text": body, "reason": SECRET},
+        {"text": SECRET[:5], "reason": SECRET[-5:]},
+    ]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[SECRET])
+
+    pages = pipeline(_application(body))
+    lines = _contents(list(map(result_card, pages)))
+    content = "\n".join(lines)
+    assert SECRET not in content
+    assert SECRET[:5] not in content and SECRET[-5:] not in content
+    assert "模型说明　合成说明 [已脱敏]" in content
+    assert "没用上的原文段落（对照下方申请原文）\n理由　[已脱敏]" in lines
+    assert lines[-1].startswith("申请原文（续）\n")
+    assert "".join(line.split("\n", 1)[1] for line in lines if line.startswith("申请原文")) == body.replace(SECRET, "[已脱敏]")
+    summary = "\n".join(_contents(list(map(result_card, _mail_summary(pages, True)))))
+    assert "通过校验 0 条，需人工核对 1 条" in summary
+    assert all(text not in summary for text in ("申请原文", "没用上的原文段落", "合成说明", SECRET))
+
+
+@pytest.mark.parametrize("size", [1, 4])
+def test_partial_sensitive_value_is_redacted_before_paginating(size):
+    secret = "H2NF5U9J7X"
+    suffix = secret[-size:]
+    body = "甲" * 1499 + secret + "\n" + "乙" * 8100
+    explanation = "乙" * 1477 + f"；只引用末尾{suffix}，需核对。"
+    reason = f"摘录含末尾{suffix}，略去。"
+    p = policy("p1", span(0, len(body)), {"user_scope": {
+        **statement("缺证据", evidence=[quote(body, suffix)]), "explanation": explanation,
+    }})
+    reply = json.dumps({"policies": [p], "unused_passages": [{"text": suffix, "reason": reason}]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    pages = pipeline(_application(body))
+    lines = _contents(list(map(result_card, pages)))
+    assert len(pages) > 1
+    assert "原文出处　「[已脱敏]」" in "\n".join(lines)
+    assert f"没用上的原文段落（对照下方申请原文）\n理由　{reason.replace(suffix, '[已脱敏]')}" in lines
+    for label, expected in (
+        ("申请原文", body.replace(secret, "[已脱敏]")),
+        ("政策 1 · 用户范围 · 待确认", "模型说明　" + explanation.replace(suffix, "[已脱敏]")),
+    ):
+        chunks = [line.split("\n", 1)[1] for line in lines if line.split("\n", 1)[0] in (label, label + "（续）")]
+        assert len(chunks) > 1
+        assert "".join(chunks).endswith(expected)
+    assert suffix not in "\n".join(lines)
+
+
+@pytest.mark.parametrize("secret_in_body", [False, True])
+def test_split_sensitive_value_is_redacted_across_advisories_and_pages(secret_in_body, monkeypatch):
+    monkeypatch.setattr("qianshu.feishu.cards._PAGE_ELEMENTS", 3)
+    pieces = ("充", "值赠", "送用户", "范围")
+    fragment = "".join(pieces)
+    secret = f"甲{fragment}乙" if secret_in_body else fragment
+    first = "、".join(pieces) + "。\n"
+    body = first + (secret if secret_in_body else "合成申请。")
+    reply = json.dumps({"policies": [
+        policy("p1", span(0, len(first)), {"user_scope": {
+            **statement("缺证据"), "explanation": pieces[2],
+        }}),
+        policy("p2", span(len(first), len(body)), {"country": {
+            **statement("缺证据"), "explanation": pieces[3],
+        }}),
+    ], "unused_passages": [
+        {"text": "合成段落甲", "reason": pieces[0]},
+        {"text": "丁" * 10000, "reason": pieces[1]},
+    ]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    displayed = []
+    for page in pipeline(_application(body)):
+        for line in _contents([result_card(page)]):
+            if line.startswith("没用上的原文段落") and "\n理由　" in line:
+                displayed.append((page.number, line.split("\n理由　", 1)[1]))
+            elif line.startswith("政策 1 · 用户范围 · 待确认\n"):
+                displayed.append((page.number, line.split("\n模型说明　", 1)[1]))
+            elif line.startswith("政策 2 · 国家 · 模型说明\n"):
+                displayed.append((page.number, line.split("\n", 1)[1]))
+
+    assert len(displayed) == len(pieces)
+    assert displayed[0][0] < displayed[1][0]
+    assert [text for _, text in displayed] == ["[已脱敏]"] * len(pieces)
+
+
+def test_unused_passage_excerpt_cannot_recombine_with_reason():
+    secret = "A12B34"
+    body = "样例A12、B34。"
+    excerpt = "样例A12"
+    reply = json.dumps({"policies": [], "unused_passages": [{"text": excerpt, "reason": "B34"}]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+    free_text = "".join(
+        part.removeprefix("理由　")
+        for line in lines if line.startswith("没用上的原文段落")
+        for part in line.split("\n")[1:]
+    )
+
+    assert secret not in free_text
+    assert all(secret[start:start + 4] not in free_text for start in range(len(secret) - 3))
+    assert all(excerpt not in line for line in lines if not line.startswith("申请原文\n"))
+    assert "没用上的原文段落（对照下方申请原文）\n理由　B34" in lines
+    assert f"申请原文\n{body}" in lines
+
+
+def test_advisories_redact_registered_fragments_absent_from_the_source():
+    body = "充、值。合成申请。"
+    long_secret = "甲合成隔离占位值乙"
+    reply = json.dumps({"policies": [policy("p1", span(0, len(body)), {
+        "user_scope": {**statement("缺证据"), "explanation": "值"},
+        "country": {**statement("缺证据"), "explanation": "需核对隔离占位值。"},
+    })], "unused_passages": [
+        {"text": "合成段落甲", "reason": "核对隔离占位。"},
+        {"text": "合成段落乙", "reason": "充"},
+    ]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[long_secret, "充值"])
+
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+
+    assert "没用上的原文段落（对照下方申请原文）\n理由　核对[已脱敏]。" in lines
+    assert "没用上的原文段落（对照下方申请原文）\n理由　[已脱敏]" in lines
+    assert "模型说明　[已脱敏]" in "\n".join(lines)
+    assert "政策 1 · 国家 · 模型说明\n需核对[已脱敏]。" in lines
+
+
+def test_advisories_keep_public_business_words_shared_with_a_sensitive_value():
+    secret = "已充值甲赠送乙用户丙"
+    body = f"已充值、赠送、用户。\n{secret}"
+    reply = json.dumps({"policies": [policy("p1", span(0, len(body)), {
+        "user_scope": {**statement("缺证据"), "explanation": "赠送"},
+        "country": {**statement("缺证据"), "explanation": "用户"},
+    })], "unused_passages": [{"text": "合成段落", "reason": "已充值"}]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+
+    assert "没用上的原文段落（对照下方申请原文）\n理由　已充值" in lines
+    assert "模型说明　赠送" in "\n".join(lines)
+    assert "政策 1 · 国家 · 模型说明\n用户" in lines
+    assert "申请原文\n已充值、赠送、用户。\n[已脱敏]" in lines
+
+
+def test_command_shows_country_and_company_keyword_explanations(tmp_path, single_policy):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    fields = reply["policies"][0]["fields"]
+    for name, explanation in {
+        "country": "合成国家证据不足", "company_keyword": "合成关键词证据不足", "user_scope": "合成范围证据不足",
+    }.items():
+        fields[name] = {**statement("缺证据"), "explanation": explanation}
+
+    lines = _contents(_run(tmp_path, body, reply))
+    assert "政策 1 · 国家 · 模型说明\n合成国家证据不足" in lines
+    assert "政策 1 · 公司关键词 · 模型说明\n合成关键词证据不足" in lines
+    assert any(line.startswith("政策 1 · 用户范围 · 待确认\n") and "模型说明　合成范围证据不足" in line for line in lines)
+    assert any(line.startswith("政策 1 · 公司 · 待确认\n") for line in lines)
+
+
+def test_zero_drafts_keep_advisories_and_original_without_validating(monkeypatch):
+    body = "合成原文"
+    reply = json.dumps({"policies": [], "unused_passages": [{"text": body, "reason": "合成说明"}]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={})
+    monkeypatch.setattr("qianshu.validate.validate_batch", lambda *a, **kw: pytest.fail("零草稿不得校验"))
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+    assert lines[1:] == [
+        "处理状态\n未提取到可办理的政策，请核对原文",
+        "没用上的原文段落（对照下方申请原文）\n理由　合成说明",
+        "申请原文\n合成原文",
+    ]
+
+
+@pytest.mark.parametrize("has_title", [True, False])
+def test_command_requires_package_confirmation_when_model_reports_no_title(tmp_path, single_policy, has_title):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    reply["policies"][0]["has_title"] = has_title
+    cards = _run(tmp_path, body, reply, tag_dates={"占位标签甲": "2099-02-15"})
+    content = "\n".join(_contents(cards))
+    assert ("政策 1 · 节目包 · 待确认" in content) is not has_title
+    assert ("缺少本条政策的标题" in content) is not has_title
+    assert ("待群卡片同意" in content) is has_title
+
+
+def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy):
+    body, rows = single_policy
+    evidence = "是否需要维护互斥组：否"
+    body += "\n" + evidence
+    rows[0]["maintain_mutual_exclusion_group"] = {"value": "否", "evidence": [evidence]}
+    content = "\n".join(_contents(_run(tmp_path, body, rows, tag_dates={"占位标签甲": "2099-02-15"})))
+    assert "申请要求不维护互斥组，需人工确认" in content
+    assert "<font color='red'>政策 1 · 提醒项\n申请要求不维护互斥组，需人工确认</font>" in content
+    assert "是否需要维护互斥组 · 候选 1\n值　否\n原文出处　「是否需要维护互斥组：否」" in content
+    assert "需追问 · 是否需要维护互斥组" in content
+    assert "停在校验，需人工确认或请申请人补充。" in content
+    assert "待群卡片同意" not in content
+
+
+def test_command_blocks_overlapping_policy_anchors(tmp_path, single_policy):
+    body, rows = single_policy
+    reply = fixed_reply(" " + body, rows)
+    first = reply["policies"][0]
+    reply["policies"].append({**first, "id": "p2", "main": span(1, 5)})
+    content = "\n".join(_contents(_run(tmp_path, body, reply)))
+    assert "需人工核对全文" in content
+    assert "body [1, 5)\n政策主段相交（overlapping_policy_mains）" in content
+    assert "未校验" in content
+    assert "待群卡片同意" not in content
+    assert "政策 1 · 用户范围\n值　占位休眠用户" in content

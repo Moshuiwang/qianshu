@@ -11,12 +11,15 @@ from unittest.mock import Mock
 import anthropic
 import httpx
 import pytest
+from anthropic.types import TextBlock, ThinkingBlock, ToolUseBlock
 
 from qianshu.__main__ import main as service_main
 from qianshu.config import ConfigError
 from qianshu.parse import ModelError, parse_application
 from qianshu.parse.__main__ import main
-from qianshu.parse.model import configured_model
+from qianshu.parse.model import ModelReplyError, configured_model, load_model_config
+from qianshu.parse.protocol import ApplicationReply
+from tests.protocol_fixtures import fixed_reply, serialized_empty
 
 
 def test_service_help_describes_current_offline_input(capsys):
@@ -32,12 +35,15 @@ def test_service_help_describes_current_offline_input(capsys):
     assert "演练" not in help_text
 
 
-@pytest.mark.parametrize(("model_config", "expected"), [
-    ({}, "claude-sonnet-5-5"),
-    ({"ANTHROPIC_MODEL": "placeholder-model"}, "placeholder-model"),
+@pytest.mark.parametrize(("model_config", "expected", "effort"), [
+    ({}, "claude-sonnet-5-5", "medium"),
+    ({"ANTHROPIC_MODEL": "placeholder-model", "ANTHROPIC_EFFORT": "low"}, "placeholder-model", "low"),
+    *[({"ANTHROPIC_EFFORT": effort}, "claude-sonnet-5-5", effort)
+      for effort in ("medium", "high", "xhigh", "max")],
 ])
-def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, caplog):
+def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, effort, caplog):
     client_type = anthropic.Anthropic
+    raw = "  \r\n" + serialized_empty() + "\r\n"
 
     def mocked_reply(request):
         assert request.url.host == "model.example.invalid"
@@ -46,9 +52,27 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
         assert payload["model"] == expected
         assert payload["system"] == "占位规则"
         assert payload["messages"] == [{"role": "user", "content": "占位正文"}]
-        assert "tools" not in payload
+        assert payload["output_config"] == {"effort": effort}
+        assert "thinking" not in payload
+        assert payload["tools"] == [{
+            "name": "submit_application_reply", "description": "提交一份申请解析声明。",
+            "input_schema": ApplicationReply.model_json_schema(),
+        }]
+        definitions = payload["tools"][0]["input_schema"]["$defs"]
+        schema = payload["tools"][0]["input_schema"]
+        assert set(schema["properties"]) == {"policies", "unused_passages"}
+        assert schema["required"] == ["policies"]
+        for name, finding in definitions.items():
+            if name.startswith("Finding_"):
+                assert set(finding["required"]) == {"status", "reason_code", "value", "candidates", "evidence"}
+                assert set(finding["properties"]) == {*finding["required"], "explanation"}
+        anchor = definitions["PolicyAnchor"]
+        assert {"source_id", "start", "end", "text"} == set(anchor["properties"])
+        assert "text" not in anchor["required"]
+        assert set(definitions["UnusedPassage"]["required"]) == {"text", "reason"}
+        assert "tool_choice" not in payload
         assert payload["stream"] is True
-        assert payload["max_tokens"] == 32000
+        assert payload["max_tokens"] == 128000
         events = [
             {"type": "message_start", "message": {
                 "id": "msg_placeholder",
@@ -60,12 +84,18 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
                 "stop_sequence": None,
                 "usage": {"input_tokens": 1, "output_tokens": 0},
             }},
-            {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}},
-            {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "[]"}},
+            {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "thinking", "thinking": "占位思考", "signature": "placeholder",
+            }},
             {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_start", "index": 1, "content_block": {
+                "type": "tool_use", "name": "submit_application_reply", "id": "toolu_placeholder", "input": {},
+            }},
+            {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": raw}},
+            {"type": "content_block_stop", "index": 1},
             {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": "tool_use", "stop_sequence": None},
                 "usage": {"output_tokens": 1},
             },
             {"type": "message_stop"},
@@ -88,8 +118,13 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
         "ANTHROPIC_BASE_URL": "https://model.example.invalid",
         **model_config,
     }
+    captured = []
     with caplog.at_level(logging.DEBUG):
-        assert configured_model(config)(system="占位规则", user="占位正文") == "[]"
+        complete = configured_model(config, on_result=captured.append)
+        assert complete(system="占位规则", user="占位正文") == raw
+    result, = captured
+    assert result.reply == raw
+    assert result.effort == effort
     assert "占位正文" not in caplog.text
     assert "model.example.invalid" not in caplog.text
 
@@ -99,72 +134,137 @@ def test_unsupported_platform_is_rejected():
         configured_model({"AI_PLATFORM": "placeholder-platform"})
 
 
+@pytest.mark.parametrize("effort", ["", " ", "HIGH", "unsupported"])
+def test_invalid_effort_from_config_file_is_rejected(tmp_path, effort):
+    config_file = tmp_path / "placeholder.env"
+    config_file.write_text(
+        f"ANTHROPIC_API_KEY=placeholder-key\nANTHROPIC_EFFORT='{effort}'\n", encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="ANTHROPIC_EFFORT"):
+        configured_model(load_model_config(env_file=config_file))
+
+
 @pytest.fixture
 def stub_stream(monkeypatch):
-    stream = Mock()
-    open_stream = Mock(return_value=nullcontext(stream))
-    client = SimpleNamespace(messages=SimpleNamespace(stream=open_stream))
+    get_reply = Mock()
+
+    def events():
+        reply = get_reply()
+        yield SimpleNamespace(type="message_start", message=reply)
+        for index, block in enumerate(getattr(reply, "content", ())):
+            if block.type == "tool_use":
+                yield SimpleNamespace(type="content_block_delta", index=index, delta=SimpleNamespace(
+                    type="input_json_delta", partial_json=json.dumps(block.input),
+                ))
+
+    open_stream = Mock(side_effect=lambda **_: nullcontext(events()))
+    client = SimpleNamespace(messages=SimpleNamespace(create=open_stream))
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
-    return open_stream, stream.get_final_message
+    return open_stream, get_reply
 
 
-def test_stream_returns_all_text_blocks(stub_stream):
-    open_stream, get_final_message = stub_stream
-    get_final_message.return_value = SimpleNamespace(
-        stop_reason="end_turn",
+def _reply_tool(input, *, name="submit_application_reply"):
+    return ToolUseBlock(type="tool_use", id="toolu_placeholder", name=name, input=input)
+
+
+def test_stream_returns_only_tool_input(stub_stream):
+    _, get_reply = stub_stream
+    payload = json.loads(serialized_empty())
+    get_reply.return_value = SimpleNamespace(
+        stop_reason="tool_use",
         content=[
-            SimpleNamespace(type="text", text="["),
-            SimpleNamespace(type="thinking"),
-            SimpleNamespace(type="text", text="]"),
+            TextBlock(type="text", text="占位说明"),
+            _reply_tool(payload),
+            ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
         ],
     )
     complete = configured_model({
         "ANTHROPIC_API_KEY": "placeholder-key",
         "ANTHROPIC_MODEL": "placeholder-model",
     })
-    assert complete(system="占位规则", user="占位正文") == "[]"
-    open_stream.assert_called_once_with(
-        model="placeholder-model",
-        system="占位规则",
-        messages=[{"role": "user", "content": "占位正文"}],
-        max_tokens=32000,
-    )
-    get_final_message.assert_called_once_with()
+    assert json.loads(complete(system="占位规则", user="占位正文")) == payload
+    get_reply.assert_called_once_with()
 
 
-@pytest.mark.parametrize("stop_reason", ["end_turn", "max_tokens"])
-def test_result_callback_records_text_blocks_and_use_without_changing_return(stub_stream, stop_reason):
-    _, get_final_message = stub_stream
-    get_final_message.return_value = SimpleNamespace(
-        stop_reason=stop_reason,
-        model="synthetic-resolved-model",
-        usage=SimpleNamespace(input_tokens=9, output_tokens=4),
-        content=[
-            SimpleNamespace(type="text", text="["),
-            SimpleNamespace(type="thinking", thinking="占位思考"),
-            SimpleNamespace(type="text", text="]"),
-        ],
+@pytest.mark.parametrize(("case", "code", "path"), [
+    ("missing", "reply_tool_missing", ()),
+    ("multiple", "reply_tool_multiple", ()),
+    ("unexpected", "reply_tool_unexpected", ()),
+    ("invalid", "reply_schema", ("policies",)),
+])
+def test_stream_rejects_bad_tool_reply_and_records_content(stub_stream, case, code, path):
+    _, get_reply = stub_stream
+    payload = json.loads(serialized_empty())
+    invalid = {**payload, "policies": "占位非法政策清单"}
+    tools = {
+        "missing": [], "multiple": [_reply_tool(payload), _reply_tool(invalid)],
+        "unexpected": [_reply_tool(payload, name="unexpected_tool")], "invalid": [_reply_tool(invalid)],
+    }[case]
+    blocks = [TextBlock(type="text", text=json.dumps(payload)), *tools]
+    get_reply.return_value = SimpleNamespace(
+        stop_reason="end_turn" if case == "missing" else "tool_use", content=blocks,
     )
     captured = []
     complete = configured_model({"ANTHROPIC_API_KEY": "placeholder-key"}, on_result=captured.append)
-    if stop_reason == "end_turn":
-        assert complete(system="", user="") == "[]"
-    else:
-        with pytest.raises(ModelError, match="max_tokens"):
-            complete(system="", user="")
+
+    with pytest.raises(ModelReplyError, match="回复解析失败") as exc:
+        complete(system="", user="")
+    assert (exc.value.code, exc.value.path) == (code, path)
     result, = captured
-    assert result.reply == "[]"
+    assert result.failure_stage == code
+    assert result.reply == exc.value.reply
+    if case == "invalid":
+        assert result.reply == json.dumps(invalid)
+    else:
+        assert json.loads(result.reply) == [
+            {**block.model_dump(exclude_unset=True), "input": json.dumps(block.input)}
+            if block.type == "tool_use" else block.model_dump(exclude_unset=True)
+            for block in blocks
+        ]
+
+
+@pytest.mark.parametrize("stop_reason", ["tool_use", "max_tokens"])
+def test_result_callback_records_blocks_and_use_without_changing_return(stub_stream, stop_reason):
+    _, get_reply = stub_stream
+    payload = json.loads(serialized_empty())
+    blocks = [
+        TextBlock(type="text", text="占位说明"),
+        ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
+        _reply_tool(payload),
+    ]
+    get_reply.return_value = SimpleNamespace(
+        stop_reason=stop_reason,
+        model="synthetic-resolved-model",
+        usage=SimpleNamespace(input_tokens=9, output_tokens=4),
+        content=blocks,
+    )
+    captured = []
+    complete = configured_model({"ANTHROPIC_API_KEY": "placeholder-key"}, on_result=captured.append)
+    if stop_reason == "tool_use":
+        assert json.loads(complete(system="", user="")) == payload
+    else:
+        with pytest.raises(ModelReplyError, match="max_tokens") as exc:
+            complete(system="", user="")
+        assert exc.value.code == "reply_truncated"
+    result, = captured
+    raw = json.dumps(payload)
+    expected = payload if stop_reason == "tool_use" else [
+        blocks[0].model_dump(exclude_unset=True),
+        blocks[1].model_dump(exclude_unset=True),
+        {**blocks[2].model_dump(exclude_unset=True), "input": raw},
+    ]
+    assert json.loads(result.reply) == expected
     assert result.stop_reason == stop_reason
-    assert result.blocks == (("text", 1), ("thinking", 4), ("text", 1))
+    assert result.blocks == (("text", 4), ("thinking", 4), ("tool_use", len(raw)))
     assert (result.input_tokens, result.output_tokens, result.model) == (9, 4, "synthetic-resolved-model")
     assert result.elapsed_ms >= 0
-    assert result.failure_stage == (None if stop_reason == "end_turn" else "model_incomplete")
+    assert result.failure_stage == (None if stop_reason == "tool_use" else "model_incomplete")
 
 
-@pytest.mark.parametrize(("stop_reason", "output_tokens"), [("refusal", 1), ("max_tokens", 32000)])
+@pytest.mark.parametrize(("stop_reason", "output_tokens"), [("refusal", 1), ("max_tokens", 128000)])
 def test_unsuccessful_stop_reason_rejects_even_valid_json(stub_stream, stop_reason, output_tokens):
-    _, get_final_message = stub_stream
-    get_final_message.return_value = SimpleNamespace(
+    _, get_reply = stub_stream
+    get_reply.return_value = SimpleNamespace(
         stop_reason=stop_reason,
         usage=SimpleNamespace(output_tokens=output_tokens),
         content=[SimpleNamespace(type="text", text="[]")],
@@ -176,8 +276,8 @@ def test_unsuccessful_stop_reason_rejects_even_valid_json(stub_stream, stop_reas
 
 @pytest.mark.parametrize("stop_reason", ["placeholder_reason", "https://model.example.invalid", None])
 def test_unknown_stop_reason_with_missing_usage(stub_stream, stop_reason):
-    _, get_final_message = stub_stream
-    get_final_message.return_value = SimpleNamespace(stop_reason=stop_reason)
+    _, get_reply = stub_stream
+    get_reply.return_value = SimpleNamespace(stop_reason=stop_reason)
     with pytest.raises(ModelError) as exc:
         configured_model({"ANTHROPIC_API_KEY": "placeholder-key"})(system="", user="占位正文")
     assert str(exc.value) == "申请解析模型回复不完整（stop_reason=unknown，输出 未知 token）。"
@@ -185,8 +285,8 @@ def test_unknown_stop_reason_with_missing_usage(stub_stream, stop_reason):
 
 @pytest.mark.parametrize("error_type", [anthropic.AnthropicError, ValueError])
 def test_stream_error_is_sanitized(stub_stream, error_type):
-    _, get_final_message = stub_stream
-    get_final_message.side_effect = error_type("占位错误详情")
+    _, get_reply = stub_stream
+    get_reply.side_effect = error_type("占位错误详情")
     with pytest.raises(ModelError) as exc:
         configured_model({"ANTHROPIC_API_KEY": "placeholder-key"})(system="", user="占位正文")
     assert str(exc.value) == "申请解析模型调用失败。"
@@ -195,8 +295,9 @@ def test_stream_error_is_sanitized(stub_stream, error_type):
 class _BrokenStream(httpx.SyncByteStream):
     """先送出部分事件，再按指定方式中断，模拟流读取中途失败。"""
 
-    def __init__(self, error):
+    def __init__(self, error, block_type):
         self._error = error
+        self._block_type = block_type
 
     def __iter__(self):
         start = {"type": "message_start", "message": {
@@ -204,24 +305,30 @@ class _BrokenStream(httpx.SyncByteStream):
             "content": [], "stop_reason": None, "stop_sequence": None,
             "usage": {"input_tokens": 1, "output_tokens": 0},
         }}
-        delta = {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "占位回复"}}
         if self._error is not None:
-            for event in (start, {"type": "content_block_start", "index": 0,
-                                  "content_block": {"type": "text", "text": ""}}, delta):
+            if self._block_type == "tool_use":
+                block = {"type": "tool_use", "id": "toolu_placeholder", "name": "submit_application_reply", "input": {}}
+                delta = {"type": "input_json_delta", "partial_json": '{"policies": ['}
+            else:
+                block = {"type": "text", "text": ""}
+                delta = {"type": "text_delta", "text": "占位回复"}
+            for event in (start, {"type": "content_block_start", "index": 0, "content_block": block},
+                          {"type": "content_block_delta", "index": 0, "delta": delta}):
                 yield f"event: {event['type']}\ndata: {json.dumps(event)}\n\n".encode()
             raise self._error
 
 
-@pytest.mark.parametrize("error", [
-    httpx.ReadError("占位错误详情"),
-    httpx.ReadTimeout("占位错误详情"),
-    httpx.RemoteProtocolError("占位错误详情"),
-    None,  # 流在 message_start 前正常结束
+@pytest.mark.parametrize(("error", "block_type"), [
+    (httpx.ReadError("占位错误详情"), "text"),
+    (httpx.ReadTimeout("占位错误详情"), "text"),
+    (httpx.RemoteProtocolError("占位错误详情"), "text"),
+    (httpx.ReadTimeout("占位错误详情"), "tool_use"),
+    (None, "text"),  # 流在 message_start 前正常结束
 ])
-def test_stream_interrupted_midway_is_sanitized(monkeypatch, error):
+def test_stream_interrupted_midway_is_sanitized(monkeypatch, error, block_type):
     client_type = anthropic.Anthropic
     http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
-        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream(error),
+        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream(error, block_type),
     )))
     monkeypatch.setattr(
         anthropic, "Anthropic",
@@ -233,7 +340,11 @@ def test_stream_interrupted_midway_is_sanitized(monkeypatch, error):
         configured_model(config, on_result=captured.append)(system="", user="占位正文")
     result, = captured
     assert result.failure_stage == ("model_call" if error is None else "reply_truncated")
-    assert result.reply == (None if error is None else "占位回复")
+    if block_type == "tool_use":
+        block, = json.loads(result.reply)
+        assert block["type"] == "tool_use" and block["input"] == '{"policies": ['
+    else:
+        assert result.reply == (None if error is None else "占位回复")
     assert str(exc.value) == "申请解析模型调用失败。"
 
 
@@ -242,7 +353,9 @@ def test_parse_entry_writes_only_to_a_new_private_file(monkeypatch, tmp_path, ca
 
     def recorded_model(config):
         assert config == {}
-        return lambda **_: '[{"company":{"value":"占位公司","evidence":["占位公司"]}}]'
+        return lambda **_: json.dumps(fixed_reply("赞比亚占位申请", [
+            {"country": {"value": "赞比亚", "evidence": ["赞比亚占位申请"]}},
+        ]))
 
     output = tmp_path / "drafts.json"
     monkeypatch.setattr(qianshu.parse, "configured_model", recorded_model)
@@ -272,18 +385,23 @@ def test_parse_entry_writes_only_to_a_new_private_file(monkeypatch, tmp_path, ca
 ])
 def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp_path, env_file, rules_dir, flags):
     monkeypatch.chdir(tmp_path)
-    Path(".env").write_text("ANTHROPIC_MODEL=placeholder-default\n", encoding="utf-8")
+    Path(".env").write_text(
+        "ANTHROPIC_MODEL=placeholder-default\nANTHROPIC_EFFORT=low\n", encoding="utf-8",
+    )
     if env_file != ".env":
-        Path(env_file).write_text("ANTHROPIC_MODEL=placeholder-custom\n", encoding="utf-8")
+        Path(env_file).write_text(
+            "ANTHROPIC_MODEL=placeholder-custom\nANTHROPIC_EFFORT=xhigh\n", encoding="utf-8",
+        )
     Path(rules_dir).symlink_to(Path(__file__).resolve().parents[2] / "rules", target_is_directory=True)
-    configured = Mock(return_value=Mock(return_value="[]"))
+    configured = Mock(return_value=Mock(return_value=serialized_empty()))
     monkeypatch.setattr("qianshu.parse.configured_model", configured)
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", "drafts.json", *flags])
     monkeypatch.setattr(sys, "stdin", io.StringIO("占位正文"))
 
     assert main() == 0
     expected_model = "placeholder-default" if env_file == ".env" else "placeholder-custom"
-    configured.assert_called_once_with({"ANTHROPIC_MODEL": expected_model})
+    expected_effort = "low" if env_file == ".env" else "xhigh"
+    configured.assert_called_once_with({"ANTHROPIC_MODEL": expected_model, "ANTHROPIC_EFFORT": expected_effort})
     configured.return_value.assert_called_once()
     assert json.loads(Path("drafts.json").read_text(encoding="utf-8")) == []
 
@@ -297,7 +415,8 @@ def test_replay_entry_uses_explicit_company_table_instead_of_default(monkeypatch
     Path(".private/companies.tsv").write_text(header + "赞比亚\t\t0001\t占位默认公司\n", encoding="utf-8")
     selected = "赞比亚\t占位所选公司\n" if legacy else header + "赞比亚\t\t0002\t占位所选公司\n"
     Path("selected.tsv").write_text(selected, encoding="utf-8")
-    Path("model.json").write_text('[{"company":{"value":"占位模型公司","evidence":["赞比亚"]}}]', encoding="utf-8")
+    reply = fixed_reply("赞比亚占位申请", [{"country": {"value": "赞比亚", "evidence": ["赞比亚"]}}])
+    Path("model.json").write_text(json.dumps(reply), encoding="utf-8")
     monkeypatch.setattr(sys, "argv", [
         "qianshu.parse", "--output", "drafts.json", "--replay", "model.json",
         "--rules-dir", str(rules), "--companies-file", "selected.tsv",
@@ -311,7 +430,7 @@ def test_replay_entry_uses_explicit_company_table_instead_of_default(monkeypatch
 
 
 @pytest.mark.parametrize("reply", [
-    '  \r\n[{"company":{"value":"占位公司","evidence":["占位公司"]}}]\r\n',
+    "  \r\n" + json.dumps(fixed_reply("占位公司", [{}])) + "\r\n",
     "占位无效回复\r\n",
 ])
 def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_path, capsys, reply):
@@ -323,7 +442,7 @@ def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_
     monkeypatch.setattr("qianshu.parse.configured_model", lambda _: model)
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(output), "--raw-output", str(raw)])
     monkeypatch.setattr(sys, "stdin", io.StringIO(body))
-    exit_code = 0 if reply.lstrip().startswith("[") else 1
+    exit_code = 0 if reply.lstrip().startswith("{") else 1
     assert main() == exit_code
     assert raw.read_bytes() == reply.encode()
     assert raw.stat().st_mode & 0o777 == 0o600
@@ -409,6 +528,47 @@ def test_replay_matches_direct_stub_without_reading_api_config(monkeypatch, tmp_
     assert json.loads(output.read_text(encoding="utf-8")) == [draft.to_dict() for draft in expected]
     assert raw.read_bytes() == replay.read_bytes()
     config.assert_not_called()
+
+
+@pytest.mark.parametrize("passages", [None, [{"text": "合成申请材料", "reason": "占位说明"}]])
+def test_replay_writes_empty_drafts_and_optional_passages(monkeypatch, tmp_path, capsys, passages):
+    body = "合成申请材料"
+    replay = tmp_path / "reply.json"
+    output = tmp_path / "drafts.json"
+    raw = tmp_path / "raw.json"
+    reply = "  \r\n" + json.dumps({"policies": [], "unused_passages": passages}, ensure_ascii=False) + "\r\n"
+    replay.write_bytes(reply.encode())
+    monkeypatch.setattr(sys, "argv", [
+        "qianshu.parse", "--replay", str(replay), "--output", str(output), "--raw-output", str(raw),
+        "--companies-file", str(Path(__file__).parent / "fixtures" / "companies.tsv"),
+    ])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(body))
+
+    assert main() == 0
+    expected = {"drafts": [], "unused_passages": passages} if passages else []
+    assert json.loads(output.read_text(encoding="utf-8")) == expected
+    assert raw.read_bytes() == reply.encode()
+    assert raw.stat().st_mode & 0o777 == 0o600
+    assert capsys.readouterr() == ("", "")
+
+
+def test_replay_writes_full_review_for_unlocated_policy_anchor(monkeypatch, tmp_path):
+    body = "合成申请"
+    reply = fixed_reply(body, [{}])
+    reply["policies"][0]["main"]["text"] = "合成未找到的引文"
+    replay = tmp_path / "reply.json"
+    output = tmp_path / "drafts.json"
+    replay.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--replay", str(replay), "--output", str(output)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(body))
+
+    assert main() == 0
+    parsed = json.loads(output.read_text(encoding="utf-8"))
+    assert parsed["requires_full_review"] is True
+    assert parsed["structure_issues"] == [
+        {"span": None, "code": "unlocated_policy_main", "policy_ids": ["p1"]},
+    ]
+    assert parsed["drafts"][0]["repeat_bonus"]["value"] == "是"
 
 
 @pytest.fixture

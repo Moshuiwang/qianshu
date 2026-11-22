@@ -8,7 +8,8 @@ from typing import get_origin
 from qianshu.draft import DraftField, PolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
-from qianshu.parse.model import ParseModel
+from qianshu.parse.evidence import STRUCTURE_REASONS
+from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
 
 from .business import COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
@@ -22,6 +23,12 @@ DOCUMENT_RESULTS = ("parsed", "model_failed", "parse_failed")
 DRAFT_RESULTS = ("unplaced", "unselected", "extra", "unclassified", "ambiguous")
 APPROVAL_FIELDS = ("approval_url", "approval_attachments")
 NEW_FIELD_RESULTS = ("determined", "uncertain", "missing", "unaligned")
+EVIDENCE_LOCATION_LABELS = {
+    "exact": "模型坐标原样正确",
+    "relocated": "程序重新定位",
+    "ambiguous": "多处不可分",
+    "not_found": "引文不存在",
+}
 
 
 class IncompleteReply(ParseError):
@@ -130,6 +137,16 @@ def _rate_counts(counts: Counter) -> dict:
     }
 
 
+def _evidence_location_report(counts: Counter) -> dict:
+    total = sum(counts[key] for key in EVIDENCE_LOCATION_LABELS)
+    located = counts["exact"] + counts["relocated"]
+    return {
+        "numerator": located, "denominator": total,
+        "percent": round(100 * located / total, 2) if total else None,
+        "counts": {key: counts[key] for key in EVIDENCE_LOCATION_LABELS},
+    }
+
+
 def _new_field_status(draft, name: str) -> str:
     if draft is None:
         return "unaligned"
@@ -188,6 +205,9 @@ def evaluate(
     }, company_table=company_rules.table if company_rules is not None else None,
         country_names=company_rules.countries if company_rules is not None else None)
     business_details = []
+    evidence_locations = Counter()
+    full_review_cards = full_review_policies = 0
+    full_review_reasons = Counter()
     reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
     reply_failed_documents = 0
 
@@ -201,6 +221,7 @@ def evaluate(
 
         drafts = []
         reply_failure = "reply_parse"
+        failure_code, failure_path = None, ()
         try:
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
@@ -210,24 +231,41 @@ def evaluate(
             received = True
             status = "parse_failed"
             reply_failure = error.reason
+            failure_code = error.reason
+        except ModelReplyError as error:
+            received = True
+            status = "parse_failed"
+            if error.code not in REPLY_FORMAT_ERRORS and error.code not in {"reply_json", "reply_document"}:
+                reply_failure = error.code
+            failure_code, failure_path = error.code, error.path
         except ModelError:
             status = "model_failed"
-        except ParseError:
+        except ParseError as error:
             status = "parse_failed"
+            failure_code, failure_path = error.code, error.path
         except Exception:
             if recording is not None and received:
                 recording.finish(token, "parse_failed", received)
             raise
         else:
             status = "parsed"
+            if getattr(drafts, "requires_full_review", False):
+                full_review_cards += 1
+                full_review_policies += len(drafts)
+                full_review_reasons.update({item.code for item in drafts.structure_issues})
+        location_counts = Counter(getattr(drafts, "evidence_locations", {}))
+        evidence_locations.update(location_counts)
         failure_reasons = set()
         if status == "parse_failed" and received:
             failure_reasons.add(reply_failure)
-        if recording is not None and recording.finish(token, status, received):
+        if recording is not None and recording.finish(
+            token, status, received, code=failure_code, path=failure_path,
+            evidence_location=_evidence_location_report(location_counts),
+        ):
             failure_reasons.add("reply_truncated")
         reply_failed_documents += bool(failure_reasons)
         for reason in failure_reasons:
-            reply_failures[reason] += 1
+            reply_failures[reason] = reply_failures.get(reason, 0) + 1
         documents[status] += 1
         business_details.append({"token": token, **business.add(document, pairs[token], drafts)})
         if status == "parsed":
@@ -285,6 +323,9 @@ def evaluate(
         "samples": len(samples),
         "strata": frozen["strata"],
         "documents": {key: documents[key] for key in DOCUMENT_RESULTS},
+        "full_document_review": {"cards": full_review_cards, "policies": full_review_policies},
+        "full_document_review_reasons": {code: full_review_reasons[code] for code in STRUCTURE_REASONS},
+        "evidence_location": _evidence_location_report(evidence_locations),
         "sample_alignment": {key: alignments[key] for key in ALIGNMENTS},
         "draft_alignment": {key: draft_counts[key] for key in DRAFT_RESULTS},
         "by_field": {name: _rate_counts(field_counts[name]) for name in eligible},
@@ -321,15 +362,29 @@ def evaluate(
 def markdown_report(report: dict) -> bytes:
     failures = report["business"]["reply_parse_failure_reasons"]
     breakdown = f"（截断 {failures['reply_truncated']}，其他未完整结束 {failures['reply_incomplete']}，解码或解析 {failures['reply_parse']}）"
+    locations = report["evidence_location"]
+    percent = locations["percent"]
+    rate = f"{percent:.2f}%" if percent is not None else "不可判定"
+    location_lines = [
+        f"- 证据定位成功率 {locations['numerator']}/{locations['denominator']}（{rate}），计字段、候选及带引文的政策锚点",
+        *(f"- {label} {locations['counts'][key]}" for key, label in EVIDENCE_LOCATION_LABELS.items()),
+    ]
+    review = report["full_document_review"]
+    review_line = f"- 需核对全文的卡片数 {review['cards']}（政策数 {review['policies']}），按政策结构与空材料计"
+    reasons = report["full_document_review_reasons"]
+    review_lines = [review_line, *(f"  - {label} {reasons[code]} 篇" for code, label in STRUCTURE_REASONS.items())]
+    if diagnostic := report.get("diagnostic_replay"):
+        review_lines.insert(0, f"- 离线诊断，源回复结构 `{diagnostic['source_reply_structure']}`，"
+                               f"当前结构 `{diagnostic['reply_structure']}`。")
     if report.get("void"):
-        return (
-            "# 解析回归计数\n\n"
-            f"- 冻结指纹 `{report['freeze_sha256']}`\n"
-            f"- 运行配置指纹 `{report['configuration_sha256']}`\n"
-            f"- 模型调用失败 {report['documents']['model_failed']} 篇\n"
-            f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}\n\n"
-            "本次放行运行作废。\n"
-        ).encode()
+        return "\n".join([
+            "# 解析回归计数", "",
+            f"- 冻结指纹 `{report['freeze_sha256']}`",
+            f"- 运行配置指纹 `{report['configuration_sha256']}`",
+            f"- 模型调用失败 {report['documents']['model_failed']} 篇",
+            f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}",
+            *review_lines, *location_lines, "", "本次放行运行作废。", "",
+        ]).encode()
 
     def lines(title, data):
         yield f"## {title}"
@@ -350,6 +405,7 @@ def markdown_report(report: dict) -> bytes:
         f"- 样例 {report['samples']} 条",
         f"- 原稿解析完成 {report['documents']['parsed']} 篇，模型调用失败 {report['documents']['model_failed']} 篇，"
         f"回复解析失败 {report['documents']['parse_failed']} 篇",
+        *review_lines, *location_lines,
         f"- 唯一对齐 {report['sample_alignment']['matched']} 条，未对齐 {report['sample_alignment']['unmatched']} 条，"
         f"歧义 {report['sample_alignment']['ambiguous']} 条", "",
         "## 分层配额与缺口", "",

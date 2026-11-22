@@ -3,22 +3,27 @@
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 from qianshu.config import ConfigError
-from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_model
+from qianshu.parse import system_message
+from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_effort, configured_model
+from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE
 
 from .business import DEFAULT_THRESHOLD
 from .corpus import make_plan
 from .freeze import freeze, load_exclusions, load_freeze
 from .packages import freeze_packages
 from .recording import MANIFEST, Recording, SavedReplies, configuration, doc_names, probe_replies
-from .runner import RUN_FILES, evaluate, markdown_report
+from .runner import RULES, RUN_FILES, evaluate, markdown_report
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
 from .summary import summarize
 
-_MODEL_SETTINGS = ("AI_PLATFORM", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL")
+_MODEL_SETTINGS = (
+    "AI_PLATFORM", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "ANTHROPIC_EFFORT",
+)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -66,6 +71,8 @@ def _arguments(argv: list[str] | None):
     run.add_argument("--replaces-recording", help="本次放行运行替代的作废录制目录。")
     replay = commands.add_parser("replay", help="离线重放已录制回复。")
     replay.add_argument("--recording", required=True)
+    replay.add_argument("--legacy-recording", action="store_true",
+                        help="将旧结构录制定点投影到薄协议，仅用于离线诊断。")
     imported = commands.add_parser("import", help="导入 probe 按用户消息指纹保存的回复。")
     imported.add_argument("--probe", required=True)
     imported.add_argument("--model-id", required=True, help="记录该历史回复所用的模型标识。")
@@ -83,27 +90,51 @@ def _arguments(argv: list[str] | None):
     summary = commands.add_parser("summarize", help="汇总同一配置的多次运行。")
     summary.add_argument("--recording", required=True, action="append")
     summary.add_argument("--out", required=True)
+    summary.add_argument("--diagnostic-replay", action="store_true", help="仅汇总旧结构离线诊断重放。")
     return parser.parse_args(argv)
+
+
+_LEGACY_REVISION = "4fb3cb5d52a394f8cd7990572ca72f8009278fea"
+
+
+def _legacy_fingerprints(repo: Path) -> tuple[str, str]:
+    try:
+        blobs = {name: subprocess.check_output(
+            ["git", "--no-replace-objects", "cat-file", "blob", f"{_LEGACY_REVISION}:rules/{name}"],
+            cwd=repo, stderr=subprocess.DEVNULL,
+        ) for name in RULES}
+    except (OSError, subprocess.CalledProcessError):
+        raise RegressionError("无法读取受信旧版本的规则文件。") from None
+    hashes = {name: digest(blob) for name, blob in blobs.items()}
+    system = system_message(*(blobs[name].decode("utf-8") for name in (
+        "parse-prompt.md", "parse-rules.md", "parse-options.tsv",
+    )))
+    return digest(json_bytes(hashes)), digest(system.encode())
 
 
 def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None:
     snapshot = load_freeze(files, files.argument(args.frozen))
     if snapshot["fingerprint"] != args.expect_sha256:
         raise RegressionError("预期冻结指纹与实际冻结指纹不一致。")
-    source = origin_run_id = None
+    source = origin_run_id = effort = None
+    legacy_recording = getattr(args, "legacy_recording", False)
+    source_system_sha = None
     settings = {}
     if args.command == "replay":
-        saved = SavedReplies(files, files.argument(args.recording))
+        saved = SavedReplies(files, files.argument(args.recording), legacy_recording=legacy_recording)
         manifest = saved.manifest
         prior = manifest["configuration"]
         if prior["freeze_sha256"] != snapshot["fingerprint"]:
             raise RegressionError("录制与本次重放的冻结指纹不一致。")
         model_id = manifest["model"]
         origin_run_id = manifest["origin_run_id"] or manifest["run_id"]
-        source = saved.for_attempts
+        if not legacy_recording and saved.reply_structure == LEGACY_REPLY_STRUCTURE:
+            raise RegressionError("旧回复结构须显式指定 --legacy-recording。")
+        source = saved
         legacy = prior["legacy_companies"] if args.legacy_companies is None else args.legacy_companies
         threshold = manifest["threshold"] if args.threshold is None else args.threshold
         release, retries = prior["release"], prior["retries"]
+        effort = prior.get("effort")
         origin = "replay"
     else:
         legacy = bool(args.legacy_companies)
@@ -121,12 +152,19 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
                 raise RegressionError("实际调用模型须显式指定 --live。")
             settings = {key: os.environ[key] for key in _MODEL_SETTINGS if key in os.environ}
             model_id = settings.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+            effort = configured_effort(settings)
             origin = "live"
         else:
             model_id, origin = "injected", "injected"
 
     rules = files.repo / "rules"
-    config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries)
+    config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries, effort=effort)
+    if legacy_recording:
+        source_rules_sha, source_system_sha = _legacy_fingerprints(files.repo)
+        if prior.get("source_rules_sha256", prior["rules_sha256"]) != source_rules_sha:
+            raise RegressionError("旧录制的系统消息须使用录制时的规则文件重建。")
+        config["source_rules_sha256"] = source_rules_sha
+        config["source_reply_structure"] = LEGACY_REPLY_STRUCTURE
     replaces_run_id = None
     if getattr(args, "replaces_recording", None):
         prior_dir = files.argument(args.replaces_recording)
@@ -143,7 +181,8 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
     names = doc_names(snapshot)
     with files.new_output(out, (*RUN_FILES, MANIFEST, *names.values())) as output:
         recording = Recording(output, names, config, model_id, model=model, source=source,
-                              origin=origin, origin_run_id=origin_run_id, replaces_run_id=replaces_run_id)
+                              origin=origin, origin_run_id=origin_run_id, replaces_run_id=replaces_run_id,
+                              source_system_sha=source_system_sha)
         if origin == "live":
             model_options = {"max_retries": 0} if release else {}
             recording.model = configured_model(settings, on_result=recording.on_result, **model_options)
@@ -158,12 +197,21 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         void = release and recording.unfinished_calls
         if void:
             reasons = report["business"]["reply_parse_failure_reasons"]
-            report = {key: report[key] for key in ("freeze_sha256", "rules_sha256", "samples", "documents")}
+            report = {key: report[key] for key in (
+                "freeze_sha256", "rules_sha256", "samples", "documents", "evidence_location",
+                "full_document_review", "full_document_review_reasons",
+            )}
             report["business"] = {
                 "counts": {"reply_parse_failed": counts["reply_parse_failed"]},
                 "reply_parse_failure_reasons": reasons,
             }
         report.update(configuration_sha256=digest(json_bytes(config)), void=void, usage=recording.public_usage())
+        if legacy_recording:
+            report["diagnostic_replay"] = {
+                "source_reply_structure": config["source_reply_structure"],
+                "reply_structure": config["reply_structure"],
+                "source_configuration_sha256": digest(json_bytes(prior)),
+            }
         public = json_bytes(report)
         output.write("mismatches.json", json_bytes(details))
         output.write("public-report.md", markdown_report(report))
@@ -209,7 +257,8 @@ def main(argv: list[str] | None = None, *, model: ParseModel | None = None) -> i
                 snapshot = load_freeze(files, files.argument(args.frozen), verify_plan=True, verify_sources=args.sources)
                 print(snapshot["fingerprint"])
             elif args.command == "summarize":
-                summarize(files, [files.argument(path) for path in args.recording], out)
+                summarize(files, [files.argument(path) for path in args.recording], out,
+                          diagnostic_replay=args.diagnostic_replay)
                 print("已生成多次运行汇总。")
             else:
                 _run(files, args, out, model)

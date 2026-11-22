@@ -32,9 +32,10 @@ from .feishu.entrance import Application, Attachment, Transport, fingerprint
 from .feishu.sdk import _Transport
 from .feishu.settings import load_handoff_settings
 from .logs import setup_logging
+from .parse import EMPTY_DRAFTS_STATUS
 from .parse._output import check_output_path
 from .parse.companies import DEFAULT_COMPANIES_FILE
-from .parse.model import configured_model
+from .parse.model import configured_model, load_model_config
 from .pipeline import Pipeline
 
 
@@ -437,6 +438,8 @@ def _mail_summary(pages: tuple[DetailPage, ...], approved: bool) -> tuple[Detail
         heading = pages[0].elements[1].get("text", {}).get("content", "")
         if heading == "处理状态\n解析完成，校验执行异常。":
             status = "解析完成，校验执行异常。"
+        elif heading == f"处理状态\n{EMPTY_DRAFTS_STATUS}":
+            status = EMPTY_DRAFTS_STATUS
         elif count := re.fullmatch(r"处理状态\n解析完成，共 ([0-9]+) 条政策。", heading):
             total = int(count[1])
             validated = sum(
@@ -549,7 +552,7 @@ def _serve(
         "ANTHROPIC_BASE_URL" in os.environ and "ANTHROPIC_BASE_URL" not in config
     ):
         raise ConfigError("请通过 .env 配置 AI 接口，并移除 SDK 的进程环境覆盖。")
-    model = configured_model(config)
+    model = configured_model(load_model_config(env_file=args.env_file, config=config))
 
     def complete(*, system: str, user: str) -> str:
         if not window.contains(time.time()):

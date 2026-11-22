@@ -3,6 +3,8 @@
 from fractions import Fraction
 from pathlib import Path
 
+from qianshu.parse.evidence import STRUCTURE_REASONS
+
 from .business import COUNT_LABELS, METRIC_LABELS
 from .recording import USAGE_KEYS, SavedReplies
 from .runner import ALIGNMENTS
@@ -31,7 +33,7 @@ def _ratio_value(entry: dict) -> Fraction | None:
     return Fraction(100 * numerator, denominator)
 
 
-def summarize(files: PrivateFiles, directories: list[Path], out: Path) -> None:
+def summarize(files: PrivateFiles, directories: list[Path], out: Path, *, diagnostic_replay: bool = False) -> None:
     reports = []
     config = None
     seen = set()
@@ -43,6 +45,9 @@ def summarize(files: PrivateFiles, directories: list[Path], out: Path) -> None:
         seen.add(run_id)
         raw = files.read(directory / "public-report.json")
         report = read_json(raw)
+        legacy_replay = manifest["origin"] == "replay" and "source_reply_structure" in manifest["configuration"]
+        if legacy_replay != diagnostic_replay:
+            raise RegressionError("旧结构离线诊断须使用 --diagnostic-replay 单独汇总。")
         config_sha = digest(json_bytes(manifest["configuration"]))
         if digest(raw) != manifest["public_report_sha256"] or config_sha != report["configuration_sha256"]:
             raise RegressionError("汇总输入的报告指纹不一致。")
@@ -68,6 +73,7 @@ def summarize(files: PrivateFiles, directories: list[Path], out: Path) -> None:
     counts["reply_parse_failed"] = _series([report["business"]["counts"]["reply_parse_failed"] for report in reports])
     data = {
         "configuration_sha256": config, "runs": len(reports), "valid_runs": len(valid), "void_runs": len(reports) - len(valid),
+        "diagnostic_replay": diagnostic_replay,
         "old_alignment": {key: _series([report["sample_alignment"][key] for report in valid]) for key in ALIGNMENTS},
         "business_rates_percent": metrics, "business_counts": counts,
         "usage": {
@@ -75,8 +81,18 @@ def summarize(files: PrivateFiles, directories: list[Path], out: Path) -> None:
             **{key: [report["usage"][key] for report in reports] for key in USAGE_KEYS},
         },
     }
+    if all("full_document_review_reasons" in report for report in reports):
+        data["full_document_review"] = {
+            key: _series([report["full_document_review"][key] for report in valid])
+            for key in ("cards", "policies")
+        }
+        data["full_document_review_reasons"] = {
+            key: _series([report["full_document_review_reasons"][key] for report in valid])
+            for key in STRUCTURE_REASONS
+        }
     lines = [
         "# 解析回归运行汇总", "", f"- 配置指纹 `{config}`",
+        *(["- 旧结构离线诊断重放"] if diagnostic_replay else []),
         f"- 共 {data['runs']} 次，有效 {data['valid_runs']} 次，作废 {data['void_runs']} 次", "",
         "| 指标 | 逐次 | 均值 | 最小 | 最大 |", "| --- | --- | ---: | ---: | ---: |",
     ]
@@ -84,9 +100,12 @@ def summarize(files: PrivateFiles, directories: list[Path], out: Path) -> None:
     def show(value) -> str:
         return f"{value:.4f}" if isinstance(value, float) else "不可判定" if value is None else str(value)
 
-    for section, labels in (("old_alignment", ALIGNMENT_LABELS), ("business_rates_percent", METRIC_LABELS),
-                            ("business_counts", COUNT_LABELS)):
-        for key, series in data[section].items():
+    for section, labels in (
+        ("old_alignment", ALIGNMENT_LABELS), ("business_rates_percent", METRIC_LABELS),
+        ("business_counts", COUNT_LABELS), ("full_document_review", {"cards": "整卡硬拦篇数", "policies": "涉及政策数"}),
+        ("full_document_review_reasons", STRUCTURE_REASONS),
+    ):
+        for key, series in data.get(section, {}).items():
             sequential = " / ".join(map(show, series["values"])) or "—"
             lines.append(f"| {labels[key]} | {sequential} | " +
                          " | ".join(show(series[part]) for part in ("mean", "min", "max")) + " |")
