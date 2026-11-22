@@ -301,4 +301,107 @@ def test_card_masks_sensitive_fragment_split_across_candidates_with_evidence():
     lines = [element["text"]["content"] for page in pipeline(Application(message, body, ()))
              for element in page.elements if element["tag"] == "div"]
     for index, excerpt in enumerate(("合成加赠", "占位甲包"), 1):
-        assert any(f"优惠政策名称 · 候选 {index}\n值　[已脱敏]\n原文出处　「{excerpt}」" in line for line in lines)
+        title = f"政策 1 · 优惠政策名称 · 候选 {index}"
+        assert f"{title}\n值　[已脱敏]" in lines
+        assert f"{title} · 原文出处 1\n{excerpt}" in lines
+    assert all(piece not in line for piece in ("甲乙", "丙丁") for line in lines)
+
+
+def test_short_name_properties_optional_in_model_tool():
+    from qianshu.parse.protocol import ApplicationReply
+
+    schema = ApplicationReply.model_json_schema()
+    definitions = schema["$defs"]
+    finding = definitions["Findings"]
+    assert "policy_short_name" not in finding["required"]
+
+    def check_optional(node):
+        if "$ref" in node:
+            node = definitions[node["$ref"].split("/")[-1]]
+        assert not node.get("required")
+        for child in node.get("properties", {}).values():
+            check_optional(child)
+        if "items" in node:
+            check_optional(node["items"])
+
+    check_optional(finding["properties"]["policy_short_name"])
+    assert set(definitions["Evidence"]["required"]) == {"span", "text"}
+    assert set(definitions["Span"]["required"]) == {"source_id", "start", "end"}
+
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+@pytest.mark.parametrize("ambiguous", [True, False])
+def test_each_short_name_omission_preserves_other_fields(explicit, ambiguous):
+    from copy import deepcopy
+    from dataclasses import fields as dataclass_fields
+    from qianshu.parse.protocol import ApplicationReply
+
+    def paths(value):
+        yield ()
+        if isinstance(value, list):
+            children = enumerate(value)
+        elif isinstance(value, dict):
+            children = value.items()
+        else:
+            return
+        for key, child in children:
+            for path in paths(child):
+                yield (key, *path)
+
+    body, fields = application("合成原名" if explicit else None)
+    reply = fixed_reply(body, [fields])
+    short = reply["policies"][0]["fields"]["policy_short_name"]
+    short["explanation"] = "合成短名说明"
+    short["evidence"][0]["span"]["text"] = short["evidence"][0]["text"]
+    if ambiguous:
+        short["candidates"] = [{"value": short["value"], "evidence": deepcopy(short["evidence"])}]
+        short.update(status="歧义", value=None)
+    baseline = parse_one(body, reply)
+    for path in paths(short):
+        changed = deepcopy(reply)
+        parent = changed["policies"][0]["fields"]
+        keys = ("policy_short_name", *path)
+        for key in keys[:-1]:
+            parent = parent[key]
+        del parent[keys[-1]]
+        ApplicationReply.model_validate_json(json.dumps(changed))
+        draft = parse_one(body, changed)
+        for name in baseline.field_results:
+            if name in {"policy_name", "policy_short_name"}:
+                continue
+            assert draft.field_results[name] == baseline.field_results[name], (path, name)
+        if explicit:
+            assert draft.policy_name == baseline.policy_name
+            assert draft.policy_name.value == "合成原名"
+        for draft_field in dataclass_fields(baseline):
+            if draft_field.name != "policy_name":
+                assert getattr(draft, draft_field.name) == getattr(baseline, draft_field.name), path
+        if not explicit:
+            assert draft.policy_name.uncertainty
+            if ambiguous or path in {
+                (), ("status",), ("value",), ("evidence",), ("evidence", 0),
+                ("evidence", 0, "text"), ("evidence", 0, "span"),
+                *(("evidence", 0, "span", key) for key in ("source_id", "start", "end")),
+            }:
+                assert not draft.policy_name.uncertainty.candidates, path
+            else:
+                assert draft.policy_name.uncertainty.candidates[0].value == COMPOSED, path
+
+
+def test_name_value_and_evidence_use_w1_card_text_check(monkeypatch):
+    from qianshu.pipeline import _CardRedaction
+
+    body, fields = application("合成原名")
+    calls = []
+    original = _CardRedaction.free_texts
+
+    def capture(self, texts):
+        calls.append(list(texts))
+        yield from original(self, texts)
+
+    monkeypatch.setattr(_CardRedaction, "free_texts", capture)
+    reply = fixed_reply(body, [fields])
+    reply["policies"][0]["fields"]["country"]["explanation"] = "合成国家说明"
+    assert "优惠政策名称\n值　合成原名" in card_text(body, model_reply(reply))
+    assert any(parts.count("合成原名") >= 2 and "合成国家说明" in parts for parts in calls)

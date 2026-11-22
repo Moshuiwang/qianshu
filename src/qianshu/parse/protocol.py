@@ -78,12 +78,32 @@ class RequestedPackage(Declaration):
     gift_package: str | None
 
 
+# 缺少完整候选或坐标时，Findings 将短名降为缺证据。
+# 工具允许模型省略这些子项，其他字段仍使用原有的必填证据结构。
+def _optional_properties(schema: dict) -> None:
+    schema.pop("required", None)
+
+
+class ShortNameSpan(Span):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+
+
+class ShortNameEvidence(Evidence):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+    span: ShortNameSpan
+
+
+class ShortNameCandidate(ProposedValue[str]):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+    evidence: list[ShortNameEvidence]
+
+
 class ShortNameFinding(Finding[str]):
     status: StatementStatus = StatementStatus.UNSUPPORTED
     reason_code: Identifier = "short_name"
     value: str | None = None
-    candidates: list[ProposedValue[str]] = Field(default_factory=list)
-    evidence: list[Evidence] = Field(default_factory=list)
+    candidates: list[ShortNameCandidate] = Field(default_factory=list)
+    evidence: list[ShortNameEvidence] = Field(default_factory=list)
 
 
 class Findings(Declaration):

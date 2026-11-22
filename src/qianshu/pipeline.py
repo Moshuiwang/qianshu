@@ -3,7 +3,7 @@
 import json
 import re
 from bisect import bisect_left, bisect_right
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from datetime import UTC, date, datetime
 from functools import partial
@@ -104,16 +104,16 @@ class _CardRedaction:
                 yield max(0, left - start), min(length, right - start)
 
     def display(
-        self, text: str, start: int | None = None, *, joined: Iterable[tuple[int, int]] = (), advisory: bool = False,
+        self, text: str, start: int | None = None, *, free_text_spans: Iterable[tuple[int, int]] | None = None,
     ) -> str:
         if not text or self.sensitive is None:
             return text
         if start is not None and self.body.startswith(text, start):
-            return _mask_spans(text, (*self._overlaps(start, len(text)), *joined))
-        matches = [*self._matches(self.sensitive, text), *self._matches(self.fragments, text), *joined]
-        if advisory:
+            return _mask_spans(text, self._overlaps(start, len(text)))
+        matches = [*self._matches(self.sensitive, text), *self._matches(self.fragments, text)]
+        if free_text_spans is not None:
             # 自由文本的短公共片段不能只凭同字摘录归到敏感坐标。
-            return _mask_spans(text, matches)
+            return _mask_spans(text, (*matches, *free_text_spans))
         length = len(text)
         for left, right in self.spans:
             # 只检查能与敏感坐标相交的原文匹配，保留单字摘录等短片段的坐标保护。
@@ -124,12 +124,13 @@ class _CardRedaction:
                 offset = self.body.find(text, offset + 1, stop)
         return _mask_spans(text, matches)
 
-    def joined_spans(self, texts: Sequence[str]) -> list[list[tuple[int, int]]]:
-        spans: list[list[tuple[int, int]]] = [[] for _ in texts]
+    def free_texts(self, texts: Sequence[str]) -> Iterator[str]:
         if not self.sensitive or not texts:
-            return spans
+            yield from texts
+            return
         joined = "".join(texts)
         offsets = list(accumulate(map(len, texts), initial=0))
+        spans: list[list[tuple[int, int]]] = [[] for _ in texts]
         # 重叠的四字窗口覆盖任意更长的片段，完整值匹配也覆盖短于四字的登记值。
         matches = [*self._matches(self.sensitive, joined), *(
             (start, start + 4) for start in range(len(joined) - 3)
@@ -139,7 +140,8 @@ class _CardRedaction:
             for index in range(bisect_right(offsets, start) - 1, bisect_left(offsets, end)):
                 left, right = offsets[index], offsets[index + 1]
                 spans[index].append((max(start, left) - left, min(end, right) - left))
-        return spans
+        for text, matches in zip(texts, spans, strict=True):
+            yield self.display(text, free_text_spans=matches)
 
 
 def _rule_pending(draft: PolicyDraft, name: str) -> bool:
@@ -183,11 +185,8 @@ def _package_row(row: PackageRow) -> dict:
     return {"当前节目包": row.current_package, "赠送节目包": row.gift_package}
 
 
-@dataclass(frozen=True, repr=False)
-class _ValueLine(CardLine):
-    candidate: bool = field(default=False, kw_only=True)
-    value: str | None = field(kw_only=True)
-    evidence: Sequence[SourceExcerpt] = field(kw_only=True)
+def _evidence(excerpts: Iterable[SourceExcerpt], redact: _CardRedaction) -> str:
+    return "\n".join(f"「{redact.display(excerpt.text, excerpt.start)}」" for excerpt in excerpts) or "无原文摘录"
 
 
 @dataclass(frozen=True, repr=False)
@@ -196,10 +195,10 @@ class _FreeTextLine(CardLine):
 
 
 def _field_lines(
-    prefix: str, field: DraftField, explanation: str | None,
+    prefix: str, field: DraftField, explanation: str | None, redact: _CardRedaction,
 ) -> Iterable[CardLine]:
-    value = _value(field.value) if field.value is not None else None
-    yield _ValueLine(prefix, "", value=value, evidence=field.evidence)
+    value = "未确定" if field.value is None else redact.display(_value(field.value))
+    yield CardLine(prefix, f"值　{value}\n原文出处　{_evidence(field.evidence, redact)}")
     if uncertainty := field.uncertainty:
         if explanation:
             yield _FreeTextLine(f"{prefix} · 待确认", f"{uncertainty.reason}\n模型说明　", free_text=explanation)
@@ -208,8 +207,9 @@ def _field_lines(
         if not uncertainty.candidates:
             yield CardLine(f"{prefix} · 候选", "无")
         for index, candidate in enumerate(uncertainty.candidates, 1):
-            yield _ValueLine(
-                f"{prefix} · 候选 {index}", "", candidate=True, value=_value(candidate.value), evidence=candidate.evidence,
+            yield CardLine(
+                f"{prefix} · 候选 {index}",
+                f"值　{redact.display(_value(candidate.value))}\n原文出处　{_evidence(candidate.evidence, redact)}",
             )
     elif explanation:
         yield _FreeTextLine(f"{prefix} · 模型说明", "", free_text=explanation)
@@ -253,7 +253,7 @@ class _Policy:
             status = "解析完成，待群卡片同意"
         return CardLine(f"{prefix} · 处理状态", status)
 
-    def lines(self, prefix: str) -> Iterable[CardLine]:
+    def lines(self, prefix: str, redact: _CardRedaction) -> Iterable[CardLine]:
         result = self.validation
         hints = self.hints
         # 校验可调整互斥组默认值，保留解析时的所有提示并补上校验产生的默认提示。
@@ -284,13 +284,32 @@ class _Policy:
                 yield CardLine(title, "建单时填写")
                 if explanation:
                     yield _FreeTextLine(f"{title} · 模型说明", "", free_text=explanation)
-            else:
-                yield from _field_lines(title, getattr(self.draft, field.name), explanation)
-                if field.name == "policy_name" and self.policy_name_source:
+            elif field.name == "policy_name":
+                name = self.draft.policy_name
+                if pending := name.uncertainty:
+                    if explanation:
+                        yield _FreeTextLine(f"{title} · 待确认", f"{pending.reason}\n模型说明　", free_text=explanation)
+                    else:
+                        yield CardLine(f"{title} · 待确认", pending.reason)
+                    if not pending.candidates:
+                        yield CardLine(f"{title} · 候选", "无")
+                elif explanation:
+                    yield _FreeTextLine(f"{title} · 模型说明", "", free_text=explanation)
+                if self.policy_name_source:
                     yield CardLine(f"{title} · 名称来源", self.policy_name_source)
+            else:
+                yield from _field_lines(title, getattr(self.draft, field.name), explanation, redact)
         for name, label in _INPUT_LABELS.items():
             if explanation := self.explanations.get(name):
                 yield _FreeTextLine(f"{prefix} · {label} · 模型说明", "", free_text=explanation)
+
+    def name_entries(self, prefix: str) -> Iterable[tuple[str, DraftField | Candidate]]:
+        title = f"{prefix} · 优惠政策名称"
+        name = self.draft.policy_name
+        yield title, name
+        if name.uncertainty:
+            for index, candidate in enumerate(name.uncertainty.candidates, 1):
+                yield f"{title} · 候选 {index}", candidate
 
 
 class Pipeline:
@@ -352,41 +371,11 @@ class Pipeline:
             yield CardLine(f"政策结构问题 {index}", location, red=True)
 
     def _detail_pages(self, body: str, lines: Sequence[CardLine], redact: _CardRedaction) -> tuple[DetailPage, ...]:
-        texts = []
-        advisories = []
-        values_and_advisories = []
-        candidates = []
-        for line in lines:
-            if isinstance(line, _FreeTextLine):
-                advisories.append(len(texts))
-                values_and_advisories.append(len(texts))
-                texts.append(line.free_text)
-            elif isinstance(line, _ValueLine):
-                if line.value is not None:
-                    if line.candidate:
-                        candidates.append(len(texts))
-                    values_and_advisories.append(len(texts))
-                    texts.append(line.value)
-                texts.extend(q.text for q in line.evidence)
-        spans = redact.joined_spans(texts)
-        # 引文与字段交错显示，也分别保护取值及模型说明连续拼接的片段。
-        for indices in (values_and_advisories, advisories, candidates):
-            extras = redact.joined_spans([texts[index] for index in indices])
-            for index, extra in zip(indices, extras, strict=True):
-                spans[index].extend(extra)
-        matches = iter(spans)
-        sections = []
-        for line in lines:
-            if isinstance(line, _FreeTextLine):
-                text = line.text + redact.display(line.free_text, joined=next(matches), advisory=True)
-            elif isinstance(line, _ValueLine):
-                value = "未确定" if line.value is None else redact.display(line.value, joined=next(matches))
-                excerpts = [redact.display(q.text, q.start, joined=next(matches)) for q in line.evidence]
-                evidence = "\n".join(f"「{excerpt}」" for excerpt in excerpts) or "无原文摘录"
-                text = f"值　{value}\n原文出处　{evidence}"
-            else:
-                text = line.text
-            sections.append(CardLine(line.label, text, line.red))
+        free_texts = redact.free_texts([line.free_text for line in lines if isinstance(line, _FreeTextLine)])
+        sections = [
+            CardLine(line.label, line.text + next(free_texts), line.red) if isinstance(line, _FreeTextLine) else line
+            for line in lines
+        ]
         sections.append(CardLine("申请原文", body))
         if self._sensitive:
             sections = [replace(line, text=self._sensitive.sub("[已脱敏]", line.text)) for line in sections]
@@ -454,6 +443,19 @@ class Pipeline:
               for item in getattr(drafts, "unused_passages", ())),
             *self._structure_reminders(body, getattr(drafts, "structure_issues", ()), redact.spans, redact.display),
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
-            *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}")),
+            *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}", redact)),
         ]
+        # 说明、名称取值、引文各自连续展示，每段单独交给 W1 的整卡自由文本入口。
+        names = [entry for index, policy in enumerate(policies, 1) for entry in policy.name_entries(f"政策 {index}")]
+        for title, entry in names:
+            if entry.value is None:
+                lines.append(CardLine(title, "值　未确定"))
+            else:
+                lines.append(_FreeTextLine(title, "值　", free_text=redact.display(entry.value)))
+        for title, entry in names:
+            if not entry.evidence:
+                lines.append(CardLine(f"{title} · 原文出处", "无原文摘录"))
+            for index, excerpt in enumerate(entry.evidence, 1):
+                lines.append(_FreeTextLine(f"{title} · 原文出处 {index}", "",
+                                           free_text=redact.display(excerpt.text, excerpt.start)))
         return self._detail_pages(display_body, lines, redact)
