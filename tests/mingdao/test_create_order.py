@@ -1710,6 +1710,15 @@ def test_extract_token_accepts_real_mingdao_cookie_shape_and_keeps_other_checks(
 
 
 def order_fixture(case, platform):
+    # X5 名称与标签共同使用测试前缀；保留模拟主名、别名及歧义关系。
+    tags = ["【测试】" + tag for tag in case.values["user_tags"]]
+    case.values["user_tags"] = tags
+    if tags:
+        case.values["policy_name"] = tags[0]
+    for row in platform.relations[case.control["user_tags"]]:
+        for key in case.config["official"]["tag_relation"]["name_keys"]:
+            if key in row:
+                row[key] = "【测试】" + row[key]
     today = case.window.start.date()
     values = deepcopy(case.values)
     values.update(start_date=(today + timedelta(days=1)).isoformat(),
@@ -1744,6 +1753,7 @@ def order_fixture(case, platform):
             f"OFFER,01,合成公司,{package},合成当前包,基本,否,,A,1,在售,2000-01-01,2100-01-01",
             f"OFFER,01,合成公司,{case.ids['gift_package']},{gift},附属,是,{package},A,1,在售,2000-01-01,2100-01-01"]),
     }
+    case.config["order_snapshot"]["companies"][0]["keyword"] = "合成公司"
     return {key: value for key, value in values.items() if value != case.values.get(key)}
 
 
@@ -1774,6 +1784,21 @@ def private_export(values):
         results[name] = {"value": value, "has_value": True, "needs_confirmation": False,
                          "issues": [], "source": "原文", "evidence": quotes, "input_fields": [],
                          "statement": {"value": value, "status": "确定", "evidence": quotes, "candidates": []}}
+    for name, value, literals in (
+        ("country", "合成国家", ["合成国家"]),
+        ("company_keyword", ["合成公司"], ["合成公司"]),
+        ("user_tags", values["user_tags"], values["user_tags"]),
+    ):
+        quotes = []
+        for literal in literals:
+            span = {"source_id": "body", "start": len(text), "end": len(text) + len(literal)}
+            quotes.append({"text": literal, "span": span})
+            text += literal + "\n"
+        results[name] = {"value": value, "has_value": True, "needs_confirmation": False, "source": "原文",
+                         "issues": [], "evidence": quotes, "input_fields": [],
+                         "statement": {"status": "确定", "value": value, "evidence": quotes, "candidates": []}}
+        if name == "user_tags":
+            fields[name]["evidence"] = [{"text": q["text"], "start": q["span"]["start"]} for q in quotes]
     if "policy_type" in results and "user_tags" in results:
         tag_quote = results["user_tags"]["evidence"]
         result = results["policy_type"]
@@ -2138,3 +2163,124 @@ def test_card_explicit_values_match_selected_options(case, platform, business_cl
     assert "互斥组按默认" not in card and "生效倍数按默认" not in card
     assert json.loads(platform.created_cells[case.control["user_tags"]]) == [{"sid": case.ids["tag"]}]
     assert case.values["user_tags"][0] in card
+
+
+@pytest.mark.parametrize("source", ["session", "template", "fragment"])
+def test_sensitive_write_value_stops_before_approval(case, platform, business_cli, source):
+    if source == "template":
+        platform.template[case.control["approval_url"]] += "/" + case.official_token
+    else:
+        value = case.session_token if source == "session" else case.session_token[4:13]
+        case.values["user_scope"] = "合成范围" + value
+    code, error = business_cli.run()
+    assert code == 1 and "凭据" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_unmapped_inactive_control_stops_before_approval(case, platform, business_cli):
+    control = str(uuid4())
+    case.config["fields"][control] = {"type": 6, "label": "可看天数"}
+    platform.template[control] = "9"
+    code, error = business_cli.run()
+    assert code == 1 and "watch_days" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_midnight_during_login_read_stops_transmission(case, platform, business_cli, monkeypatch):
+    today = case.window.start.date()
+    case.values["start_date"] = today.isoformat()
+    midnight = datetime.combine(today + timedelta(days=1), datetime.min.time(), UTC)
+    case.evidence["window"]["end"] = (midnight + timedelta(days=1)).isoformat()
+    read = order.private_bytes
+
+    def read_across_midnight(path):
+        data = read(path)
+        if path.name == "mingdao-state.json" and business_cli.summaries:
+            business_cli.now[0] = midnight.timestamp()
+        return data
+
+    monkeypatch.setattr(order, "private_bytes", read_across_midnight)
+    code, _ = business_cli.run()
+    assert code == 1 and platform.create_count == 0
+    assert len(business_cli.summaries) == 1
+    assert any("未建单" in msg and "开始日期" in msg for msg in business_cli.notices)
+
+
+@pytest.mark.parametrize("multiple", [True, False])
+def test_targeted_original_name_requires_matching_unique_tag(case, platform, business_cli, multiple):
+    if multiple:
+        control = case.control["user_tags"]
+        key, _ = case.config["official"]["tag_relation"]["name_keys"]
+        tag = "第二普通标签"
+        row = {**record_identity(str(uuid4())), key: tag}
+        platform.relations[control].append(row)
+        platform.template[control] = 2
+        case.values["user_tags"].append(tag)
+        case.config["order_snapshot"]["tags"].append(
+            {"name": tag, "id": row["rowId"], "end": case.values["end_date"], "shadow": False})
+    else:
+        case.values["policy_name"] = "【测试】不同名"
+    code, error = business_cli.run()
+    assert code == 1 and "唯一标签" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_selected_tag_requires_its_own_quote(case, platform, business_cli):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    results = draft["field_results"]
+    quote = results["user_scope"]["evidence"]
+    for key in ("user_tags", "policy_type"):
+        results[key]["evidence"] = quote
+        draft[key]["evidence"] = draft["user_scope"]["evidence"]
+    results["user_tags"]["statement"]["evidence"] = quote
+    code, error = business_cli.run(export)
+    assert code == 1 and "标签引文" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_original_company_requires_confirmed_country(case, platform, business_cli):
+    export = private_export(case.values)
+    country = export["drafts"][0]["field_results"].setdefault("country", {"statement": {}})
+    country.update(has_value=False, needs_confirmation=True)
+    country["statement"]["status"] = "歧义"
+    code, error = business_cli.run(export)
+    assert code == 1 and "公司主体查表输入" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_published_days_and_package_names_match_request(case, platform, business_cli):
+    code, error = business_cli.run()
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    cells = platform.created_cells
+    days = [cells[case.control[key]] for key in ("recharge_days", "gift_days")]
+    assert "充值 / 赠送天数：" + " / ".join(days) in card.splitlines()
+    packages = case.control["packages"]
+    names = {entry["sid"]: entry["name"] for row in platform.relations[packages]
+             for key in ("current", "gift") for entry in row[case.child[key]]}
+    pairs = []
+    for row in json.loads(cells[packages]):
+        children = {cell["controlId"]: json.loads(cell["value"]) for cell in row}
+        pairs.append(" / ".join(names[children[case.child[key]][0]["sid"]] for key in ("current", "gift")))
+    assert "节目包（当前 / 赠送）：" + "；".join(pairs) in card.splitlines()
+
+
+def test_only_evidence_intersects_secret_and_stays_masked(case, platform, business_cli):
+    export = private_export(case.values)
+    block = export["sources"][0]
+    offset = 4
+    fragment = case.session_token[offset:13]
+    start = len(block["text"]) + offset
+    block["text"] += case.session_token
+    draft = export["drafts"][0]
+    result = draft["field_results"]["user_scope"]
+    quote = {"text": fragment, "span": {"source_id": "body", "start": start, "end": start + len(fragment)}}
+    result["evidence"] = result["statement"]["evidence"] = [quote]
+    draft["user_scope"]["evidence"] = [{"text": fragment, "start": start}]
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert "用户范围依据：[已脱敏]" in card
+    assert fragment not in card + "".join(business_cli.notices)
+    assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]

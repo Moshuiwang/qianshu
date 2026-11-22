@@ -32,6 +32,7 @@ from qianshu.parse.benefits import (
     BenefitCatalog, OFFER_FIELD_LABELS, benefit_applicability, benefit_field_format, duration_days, tariff_amount,
 )
 from qianshu.parse.evidence import Sources, intersect
+from qianshu.parse.names import _tag_boundary
 from qianshu.parse.package_levels import copy_for, decode_package_levels, unique_offer
 from qianshu.parse.scope import company_mentioned
 from qianshu.parse.protocol import Duration, SourceBlock, Span
@@ -623,12 +624,11 @@ def check_derivation(name, value, result, draft, declared, reason):
 
 def verify_company_inputs(draft, sources, owners, snapshot, country):
     result = draft["field_results"]["company"]
-    if result.get("source") != "查表派生":
-        return
     results = draft["field_results"]
     reason = "公司主体查表输入未确认"
     for key in ("country", "company_keyword"):
-        operand = results[key]
+        operand = results.get(key)
+        require(isinstance(operand, dict) and operand.get("program_status") is None, reason)
         statement = operand["statement"]
         require(operand["issues"] == [] and statement.get("candidates") == [], reason)
         if key == "company_keyword" and statement.get("status") == "原文未写":
@@ -718,6 +718,9 @@ def order_evidence(values, fields_in, draft, sources, owners):
             projected.append({"text": quote["text"], "start": located.start if located.source_id == "body" else None})
             excerpts.append((name, span, quote["text"]))
         require(fields_in[name].get("evidence") == projected, reason)
+        if name == "user_tags":
+            require(all(any(q["text"] == tag and _tag_boundary(Span.model_validate(q["span"]), sources)
+                            for q in quotes) for tag in value), "所选标签缺少逐字标签引文")
     return excerpts, adjustments
 
 
@@ -1325,17 +1328,34 @@ def check_catalog(values, snapshot, results):
                 "充值金额与资费计算结果不一致")
 
 
-def verify_order_request(payload, config, template, relations, values, inactive):
+def check_write_credentials(encoded, spec, sensitive):
+    reason = "建单字段与凭据冲突"
+    require(not any(secret in encoded for secret in sensitive), reason)
+    if spec["type"] == 34:
+        for row in decode(encoded):
+            for cell in row:
+                check_write_credentials(cell["value"], spec["children"][cell["controlId"]], sensitive)
+    elif spec["type"] in _ARRAY:
+        for item in decode(encoded):
+            values = item.values() if isinstance(item, dict) else (item,)
+            require(not any(secret in value for value in values for secret in sensitive), reason)
+
+
+def verify_order_request(payload, config, template, relations, values, inactive, sensitive):
     schema = config["fields"]
     controls = {s["draft"]: c for c, s in schema.items() if "draft" in s}
     items = decode(payload)["receiveControls"]
     actual = {item["controlId"]: item["value"] for item in items}
     require(len(items) == len(actual) and actual.keys() == schema.keys()
             and all(item["type"] == schema[item["controlId"]]["type"] for item in items), "请求控件不完整")
-    for name in inactive | (OFFER_FIELD_LABELS.keys() - values.keys()):
-        if name in controls:
-            control = controls[name]
-            require(actual[control] == encode_cell(None, schema[control]), f"请求中的优惠字段 {name} 须为空")
+    empty_fields = inactive | (OFFER_FIELD_LABELS.keys() - values.keys())
+    labels = {**OFFER_FIELD_LABELS, "recharge_days": "充值天数", "gift_days": "赠送天数"}
+    by_label = {label: name for name, label in labels.items()}
+    for control, spec in schema.items():
+        check_write_credentials(actual[control], spec, sensitive)
+        for name in (spec.get("draft"), by_label.get(spec["label"], spec["label"])):
+            if name in empty_fields:
+                require(actual[control] == encode_cell(None, spec), f"请求中的优惠字段 {name} 须为空")
     option_fields = {"policy_type", "benefit_type", "maintain_mutual_exclusion_group",
                      "trigger_once", "repeat_bonus", "cancel_on_downgrade"}
     for name in values.keys() - {"user_tags", "packages", "company"}:
@@ -1382,6 +1402,7 @@ def verify_selected_tags(config, controls, actual, relations, values, snapshot):
         require(not shadow or len(tags) == 1, "影子标签须单选")
         dates.append(ends.pop())
     require(values["end_date"] <= max(dates).isoformat(), "政策结束日期晚于标签截止日")
+    require(values["user_tags"] == [values["policy_name"]], "定向政策名称须与唯一标签一致")
     return max(dates)
 
 
@@ -1437,20 +1458,23 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
             redact = _CardRedaction(text, pattern, fragments)
             for block in blocks:
                 redactions[block.id] = (redact, block.start - start)
-    def safe(text):
+    def checked_display_value(text):
         for redact, _ in redactions.values():
-            text, = redact.free_texts([text])
+            displayed, = redact.free_texts([text])
+            require(displayed == text, "建单字段与凭据冲突")
         return text
 
     labels = {s["draft"]: s["label"] for s in config["fields"].values() if "draft" in s}
-    visible = dict(values)
-    for name in ("policy_name", "company", "user_scope"):
-        visible[name] = safe(values[name])
-    require(visible["policy_name"] == values["policy_name"], "公告名称与凭据冲突")
-    visible["user_tags"] = [safe(tag) for tag in values["user_tags"]]
-    visible["packages"] = [{k: safe(v) if v else v for k, v in row.items()} for row in values["packages"]]
-    lines = [card_summary(visible), *(f"{labels.get(k, k)}：{safe(str(v))}" for k, v in visible.items()
-             if k not in (*_VARIABLE, "user_tags", "packages")), f"用户范围：{visible['user_scope']}",
+    for name in ("policy_name", "user_scope"):
+        checked_display_value(values[name])
+    for tag in values["user_tags"]:
+        checked_display_value(tag)
+    for row in values["packages"]:
+        for value in row.values():
+            if value:
+                checked_display_value(value)
+    lines = [card_summary(values), *(f"{labels.get(k, k)}：{checked_display_value(str(v))}" for k, v in values.items()
+             if k not in (*_VARIABLE, "user_tags", "packages")), f"用户范围：{values['user_scope']}",
              f"标签最晚截止日：{deadline}", *("自动调整：" + a for a in adjustments)]
     summary = "\n".join(lines)
     for name, span, text in excerpts:
@@ -1538,7 +1562,7 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
 
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
               contact, login_check, stop, *, packages, company,
-              clock=time.time, pause=time.sleep, monotonic=time.monotonic):
+              clock=time.time, pause=time.sleep, monotonic=time.monotonic, check_start_date=None):
     def announce(text):
         feishu.transport.announce(f"{ledger.name} · {text}\n{contact}")
 
@@ -1558,6 +1582,8 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         login_check()
         stop_if_interrupted(stop)
         check_approval()
+        if check_start_date is not None:
+            check_start_date()
 
     try:
         while not feishu.approval_connection_ready():
@@ -1691,14 +1717,16 @@ def run(args, directory, *, clock=time.time):
 
     def login_check():
         require(not pending, "降包用户取消优惠须确认具体取值")
-        today = datetime.fromtimestamp(clock(), UTC).date()
-        approved_start = effective_start_date(date.fromisoformat(draft["start_date"]["value"]), today)
-        require(values["start_date"] == approved_start.isoformat(),
-                "经卡片确认的开始日期已过，需重新审批")
         current = private_bytes(login_path)
         require(digest(current) == evidence["login_sha256"]
                 and extract_token(decode(current), config["create"]["session_cookie"]) == token,
                 "建单登录状态已变化")
+
+    def check_start_date():
+        today = datetime.fromtimestamp(clock(), UTC).date()
+        approved_start = effective_start_date(date.fromisoformat(draft["start_date"]["value"]), today)
+        require(values["start_date"] == approved_start.isoformat(),
+                "经卡片确认的开始日期已过，需重新审批")
 
     create = CreateRequest(config["create"], evidence, token)
     worksheet = config["create"]["identifiers"]["worksheetId"]
@@ -1726,7 +1754,7 @@ def run(args, directory, *, clock=time.time):
                     is_test=evidence["is_test"],
                 )
                 payload = create.payload(controls)
-                deadline = verify_order_request(payload, config, cells, relations, values, inactive)
+                deadline = verify_order_request(payload, config, cells, relations, values, inactive, sensitive)
                 require(decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
                 summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline)
             except (KeyError, ValueError, TypeError, IndexError, AttributeError):
@@ -1749,6 +1777,7 @@ def run(args, directory, *, clock=time.time):
             return service.run_create(lambda stop: run_order(
                 ledger, api, create, service, window, payload, summary, controls, config, evidence,
                 contact, login_check, stop, packages=values["packages"], company=values["company"], clock=clock,
+                check_start_date=check_start_date,
             ))
 
 
