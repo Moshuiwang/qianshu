@@ -36,6 +36,7 @@ _CONFIRM = {
     "package_title_required": "缺少本条政策的标题，请补充标题并确认当前节目包（R5）。",
     "policy_name_conflict": "原文政策名称与唯一的用户标签冲突。",
     "unique_tag_required": "需要一个确定的用户标签才能取优惠政策名称。",
+    "country_role_conflict": "国家名称或角色无法唯一对应本条适用地。",
     "company_lookup_unresolved": "公司对照表无法唯一确定公司。",
     "company_subject_conflict": "明示的公司主体与公司对照表不一致。",
 }
@@ -220,7 +221,7 @@ def _draft(
                 results[name] = replace(result, value=value)
 
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
-    country_company.resolve_country_company(results, rules)
+    country_company.resolve_country_company(policy, results, review, rules)
     dates.verify_dates(results)
     hints = [
         *names.derive_names(results),

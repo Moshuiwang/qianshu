@@ -9,9 +9,29 @@
 南非	South Africa	ZA
 莫桑比克	Mozambique	MZ
 马拉维	Malawi	MW
-刚果（金）	Democratic Republic of the Congo	DR Congo	DRC	CD
-刚果（布）	Congo-Brazzaville	CG
+刚果（金）	Democratic Republic of the Congo	DR Congo	DRC	CD	刚果金	刚果民主共和国
+刚果（布）	Congo-Brazzaville	CG	刚果布	刚果共和国	Republic of the Congo
 喀麦隆	Cameroon	CM
 科特迪瓦	Côte d’Ivoire	Ivory Coast	CI
 塞内加尔	Senegal	SN
 马达加斯加	Madagascar	MG
+中非	中非共和国	Central African Republic	CF
+乍得	Chad	TD
+冈比亚	Gambia	The Gambia	GM
+几内亚	Guinea	GN
+几内亚比绍	几内亚比绍共和国	几内亚-比绍	Guinea-Bissau	GW
+利比里亚	Liberia	LR
+加蓬	Gabon	GA
+博茨瓦纳	Botswana	BW
+厄立特里亚	Eritrea	ER
+埃塞俄比亚	Ethiopia	ET
+塞拉利昂	Sierra Leone	SL
+布基纳法索	Burkina Faso	BF
+斯威士兰	Eswatini	Swaziland	SZ
+津巴布韦	Zimbabwe	ZW
+索马里	Somalia	SO
+纳米比亚	Namibia	NA
+莱索托	Lesotho	LS
+贝宁	Benin	BJ
+赤道几内亚	Equatorial Guinea	GQ
+马里	Mali	ML

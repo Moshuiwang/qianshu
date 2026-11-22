@@ -68,6 +68,18 @@ class Finding[T](Declaration):
     explanation: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
+class CountryMention(Declaration):
+    role: Literal["适用地", "比较或背景", "排除对象"]
+    evidence: Evidence
+
+
+class CountryFinding(Finding[str]):
+    mentions: list[CountryMention] | None = Field(
+        default=None, exclude_if=lambda value: value is None,
+        description="逐个列出与本条相关的国家提及及角色。每段引文只摘录该国家名、别名或代码。",
+    )
+
+
 class Duration(Declaration):
     quantity: int
     unit: Literal["天", "月"]
@@ -81,7 +93,7 @@ class RequestedPackage(Declaration):
 class Findings(Declaration):
     policy_name: Finding[str]
     maintain_mutual_exclusion_group: Finding[YesNo]
-    country: Finding[str]
+    country: CountryFinding
     company: Finding[str]
     company_keyword: Finding[list[str]]
     policy_type: Finding[str]

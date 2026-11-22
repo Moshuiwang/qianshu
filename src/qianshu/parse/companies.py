@@ -8,10 +8,11 @@ from io import StringIO
 from itertools import chain
 from pathlib import Path
 
-from .scope import company_mentioned, read_countries
+from .scope import company_mentioned, country_matches, read_countries
 
 DEFAULT_COMPANIES_FILE = Path(".private/companies.tsv")
 _HEADER = ["国家", "关键词", "公司内部编号", "公司显示名"]
+_LEGACY_COUNTRY_NAMES = ("刚果金", "刚果布")
 _LOG = logging.getLogger(__name__)
 
 
@@ -115,6 +116,10 @@ def _add_company(
         complete = display_name and number
     if not complete:
         return False
+    if country in _LEGACY_COUNTRY_NAMES:
+        matches = country_matches([country], countries, exact=True)
+        if len(matches) == 1:
+            country = next(iter(matches))
     if country not in countries:
         _warn_row(line)
         return True
