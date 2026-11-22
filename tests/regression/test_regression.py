@@ -1367,6 +1367,47 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
         assert result["policies"][0]["fields"] == {name: expected[review[name]] for name in values}
 
 
+@pytest.mark.parametrize(("confirm", "expected"), [
+    (False, "false_determined"),
+    (True, "justified_confirmation"),
+])
+def test_g285_uses_frozen_pairing_tags_when_tag_gold_is_excluded(confirm, expected):
+    from qianshu.draft import SourceExcerpt
+    from qianshu.regression.business import BusinessScore
+
+    tags = ["占位标签甲", "占位标签乙"]
+    configuration = {
+        "policy_name": {"value": tags[0]},
+        "policy_type": {"value": "公开政策"},
+        "user_tags": {"exclude": "historical_rule"},
+    }
+    pair = {
+        "id": "policy", "configuration": configuration,
+        "source_status": {"user_tags": "确定"},
+        "pairing": {"user_tags": tags},
+    }
+    sample = {"country": "占位地区", "benefit_type": "赠送时长", "policy_type": "公开政策"}
+    frozen = {
+        "samples": {"policy": sample},
+        "denominators": freeze_module._denominators([pair], configuration),
+    }
+    body = "占位原文"
+    uncertainty = Uncertainty(reason="占位待确认") if confirm else None
+    evidence = [SourceExcerpt(text=body, start=0)]
+    draft = SimpleNamespace(
+        benefit_type=DraftField(value=sample["benefit_type"]),
+        policy_name=DraftField(value=tags[0], evidence=evidence, uncertainty=uncertainty),
+        policy_type=DraftField(value="公开政策", evidence=evidence, uncertainty=uncertainty),
+        user_tags=DraftField(value=tags, evidence=evidence),
+        to_dict=lambda: {},
+    )
+
+    score = BusinessScore(frozen, 2, {})
+    result = score.add({"body": body}, [pair], [draft])
+    assert result["policies"][0]["fields"] == {"policy_name": expected, "policy_type": expected}
+    assert score.report(0)["rates"]["false_determined"]["denominator"] == 2
+
+
 def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
     from qianshu.parse.companies import CompanyRow
     from qianshu.regression.business import _g285_mark

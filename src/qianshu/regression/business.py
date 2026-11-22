@@ -21,7 +21,7 @@ LEGACY_DEFAULTS = {
     "repeat_bonus": "是", "effective_multiplier": 1,
 }
 G285_MAPPING = {
-    "version": "G285-2",
+    "version": "G285-3",
     "datasets": ["exam", "blind", "packages"],
     "inferable": "included_frozen_fields",
     "excluded": "outside_denominator",
@@ -292,18 +292,17 @@ def _g285_mark(
         tag_field = rule["input"]
         tag_entry = configuration.get(tag_field, {})
         needs_review |= source_status.get(tag_field) in unresolved_inputs
-        # 金标排除只影响可比性，原文状态独立审定。
-        if "exclude" not in tag_entry:
-            tags = tag_entry.get("value", pair.get("pairing", {}).get(tag_field))
-            if tags is None:
-                needs_review = True
-            elif name == "policy_name":
-                needs_review |= (
-                    len(tags) != rule["required_count"] or (rule["must_match_tag"] and value not in tags)
-                )
-            else:
-                expected = rule["nonempty"] if tags else rule["empty"]
-                needs_review |= value != expected
+        # 标签金标排除时，仍可用独立冻结的标签集合核对名称和类型。
+        tags = tag_entry.get("value", pair.get("pairing", {}).get(tag_field))
+        if tags is None:
+            needs_review |= "exclude" not in tag_entry
+        elif name == "policy_name":
+            needs_review |= (
+                len(tags) != rule["required_count"] or (rule["must_match_tag"] and value not in tags)
+            )
+        else:
+            expected = rule["nonempty"] if tags else rule["empty"]
+            needs_review |= value != expected
     elif name == "company":
         table = company_table or {}
         country = sample[rule["table_key"]]
