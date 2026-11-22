@@ -31,12 +31,13 @@ def _arguments(argv: list[str] | None):
     parser = _Parser(description="生成、冻结和运行千树Bot本地解析回归考题。")
     commands = parser.add_subparsers(dest="command", required=True)
 
-    plan = commands.add_parser("plan", help="生成私有候选配额和同层审定顺序。")
+    plan = commands.add_parser("plan", help="生成私有考题或盲测抽样计划，或节目包候选池。")
     plan.add_argument("--corpus", required=True, help="语料根目录，须为 .private 或其子目录。")
     plan.add_argument("--out", required=True, help="新的私有输出目录。")
+    plan.add_argument("--dataset", choices=("blind", "packages"), default="exam")
     size = plan.add_mutually_exclusive_group()
-    size.add_argument("--size", type=int, default=150, help="分层抽样规模，默认 150。")
-    size.add_argument("--all", action="store_true", help="审定并运行全部候选。")
+    size.add_argument("--size", type=int, default=150, help="考题和盲测的分层抽样规模，默认 150。")
+    size.add_argument("--all", action="store_true", help="审定并运行全部考题或盲测候选。")
 
     build = commands.add_parser("freeze", help="冻结已独立审定的考题。")
     build.add_argument("--corpus", required=True)
@@ -48,12 +49,13 @@ def _arguments(argv: list[str] | None):
 
     packages = commands.add_parser("freeze-packages", help="冻结私有节目包补充审定资料。")
     packages.add_argument("--corpus", required=True)
+    packages.add_argument("--plan", required=True)
     packages.add_argument("--reviews", required=True)
     packages.add_argument("--companies", required=True)
     packages.add_argument("--out", required=True)
-    for command in (build, packages):
+    for command in (plan, build, packages):
         command.add_argument("--exclude-frozen", action="append", default=[])
-        command.add_argument("--exclude-holdout-list", help="首次冻结用的对方留集正文指纹清单。")
+        command.add_argument("--exclude-holdout-list", help="对方留集的整篇原稿指纹清单。")
 
     verify = commands.add_parser("verify", help="核验冻结产物的指纹、引用和抽样分层。")
     verify.add_argument("--frozen", required=True)
@@ -176,24 +178,32 @@ def main(argv: list[str] | None = None, *, model: ParseModel | None = None) -> i
         files = PrivateFiles(Path.cwd())
         with files.open():
             out = files.argument(args.out) if hasattr(args, "out") else None
-            if args.command == "plan":
-                plan = make_plan(files, files.argument(args.corpus, allow_root=True), None if args.all else args.size)
-                raw = json_bytes(plan)
-                with files.new_output(out, ("plan.json",)) as output:
-                    output.write("plan.json", raw)
-                print(f"候选 {plan['candidate_count']} 条，目标 {plan['size']} 条。")
-            elif args.command in ("freeze", "freeze-packages"):
-                dataset = args.dataset if args.command == "freeze" else "packages"
+            if args.command in ("plan", "freeze", "freeze-packages"):
+                dataset = "packages" if args.command == "freeze-packages" else args.dataset
+                if args.command == "plan" and dataset == "exam" and (args.exclude_frozen or args.exclude_holdout_list):
+                    raise RegressionError("生成排除式抽样计划须指定留集类别。")
                 peer_list = files.argument(args.exclude_holdout_list) if args.exclude_holdout_list else None
                 exclusions = load_exclusions(files, dataset, [files.argument(path) for path in args.exclude_frozen], peer_list)
                 corpus = files.argument(args.corpus, allow_root=True)
+                if args.command == "plan":
+                    plan = make_plan(
+                        files, corpus, None if args.all else args.size, dataset=dataset, exclusions=exclusions,
+                    )
+                    with files.new_output(out, ("plan.json",)) as output:
+                        output.write("plan.json", json_bytes(plan))
+                    if dataset == "packages":
+                        print(f"节目包候选池 {plan['candidate_count']} 条。")
+                    else:
+                        print(f"候选 {plan['candidate_count']} 条，目标 {plan['size']} 条。")
+                    return 0
+                plan_path = files.argument(args.plan)
                 reviews = files.argument(args.reviews)
                 companies = files.argument(args.companies)
                 if args.command == "freeze":
-                    checksum = freeze(files, corpus, files.argument(args.plan), reviews, companies, out,
+                    checksum = freeze(files, corpus, plan_path, reviews, companies, out,
                                       dataset=dataset, exclusions=exclusions)
                 else:
-                    checksum = freeze_packages(files, corpus, reviews, companies, out, exclusions=exclusions)
+                    checksum = freeze_packages(files, corpus, plan_path, reviews, companies, out, exclusions=exclusions)
                 print(checksum)
             elif args.command == "verify":
                 snapshot = load_freeze(files, files.argument(args.frozen), verify_plan=True, verify_sources=args.sources)

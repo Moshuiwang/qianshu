@@ -17,7 +17,7 @@ from qianshu.draft import DraftField, PackageRow, Uncertainty
 from qianshu.regression import freeze as freeze_module, runner
 from qianshu.regression.__main__ import main
 from qianshu.regression.compare import FIELD_LABELS, compare_field, normalize
-from qianshu.regression.corpus import CANDIDATES, FIELDS, PAIRS, SEED, make_plan, select
+from qianshu.regression.corpus import CANDIDATES, DOCUMENTS, FIELDS, PAIRS, SEED, body_hashes, make_plan, select
 from qianshu.regression.runner import align
 from qianshu.regression.storage import PrivateFiles, RegressionError, digest, json_bytes
 
@@ -193,6 +193,42 @@ def test_stratifies_by_largest_remainder_and_replaces_only_within_layer(repo):
     del reviews[timing["candidates"][-1]["row_id"]]
     with pytest.raises(RegressionError, match="抽样顺序中仍有未审定候选，当前层尚需 1 条"):
         select(plan, reviews)
+
+
+def test_holdout_plan_reapportions_quotas_after_both_document_hash_matches(repo):
+    tokens = ["doc-exact"] * 2 + ["doc-normalized"] + [f"doc-{i}" for i in range(5)] + ["doc-normalized", "doc-8"]
+    rows = [
+        (f"row{i}", token, "synthetic-country-a", "定向政策", "赠送时长" if i < 6 else "升级权益")
+        for i, token in enumerate(tokens)
+    ]
+    root = repo / CORPUS
+    catalogs(root, rows)
+    exact_body = "占位原稿甲"
+    normalized_body = "占位　Ａ\n"
+    for token in set(tokens):
+        body = {"doc-exact": exact_body, "doc-normalized": normalized_body}.get(token, f"占位正文 {token}")
+        put_json(root / DOCUMENTS / f"{token}.json", {
+            "complete": True, "token": token, "plain_text": body,
+            "policy_row_ids": [row_id for row_id, row_token, *_ in rows if row_token == token],
+        })
+    exact, _ = body_hashes(exact_body)
+    _, normalized = body_hashes("占位A")
+    assert normalized == body_hashes(normalized_body)[1]
+    unrelated = digest(b"synthetic nonmatching hash")
+    exclusions = {"exam": (digest(b"exam"), [(exact, unrelated)]),
+                  "packages": (digest(b"packages"), [(unrelated, normalized)])}
+    with PrivateFiles(repo.parent).open() as files:
+        exam = make_plan(files, CORPUS, 3)
+        plan = make_plan(files, CORPUS, 3, dataset="blind", exclusions=exclusions)
+    assert "dataset" not in exam and "excluded_sets_sha256" not in exam
+    assert [layer["quota"] for layer in exam["strata"]] == [1, 2]
+    assert plan["dataset"] == "blind" and plan["candidate_count"] == 6
+    assert plan["excluded_sets_sha256"] == {"exam": digest(b"exam"), "packages": digest(b"packages")}
+    assert [layer["quota"] for layer in plan["strata"]] == [2, 1]
+    for original, filtered in zip(exam["strata"], plan["strata"], strict=True):
+        assert filtered["candidates"] == [
+            row for row in original["candidates"] if row["token"] not in {"doc-exact", "doc-normalized"}
+        ]
 
 
 def test_freeze_records_reviewed_configuration_and_fingerprints(repo, corpus, frozen, capsys):
@@ -1414,9 +1450,63 @@ def freeze_disjoint_exam(corpus):
 def peer_list(repo, dataset, bodies):
     put_json(repo / "peer.json", {
         "dataset": dataset,
-        "documents": [[digest(body.encode()), freeze_module.body_fingerprint(body)] for body in bodies],
+        "documents": [body_hashes(body) for body in bodies],
     })
     return ["--exclude-frozen", ".private/exam", "--exclude-holdout-list", ".private/peer.json"]
+
+
+def plan_holdout(dataset, exclusions, out=None):
+    out = out or f".private/{dataset}-plan"
+    sampling = ["--all"] if dataset == "blind" else []
+    return main(["plan", "--corpus", PLAN[0], "--dataset", dataset, "--out", out, *sampling, *exclusions])
+
+
+def test_freeze_packages_accepts_any_reviewed_subset_of_targeted_pool(repo, corpus, capsys):
+    freeze_disjoint_exam(corpus)
+    blind_bodies = ["占位单条原稿　\n", "其他盲测候选原稿"]
+    exclusions = peer_list(repo, "blind", blind_bodies)
+    assert plan_holdout("packages", exclusions) == 0
+    path = repo / "packages-plan/plan.json"
+    plan = get_json(path)
+    assert plan["mode"] == "targeted" and plan["candidate_count"] == 2
+    assert set(plan["candidates"]) == {"policy-a", "policy-b"}
+    assert not {"size", "seed", "strata"} & plan.keys()
+    assert all("rank_hash" not in candidate for candidate in plan["candidates"].values())
+
+    # A changed candidate pool is rejected, and key order has no effect on the comparison.
+    reversed_pool = dict(reversed(list(plan["candidates"].items())))
+    items = {
+        "policy-b": {
+            "token": "doc-batch", "span": [BATCH.index(SECOND), len(BATCH)], "mention": "只写档位",
+            "rows": [], "complete": False, "basis": "占位审定",
+        },
+    }
+    review_path = repo / "package-review.json"
+    put_json(review_path, {"schema": 1, "items": items})
+    args = ["freeze-packages", "--corpus", PLAN[0], "--plan", ".private/packages-plan/plan.json",
+            "--reviews", ".private/package-review.json", "--companies", ".private/companies.tsv",
+            "--out", ".private/packages"]
+    put_json(path, {**plan, "candidates": {"policy-b": reversed_pool["policy-b"]}, "candidate_count": 1})
+    assert main([*args, *exclusions]) == 1
+    assert "当前语料不符" in capsys.readouterr().err
+    put_json(path, {**plan, "candidates": reversed_pool})
+
+    different = peer_list(repo, "blind", [*blind_bodies, "新增盲测候选原稿"])
+    assert main([*args, *different]) == 1
+    assert "排除集指纹不符" in capsys.readouterr().err
+
+    exclusions = peer_list(repo, "blind", blind_bodies)
+    put_json(review_path, {"schema": 1, "items": {
+        **items, "policy-c": {**items["policy-b"], "token": "doc-single", "span": [0, 4]},
+    }})
+    assert main([*args, *exclusions]) == 1
+    assert "候选池之外" in capsys.readouterr().err
+    assert not (repo / "packages").exists()
+    put_json(review_path, {"schema": 1, "items": items})
+    assert main([*args, *exclusions]) == 0
+    with PrivateFiles(Path.cwd()).open() as files:
+        frozen = freeze_module.load_freeze(files, Path("packages"), verify_sources=True)
+    assert {sample["row_id"] for sample in frozen["samples"].values()} == {"policy-b"}
 
 
 @pytest.mark.parametrize("ambiguous_benefit", [False, True])
@@ -1436,24 +1526,33 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
     if ambiguous_benefit:
         review["items"]["policy-a"]["source_status"] = {"benefit_type": "歧义"}
     put_json(repo / "package-review.json", review)
-    args = ["freeze-packages", "--corpus", ".private/archive", "--reviews", ".private/package-review.json",
+    args = ["freeze-packages", "--corpus", ".private/archive", "--plan", ".private/packages-plan/plan.json",
+            "--reviews", ".private/package-review.json",
             "--companies", ".private/companies.tsv", "--out", ".private/packages"]
     freeze_disjoint_exam(corpus)
     blind_exclusions = peer_list(repo, "packages", [BATCH])
-    review = get_json(repo / "review.json")
-    review["reviews"]["policy-a"] = review["reviews"]["policy-b"] = {"exclude": "source_anomaly"}
-    put_json(repo / "blind-review.json", review)
+    assert plan_holdout("blind", blind_exclusions) == 0
+    blind_review = get_json(repo / "review.json")
+    blind_review["reviews"] = {"policy-c": blind_review["reviews"]["policy-c"]}
+    put_json(repo / "blind-review.json", blind_review)
     blind_inputs = [*FREEZE]
+    blind_inputs[blind_inputs.index(".private/plan/plan.json")] = ".private/blind-plan/plan.json"
     blind_inputs[blind_inputs.index(".private/review.json")] = ".private/blind-review.json"
     blind_inputs[-1] = ".private/blind"
     assert main(["freeze", *blind_inputs, "--dataset", "blind", *blind_exclusions]) == 0
     blind_sha = capsys.readouterr().out.splitlines()[-1]
     assert main(args) == 1
     assert main([*args, *peer_list(repo, "blind", [])]) == 1
-    assert main([*args, "--exclude-frozen", ".private/exam", "--exclude-frozen", ".private/blind"]) == 0
+    package_exclusions = ["--exclude-frozen", ".private/exam", "--exclude-frozen", ".private/blind"]
+    assert plan_holdout("packages", package_exclusions) == 0
+    assert main([*args, *peer_list(repo, "blind", ["占位单条原稿\n"])]) == 1
+    assert "排除集指纹不符" in capsys.readouterr().err
+    assert main([*args, *package_exclusions]) == 0
     fingerprint = capsys.readouterr().out.strip()
     manifest = get_json(repo / "packages/manifest.json")
     assert manifest["excluded_sets_sha256"]["blind"] == blind_sha
+    assert manifest["plan_sha256"] == digest((repo / "packages-plan/plan.json").read_bytes())
+    assert main(["verify", "--frozen", ".private/packages", "--sources"]) == 0
     with PrivateFiles(Path.cwd()).open() as files:
         frozen = freeze_module.load_freeze(files, Path("packages"))
     pair = next(pair for pair in frozen["pairs"].values() if pair["row_id"] == "policy-a")
@@ -1503,19 +1602,33 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
         source_status={"effective_multiplier": "原文未写"},
     )
     put_json(repo / "review.json", review)
-    args = ["freeze", *FREEZE, "--dataset", "blind"]
+    assert main(["freeze", *FREEZE, "--dataset", "blind",
+                 *peer_list(repo, "packages", ["排除用占位正文"])]) == 1
+    assert "数据集或排除集指纹不符" in capsys.readouterr().err
+    blind_inputs = [*FREEZE]
+    blind_inputs[blind_inputs.index(".private/plan/plan.json")] = ".private/blind-plan/plan.json"
+    args = ["freeze", *blind_inputs, "--dataset", "blind"]
     assert main(args) == 1
     assert main([*args, "--exclude-frozen", ".private/exam"]) == 1
     assert main([*args, *peer_list(repo, "packages", [])]) == 1
-    exclusions = peer_list(repo, "packages", [BATCH])
-    listing = get_json(repo / "peer.json")
-    listing["documents"][0][1] = digest(b"synthetic nonmatching normalized hash")
-    put_json(repo / "peer.json", listing)
-    assert main([*args, *exclusions]) == 1
-    assert main([*args, *peer_list(repo, "packages", [BATCH + "　\n"])]) == 1
-    assert "归一化后相同" in capsys.readouterr().err
+    assert plan_holdout("blind", peer_list(repo, "packages", ["排除用占位正文"])) == 0
+    different = peer_list(repo, "packages", ["另一份排除占位正文"])
+    assert plan_holdout("blind", different, out=".private/other-plan") == 0
+    plan = get_json(repo / "blind-plan/plan.json")
+    other = get_json(repo / "other-plan/plan.json")
+    assert plan["strata"] == other["strata"] and plan["excluded_sets_sha256"] != other["excluded_sets_sha256"]
+    assert main([*args, *different]) == 1
+    assert "排除集指纹不符" in capsys.readouterr().err
     assert not (repo / "frozen").exists()
-    assert main([*args, *peer_list(repo, "packages", ["排除用占位正文"])]) == 0
+    exclusions = peer_list(repo, "packages", ["排除用占位正文"])
+    path = repo / "blind-plan/plan.json"
+    raw = path.read_bytes()
+    max(plan["strata"], key=lambda layer: len(layer["candidates"]))["candidates"].reverse()
+    put_json(path, plan)
+    assert main([*args, *exclusions]) == 1
+    assert "当前语料不符" in capsys.readouterr().err
+    path.write_bytes(raw)
+    assert main([*args, *exclusions]) == 0
     checksum = capsys.readouterr().out.splitlines()[-1]
     files = PrivateFiles(Path.cwd())
     with files.open():
