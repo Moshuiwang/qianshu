@@ -89,7 +89,7 @@ def pairing_fingerprint(threshold: int) -> str:
     return digest(json_bytes({
         "version": PAIRING_VERSION, "weights": WEIGHTS, "empty_weights": EMPTY_WEIGHTS, "threshold": threshold,
         "gold_keys": ["included_gold", "reviewed_pairing", "unexcluded_sample_metadata"],
-        "draft_keys": "located_statement_value",
+        "draft_keys": "v3_with_located_pending_field_fallback",
         "ties": "retain_only_pairs_common_to_all_optimal_assignments",
         "user_tags": {
             "normalization": ["NFKC", "casefold", "strip", "remove_one_shadow_suffix_with_nonempty_base", "sorted_set"],
@@ -224,11 +224,23 @@ def key_value(name: str, value):
 
 
 def _draft_keys(draft, countries: dict[str, str], sources: Sources, options: dict) -> dict:
+    # v3 先按卡片投影取键，包括已确认的 R10 公司和它唯一映射的国家。
     keys = {}
+    for name in PAIR_FIELDS:
+        field = getattr(draft, name, None)
+        if not needs_confirmation(field):
+            keys[name] = key_value(name, field.value)
+    country = getattr(draft, "country", None)
+    keys["country"] = country.value if not needs_confirmation(country) else countries.get(keys.get("company"))
+
     results = getattr(draft, "field_results", {})
     for name in ("country", *PAIR_FIELDS):
-        if name in results:
-            statement = results[name].statement
+        field = getattr(draft, name, None)
+        result = results.get(name)
+        if not needs_confirmation(field if field is not None else result):
+            continue
+        if result is not None:
+            statement = result.statement
             if statement.value is None or not statement.evidence or not all(
                 sources.locate_quote(quote.span, quote.text)[0] is not None for quote in statement.evidence
             ):
@@ -240,7 +252,6 @@ def _draft_keys(draft, countries: dict[str, str], sources: Sources, options: dic
                 value = _normalized_value(name, statement.value, options)
         else:
             # 无声明的旧投影须明确标为原文，避免用查表值或默认值配对。
-            field = getattr(draft, name, None)
             if getattr(field, "value_source", None) != ValueSource.ORIGINAL or field.value is None:
                 continue
             if not field.evidence or not all(
@@ -250,9 +261,10 @@ def _draft_keys(draft, countries: dict[str, str], sources: Sources, options: dic
             ):
                 continue
             value = field.value
-        keys[name] = value if name == "country" else key_value(name, value)
-    if keys.get("country") is None:
-        keys["country"] = countries.get(keys.get("company"))
+        if name == "country":
+            keys["pending_country"] = value
+        else:
+            keys[name] = key_value(name, value)
     return keys
 
 
@@ -272,7 +284,8 @@ def _score(gold: dict, draft: dict) -> list[str]:
         return value is not None and value == key_value(name, gold.get(name))
 
     hits = []
-    if equal("company") or (draft["country"] is not None and draft["country"] == gold["country"]):
+    countries = (draft["country"], draft.get("pending_country"))
+    if equal("company") or (gold["country"] is not None and gold["country"] in countries):
         hits.append("country_or_company")
     hits.extend(name for name in (
         "benefit_type", "packages", "recharge_days", "gift_days", "recharge_amount", "user_tags",

@@ -465,12 +465,17 @@ def markdown_report(report: dict) -> bytes:
     if diagnostic := report.get("diagnostic_replay"):
         review_lines.insert(0, f"- 离线诊断，源回复结构 `{diagnostic['source_reply_structure']}`，"
                                f"当前结构 `{diagnostic['reply_structure']}`。")
+    business = report["business"]
+    pairing_lines = [
+        f"- 配对配置指纹 `{business['pairing_sha256']}`",
+        f"- 业务配对版本 {business['pairing_version']}，量尺指纹 `{business['measure_sha256']}`",
+    ]
     if report.get("void"):
         return "\n".join([
             "# 解析回归计数", "",
             f"- 冻结指纹 `{report['freeze_sha256']}`",
             f"- 运行配置指纹 `{report['configuration_sha256']}`",
-            f"- 业务配对版本 {report['business']['pairing_version']}",
+            *pairing_lines,
             f"- 模型调用失败 {report['documents']['model_failed']} 篇",
             f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}",
             *review_lines, *location_lines, "", "本次放行运行作废。", "",
@@ -534,8 +539,7 @@ def markdown_report(report: dict) -> bytes:
                 counts.update({status: field[status] for status in STATUSES})
             groups[label] = _rate_counts(counts)
         result.extend(lines(f"{title}（按字段项汇总）", groups))
-    result.extend(["## 业务配对量尺", "", f"- 配对配置指纹 `{report['business']['pairing_sha256']}`"])
-    result.append(f"- 业务配对版本 {report['business']['pairing_version']}，量尺指纹 `{report['business']['measure_sha256']}`")
+    result.extend(["## 业务配对量尺", "", *pairing_lines])
     for key, metric in report["business"].get("rates", {}).items():
         numerator, denominator, percent = (metric[key] for key in ("numerator", "denominator", "percent"))
         fraction = f"{numerator}/{denominator}" if denominator is not None else "—"

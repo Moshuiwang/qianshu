@@ -8,6 +8,7 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
+from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -1378,11 +1379,14 @@ def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, fro
     for name, model in (("first", no_policies), ("second", no_policies), ("void", one_failed_reply)):
         assert main([*run_args(frozen, f".private/{name}"), "--release"], model=model) == 0
     void = get_json(repo / "void" / "public-report.json")
+    config = get_json(repo / "void" / "recording.json")["configuration"]
     assert void["void"] and void["business"] == {
-        "pairing_version": 4,
+        "pairing_version": 4, "pairing_sha256": config["pairing_sha256"], "measure_sha256": config["measure_sha256"],
         "counts": {"reply_parse_failed": 1},
         "reply_parse_failure_reasons": {"reply_parse": 1, "reply_incomplete": 0, "reply_truncated": 0, "reply_refused": 0},
     }
+    markdown = (repo / "void" / "public-report.md").read_text()
+    assert all(config[key] in markdown for key in ("pairing_sha256", "measure_sha256"))
     assert "sample_alignment" not in void
     args = ["summarize", "--recording", ".private/first", "--recording", ".private/second",
             "--recording", ".private/void", "--out", ".private/summary"]
@@ -1514,11 +1518,67 @@ def test_country_pairing_uses_located_model_value(status, quotes, weight):
     reply["policies"][0]["fields"]["country"]["status"] = status
     draft = parse_one(body, reply)
     sample = {"country": "赞比亚", "benefit_type": "赠送时长"}
-    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {})
+    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {"占位公司甲": "赞比亚"})
     policy = score.add({"body": body}, [{"id": "p", "configuration": {}}], [draft])["policies"][0]
     assert draft.field_results["country"].needs_confirmation == (status != "确定" or weight == 0)
     assert policy["positive_scores"] == ([{"draft": 0, "score": weight, "keys": ["country_or_company"]}]
                                          if weight else [])
+
+
+@pytest.mark.parametrize("explicit_company", [False, True])
+def test_pairing_preserves_r10_company_and_its_country_mapping(explicit_company):
+    from qianshu.regression.business import BusinessScore
+    from tests.parse.test_names import parse_one
+
+    body = "Mozambique 占位 TMT 公司"
+    fields = {"country": {"value": "Mozambique", "evidence": ["Mozambique"]}}
+    if explicit_company:
+        company = "占位 TMT 公司"
+        fields["company"] = {"value": company, "evidence": [company]}
+        fields["company_keyword"] = {"value": ["TMT"], "evidence": ["TMT"]}
+        # 只有映射回中文国家才能得分。
+        sample, configuration = {"country": "莫桑比克"}, {}
+    else:
+        company = "占位莫桑比克默认公司"
+        # 独立验证 R10 默认公司本身的得分。
+        sample, configuration = {"country": "合成其他地区"}, {"company": {"value": company}}
+    draft = parse_one(body, fixed_reply(body, [fields]))
+    assert draft.field_results["company"].source == "查表派生"
+    assert draft.company.value == company
+    sample["benefit_type"] = "赠送时长"
+    frozen = {"samples": {"p": sample}, "denominators": {"fields": {}}}
+    score = BusinessScore(frozen, 2, {company: "莫桑比克"})
+    pair = {"id": "p", "configuration": configuration}
+    policy, = score.add({"body": body}, [pair], [draft])["policies"]
+    assert policy["positive_scores"] == [{"draft": 0, "score": 4, "keys": ["country_or_company"]}]
+
+
+def test_v4_scores_at_least_v3_for_every_nonempty_subset_of_confirmed_keys():
+    from qianshu.regression.business import BusinessScore
+
+    # 各组在 v3 中的独立贡献，覆盖复合日期键与两个空集合的权重。
+    groups = [
+        ({"company": "合成公司"}, 4), ({"benefit_type": "赠送时长"}, 2),
+        ({"packages": []}, 4), ({"recharge_days": 10}, 2), ({"gift_days": 5}, 2),
+        ({"recharge_amount": 20}, 2), ({"user_tags": []}, 3),
+        ({"start_date": "2099-01-01", "end_date": "2099-01-15"}, 2),
+    ]
+    values = {name: value for group, _ in groups for name, value in group.items()}
+    sample = {"country": "合成国家", "benefit_type": "赠送时长"}
+    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {})
+    pair = {"id": "p", "configuration": {name: {"value": value} for name, value in values.items()}}
+    for size in range(1, len(groups) + 1):
+        for subset in combinations(groups, size):
+            fields = {name: DraftField(value=value) for group, _ in subset for name, value in group.items()}
+            expected_v3 = sum(weight for _, weight in subset)
+            pending_gift = "gift_days" not in fields
+            if pending_gift:
+                fields["gift_days"] = located_field(5)
+                fields["gift_days"].uncertainty = Uncertainty(reason="合成待确认")
+            draft = SimpleNamespace(**fields, to_dict=lambda: {})
+            policy, = score.add({"body": "占位"}, [pair], [draft])["policies"]
+            assert policy["draft"] == 0
+            assert policy["positive_scores"][0]["score"] == expected_v3 + (2 if pending_gift else 0)
 
 
 def test_package_pairing_uses_model_rows_before_card_projection():
@@ -2131,7 +2191,7 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
     assert main(_replay_args(checksum)) == 0
     assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
 
-def test_amount_dates_and_candidates_only_count_located_business_keys(monkeypatch):
+def test_confirmed_keys_include_derived_tags_and_pending_candidates_do_not_score(monkeypatch):
     from qianshu.draft import Candidate, PackageRow
     from qianshu.regression.business import WEIGHTS, _draft_keys, _gold_keys, _score, pairing_fingerprint
 
@@ -2163,7 +2223,7 @@ def test_amount_dates_and_candidates_only_count_located_business_keys(monkeypatc
         start_date=located_field("2099-01-15"), end_date=located_field("2099-02-01"),
     )
     sources = parse.Sources([parse.SourceBlock("body", "占位", "body")])
-    assert _score(gold, _draft_keys(draft, {}, sources, {})) == ["recharge_amount", "date_overlap"]
+    assert _score(gold, _draft_keys(draft, {}, sources, {})) == ["recharge_amount", "user_tags", "date_overlap"]
     fingerprint = pairing_fingerprint(2)
     assert fingerprint != pairing_fingerprint(3)
     monkeypatch.setitem(WEIGHTS, "packages", 4)
