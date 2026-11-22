@@ -4,7 +4,10 @@ from collections import Counter, defaultdict
 from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
+from re import fullmatch
+from unicodedata import normalize as unicode_normalize
 
+from .business import PAIR_FIELDS, SOURCE_STATUSES, key_value
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, normalize
 from .corpus import Corpus, make_plan, select
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
@@ -17,6 +20,7 @@ PACKAGE_STYLES = {
     "both": "两类并写",
     "neither_recognized": "两类都没认出",
 }
+HOLDOUT_PEERS = {"blind": "packages", "packages": "blind"}
 
 
 def _json_lines(items, key: str) -> bytes:
@@ -36,6 +40,65 @@ def _check_spans(spans: list[list[int]], body: str) -> None:
     ordered = sorted(spans)
     if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
         raise RegressionError("同一原稿的审定政策段落重叠。")
+
+
+def body_fingerprint(body: str) -> str:
+    return digest("".join(unicode_normalize("NFKC", body).split()).encode())
+
+
+def _body_hashes(body: str) -> tuple[str, str]:
+    return digest(body.encode()), body_fingerprint(body)
+
+
+def load_exclusions(
+    files: PrivateFiles, dataset: str, frozen_paths: list[Path], peer_list: Path | None,
+) -> dict:
+    exclusions = {}
+    for path in frozen_paths:
+        snapshot = load_freeze(files, path)
+        kind = snapshot["dataset"]
+        if kind in exclusions:
+            raise RegressionError("排除集的数据集类别重复。")
+        exclusions[kind] = (snapshot["fingerprint"], [_body_hashes(doc["body"]) for doc in snapshot["documents"].values()])
+    if peer_list is not None:
+        raw = files.read(peer_list)
+        data = read_json(raw)
+        kind = HOLDOUT_PEERS.get(dataset)
+        if kind is None or data.get("dataset") != kind or kind in exclusions:
+            raise RegressionError("对方留集的排除清单类别不符或重复。")
+        rows = data.get("documents")
+        if (
+            not isinstance(rows, list) or not rows
+            or any(not isinstance(row, list) or len(row) != 2 or any(
+                not isinstance(value, str) or not fullmatch(r"[a-f0-9]{64}", value) for value in row
+            ) for row in rows)
+        ):
+            raise RegressionError("对方留集排除清单为空或正文指纹格式无效。")
+        exclusions[kind] = (digest(raw), rows)
+    _require_exclusions(dataset, exclusions)
+    return exclusions
+
+
+def _require_exclusions(dataset: str, exclusions: dict) -> None:
+    peer = HOLDOUT_PEERS.get(dataset)
+    if peer is not None and (
+        exclusions.keys() != {"exam", peer} or any(not hashes for _, hashes in exclusions.values())
+    ):
+        raise RegressionError("冻结留集须提供冻结考题和对方留集的非空排除集。")
+
+
+def check_excluded(documents: list[dict], dataset: str, exclusions: dict) -> dict:
+    _require_exclusions(dataset, exclusions)
+    exact, normalized = set(), set()
+    for _, hashes in exclusions.values():
+        for raw, canonical in hashes:
+            exact.add(raw)
+            normalized.add(canonical)
+    if any(raw in exact or canonical in normalized for raw, canonical in (
+        _body_hashes(doc["body"]) for doc in documents
+    )):
+        raise RegressionError("冻结资料与排除集存在相同或归一化后相同的申请。")
+    return {kind: fingerprint for kind, (fingerprint, _) in exclusions.items()}
 
 
 def _denominators(pairs: list[dict], fields: Iterable[str]) -> dict:
@@ -100,8 +163,68 @@ def _check_plan_strata(manifest: dict, plan: dict) -> None:
         raise RegressionError("冻结的分层类别、配额或候选数与抽样计划不一致。")
 
 
+def _check_business(pair: dict, frozen_fields) -> None:
+    statuses = pair.get("source_status", {})
+    if (
+        not isinstance(statuses, dict) or not statuses.keys() <= FIELD_LABELS.keys()
+        or any(not isinstance(status, str) or status not in SOURCE_STATUSES for status in statuses.values())
+    ):
+        raise RegressionError("业务审定的原文状态无效。")
+    keywords = pair.get("company_keywords", [])
+    if (
+        not isinstance(keywords, list)
+        or any(not isinstance(keyword, str) or not keyword.strip() or keyword != keyword.strip() for keyword in keywords)
+        or len({keyword.casefold() for keyword in keywords}) != len(keywords)
+    ):
+        raise RegressionError("独立审定的公司关键词格式无效或有重复值。")
+    business = pair.get("business", {})
+    if not isinstance(business, dict) or not business.keys() <= frozen_fields:
+        raise RegressionError("业务审定标记和冻结字段不一致。")
+    for mark in business.values():
+        if (
+            not isinstance(mark, dict) or not mark.keys() <= {"inferable", "auto_allowed", "default_allowed"}
+            or any(type(value) is not bool for value in mark.values())
+        ):
+            raise RegressionError("业务审定须使用独立审定的布尔标记。")
+    if "card_complete" in pair and type(pair["card_complete"]) is not bool:
+        raise RegressionError("整卡完整性须使用布尔标记。")
+    pairing = pair.get("pairing", {})
+    if not isinstance(pairing, dict) or not pairing.keys() <= set(PAIR_FIELDS):
+        raise RegressionError("独立审定的业务配对键无效。")
+    for name, value in pairing.items():
+        normalized = key_value(name, value)
+        gold = pair["configuration"].get(name, {}).get("value")
+        if normalized is None or (gold is not None and normalized != key_value(name, gold)):
+            raise RegressionError("业务配对键格式无效或与冻结金标冲突。")
+
+
+def write_snapshot(
+    files: PrivateFiles, destination: Path, manifest: dict, samples: list[dict],
+    pairs: list[dict], documents: list[dict], companies: bytes, frozen_fields,
+) -> str:
+    artifacts = {
+        "samples.jsonl": _json_lines(samples, "id"),
+        "pairs.jsonl": _json_lines(pairs, "id"),
+        "documents.jsonl": _json_lines(documents, "token"),
+        "denominators.json": json_bytes(_denominators(pairs, frozen_fields)),
+        "companies.tsv": companies,
+    }
+    manifest_raw = json_bytes({
+        **manifest, "artifact_sha256": {name: digest(raw) for name, raw in artifacts.items()},
+    })
+    with files.new_output(destination, FREEZE_FILES) as output:
+        for name, raw in artifacts.items():
+            output.write(name, raw)
+        output.write("audit.json", json_bytes({"created_utc": datetime.now(UTC).isoformat(timespec="seconds")}))
+        output.write("manifest.json", manifest_raw)
+    return digest(manifest_raw)
+
+
 def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path: Path,
-           companies_path: Path, destination: Path) -> str:
+           companies_path: Path, destination: Path, *, dataset: str = "exam",
+           exclusions: dict | None = None) -> str:
+    exclusions = {} if exclusions is None else exclusions
+    _require_exclusions(dataset, exclusions)
     plan_raw = files.read(plan_path)
     plan = read_json(plan_raw)
     current = make_plan(files, corpus_root, None if plan["mode"] == "all" else plan["size"])
@@ -149,25 +272,23 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
             configuration = corpus.configuration(row, audit["fields"])
             sample_id = digest(json_bytes([token, row_id]))
             samples.append({"id": sample_id, **row})
-            pairs.append({
+            pair = {
                 "id": sample_id, "row_id": row_id, "token": token, "span": span, "basis": audit["basis"],
                 "materials": materials, "configuration": configuration,
-            })
+                **{key: audit[key] for key in ("business", "card_complete", "pairing", "source_status", "company_keywords")
+                   if key in audit},
+            }
+            _check_business(pair, FIELD_LABELS.keys())
+            pairs.append(pair)
 
+    excluded_set_hashes = check_excluded(documents, dataset, exclusions)
     source_hashes = {str(corpus_root / name): checksum for name, checksum in plan["source_hashes"].items()}
     source_hashes.update(corpus.read_hashes)
     source_hashes.update({
         str(plan_path): digest(plan_raw), str(review_path): digest(review_raw), str(companies_path): digest(companies),
     })
-    artifacts = {
-        "samples.jsonl": _json_lines(samples, "id"),
-        "pairs.jsonl": _json_lines(pairs, "id"),
-        "documents.jsonl": _json_lines(documents, "token"),
-        "denominators.json": json_bytes(_denominators(pairs, FIELD_LABELS)),
-        "companies.tsv": companies,
-    }
     manifest = {
-        "schema": 2, "comparison_version": 1,
+        "schema": 3, "comparison_version": 1, "dataset": dataset,
         "reviewer_role": review["reviewer_role"], "mode": plan["mode"], "seed": plan["seed"],
         "plan_sha256": digest(plan_raw), "count": len(samples), "documents": len(documents),
         "candidate_count": plan["candidate_count"], "target": plan["size"],
@@ -176,15 +297,10 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
             for layer, summary in zip(plan["strata"], _strata_with_counts(plan["strata"], samples), strict=True)
         ],
         "rejected": rejected, "source_sha256": source_hashes,
-        "artifact_sha256": {name: digest(raw) for name, raw in artifacts.items()},
     }
-    manifest_raw = json_bytes(manifest)
-    with files.new_output(destination, FREEZE_FILES) as output:
-        for name, raw in artifacts.items():
-            output.write(name, raw)
-        output.write("audit.json", json_bytes({"created_utc": datetime.now(UTC).isoformat(timespec="seconds")}))
-        output.write("manifest.json", manifest_raw)
-    return digest(manifest_raw)
+    if excluded_set_hashes:
+        manifest["excluded_sets_sha256"] = excluded_set_hashes
+    return write_snapshot(files, destination, manifest, samples, pairs, documents, companies, FIELD_LABELS)
 
 
 def _indexed(raw: bytes, key: str) -> dict:
@@ -198,8 +314,20 @@ def _indexed(raw: bytes, key: str) -> dict:
 def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = False, verify_sources: bool = False) -> dict:
     manifest_raw = files.read(directory / "manifest.json")
     manifest = read_json(manifest_raw)
-    if manifest["schema"] not in (1, 2) or manifest["comparison_version"] != 1 or json_bytes(manifest) != manifest_raw:
+    dataset = manifest.get("dataset", "exam")
+    if (
+        manifest["schema"] not in (1, 2, 3) or manifest["comparison_version"] != 1
+        or dataset not in ("exam", "blind", "packages") or json_bytes(manifest) != manifest_raw
+    ):
         raise RegressionError("冻结清单版本或清单格式不受支持。")
+    if "excluded_sets_sha256" in manifest:
+        exclusions = manifest["excluded_sets_sha256"]
+        peer = HOLDOUT_PEERS.get(dataset)
+        if (
+            not isinstance(exclusions, dict) or (peer is not None and exclusions.keys() != {"exam", peer})
+            or any(not isinstance(value, str) or not fullmatch(r"[a-f0-9]{64}", value) for value in exclusions.values())
+        ):
+            raise RegressionError("冻结清单的排除集指纹无效。")
     raw = {name: files.read(directory / name) for name in ARTIFACTS}
     if {name: digest(data) for name, data in raw.items()} != manifest["artifact_sha256"]:
         raise RegressionError("冻结产物指纹校验失败。")
@@ -227,6 +355,9 @@ def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = Fal
             or not isinstance(sample["country"], str) or not sample["country"]
         ):
             raise RegressionError("冻结的配置配对与样例清单不一致。")
+        _check_business(pair, frozen_fields)
+        if dataset == "packages" and pair.get("package_style") not in {"name_only", "both", "tier_only"}:
+            raise RegressionError("补充集政策缺少有效的节目包写法标记。")
         by_token[pair["token"]].append(pair["span"])
         for name, field in pair["configuration"].items():
             if field.keys() == {"value"} and normalize(name, field["value"]) == field["value"]:
@@ -235,7 +366,7 @@ def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = Fal
                 raise RegressionError("冻结的配置字段值或排除标记无效。")
     for token, doc in documents.items():
         _check_spans([*by_token[token], *doc["other_spans"]], doc["body"])
-        if manifest["schema"] == 2 and doc.get("package_style") not in PACKAGE_STYLES:
+        if manifest["schema"] >= 2 and doc.get("package_style") not in PACKAGE_STYLES:
             raise RegressionError("冻结的节目包写法类别无效。")
 
     if json_bytes(_denominators(list(pairs.values()), frozen_fields)) != raw["denominators.json"]:
@@ -246,7 +377,7 @@ def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = Fal
         or sum(layer["included_count"] for layer in strata) != manifest["count"]
     ):
         raise RegressionError("冻结的分层合计与目标配额或样例总数不一致。")
-    if verify_plan or verify_sources:
+    if (verify_plan or verify_sources) and dataset != "packages":
         sources = manifest["source_sha256"]
         plan_checksum = manifest["plan_sha256"]
         plan_name = next((name for name, checksum in sources.items() if checksum == plan_checksum), None)
@@ -260,7 +391,12 @@ def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = Fal
             for name, checksum in sources.items():
                 if name != plan_name and digest(files.read(name)) != checksum:
                     raise RegressionError("冻结的语料来源指纹已变化。")
+    elif verify_sources:
+        for name, checksum in manifest["source_sha256"].items():
+            if digest(files.read(name)) != checksum:
+                raise RegressionError("冻结的语料来源指纹已变化。")
     return {
         "fingerprint": digest(manifest_raw), "samples": samples, "pairs": pairs, "documents": documents,
         "denominators": denominators, "strata": strata, "companies_text": raw["companies.tsv"].decode("utf-8"),
+        "dataset": dataset,
     }
