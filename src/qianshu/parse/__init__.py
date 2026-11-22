@@ -38,8 +38,7 @@ _CONFIRM = {
     "company_subject_conflict": "明示的公司主体与公司对照表不一致。",
 }
 _STRUCTURAL_ISSUES = {
-    "invalid_policy", "overlapping_policy_mains", "invalid_clause", "local_remark_overlap",
-    "invalid_coverage", "unsupported_coverage_use", "coverage_gap", "missing_block_coverage",
+    "invalid_clause", "local_remark_overlap", "unsupported_coverage_use", "coverage_gap",
     "invalid_pending_reference",
     "unbound_pending_coverage", "invalid_evidence", "invalid_checked_range", "invalid_certain_evidence",
     "invalid_date_use", "date_target_mismatch", "tag_evidence_mismatch",
@@ -179,8 +178,6 @@ def _decode(reply: str) -> ApplicationReply:
         raise ParseError("申请解析模型回复结构不符合协议。", code="reply_schema", path=path) from None
     if not result.policies and result.document is None:
         raise ParseError("空政策清单缺少文档级判定。", code="reply_document", path=("document",))
-    if result.policies and result.document and result.document.status is DocumentStatus.NO_POLICY:
-        raise ParseError("文档判定与政策清单冲突。", code="reply_document", path=("document",))
     return result
 
 
@@ -259,7 +256,7 @@ def _draft(
     }
     draft.hints = hints
     draft.field_results = results
-    draft.source_span = _body_offsets(review.main[policy.id])
+    draft.source_span = _body_offsets(review.main[id(policy)])
     draft.source_evidence_spans = tuple(sorted({
         span for result in results.values() for quote in result.evidence
         if (span := _body_offsets(review.sources.locate(quote.span))) is not None

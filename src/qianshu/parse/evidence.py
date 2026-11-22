@@ -11,10 +11,6 @@ from .protocol import (
 )
 
 FIELD_IDS = frozenset(Findings.model_fields)
-_COVERAGE_REVIEW_CODES = frozenset({
-    "coverage_gap", "declared_pending", "invalid_coverage", "invalid_pending_reference",
-    "missing_block_coverage", "unbound_pending_coverage", "unsupported_coverage_use",
-})
 
 
 @dataclass(frozen=True, repr=False)
@@ -29,18 +25,10 @@ class ReviewRange:
     @property
     def requires_full_review(self) -> bool:
         fields_by_policy = self.fields_by_policy or {}
-        return not self.policy_ids or (
-            self.code in _COVERAGE_REVIEW_CODES
-            and any(not fields_by_policy.get(policy_id) for policy_id in self.policy_ids)
-        )
+        return not self.policy_ids or any(not fields_by_policy.get(policy_id) for policy_id in self.policy_ids)
 
     def affects_field(self, policy_id: str, name: str) -> bool:
-        if policy_id not in self.policy_ids:
-            return False
-        names = (self.fields_by_policy or {}).get(policy_id)
-        if names:
-            return name in names
-        return self.code not in _COVERAGE_REVIEW_CODES and self.code != "invalid_clause"
+        return name in (self.fields_by_policy or {}).get(policy_id, ())
 
 
 class Sources:
@@ -175,14 +163,15 @@ class EvidenceReview:
                 self._locations[key] = sources.locate_quote(span, text)
             self.evidence_locations[self._locations[key][1]] += 1
         self.pending: list[ReviewRange] = []
-        self._unlocated_clauses: dict[str, Clause] = {}
-        self.policies = {policy.id: policy for policy in reply.policies}
+        self.policies: dict[str, list[Policy]] = defaultdict(list)
+        for policy in reply.policies:
+            self.policies[policy.id].append(policy)
         self.clauses = {clause.id: clause for clause in reply.clauses}
-        self.invalid_policies = {key for key, count in Counter(p.id for p in reply.policies).items() if count > 1}
+        self.duplicate_policy_ids = {key for key, policies in self.policies.items() if len(policies) > 1}
         self.invalid_clauses = {key for key, count in Counter(c.id for c in reply.clauses).items() if count > 1}
-        self.main = {p.id: self._locate(p.main) for p in reply.policies}
-        self.continuations = {p.id: self._locate_all(p.continuations) for p in reply.policies}
-        self.local = {p.id: tuple(filter(None, (self.main[p.id], *self.continuations[p.id])))
+        self.main = {id(p): self._locate(p.main) for p in reply.policies}
+        self.continuations = {id(p): self._locate_all(p.continuations) for p in reply.policies}
+        self.local = {id(p): tuple(filter(None, (self.main[id(p)], *self.continuations[id(p)])))
                       for p in reply.policies}
         self.clause_spans = {c.id: self._locate_all(c.spans) for c in reply.clauses}
         self.applicable: dict[str, list[Clause]] = defaultdict(list)
@@ -193,15 +182,17 @@ class EvidenceReview:
             by_policy = {item.policy_id: frozenset(item.field_ids) for item in pending.fields_by_policy}
             if (set(pending.policy_ids) - self.policies.keys()
                 or len(by_policy) != len(pending.fields_by_policy) or set(by_policy) - set(pending.policy_ids)
-                or any(ids - FIELD_IDS for ids in by_policy.values())
-                or (span is None and pending.span.text is None)):
+                or any(ids - FIELD_IDS for ids in by_policy.values())):
                 self.pending.append(ReviewRange(span, "invalid_pending_reference", reason_code=pending.reason_code))
             else:
                 code = "declared_pending" if span is not None else "invalid_pending_reference"
                 self.pending.append(ReviewRange(span, code, tuple(pending.policy_ids), by_policy,
                                                 reason_code=pending.reason_code))
-        if reply.document and reply.document.status is not DocumentStatus.NO_POLICY:
-            self.pending.append(ReviewRange(None, "document_pending", reason_code=reply.document.reason_code))
+        if reply.document:
+            if reply.document.status is not DocumentStatus.NO_POLICY:
+                self.pending.append(ReviewRange(None, "document_pending", reason_code=reply.document.reason_code))
+            elif reply.policies:
+                self.pending.append(ReviewRange(None, "document_policy_conflict", reason_code=reply.document.reason_code))
         unique = dict.fromkeys(
             (item.span, item.code, item.policy_ids, tuple(sorted((item.fields_by_policy or {}).items())),
              item.block_id, item.reason_code)
@@ -224,22 +215,35 @@ class EvidenceReview:
 
     def _check_structure(self) -> None:
         for policy in self.reply.policies:
-            if (self.main[policy.id] is None or len(self.continuations[policy.id]) != len(policy.continuations)
-                or len(set(policy.shared_clause_ids)) != len(policy.shared_clause_ids)
+            main = self.main[id(policy)]
+            problems = []
+            if policy.id in self.duplicate_policy_ids:
+                problems.append((main, "duplicate_policy_id"))
+            if main is None:
+                problems.append((None, "unlocated_policy_main"))
+            if len(self.continuations[id(policy)]) != len(policy.continuations):
+                problems.append((None, "unlocated_policy_continuation"))
+            if (len(set(policy.shared_clause_ids)) != len(policy.shared_clause_ids)
                 or set(policy.shared_clause_ids) - self.clauses.keys()):
-                self.invalid_policies.add(policy.id)
-        for policy_id in sorted(self.invalid_policies):
-            self.pending.append(ReviewRange(self.main[policy_id], "invalid_policy", (policy_id,)))
+                problems.append((main, "invalid_policy_shared_clause_ids"))
+            self.pending.extend(ReviewRange(span, "invalid_policy", (policy.id,), reason_code=code)
+                                for span, code in problems)
         for first, second in combinations(self.reply.policies, 2):
-            if overlap := intersect(self.main[first.id], self.main[second.id]):
-                self.pending.append(ReviewRange(overlap, "overlapping_policy_mains", (first.id, second.id)))
+            if overlap := intersect(self.main[id(first)], self.main[id(second)]):
+                ids = tuple(dict.fromkeys((first.id, second.id)))
+                self.pending.append(ReviewRange(overlap, "overlapping_policy_mains", ids))
 
         references = defaultdict(set)
+        field_references = defaultdict(lambda: defaultdict(set))
         for policy in self.reply.policies:
             for clause_id in policy.shared_clause_ids:
                 references[clause_id].add(policy.id)
+            for name in FIELD_IDS:
+                for quote in _quotes(getattr(policy.fields, name)):
+                    field_references[quote.clause_id][policy.id].add(name)
         for clause in self.reply.clauses:
-            spans = self.clause_spans[clause.id]
+            locations = tuple(self._locate(span) for span in clause.spans)
+            spans = tuple(filter(None, locations))
             ids = set(clause.policy_ids)
             invalid = (
                 clause.id in self.invalid_clauses or not clause.spans
@@ -248,43 +252,55 @@ class EvidenceReview:
                 or bool(set(clause.field_ids) - FIELD_IDS)
             )
             if clause.scope == "局部":
-                invalid |= len(ids) != 1 or bool(references[clause.id]) or any(
-                    any(uncovered(span, self.local.get(owner, ()))) for span in spans for owner in ids
+                invalid |= len(ids) != 1 or bool(references[clause.id]) or not any(
+                    self._local_clause_fits(policy, spans) for owner in ids for policy in self.policies.get(owner, ())
                 )
             else:
                 invalid |= ids != references[clause.id]
             if (clause.kind == "备注" and clause.scope == "局部" and len(clause.policy_ids) == 1
-                and clause.policy_ids[0] in self.policies):
-                self._check_remark(clause)
+                and len(self.policies.get(clause.policy_ids[0], ())) == 1):
+                self._check_remark(clause, spans)
             if invalid or len(spans) != len(clause.spans):
                 self.invalid_clauses.add(clause.id)
-                bound = tuple(sorted((ids | references[clause.id]) & self.policies.keys()))
-                if not invalid:
-                    self._unlocated_clauses[clause.id] = clause
-                else:
-                    field_ids = FIELD_IDS.intersection(clause.field_ids)
-                    self.pending.append(ReviewRange(
-                        spans[0] if spans else None, "invalid_clause", bound,
-                        {policy_id: field_ids for policy_id in bound},
-                    ))
+                owning_ids = (ids | references[clause.id]) & self.policies.keys()
+                by_policy = {policy_id: set() for policy_id in owning_ids}
+                for policy_id in owning_ids:
+                    for name in FIELD_IDS.intersection(clause.field_ids):
+                        if invalid or any(getattr(p.fields, name).status is StatementStatus.UNWRITTEN
+                                          for p in self.policies[policy_id]):
+                            by_policy[policy_id].add(name)
+                for policy_id, names in field_references[clause.id].items():
+                    by_policy.setdefault(policy_id, set()).update(names)
+                fields = {policy_id: frozenset(names) for policy_id, names in by_policy.items()}
+                reason = None if invalid else "unlocated_clause_quote"
+                self.pending.extend(ReviewRange(location, "invalid_clause", tuple(sorted(fields)), fields,
+                                                reason_code=reason) for location in locations or (None,))
                 continue
             corrected = clause.model_copy(update={"spans": [self.corrected_span(span) for span in clause.spans]})
             for policy_id in clause.policy_ids:
                 self.applicable[policy_id].append(corrected)
 
-    def _check_remark(self, clause: Clause) -> None:
+    def _local_clause_fits(self, policy: Policy, spans: tuple[Span, ...]) -> bool:
+        # 政策坐标不完整由整卡处理；完整坐标才能证明条款越界。
+        local = self.local[id(policy)]
+        return len(local) != 1 + len(policy.continuations) or not any(
+            any(uncovered(span, local)) for span in spans
+        )
+
+    def _check_remark(self, clause: Clause, spans: tuple[Span, ...]) -> None:
         owner = clause.policy_ids[0]
+        owning_policy, = self.policies[owner]
         for policy in self.reply.policies:
             if policy.id == owner:
                 continue
             reference_spans = tuple(
                 part for name in FIELD_IDS for part in self._reference_spans(getattr(policy.fields, name))
             )
-            for remark in self.clause_spans[clause.id]:
-                collisions = {overlap for span in (*self.local[policy.id], *reference_spans)
+            for remark in spans:
+                collisions = {overlap for span in (*self.local[id(policy)], *reference_spans)
                               if (overlap := intersect(remark, span))}
                 for overlap in sorted(collisions, key=lambda span: (span.source_id, span.start, span.end)):
-                    by_policy = {p.id: self._fields_at(p, overlap) for p in (self.policies[owner], policy)}
+                    by_policy = {p.id: self._fields_at(p, overlap) for p in (owning_policy, policy)}
                     self.pending.append(ReviewRange(overlap, "local_remark_overlap", (owner, policy.id), by_policy))
 
     def _reference_spans(self, statement: Finding) -> Iterable[Span]:
@@ -302,12 +318,10 @@ class EvidenceReview:
     def _check_coverage(self) -> None:
         support = defaultdict(list)
         for policy in self.reply.policies:
-            if self.main[policy.id]:
-                support["政策条款"].append(self.main[policy.id])
-            support["续行"].extend(self.continuations[policy.id])
+            if self.main[id(policy)]:
+                support["政策条款"].append(self.main[id(policy)])
+            support["续行"].extend(self.continuations[id(policy)])
         for clause in self.reply.clauses:
-            if clause.id in self._unlocated_clauses:
-                continue
             use = "政策条款" if clause.kind == "正文" else clause.kind
             # 已列为待核的结构无效条款仍能说明已定位坐标的覆盖用途。
             spans = self._locate_all(clause.spans) if clause.id in self.invalid_clauses else self.clause_spans[clause.id]
@@ -327,31 +341,37 @@ class EvidenceReview:
                 if item.use == "待确认范围":
                     for gap in uncovered(span, declared_pending):
                         self.pending.append(self._inferred_range(gap, "unbound_pending_coverage"))
-            elif any(uncovered(span, support[item.use])):
-                self.pending.append(self._inferred_range(span, "unsupported_coverage_use"))
             else:
-                coverage.append(span)
+                supported = [part for item_span in support[item.use] if (part := intersect(span, item_span))]
+                coverage.extend(supported)
+                for gap in uncovered(span, supported):
+                    self.pending.append(self._inferred_range(gap, "unsupported_coverage_use"))
         for block in self.sources.blocks.values():
             if block.text:
                 span = Span(source_id=block.source_id, start=block.start, end=block.start + len(block.text))
                 if block.id not in described_blocks:
-                    self.pending.append(replace(self._inferred_range(span, "missing_block_coverage"), block_id=block.id))
+                    self.pending.append(ReviewRange(span, "missing_block_coverage", block_id=block.id))
                 for gap in uncovered(span, coverage):
                     self.pending.append(self._inferred_range(gap, "coverage_gap"))
 
     def _inferred_range(self, span: Span, code: str) -> ReviewRange:
         fields_by_policy = {}
         for policy in self.reply.policies:
-            names = self._fields_at(policy, span)
-            applicable = (*self.local[policy.id], *(
+            names = frozenset(
+                name for name in FIELD_IDS
+                if not any(uncovered(span, self._reference_spans(getattr(policy.fields, name))))
+            )
+            applicable = (*self.local[id(policy)], *(
                 part for clause in self.reply.clauses if policy.id in clause.policy_ids
                 for part in self.clause_spans[clause.id]
             ))
             if names or any(intersect(span, part) for part in applicable):
-                fields_by_policy[policy.id] = names
+                fields_by_policy[policy.id] = fields_by_policy.get(policy.id, frozenset()) | names
         return ReviewRange(span, code, tuple(fields_by_policy), fields_by_policy)
 
     def _pending_codes(self, policy: Policy, name: str) -> Iterable[str]:
+        if policy.id in self.duplicate_policy_ids:
+            return
         for pending in self.pending:
             if pending.affects_field(policy.id, name):
                 yield pending.code
@@ -362,6 +382,7 @@ class EvidenceReview:
         if (span is not None and clause is not None and clause.id not in self.invalid_clauses
             and policy.id in clause.policy_ids and name in clause.field_ids
             and (clause.kind != "前言" or name in ("start_date", "end_date"))
+            and (clause.scope != "局部" or self._local_clause_fits(policy, self.clause_spans[clause.id]))
             and not any(uncovered(self.sources.locate(span), self.clause_spans[clause.id]))):
             return quote.model_copy(update={"span": span})
         return None
@@ -370,8 +391,6 @@ class EvidenceReview:
         statement = getattr(policy.fields, name)
         codes = list(self._pending_codes(policy, name))
         quotes = list(_quotes(statement))
-        if any(quote.clause_id in self._unlocated_clauses for quote in quotes):
-            codes.append("invalid_clause")
         verified_quotes = [self.verified_quote(policy, name, quote) for quote in quotes]
         valid = tuple(q for q in verified_quotes[:len(statement.evidence)] if q is not None)
         if None in verified_quotes:
@@ -382,12 +401,10 @@ class EvidenceReview:
 
         status = statement.status
         if status is StatementStatus.UNWRITTEN:
-            if any(policy.id in clause.policy_ids and name in clause.field_ids
-                   for clause in self._unlocated_clauses.values()):
-                codes.append("invalid_clause")
             checked = self._locate_all(statement.checked)
-            applicable = [clause for clause in self.applicable[policy.id] if name in clause.field_ids]
-            required = (*self.local[policy.id], *(
+            applicable = [clause for clause in self.applicable[policy.id] if name in clause.field_ids
+                          and (clause.scope != "局部" or self._local_clause_fits(policy, self.clause_spans[clause.id]))]
+            required = (*self.local[id(policy)], *(
                 span for clause in applicable for span in self.clause_spans[clause.id]
             ))
             if (quotes or statement.candidates or statement.value is not None or not checked

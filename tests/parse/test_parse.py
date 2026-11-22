@@ -267,7 +267,10 @@ def test_unlocated_clause_quote_only_marks_fields_that_depend_on_it(text, outcom
     drafts = parse_fixed(body, document(body, [p], [c, other], coverage=[{"span": main, "use": "政策条款"}]))
     draft, = drafts
 
-    assert not drafts.pending
+    pending, = drafts.pending
+    assert (pending.code, pending.reason_code, pending.span) == ("invalid_clause", "unlocated_clause_quote", None)
+    assert pending.fields_by_policy == {"p1": {"trigger_once", "user_scope"}}
+    assert not drafts.requires_full_review
     assert drafts.evidence_locations == {"exact": 2, outcome: 1}
     assert draft.user_scope.value is None
     assert draft.to_dict()["field_results"][name]["program_status"] == "缺证据"
@@ -275,6 +278,21 @@ def test_unlocated_clause_quote_only_marks_fields_that_depend_on_it(text, outcom
     assert not draft.field_results["repeat_bonus"].needs_confirmation
     assert draft.trigger_once.value is None
     assert draft.field_results["trigger_once"].issues == ("invalid_clause",)
+
+
+def test_unlocated_clause_without_dependent_fields_requires_full_review():
+    body = "占位甲"
+    main = span(0, len(body))
+    p = policy("p1", main)
+    c = clause("c", [{**main, "text": "未找到的合成引文"}], [], ["p1"])
+    baseline = parse_fixed(body, document(body, [p]))
+    drafts = parse_fixed(body, document(body, [p], [c]))
+
+    pending, = drafts.pending
+    assert pending.code == "invalid_clause"
+    assert pending.span is None
+    assert drafts.requires_full_review
+    assert drafts[0].field_results == baseline[0].field_results
 
 
 @pytest.mark.parametrize("clause_start", [1, 2])
@@ -454,9 +472,13 @@ def test_invalid_shared_clause_only_marks_declared_or_referencing_fields(has_fie
     pending, = drafts.pending
     assert pending.code == "invalid_clause"
     assert pending.span.model_dump(exclude_none=True) == shared
-    assert pending.policy_ids == ("p1", "p2")
     expected_fields = {"trigger_once"} if has_field_links else set()
-    assert pending.fields_by_policy == {"p1": expected_fields, "p2": expected_fields}
+    expected_bindings = {"p1": expected_fields, "p2": expected_fields}
+    if has_field_links:
+        expected_bindings["p3"] = {"user_scope"}
+    assert pending.policy_ids == tuple(expected_bindings)
+    assert pending.fields_by_policy == expected_bindings
+    assert drafts.requires_full_review is not has_field_links
     assert all(draft.repeat_bonus.value == "是" for draft in drafts)
     for draft in (first_draft, second_draft):
         assert draft.field_results["trigger_once"].needs_confirmation is has_field_links
@@ -503,6 +525,86 @@ def test_local_remark_overlap_includes_full_clause_of_each_reference():
     assert pending.fields_by_policy == {"p1": {name}, "p2": {name}}
     assert all(draft.user_scope.value is None for draft in result)
     assert all(draft.repeat_bonus.value == "是" for draft in result)
+
+
+def test_local_remark_overlap_with_one_unbound_policy_requires_full_review():
+    body = "甲段乙段甲备注"
+    remark = span(4, 7)
+    name = "user_scope"
+    p1 = policy("p1", span(0, 2), {name: statement("确定", value="甲", evidence=[quote(body, "甲备注", "r")])},
+                continuations=[remark])
+    p2 = policy("p2", span(2, 4), continuations=[remark])
+    c = clause("r", [remark], [name], ["p1"], kind="备注")
+    result = parse_fixed(body, document(body, [p1, p2], [c]))
+
+    pending, = result.pending
+    assert pending.code == "local_remark_overlap"
+    assert pending.fields_by_policy == {"p1": {name}, "p2": set()}
+    assert result.requires_full_review
+    assert result[0].field_results[name].issues == ("local_remark_overlap",)
+    assert all(draft.repeat_bonus.value == "是" for draft in result)
+
+
+@pytest.mark.parametrize(("problem", "code", "reason"), [
+    ("main", "invalid_policy", "unlocated_policy_main"),
+    ("continuation", "invalid_policy", "unlocated_policy_continuation"),
+    ("shared", "invalid_policy", "invalid_policy_shared_clause_ids"),
+    ("overlap", "overlapping_policy_mains", None),
+    ("duplicate", "invalid_policy", "duplicate_policy_id"),
+])
+def test_policy_structure_findings_preserve_independent_fields(problem, code, reason):
+    body = "甲正文乙正文"
+    reply = fixed_reply(body, [
+        {"user_scope": {"value": "甲", "evidence": ["甲正文"]}},
+        {"user_scope": {"value": "乙", "evidence": ["乙正文"]}},
+    ], policy_ranges=[(0, 3), (3, 6)])
+    baseline = parse_fixed(body, reply)
+    first, second = reply["policies"]
+    if problem == "main":
+        first["main"] = {**first["main"], "text": "未找到的合成主段"}
+    elif problem == "continuation":
+        first["continuations"].append(span(6, 9))
+    elif problem == "shared":
+        first["shared_clause_ids"].append("missing-clause")
+    elif problem == "overlap":
+        first["main"] = span(0, 4)
+        for field in first["fields"].values():
+            if field["checked"]:
+                field["checked"] = [first["main"]]
+        baseline[0] = parse_fixed(body, document(body, [first], [reply["clauses"][0]]))[0]
+    else:
+        second["id"] = first["id"]
+        reply["clauses"][1]["policy_ids"] = [first["id"]]
+
+    result = parse_fixed(body, reply)
+
+    assert result.requires_full_review
+    assert {(item.code, item.reason_code) for item in result.pending} == {(code, reason)}
+    assert all(not item.fields_by_policy for item in result.pending)
+    assert [draft.field_results for draft in result] == [draft.field_results for draft in baseline]
+    assert [draft.source_span for draft in result] == [
+        None if problem == "main" else (0, 4) if problem == "overlap" else (0, 3), (3, 6),
+    ]
+
+
+@pytest.mark.parametrize("with_quote", [False, True])
+def test_pending_with_unlocated_coordinates_keeps_explicit_field_binding(with_quote):
+    body = "甲正文"
+    main = span(0, len(body))
+    location = span(len(body), len(body) + 1)
+    if with_quote:
+        location["text"] = "未找到的合成引文"
+    result = parse_fixed(body, document(body, [policy("p1", main)], pending=[{
+        "span": location, "reason_code": "fixture", "policy_ids": ["p1"],
+        "fields_by_policy": [{"policy_id": "p1", "field_ids": ["repeat_bonus"]}],
+    }]))
+
+    pending, = result.pending
+    assert pending.code == "invalid_pending_reference"
+    assert pending.span is None
+    assert not result.requires_full_review
+    assert result[0].field_results["repeat_bonus"].issues == ("invalid_pending_reference",)
+    assert result[0].trigger_once.value == "否"
 
 
 @pytest.mark.parametrize("coverage", ["gap", "bound", "policy_only", "mixed", "unbound", "all"])
@@ -557,7 +659,7 @@ def test_overlapping_input_blocks_each_require_coverage_description():
 
     body = "合成申请"
     extra = [SourceBlock(block_id, body[:3], "body") for block_id in ("part-a", "part-b")]
-    reply = document(body, [policy("p1", span(0, len(body)))])
+    reply = fixed_reply(body, [{"user_scope": {"value": "合成", "evidence": ["合成申"]}}])
     reply["coverage"].append({"span": span(0, 3, "part-a"), "use": "其他文本"})
 
     result = parse_fixed(body, reply, additional_blocks=extra)
@@ -565,13 +667,78 @@ def test_overlapping_input_blocks_each_require_coverage_description():
     assert pending.code == "missing_block_coverage"
     assert pending.block_id == "part-b"
     assert result.requires_full_review
-    assert pending.policy_ids == ("p1",)
+    assert not pending.policy_ids
+    assert result[0].user_scope.value == "合成"
     assert result[0].maintain_mutual_exclusion_group.value == "是"
 
     reply["coverage"].append({"span": span(0, 3, "part-b"), "use": "其他文本"})
     result = parse_fixed(body, reply, additional_blocks=extra)
     assert not result.pending
     assert result[0].maintain_mutual_exclusion_group.value == "是"
+
+
+@pytest.mark.parametrize("case", ["exact_gap", "overlap_only", "unsupported_use", "invalid_coverage"])
+def test_coverage_failure_only_follows_fields_with_complete_range_binding(case):
+    body = "甲主段甲注尾段"
+    main, remark, tail = span(0, 3), span(3, 5), span(5, 7)
+    p = policy("p1", main, {"user_scope": statement("确定", value="甲", evidence=[quote(body, "甲注", "r")])},
+               continuations=[remark])
+    c = clause("r", [remark], ["user_scope"], ["p1"], kind="备注")
+    coverage = [{"span": main, "use": "政策条款"}]
+    if case != "overlap_only":
+        coverage.append({"span": tail, "use": "其他文本"})
+    if case == "unsupported_use":
+        coverage[0] = {"span": span(0, 5), "use": "政策条款"}
+    if case == "invalid_coverage":
+        coverage.extend([{"span": remark, "use": "备注"}, {"span": span(7, 8), "use": "其他文本"}])
+    result = parse_fixed(body, document(body, [p], [c], coverage=coverage))
+
+    scoped = case in ("exact_gap", "unsupported_use")
+    assert result.requires_full_review is not scoped
+    expected_codes = {
+        "exact_gap": ["coverage_gap"],
+        "overlap_only": ["coverage_gap"],
+        "unsupported_use": ["unsupported_coverage_use", "coverage_gap"],
+        "invalid_coverage": ["invalid_coverage"],
+    }
+    assert [item.code for item in result.pending] == expected_codes[case]
+    assert result[0].user_scope.value == (None if scoped else "甲")
+    assert result[0].repeat_bonus.value == "是"
+    if scoped:
+        assert all(item.span.model_dump(exclude_none=True) == remark for item in result.pending)
+
+
+def test_failed_quote_does_not_downgrade_another_field_using_same_clause():
+    body = "甲主段"
+    main = span(0, len(body))
+    p = policy("p1", main, {
+        "user_scope": statement("确定", value="甲", evidence=[quote(body, "未找到的合成引文", "c")]),
+        "repeat_bonus": statement("确定", value="否", evidence=[quote(body, "甲主段", "c")]),
+    })
+    c = clause("c", [main], ["user_scope", "repeat_bonus"], ["p1"])
+    result = parse_fixed(body, document(body, [p], [c]))
+
+    assert not result.pending
+    assert "invalid_evidence" in result[0].field_results["user_scope"].issues
+    assert result[0].repeat_bonus.value == "否"
+
+
+def test_field_review_preserves_only_product_defined_derivations():
+    body = "占位甲"
+    reply = fixed_reply(body, [{"user_tags": {"value": [body], "evidence": [body]}}])
+    baseline, = parse_fixed(body, reply)
+    reply["pending"] = [{
+        "span": span(0, len(body)), "reason_code": "fixture", "policy_ids": ["p1"],
+        "fields_by_policy": [{"policy_id": "p1", "field_ids": ["user_tags"]}],
+    }]
+    result = parse_fixed(body, reply)
+
+    assert not result.requires_full_review
+    assert baseline.policy_name.value == body
+    assert baseline.policy_type.value == "定向政策"
+    assert {name for name, field in result[0].field_results.items() if field != baseline.field_results[name]} == {
+        "user_tags", "policy_type", "policy_name",
+    }
 
 
 def test_policy_type_candidates_retain_their_own_evidence():
