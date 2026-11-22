@@ -22,6 +22,12 @@ DOCUMENT_RESULTS = ("parsed", "model_failed", "parse_failed")
 DRAFT_RESULTS = ("unplaced", "unselected", "extra", "unclassified", "ambiguous")
 APPROVAL_FIELDS = ("approval_url", "approval_attachments")
 NEW_FIELD_RESULTS = ("determined", "uncertain", "missing", "unaligned")
+EVIDENCE_LOCATION_LABELS = {
+    "exact": "模型坐标原样正确",
+    "relocated": "程序重新定位",
+    "ambiguous": "多处不可分",
+    "not_found": "引文不存在",
+}
 
 
 class IncompleteReply(ParseError):
@@ -130,6 +136,16 @@ def _rate_counts(counts: Counter) -> dict:
     }
 
 
+def _evidence_location_report(counts: Counter) -> dict:
+    total = sum(counts[key] for key in EVIDENCE_LOCATION_LABELS)
+    located = counts["exact"] + counts["relocated"]
+    return {
+        "numerator": located, "denominator": total,
+        "percent": round(100 * located / total, 2) if total else None,
+        "counts": {key: counts[key] for key in EVIDENCE_LOCATION_LABELS},
+    }
+
+
 def _new_field_status(draft, name: str) -> str:
     if draft is None:
         return "unaligned"
@@ -188,6 +204,7 @@ def evaluate(
     }, company_table=company_rules.table if company_rules is not None else None,
         country_names=company_rules.countries if company_rules is not None else None)
     business_details = []
+    evidence_locations = Counter()
     reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
     reply_failed_documents = 0
 
@@ -229,11 +246,14 @@ def evaluate(
             raise
         else:
             status = "parsed"
+        location_counts = Counter(getattr(drafts, "evidence_locations", {}))
+        evidence_locations.update(location_counts)
         failure_reasons = set()
         if status == "parse_failed" and received:
             failure_reasons.add(reply_failure)
         if recording is not None and recording.finish(
             token, status, received, code=failure_code, path=failure_path,
+            evidence_location=_evidence_location_report(location_counts),
         ):
             failure_reasons.add("reply_truncated")
         reply_failed_documents += bool(failure_reasons)
@@ -296,6 +316,7 @@ def evaluate(
         "samples": len(samples),
         "strata": frozen["strata"],
         "documents": {key: documents[key] for key in DOCUMENT_RESULTS},
+        "evidence_location": _evidence_location_report(evidence_locations),
         "sample_alignment": {key: alignments[key] for key in ALIGNMENTS},
         "draft_alignment": {key: draft_counts[key] for key in DRAFT_RESULTS},
         "by_field": {name: _rate_counts(field_counts[name]) for name in eligible},
@@ -332,15 +353,22 @@ def evaluate(
 def markdown_report(report: dict) -> bytes:
     failures = report["business"]["reply_parse_failure_reasons"]
     breakdown = f"（截断 {failures['reply_truncated']}，其他未完整结束 {failures['reply_incomplete']}，解码或解析 {failures['reply_parse']}）"
+    locations = report["evidence_location"]
+    percent = locations["percent"]
+    rate = f"{percent:.2f}%" if percent is not None else "不可判定"
+    location_lines = [
+        f"- 证据定位成功率 {locations['numerator']}/{locations['denominator']}（{rate}）",
+        *(f"- {label} {locations['counts'][key]}" for key, label in EVIDENCE_LOCATION_LABELS.items()),
+    ]
     if report.get("void"):
-        return (
-            "# 解析回归计数\n\n"
-            f"- 冻结指纹 `{report['freeze_sha256']}`\n"
-            f"- 运行配置指纹 `{report['configuration_sha256']}`\n"
-            f"- 模型调用失败 {report['documents']['model_failed']} 篇\n"
-            f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}\n\n"
-            "本次放行运行作废。\n"
-        ).encode()
+        return "\n".join([
+            "# 解析回归计数", "",
+            f"- 冻结指纹 `{report['freeze_sha256']}`",
+            f"- 运行配置指纹 `{report['configuration_sha256']}`",
+            f"- 模型调用失败 {report['documents']['model_failed']} 篇",
+            f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}",
+            *location_lines, "", "本次放行运行作废。", "",
+        ]).encode()
 
     def lines(title, data):
         yield f"## {title}"
@@ -361,6 +389,7 @@ def markdown_report(report: dict) -> bytes:
         f"- 样例 {report['samples']} 条",
         f"- 原稿解析完成 {report['documents']['parsed']} 篇，模型调用失败 {report['documents']['model_failed']} 篇，"
         f"回复解析失败 {report['documents']['parse_failed']} 篇",
+        *location_lines,
         f"- 唯一对齐 {report['sample_alignment']['matched']} 条，未对齐 {report['sample_alignment']['unmatched']} 条，"
         f"歧义 {report['sample_alignment']['ambiguous']} 条", "",
         "## 分层配额与缺口", "",

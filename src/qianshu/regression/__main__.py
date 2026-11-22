@@ -162,7 +162,9 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         void = release and recording.unfinished_calls
         if void:
             reasons = report["business"]["reply_parse_failure_reasons"]
-            report = {key: report[key] for key in ("freeze_sha256", "rules_sha256", "samples", "documents")}
+            report = {key: report[key] for key in (
+                "freeze_sha256", "rules_sha256", "samples", "documents", "evidence_location",
+            )}
             report["business"] = {
                 "counts": {"reply_parse_failed": counts["reply_parse_failed"]},
                 "reply_parse_failure_reasons": reasons,

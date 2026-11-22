@@ -5,6 +5,7 @@ from enum import StrEnum
 from typing import Annotated, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
+from pydantic.json_schema import SkipJsonSchema
 
 from qianshu.draft import YesNo
 
@@ -47,6 +48,8 @@ class Span(Declaration, frozen=True):
     source_id: Identifier
     start: int
     end: int
+    # 解析端接受带引文的范围，保持发给模型的 schema 不变。
+    text: SkipJsonSchema[str | None] = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class Evidence(Declaration):

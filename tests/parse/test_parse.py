@@ -156,6 +156,148 @@ def parse_fixed(body, reply, **options):
     return parse_application(body, model=lambda **_: json.dumps(reply, ensure_ascii=False), **options)
 
 
+@pytest.mark.parametrize(("text", "start", "end", "expected", "outcome"), [
+    ("🧪甲", 1, 3, 1, "exact"),
+    ("🧪甲", 1, 2, 1, "relocated"),
+    ("首", 1, 2, 0, "relocated"),
+    ("首", 100, 99, 0, "relocated"),
+    ("🧪甲", 6, 8, 5, "relocated"),
+    ("🧪甲", 3, 5, None, "ambiguous"),
+    ("占位缺失", 1, 5, None, "not_found"),
+])
+def test_quote_location_uses_nearest_unicode_start(text, start, end, expected, outcome):
+    body = "首🧪甲中间🧪甲尾乙段"
+    main = span(0, 8)
+    name = "user_scope"
+    q = {"clause_id": "c", "span": span(start, end), "text": text}
+    p = policy("p1", main, {name: statement("确定", value="占位用户", evidence=[q])})
+    c = clause("c", [main], [name], ["p1"])
+    drafts = parse_fixed(body, document(body, [p, policy("p2", span(8, len(body)))], [c]))
+    first, second = drafts
+    assert not drafts.pending
+    assert drafts.evidence_locations == {outcome: 1}
+    assert first.field_results[name].statement.evidence[0].span.start == start
+    if expected is None:
+        assert first.user_scope.value is None
+        assert first.to_dict()["field_results"][name]["program_status"] == "缺证据"
+        assert not first.user_scope.evidence
+    else:
+        assert first.user_scope.value == "占位用户"
+        assert first.user_scope.evidence[0].start == expected
+        assert first.source_evidence_spans == ((expected, expected + len(text)),)
+    assert first.repeat_bonus.value == second.repeat_bonus.value == "是"
+
+
+def test_quoted_ranges_are_corrected_before_overlap_and_coverage_checks():
+    body = "甲主段乙主段"
+    first = {**span(1, 4), "text": "甲主段"}
+    second = span(3, 6)
+    clause_range = {**span(5, 6), "text": "甲主段"}
+    checked = {**span(2, 5), "text": "甲主段"}
+    coverage = {**span(2, 8), "text": body}
+    q = {"clause_id": "c", "span": span(1, 2), "text": "甲"}
+    p = policy("p1", first, {"user_scope": statement("确定", value="甲", evidence=[q])}, checked=[checked])
+    c = clause("c", [clause_range], ["user_scope"], ["p1"])
+    drafts = parse_fixed(body, document(body, [p, policy("p2", second)], [c],
+                                         coverage=[{"span": coverage, "use": "政策条款"}]))
+    first, second = drafts
+    assert not drafts.pending
+    assert drafts.evidence_locations == {"relocated": len(p["fields"]) + 3}
+    assert first.user_scope.value == "甲"
+    assert first.scope["main"] == span(0, 3)
+    assert first.scope["clauses"][0]["spans"] == [span(0, 3)]
+    assert first.source_span == (0, 3)
+    assert first.repeat_bonus.value == second.repeat_bonus.value == "是"
+
+
+def test_nearest_quote_outside_clause_does_not_fall_back_to_in_scope_occurrence():
+    body = "引文甲段乙段引文"
+    main = span(0, 4)
+    p = policy("p1", main, {"user_scope": statement("确定", value="甲", evidence=[
+        {"clause_id": "c", "span": span(5, 7), "text": "引文"},
+    ])})
+    c = clause("c", [main], ["user_scope"], ["p1"])
+    drafts = parse_fixed(body, document(body, [p], [c]))
+    assert drafts.evidence_locations == {"relocated": 1}
+    assert drafts[0].user_scope.value is None
+
+
+def test_tied_quote_in_another_policy_remark_does_not_add_a_scope_conflict():
+    body = "甲段备注乙段备注"
+    first, second, remark = span(0, 4), span(4, 8), span(2, 4)
+    name = "user_scope"
+    q = quote(body, "备注", "c")
+    p1 = policy("p1", first, {name: statement("确定", value="甲", evidence=[q])})
+    p2 = policy("p2", second, {name: statement("确定", value="乙", evidence=[{**q, "span": span(4, 6)}])})
+    c = clause("c", [{**remark, "start": 1, "text": "备注"}], [name], ["p1"], kind="备注")
+    drafts = parse_fixed(body, document(body, [p1, p2], [c]))
+    assert not drafts.pending
+    assert drafts[0].user_scope.value == "甲"
+    assert drafts[1].user_scope.value is None
+    assert drafts[1].field_results[name].issues == ("invalid_evidence", "invalid_certain_evidence")
+    assert drafts[0].repeat_bonus.value == drafts[1].repeat_bonus.value == "是"
+
+
+def test_tied_full_clause_quote_only_marks_its_bound_field():
+    body = "甲注中间甲注"
+    main = span(0, len(body))
+    name = "user_scope"
+    p = policy("p1", main, {name: statement("确定", value="甲", evidence=[quote(body, "甲注", "c")])})
+    c = clause("c", [{**span(2, 4), "text": "甲注"}], [name], ["p1"])
+    drafts = parse_fixed(body, document(body, [p], [c]))
+    assert not drafts.pending
+    assert drafts.evidence_locations == {"exact": 1, "ambiguous": 1}
+    assert drafts[0].user_scope.value is None
+    assert "invalid_clause" in drafts[0].field_results[name].issues
+    assert drafts[0].repeat_bonus.value == "是"
+
+
+def test_tied_checked_range_blocks_only_its_fields_default():
+    body = "甲注中间甲注"
+    main = span(0, len(body))
+    name = "repeat_bonus"
+    checked = {**span(2, 4), "text": "甲注"}
+    p = policy("p1", main, {name: statement("原文未写", checked=[checked])})
+    drafts = parse_fixed(body, document(body, [p]))
+    assert not drafts.pending
+    assert drafts.evidence_locations == {"ambiguous": 1}
+    assert drafts[0].field_results[name].issues == ("invalid_checked_range",)
+    assert drafts[0].repeat_bonus.value is None
+    assert drafts[0].trigger_once.value == "否"
+
+
+def test_quoted_pending_and_coverage_ranges_use_corrected_coordinates():
+    body = "甲段待确认"
+    main = span(0, 2)
+    covered = {**span(0, 3), "text": "待确认"}
+    pending = {**span(1, 4), "text": "待确认"}
+    drafts = parse_fixed(body, document(body, [policy("p1", main)], coverage=[
+        {"span": main, "use": "政策条款"}, {"span": covered, "use": "待确认范围"},
+    ], pending=[{
+        "span": pending, "reason_code": "fixture", "policy_ids": ["p1"],
+        "fields_by_policy": [{"policy_id": "p1", "field_ids": ["user_scope"]}],
+    }]))
+    review, = drafts.pending
+    assert review.code == "declared_pending"
+    assert (review.span.start, review.span.end) == (2, 5)
+    assert drafts.evidence_locations == {"relocated": 2}
+    assert drafts[0].field_results["user_scope"].issues == ("declared_pending",)
+    assert drafts[0].repeat_bonus.value == "是"
+
+
+def test_candidate_evidence_projects_corrected_coordinates():
+    body = "引文甲"
+    main = span(0, len(body))
+    name = "user_scope"
+    candidate = {"value": "甲", "evidence": [{"clause_id": "c", "span": span(4, 6), "text": "引文"}]}
+    p = policy("p1", main, {name: statement("歧义", candidates=[candidate])})
+    c = clause("c", [main], [name], ["p1"])
+    drafts = parse_fixed(body, document(body, [p], [c]))
+    assert drafts.evidence_locations == {"relocated": 1}
+    assert drafts[0].user_scope.value is None
+    assert drafts[0].user_scope.uncertainty.candidates[0].evidence[0].start == 0
+
+
 def test_six_synthetic_policies_match_manual_expectations(application, recorded_reply):
     drafts = parse_fixed(application, json.loads(recorded_reply))
     assert len(drafts) == 6
@@ -248,7 +390,7 @@ def test_non_effective_or_uncertain_clause_keeps_field_pending(status, dispositi
 def test_local_remark_overlap_marks_both_policies_and_keeps_other_fields():
     body = "甲主段乙主段备注"
     first, second, remark = span(0, 3), span(3, 6), span(6, 8)
-    q = quote(body, "备注", "r")
+    q = {**quote(body, "备注", "r"), "span": span(0, 2)}
     p1 = policy("p1", first, {"user_scope": statement("确定", value="甲", evidence=[q])}, continuations=[remark])
     p2 = policy("p2", second, {"user_scope": statement("确定", value="乙", evidence=[q])})
     c = clause("r", [remark], ["user_scope"], ["p1"], kind="备注")
@@ -351,7 +493,8 @@ def test_attachment_coordinates_map_to_source_and_remain_exact(valid):
     body, attachment = "合成申请", "🙂占位用户"
     main = span(0, len(body))
     location = span(1, len(attachment), "a-part")
-    excerpt = {"clause_id": "a", "span": location, "text": "占位用户" if valid else "占位"}
+    excerpt = {"clause_id": "a", "span": span(0, len(attachment) - 1, "a-part"),
+               "text": "占位用户" if valid else "占位缺失"}
     p = policy("p1", main, {"user_scope": statement("确定", value="占位", evidence=[excerpt])}, continuations=[location])
     c = clause("a", [location], ["user_scope"], ["p1"], kind="续行")
     declared = [{"span": main, "use": "政策条款"},
@@ -360,6 +503,10 @@ def test_attachment_coordinates_map_to_source_and_remain_exact(valid):
                          additional_blocks=[SourceBlock("a-part", attachment, "attachment", 10)])
     assert not drafts.pending
     assert drafts[0].user_scope.value == ("占位" if valid else None)
+    assert drafts.evidence_locations == ({"relocated": 1} if valid else {"not_found": 1})
+    if valid:
+        assert drafts[0].field_results["user_scope"].evidence[0].span.start == 1
+        assert drafts[0].user_scope.evidence[0].start is None
 
 
 @pytest.mark.parametrize("status", ["经检查无政策", "可能有政策但无法切分", "材料不足"])

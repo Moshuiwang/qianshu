@@ -1183,8 +1183,16 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         monkeypatch.delenv(key, raising=False)
 
     attempts = Counter()
+    batch = fixed_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST, "占位正文甲", "包", "占位缺失引文"]}}])
+    _, shifted, tied, _ = batch["policies"][0]["fields"]["country"]["evidence"]
+    shifted["span"]["start"] += 1
+    tied["span"]["start"] = (BATCH.index("包") + BATCH.rindex("包")) // 2
+    expected_locations = {
+        "numerator": 2, "denominator": 4, "percent": 50.0,
+        "counts": {"exact": 1, "relocated": 1, "ambiguous": 1, "not_found": 1},
+    }
     responses = {
-        BATCH: shaped_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST]}}]),
+        BATCH: json.dumps(batch, ensure_ascii=False),
         "占位单条原稿\n": "占位无效回包",
     }
 
@@ -1228,6 +1236,11 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         }
         assert final["reply"] in responses.values()
         assert record["failure_stage"] == ("reply_parse" if final["reply"] == responses["占位单条原稿\n"] else None)
+        if record["failure_stage"] == "reply_parse":
+            assert record["evidence_location"]["denominator"] == 0
+            assert record["evidence_location"]["percent"] is None
+        else:
+            assert record["evidence_location"] == expected_locations
         assert "占位保密失败详情" not in path.read_text()
         assert path.stat().st_mode & 0o777 == 0o600
 
@@ -1239,13 +1252,17 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
     for name in runner.RUN_FILES:
         assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
     report = get_json(repo / "run" / "public-report.json")
+    assert report["evidence_location"] == expected_locations
     assert report["business"]["counts"]["reply_parse_failed"] == 1
     assert report["documents"]["parse_failed"] == 1 and report["void"] is False
     assert report["usage"]["input_tokens"] == {"captured_attempts": 2, "total": 24}
     assert report["usage"]["elapsed_ms"] == {"captured_attempts": 4, "total": 54}
     public = (repo / "run" / "public-report.md").read_text() + (repo / "run" / "public-report.json").read_text()
     assert "唯一对齐" in public and "可比字段全对率" in public
-    for private in ("占位无效回包", "占位保密失败详情", "synthetic-model"):
+    assert "证据定位成功率 2/4（50.00%）" in public
+    for label in ("模型坐标原样正确", "程序重新定位", "多处不可分", "引文不存在"):
+        assert f"{label} 1" in public
+    for private in ("占位无效回包", "占位保密失败详情", "占位缺失引文", FIRST, "synthetic-model"):
         assert private not in public + capsys.readouterr().err
 
     name = next(iter(recording["artifact_sha256"]))

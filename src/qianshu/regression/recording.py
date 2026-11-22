@@ -201,7 +201,7 @@ class Recording:
 
     def finish(
         self, token: str, status: str, received: bool, *,
-        code: str | None = None, path: tuple = (),
+        code: str | None = None, path: tuple = (), evidence_location: dict | None = None,
     ) -> bool:
         """写入本篇录制，返回是否有传输中断造成的截断。"""
         attempts = self.document["attempts"]
@@ -217,7 +217,7 @@ class Recording:
         record = {
             **self.document, "run_id": self.run_id, "configuration": self.config,
             "model": self.model_id, "failure_stage": failure, "protocol_version": PROTOCOL_VERSION,
-            "reason_code": code, "structure_path": path,
+            "reason_code": code, "structure_path": path, "evidence_location": evidence_location,
         }
         name = self.names[token]
         raw = json_bytes(record)

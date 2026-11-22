@@ -3,7 +3,7 @@
 from collections import Counter, defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from itertools import combinations
+from itertools import chain, combinations
 
 from .protocol import (
     ApplicationReply, Clause, DocumentStatus, Evidence, FieldResult, Finding, Findings,
@@ -46,9 +46,27 @@ class Sources:
             return None
         return Span(source_id=block.source_id, start=block.start + span.start, end=block.start + span.end)
 
-    def matches(self, excerpt: Evidence) -> bool:
-        span = excerpt.span
-        return self.locate(span) is not None and self.blocks[span.source_id].text[span.start:span.end] == excerpt.text
+    def locate_quote(self, span: Span, text: str) -> tuple[Span | None, str]:
+        block = self.blocks.get(span.source_id)
+        if block is None or not text:
+            return None, "not_found"
+        start = block.text.find(text)
+        if start < 0:
+            return None, "not_found"
+        nearest = start
+        tied = False
+        while (start := block.text.find(text, start + 1)) >= 0:
+            distance = abs(start - span.start)
+            best = abs(nearest - span.start)
+            if distance < best:
+                nearest, tied = start, False
+            elif distance == best:
+                tied = True
+        if tied:
+            return None, "ambiguous"
+        end = nearest + len(text)
+        outcome = "exact" if (nearest, end) == (span.start, span.end) else "relocated"
+        return Span(source_id=span.source_id, start=nearest, end=end), outcome
 
 
 def intersect(left: Span | None, right: Span | None) -> Span | None:
@@ -101,18 +119,47 @@ def _quotes(statement: Finding) -> Iterable[Evidence]:
         yield from candidate.evidence
 
 
+def _declared_quotes(reply: ApplicationReply) -> Iterable[tuple[Span, str]]:
+    for policy in reply.policies:
+        for span in (policy.main, *policy.continuations):
+            if span.text is not None:
+                yield span, span.text
+        for name in policy.fields.__class__.model_fields:
+            statement = getattr(policy.fields, name)
+            for quote in _quotes(statement):
+                yield quote.span, quote.text
+            for span in statement.checked:
+                if span.text is not None:
+                    yield span, span.text
+    for span in chain(
+        (span for clause in reply.clauses for span in clause.spans),
+        (item.span for item in reply.coverage),
+        (item.span for item in reply.pending),
+    ):
+        if span.text is not None:
+            yield span, span.text
+
+
 class EvidenceReview:
     """核对坐标和模型声明，并按声明关联待确认字段。"""
 
     def __init__(self, reply: ApplicationReply, sources: Sources):
         self.reply = reply
         self.sources = sources
+        self.evidence_locations: Counter[str] = Counter()
+        self._locations: dict[tuple[Span, str], tuple[Span | None, str]] = {}
+        for span, text in _declared_quotes(reply):
+            key = span, text
+            if key not in self._locations:
+                self._locations[key] = sources.locate_quote(span, text)
+            self.evidence_locations[self._locations[key][1]] += 1
         self.pending: list[ReviewRange] = []
+        self._unlocated_clause_fields: dict[str, set[str]] = defaultdict(set)
         self.policies = {policy.id: policy for policy in reply.policies}
         self.clauses = {clause.id: clause for clause in reply.clauses}
         self.invalid_policies = {key for key, count in Counter(p.id for p in reply.policies).items() if count > 1}
         self.invalid_clauses = {key for key, count in Counter(c.id for c in reply.clauses).items() if count > 1}
-        self.main = {p.id: sources.locate(p.main) for p in reply.policies}
+        self.main = {p.id: self._locate(p.main) for p in reply.policies}
         self.continuations = {p.id: self._locate_all(p.continuations) for p in reply.policies}
         self.local = {p.id: tuple(filter(None, (self.main[p.id], *self.continuations[p.id])))
                       for p in reply.policies}
@@ -121,14 +168,16 @@ class EvidenceReview:
         self._check_structure()
         self._check_coverage()
         for pending in reply.pending:
-            span = self.sources.locate(pending.span)
+            span = self._locate(pending.span)
             by_policy = {item.policy_id: frozenset(item.field_ids) for item in pending.fields_by_policy}
-            if (span is None or set(pending.policy_ids) - self.policies.keys()
+            if (set(pending.policy_ids) - self.policies.keys()
                 or len(by_policy) != len(pending.fields_by_policy) or set(by_policy) - set(pending.policy_ids)
-                or any(ids - FIELD_IDS for ids in by_policy.values())):
+                or any(ids - FIELD_IDS for ids in by_policy.values())
+                or (span is None and pending.span.text is None)):
                 self.pending.append(ReviewRange(span, "invalid_pending_reference"))
             else:
-                self.pending.append(ReviewRange(span, "declared_pending", tuple(pending.policy_ids), by_policy))
+                code = "declared_pending" if span is not None else "invalid_pending_reference"
+                self.pending.append(ReviewRange(span, code, tuple(pending.policy_ids), by_policy))
         if reply.document and reply.document.status is not DocumentStatus.NO_POLICY:
             self.pending.append(ReviewRange(None, "document_pending"))
         unique = dict.fromkeys(
@@ -140,8 +189,15 @@ class EvidenceReview:
             for span, code, ids, by_policy, block_id in unique
         ]
 
-    def _locate_all(self, spans: list[Span]) -> tuple[Span, ...]:
-        return tuple(located for span in spans if (located := self.sources.locate(span)) is not None)
+    def corrected_span(self, span: Span) -> Span | None:
+        return span if span.text is None else self._locations[span, span.text][0]
+
+    def _locate(self, span: Span) -> Span | None:
+        corrected = self.corrected_span(span)
+        return self.sources.locate(corrected) if corrected is not None else None
+
+    def _locate_all(self, spans: Iterable[Span]) -> tuple[Span, ...]:
+        return tuple(located for span in spans if (located := self._locate(span)) is not None)
 
     def _check_structure(self) -> None:
         for policy in self.reply.policies:
@@ -163,7 +219,8 @@ class EvidenceReview:
             spans = self.clause_spans[clause.id]
             ids = set(clause.policy_ids)
             invalid = (
-                clause.id in self.invalid_clauses or not spans or len(spans) != len(clause.spans)
+                clause.id in self.invalid_clauses or not clause.spans
+                or any(span.text is None and self.sources.locate(span) is None for span in clause.spans)
                 or not ids or len(ids) != len(clause.policy_ids) or bool(ids - self.policies.keys())
                 or bool(set(clause.field_ids) - FIELD_IDS)
             )
@@ -176,13 +233,19 @@ class EvidenceReview:
             if (clause.kind == "备注" and clause.scope == "局部" and len(clause.policy_ids) == 1
                 and clause.policy_ids[0] in self.policies):
                 self._check_remark(clause)
-            if invalid:
+            if invalid or len(spans) != len(clause.spans):
                 self.invalid_clauses.add(clause.id)
                 bound = tuple(sorted((ids | references[clause.id]) & self.policies.keys()))
-                self.pending.append(ReviewRange(spans[0] if spans else None, "invalid_clause", bound))
+                # 引文无法定位时，已有明确绑定的条款只影响其声明字段。
+                if not invalid and clause.field_ids:
+                    for policy_id in bound:
+                        self._unlocated_clause_fields[policy_id].update(clause.field_ids)
+                else:
+                    self.pending.append(ReviewRange(spans[0] if spans else None, "invalid_clause", bound))
                 continue
+            corrected = clause.model_copy(update={"spans": [self.corrected_span(span) for span in clause.spans]})
             for policy_id in clause.policy_ids:
-                self.applicable[policy_id].append(clause)
+                self.applicable[policy_id].append(corrected)
 
     def _check_remark(self, clause: Clause) -> None:
         owner = clause.policy_ids[0]
@@ -201,9 +264,9 @@ class EvidenceReview:
 
     def _reference_spans(self, statement: Finding) -> Iterable[Span]:
         for quote in _quotes(statement):
-            if location := self.sources.locate(quote.span):
-                yield location
-            yield from self.clause_spans.get(quote.clause_id, ())
+            if span := self._locations[quote.span, quote.text][0]:
+                yield self.sources.locate(span)
+                yield from self.clause_spans.get(quote.clause_id, ())
 
     def _fields_at(self, policy: Policy, span: Span) -> frozenset[str]:
         return frozenset(
@@ -224,9 +287,9 @@ class EvidenceReview:
 
         coverage = []
         described_blocks = set()
-        declared_pending = self._locate_all([pending.span for pending in self.reply.pending])
+        declared_pending = self._locate_all(pending.span for pending in self.reply.pending)
         for item in self.reply.coverage:
-            span = self.sources.locate(item.span)
+            span = self._locate(item.span)
             if span is None:
                 self.pending.append(ReviewRange(None, "invalid_coverage"))
                 continue
@@ -269,20 +332,25 @@ class EvidenceReview:
                 if not names or name in names:
                     yield pending.code
 
-    def quote_valid(self, policy: Policy, name: str, quote: Evidence) -> bool:
+    def verified_quote(self, policy: Policy, name: str, quote: Evidence) -> Evidence | None:
+        span = self._locations[quote.span, quote.text][0]
         clause = self.clauses.get(quote.clause_id)
-        return (clause is not None and clause.id not in self.invalid_clauses
-                and policy.id in clause.policy_ids and name in clause.field_ids
-                and (clause.kind != "前言" or name in ("start_date", "end_date"))
-                and self.sources.matches(quote)
-                and not any(uncovered(self.sources.locate(quote.span), self.clause_spans[clause.id])))
+        if (span is not None and clause is not None and clause.id not in self.invalid_clauses
+            and policy.id in clause.policy_ids and name in clause.field_ids
+            and (clause.kind != "前言" or name in ("start_date", "end_date"))
+            and not any(uncovered(self.sources.locate(span), self.clause_spans[clause.id]))):
+            return quote.model_copy(update={"span": span})
+        return None
 
     def field(self, policy: Policy, name: str) -> FieldResult:
         statement = getattr(policy.fields, name)
         codes = list(self._pending_codes(policy, name))
+        if name in self._unlocated_clause_fields.get(policy.id, ()):
+            codes.append("invalid_clause")
         quotes = list(_quotes(statement))
-        valid = tuple(q for q in statement.evidence if self.quote_valid(policy, name, q))
-        if len(valid) != len(statement.evidence) or any(not self.quote_valid(policy, name, q) for q in quotes):
+        verified_quotes = [self.verified_quote(policy, name, quote) for quote in quotes]
+        valid = tuple(q for q in verified_quotes[:len(statement.evidence)] if q is not None)
+        if None in verified_quotes:
             codes.append("invalid_evidence")
         if any(self.clauses[q.clause_id].status != "确定" or self.clauses[q.clause_id].disposition != "生效"
                for q in quotes if q.clause_id in self.clauses):

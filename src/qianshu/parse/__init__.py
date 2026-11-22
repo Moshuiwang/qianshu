@@ -87,12 +87,13 @@ class ParseResult(list[ParsedPolicyDraft]):
     def __init__(
         self, drafts: Iterable[ParsedPolicyDraft] = (), *,
         pending: Iterable[ReviewRange] = (), document: DocumentFinding | None = None,
-        declaration: ApplicationReply | None = None,
+        declaration: ApplicationReply | None = None, evidence_locations: Mapping[str, int] | None = None,
     ):
         super().__init__(drafts)
         self.pending = tuple(pending)
         self.document = document
         self.declaration = declaration
+        self.evidence_locations = dict(evidence_locations or {})
 
 
 def parse_application(
@@ -153,7 +154,8 @@ def parse_application(
     parsed = _decode(reply)
     review = EvidenceReview(parsed, sources)
     drafts = [_draft(policy, review, company_rules, options) for policy in parsed.policies]
-    return ParseResult(drafts, pending=review.pending, document=parsed.document, declaration=parsed)
+    return ParseResult(drafts, pending=review.pending, document=parsed.document, declaration=parsed,
+                       evidence_locations=review.evidence_locations)
 
 
 def _decode(reply: str) -> ApplicationReply:
@@ -238,8 +240,12 @@ def _draft(
         for field in fields(PolicyDraft)
     })
     draft.policy_id = policy.id
+    corrected = policy.model_copy(update={
+        "main": review.corrected_span(policy.main) or policy.main,
+        "continuations": [review.corrected_span(span) or span for span in policy.continuations],
+    })
     draft.scope = {
-        **policy.model_dump(mode="json", exclude={"fields"}),
+        **corrected.model_dump(mode="json", exclude={"fields"}),
         "clauses": [clause.model_dump(mode="json") for clause in review.applicable[policy.id]],
     }
     draft.hints = hints
@@ -271,10 +277,9 @@ def _project(results: dict[str, FieldResult], name: str, policy, review: Evidenc
     statement: Finding = result.statement
     for candidate in statement.candidates:
         value = _normalized_value(name, candidate.value, options)
-        if value is not None and candidate.evidence and all(
-            review.quote_valid(policy, name, quote) for quote in candidate.evidence
-        ):
-            candidates.append(Candidate(value=value, evidence=[_excerpt(q, review.sources) for q in candidate.evidence]))
+        verified = [review.verified_quote(policy, name, quote) for quote in candidate.evidence]
+        if value is not None and verified and None not in verified:
+            candidates.append(Candidate(value=value, evidence=[_excerpt(q, review.sources) for q in verified]))
     if statement.value is not None and evidence:
         value = _normalized_value(name, statement.value, options)
         if value is not None:
