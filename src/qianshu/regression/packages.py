@@ -3,9 +3,9 @@
 from collections import Counter, defaultdict
 from pathlib import Path
 
-from .compare import BENEFIT_TYPES, POLICY_TYPES, normalize
-from .corpus import PAIRS, document_body, identifier, table
-from .freeze import _check_business, _check_spans, check_excluded, write_snapshot
+from .compare import normalize
+from .corpus import DOCUMENTS, document_body
+from .freeze import _check_business, _check_spans, check_excluded, load_current_plan, write_snapshot
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
 
 MENTIONS = {
@@ -16,10 +16,12 @@ MENTIONS = {
 
 
 def freeze_packages(
-    files: PrivateFiles, corpus: Path, review: Path, companies_path: Path, destination: Path,
+    files: PrivateFiles, corpus: Path, plan_path: Path, review: Path, companies_path: Path, destination: Path,
     *, exclusions: dict,
 ) -> str:
-    sources = {}
+    plan, plan_checksum = load_current_plan(files, corpus, plan_path, "packages", exclusions)
+    sources = {str(corpus / name): checksum for name, checksum in plan["source_hashes"].items()}
+    sources[str(plan_path)] = plan_checksum
 
     def read(path: Path) -> bytes:
         content = files.read(path)
@@ -29,20 +31,16 @@ def freeze_packages(
     reviewed = read_json(read(review))
     if reviewed["schema"] != 1 or not isinstance(reviewed["items"], dict) or not reviewed["items"]:
         raise RegressionError("节目包补充审定文件为空或版本无效。")
-    index = defaultdict(set)
-    for row in table(read(corpus / PAIRS)):
-        index[row["政策 rowId"], row["原稿 token"]].add((row["国家"], row["政策类型"], row["优惠类型"]))
+    candidates = plan["candidates"]
+    if not reviewed["items"].keys() <= candidates.keys():
+        raise RegressionError("节目包审定记录含候选池之外的政策。")
     by_token = defaultdict(list)
     samples, pairs, documents = [], [], []
     for row_id, item in reviewed["items"].items():
-        identifier(row_id)
-        token = identifier(item["token"])
-        matches = index[row_id, token]
-        if len(matches) != 1:
+        sample = candidates[row_id]
+        token = sample["token"]
+        if item["token"] != token:
             raise RegressionError("节目包审定政策不能唯一对应语料索引。")
-        (country, policy, benefit), = matches
-        if not country or policy not in POLICY_TYPES or benefit not in BENEFIT_TYPES:
-            raise RegressionError("节目包审定政策的分层信息无效。")
         style = MENTIONS.get(item["mention"])
         if style is None or type(item["complete"]) is not bool or not isinstance(item["basis"], str) or not item["basis"].strip():
             raise RegressionError("节目包补充审定的写法、枚举标记或依据无效。")
@@ -52,10 +50,7 @@ def freeze_packages(
         if not rows and style != "tier_only":
             raise RegressionError("具体包名的节目包审定须提供行集合。")
         sample_id = digest(json_bytes([token, row_id]))
-        samples.append({
-            "id": sample_id, "row_id": row_id, "token": token, "country": country,
-            "policy_type": policy, "benefit_type": benefit,
-        })
+        samples.append({"id": sample_id, **sample})
         pair = {
             "id": sample_id, "row_id": row_id, "token": token, "span": item["span"], "basis": item["basis"],
             "configuration": {"packages": {"value": rows}},
@@ -68,7 +63,7 @@ def freeze_packages(
         by_token[token].append((pair, item["complete"]))
 
     for token, records in by_token.items():
-        doc = read_json(read(corpus / "wiki-corpus/docs" / f"{token}.json"))
+        doc = read_json(read(corpus / DOCUMENTS / f"{token}.json"))
         body = document_body(doc, token, {pair["row_id"] for pair, _ in records})
         _check_spans([pair["span"] for pair, _ in records], body)
         complete = {mark for _, mark in records}
@@ -86,7 +81,9 @@ def freeze_packages(
     counts = Counter((sample["policy_type"], sample["benefit_type"]) for sample in samples)
     manifest = {
         "schema": 3, "comparison_version": 1, "dataset": "packages", "count": len(samples),
-        "target": len(samples), "documents": len(documents), "source_sha256": sources,
+        "mode": plan["mode"], "plan_sha256": plan_checksum,
+        "candidate_count": plan["candidate_count"], "target": len(samples),
+        "documents": len(documents), "source_sha256": sources,
         "excluded_sets_sha256": excluded_set_hashes,
         "strata": [{"policy_type": policy, "benefit_type": benefit, "quota": count}
                    for (policy, benefit), count in sorted(counts.items())],

@@ -6,6 +6,7 @@ import re
 from collections import defaultdict
 from decimal import Decimal
 from pathlib import Path
+from unicodedata import normalize as unicode_normalize
 
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, normalize
 from .storage import PrivateFiles, RegressionError, digest, read_json
@@ -14,6 +15,7 @@ SEED = "qianshu-r4-v1"
 CANDIDATES = Path("policy-corpus/analysis/exam-candidates.tsv")
 PAIRS = Path("wiki-corpus/pairs.tsv")
 FIELDS = Path("policy-corpus/analysis/field-reference.json")
+DOCUMENTS = Path("wiki-corpus/docs")
 _ID = re.compile(r"[A-Za-z0-9_-]+")
 _INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)")
 _RELATION_ID_KEYS = {"rowId", "rowid", "sid"}
@@ -30,7 +32,31 @@ def table(raw: bytes):
     return csv.DictReader(io.StringIO(raw.decode("utf-8-sig"), newline=""), delimiter="\t")
 
 
-def make_plan(files: PrivateFiles, corpus: Path, size: int | None) -> dict:
+def body_fingerprint(body: str) -> str:
+    return digest("".join(unicode_normalize("NFKC", body).split()).encode())
+
+
+def body_hashes(body: str) -> tuple[str, str]:
+    return digest(body.encode()), body_fingerprint(body)
+
+
+def excluded_body_hashes(exclusions: dict) -> tuple[set[str], set[str]]:
+    exact, normalized = set(), set()
+    for _, hashes in exclusions.values():
+        for raw, canonical in hashes:
+            exact.add(raw)
+            normalized.add(canonical)
+    return exact, normalized
+
+
+def exclusion_fingerprints(exclusions: dict) -> dict:
+    return {kind: fingerprint for kind, (fingerprint, _) in exclusions.items()}
+
+
+def make_plan(
+    files: PrivateFiles, corpus: Path, size: int | None, *,
+    dataset: str = "exam", exclusions: dict | None = None,
+) -> dict:
     candidate_data = files.read(corpus / CANDIDATES)
     pair_data = files.read(corpus / PAIRS)
     links = defaultdict(set)
@@ -54,10 +80,39 @@ def make_plan(files: PrivateFiles, corpus: Path, size: int | None) -> dict:
         seen.add(row_id)
         strata[policy, benefit].append({
             "row_id": row_id, "token": token, "country": country, "shape": row["原稿形态"],
-            "rank_hash": digest(f"{SEED}\0{row_id}".encode()),
         })
 
-    total = len(seen)
+    if exclusions:
+        exact, normalized = excluded_body_hashes(exclusions)
+        by_token = defaultdict(set)
+        for rows in strata.values():
+            for row in rows:
+                by_token[row["token"]].add(row["row_id"])
+        excluded_tokens = set()
+        for token, ids in by_token.items():
+            doc = read_json(files.read(corpus / DOCUMENTS / f"{token}.json"))
+            raw, canonical = body_hashes(document_body(doc, token, ids))
+            if raw in exact or canonical in normalized:
+                excluded_tokens.add(token)
+        strata = {
+            key: [row for row in rows if row["token"] not in excluded_tokens]
+            for key, rows in strata.items()
+        }
+        strata = {key: rows for key, rows in strata.items() if rows}
+
+    total = sum(map(len, strata.values()))
+    source_hashes = {str(CANDIDATES): digest(candidate_data), str(PAIRS): digest(pair_data)}
+    if dataset == "packages":
+        return {
+            "schema": 1, "dataset": dataset, "mode": "targeted",
+            "candidate_count": total, "source_hashes": source_hashes,
+            "excluded_sets_sha256": exclusion_fingerprints(exclusions or {}),
+            "candidates": {
+                row["row_id"]: {**row, "policy_type": policy, "benefit_type": benefit}
+                for (policy, benefit), rows in strata.items() for row in rows
+            },
+        }
+
     target = total if size is None else size
     if not 0 < target <= total:
         raise RegressionError(f"抽样规模必须介于 1 和候选总数 {total} 之间。")
@@ -67,17 +122,23 @@ def make_plan(files: PrivateFiles, corpus: Path, size: int | None) -> dict:
     remainders = sorted(strata, key=lambda key: (-(target * len(strata[key]) % total), key))
     for key in remainders[:target - sum(quotas.values())]:
         quotas[key] += 1
+    for rows in strata.values():
+        for row in rows:
+            row["rank_hash"] = digest(f"{SEED}\0{row['row_id']}".encode())
 
-    return {
+    plan = {
         "schema": 1, "seed": SEED, "mode": "all" if size is None else "sample",
         "size": target, "candidate_count": total,
-        "source_hashes": {str(CANDIDATES): digest(candidate_data), str(PAIRS): digest(pair_data)},
+        "source_hashes": source_hashes,
         "strata": [
             {"policy_type": key[0], "benefit_type": key[1], "quota": quotas[key],
              "candidates": sorted(rows, key=lambda row: (row["rank_hash"], row["row_id"]))}
             for key, rows in sorted(strata.items())
         ],
     }
+    if dataset != "exam" or exclusions:
+        plan.update(dataset=dataset, excluded_sets_sha256=exclusion_fingerprints(exclusions or {}))
+    return plan
 
 
 def select(plan: dict, reviews: dict) -> tuple[list[dict], list[dict]]:
@@ -219,7 +280,7 @@ class Corpus:
         return raw
 
     def document(self, token: str, ids: set[str]) -> str:
-        doc = read_json(self.read(Path("wiki-corpus/docs") / f"{token}.json"))
+        doc = read_json(self.read(DOCUMENTS / f"{token}.json"))
         return document_body(doc, token, ids)
 
     def configuration(self, sample: dict, decisions: dict) -> dict:

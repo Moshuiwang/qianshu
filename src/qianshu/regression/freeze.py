@@ -5,11 +5,10 @@ from collections.abc import Iterable
 from datetime import UTC, datetime
 from pathlib import Path
 from re import fullmatch
-from unicodedata import normalize as unicode_normalize
 
 from .business import PAIR_FIELDS, SOURCE_STATUSES, key_value
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, normalize
-from .corpus import Corpus, make_plan, select
+from .corpus import Corpus, body_hashes, excluded_body_hashes, exclusion_fingerprints, make_plan, select
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
 
 ARTIFACTS = ("samples.jsonl", "pairs.jsonl", "documents.jsonl", "denominators.json", "companies.tsv")
@@ -42,14 +41,6 @@ def _check_spans(spans: list[list[int]], body: str) -> None:
         raise RegressionError("同一原稿的审定政策段落重叠。")
 
 
-def body_fingerprint(body: str) -> str:
-    return digest("".join(unicode_normalize("NFKC", body).split()).encode())
-
-
-def _body_hashes(body: str) -> tuple[str, str]:
-    return digest(body.encode()), body_fingerprint(body)
-
-
 def load_exclusions(
     files: PrivateFiles, dataset: str, frozen_paths: list[Path], peer_list: Path | None,
 ) -> dict:
@@ -59,7 +50,7 @@ def load_exclusions(
         kind = snapshot["dataset"]
         if kind in exclusions:
             raise RegressionError("排除集的数据集类别重复。")
-        exclusions[kind] = (snapshot["fingerprint"], [_body_hashes(doc["body"]) for doc in snapshot["documents"].values()])
+        exclusions[kind] = (snapshot["fingerprint"], [body_hashes(doc["body"]) for doc in snapshot["documents"].values()])
     if peer_list is not None:
         raw = files.read(peer_list)
         data = read_json(raw)
@@ -84,21 +75,17 @@ def _require_exclusions(dataset: str, exclusions: dict) -> None:
     if peer is not None and (
         exclusions.keys() != {"exam", peer} or any(not hashes for _, hashes in exclusions.values())
     ):
-        raise RegressionError("冻结留集须提供冻结考题和对方留集的非空排除集。")
+        raise RegressionError("留集须提供冻结考题和对方留集的非空排除集。")
 
 
 def check_excluded(documents: list[dict], dataset: str, exclusions: dict) -> dict:
     _require_exclusions(dataset, exclusions)
-    exact, normalized = set(), set()
-    for _, hashes in exclusions.values():
-        for raw, canonical in hashes:
-            exact.add(raw)
-            normalized.add(canonical)
+    exact, normalized = excluded_body_hashes(exclusions)
     if any(raw in exact or canonical in normalized for raw, canonical in (
-        _body_hashes(doc["body"]) for doc in documents
+        body_hashes(doc["body"]) for doc in documents
     )):
         raise RegressionError("冻结资料与排除集存在相同或归一化后相同的申请。")
-    return {kind: fingerprint for kind, (fingerprint, _) in exclusions.items()}
+    return exclusion_fingerprints(exclusions)
 
 
 def _denominators(pairs: list[dict], fields: Iterable[str]) -> dict:
@@ -145,7 +132,25 @@ def _strata_with_counts(layers: list[dict], samples: Iterable[dict]) -> list[dic
     return strata
 
 
-def _check_plan_strata(manifest: dict, plan: dict) -> None:
+def _check_frozen_plan(manifest: dict, plan: dict, samples: Iterable[dict]) -> None:
+    if "dataset" in plan and (
+        plan["dataset"] != manifest.get("dataset", "exam")
+        or plan["excluded_sets_sha256"] != manifest.get("excluded_sets_sha256", {})
+    ):
+        raise RegressionError("冻结的数据集或排除集指纹与候选计划不一致。")
+    if manifest.get("mode") == "targeted":
+        if (
+            plan["mode"] != "targeted"
+            or len(plan["candidates"]) != plan["candidate_count"]
+            or plan["candidate_count"] != manifest["candidate_count"]
+            or any(
+                plan["candidates"].get(sample["row_id"]) != {key: value for key, value in sample.items() if key != "id"}
+                for sample in samples
+            )
+        ):
+            raise RegressionError("冻结的样例或候选数与节目包候选池不一致。")
+        return
+
     planned = {
         (layer["policy_type"], layer["benefit_type"]): (layer["quota"], len(layer["candidates"]))
         for layer in plan["strata"]
@@ -220,16 +225,33 @@ def write_snapshot(
     return digest(manifest_raw)
 
 
+def load_current_plan(
+    files: PrivateFiles, corpus_root: Path, plan_path: Path, dataset: str, exclusions: dict,
+) -> tuple[dict, str]:
+    _require_exclusions(dataset, exclusions)
+    plan_raw = files.read(plan_path)
+    plan = read_json(plan_raw)
+    plan_exclusions = exclusions if dataset in HOLDOUT_PEERS else {}
+    if dataset in HOLDOUT_PEERS and (
+        plan.get("dataset") != dataset
+        or plan.get("excluded_sets_sha256") != exclusion_fingerprints(plan_exclusions)
+    ):
+        raise RegressionError("候选计划的数据集或排除集指纹不符，请重新生成计划。")
+    size = None if dataset == "packages" or plan["mode"] == "all" else plan["size"]
+    current = make_plan(
+        files, corpus_root, size,
+        dataset=dataset, exclusions=plan_exclusions,
+    )
+    if plan != current:
+        raise RegressionError("候选计划与当前语料不符，请复核后重新生成计划。")
+    return plan, digest(plan_raw)
+
+
 def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path: Path,
            companies_path: Path, destination: Path, *, dataset: str = "exam",
            exclusions: dict | None = None) -> str:
     exclusions = {} if exclusions is None else exclusions
-    _require_exclusions(dataset, exclusions)
-    plan_raw = files.read(plan_path)
-    plan = read_json(plan_raw)
-    current = make_plan(files, corpus_root, None if plan["mode"] == "all" else plan["size"])
-    if plan != current:
-        raise RegressionError("候选计划与当前语料不符，请复核后重新生成计划。")
+    plan, plan_checksum = load_current_plan(files, corpus_root, plan_path, dataset, exclusions)
     review_raw = files.read(review_path)
     review = read_json(review_raw)
     if review["schema"] != 1 or not isinstance(review["reviewer_role"], str) or not review["reviewer_role"].strip():
@@ -285,12 +307,12 @@ def freeze(files: PrivateFiles, corpus_root: Path, plan_path: Path, review_path:
     source_hashes = {str(corpus_root / name): checksum for name, checksum in plan["source_hashes"].items()}
     source_hashes.update(corpus.read_hashes)
     source_hashes.update({
-        str(plan_path): digest(plan_raw), str(review_path): digest(review_raw), str(companies_path): digest(companies),
+        str(plan_path): plan_checksum, str(review_path): digest(review_raw), str(companies_path): digest(companies),
     })
     manifest = {
         "schema": 3, "comparison_version": 1, "dataset": dataset,
         "reviewer_role": review["reviewer_role"], "mode": plan["mode"], "seed": plan["seed"],
-        "plan_sha256": digest(plan_raw), "count": len(samples), "documents": len(documents),
+        "plan_sha256": plan_checksum, "count": len(samples), "documents": len(documents),
         "candidate_count": plan["candidate_count"], "target": plan["size"],
         "strata": [
             {**summary, "candidate_count": len(layer["candidates"])}
@@ -377,16 +399,16 @@ def load_freeze(files: PrivateFiles, directory: Path, *, verify_plan: bool = Fal
         or sum(layer["included_count"] for layer in strata) != manifest["count"]
     ):
         raise RegressionError("冻结的分层合计与目标配额或样例总数不一致。")
-    if (verify_plan or verify_sources) and dataset != "packages":
+    if (verify_plan or verify_sources) and (dataset != "packages" or "plan_sha256" in manifest):
         sources = manifest["source_sha256"]
         plan_checksum = manifest["plan_sha256"]
         plan_name = next((name for name, checksum in sources.items() if checksum == plan_checksum), None)
         if plan_name is None:
-            raise RegressionError("冻结的来源清单缺少抽样计划指纹。")
+            raise RegressionError("冻结的来源清单缺少候选计划指纹。")
         plan_raw = files.read(plan_name)
         if digest(plan_raw) != plan_checksum:
-            raise RegressionError("冻结的抽样计划指纹已变化。")
-        _check_plan_strata(manifest, read_json(plan_raw))
+            raise RegressionError("冻结的候选计划指纹已变化。")
+        _check_frozen_plan(manifest, read_json(plan_raw), samples.values())
         if verify_sources:
             for name, checksum in sources.items():
                 if name != plan_name and digest(files.read(name)) != checksum:
