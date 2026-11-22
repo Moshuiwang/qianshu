@@ -55,9 +55,7 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
             "name": "submit_application_reply", "description": "提交一份申请解析声明。",
             "input_schema": ApplicationReply.model_json_schema(),
         }]
-        assert payload["tool_choice"] == {
-            "type": "tool", "name": "submit_application_reply", "disable_parallel_tool_use": True,
-        }
+        assert "tool_choice" not in payload
         assert payload["stream"] is True
         assert payload["max_tokens"] == 32000
         events = [
@@ -72,10 +70,14 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
                 "usage": {"input_tokens": 1, "output_tokens": 0},
             }},
             {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "thinking", "thinking": "占位思考", "signature": "placeholder",
+            }},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_start", "index": 1, "content_block": {
                 "type": "tool_use", "name": "submit_application_reply", "id": "toolu_placeholder", "input": {},
             }},
-            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": raw}},
-            {"type": "content_block_stop", "index": 0},
+            {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": raw}},
+            {"type": "content_block_stop", "index": 1},
             {
                 "type": "message_delta",
                 "delta": {"stop_reason": "tool_use", "stop_sequence": None},
@@ -373,11 +375,11 @@ def test_replay_entry_uses_explicit_company_table_instead_of_default(monkeypatch
     assert draft["company"]["uncertainty"] is None
 
 
-@pytest.mark.parametrize("reply", [
-    "  \r\n" + json.dumps(fixed_reply("占位公司", [{}])) + "\r\n",
-    "占位无效回复\r\n",
+@pytest.mark.parametrize(("reply", "exit_code"), [
+    ("  \r\n" + json.dumps(fixed_reply("占位公司", [{}])) + "\r\n", 0),
+    ("占位无效回复\r\n", 1),
 ])
-def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_path, capsys, reply):
+def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_path, capsys, reply, exit_code):
     body = "占位公司"
     raw = tmp_path / "raw.txt"
     output = tmp_path / "drafts.json"
@@ -386,7 +388,6 @@ def test_raw_output_preserves_original_reply_before_validation(monkeypatch, tmp_
     monkeypatch.setattr("qianshu.parse.configured_model", lambda _: model)
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", str(output), "--raw-output", str(raw)])
     monkeypatch.setattr(sys, "stdin", io.StringIO(body))
-    exit_code = 0 if reply.lstrip().startswith("[") else 1
     assert main() == exit_code
     assert raw.read_bytes() == reply.encode()
     assert raw.stat().st_mode & 0o777 == 0o600

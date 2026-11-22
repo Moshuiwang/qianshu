@@ -171,7 +171,7 @@ def _decode(reply: str) -> ApplicationReply:
     try:
         json.loads(reply, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
     except (ValueError, TypeError, RecursionError):
-        raise ParseError("申请解析模型回复不是有效的结构化 JSON。", code="reply_json") from None
+        raise ParseError("申请解析模型回复不是有效的政策 JSON。", code="reply_json") from None
     try:
         result = ApplicationReply.model_validate_json(reply)
     except ValidationError as error:

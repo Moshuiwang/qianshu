@@ -130,7 +130,7 @@ def test_requires_complete_structured_json_without_a_wrapper():
     "以下为解析结果：\n```json\n[{\"company\":{\"value\":\"占位甲\",\"value\":\"占位乙\"}}]\n```",
 ])
 def test_cannot_discard_leftover_text_or_bypass_json_rules(reply):
-    with pytest.raises(ParseError, match="不是有效的结构化 JSON"):
+    with pytest.raises(ParseError, match="不是有效的政策 JSON"):
         parse_application("占位正文", model=lambda **_: reply)
 
 

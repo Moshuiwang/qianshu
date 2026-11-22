@@ -126,7 +126,6 @@ def configured_model(
                         "description": "提交一份申请解析声明。",
                         "input_schema": ApplicationReply.model_json_schema(),
                     }],
-                    tool_choice={"type": "tool", "name": _REPLY_TOOL, "disable_parallel_tool_use": True},
                 ) as stream:
                     reply = stream.get_final_message()
         # 流式读取中途断开或超时时，SDK 不包装传输层异常；流在 message_start 前结束时 SDK 抛 AssertionError。

@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 from collections import Counter
+from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -901,6 +902,39 @@ def test_output_moved_during_model_run_is_not_written(repo, frozen):
 
 def _replay_args(fingerprint, source=".private/run", out=".private/replay"):
     return ["replay", "--recording", source, *run_args(fingerprint, out)[1:]]
+
+
+def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkeypatch):
+    import anthropic
+    from anthropic.types import TextBlock, ThinkingBlock
+
+    blocks = [
+        ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
+        TextBlock(type="text", text=serialized_empty(BATCH)),
+    ]
+    reply = SimpleNamespace(stop_reason="end_turn", content=blocks)
+
+    def stream(**payload):
+        assert "tool_choice" not in payload
+        assert "必须调用 `submit_application_reply` 一次" in payload["system"]
+        assert "不要用文字回答" in payload["system"]
+        return nullcontext(SimpleNamespace(get_final_message=lambda: reply))
+
+    client = SimpleNamespace(messages=SimpleNamespace(stream=stream))
+    monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
+    monkeypatch.setenv("AI_PLATFORM", "anthropic")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
+    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    report = get_json(repo / "run/public-report.json")
+    assert report["documents"] == {"model_failed": 0, "parse_failed": 2, "parsed": 0}
+    assert report["business"]["counts"]["reply_parse_failed"] == 2
+    record = get_json(repo / "run/document-00001.json")
+    attempt, = record["attempts"]
+    assert attempt["failure_stage"] == record["reason_code"] == "reply_tool_missing"
+    assert json.loads(attempt["reply"]) == [block.model_dump(exclude_unset=True) for block in blocks]
+    assert main(_replay_args(frozen)) == 0
+    for name in runner.RUN_FILES:
+        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
 
 
 @pytest.mark.parametrize(("stop", "reason"), [
