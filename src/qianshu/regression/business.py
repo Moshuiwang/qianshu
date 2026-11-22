@@ -6,6 +6,9 @@ from decimal import Decimal, InvalidOperation
 from re import Pattern
 from unicodedata import normalize as unicode_normalize
 
+from qianshu.parse import _normalized_value
+from qianshu.parse.evidence import Sources
+from qianshu.parse.protocol import SourceBlock, ValueSource
 from qianshu.parse.companies import CompanyTable
 from qianshu.parse.names import MAX_NAME_LENGTH, ORIGINAL_NAME_LABEL, PROPOSED_NAME_LABEL, compose_public_name
 from qianshu.parse.scope import country_matches
@@ -19,6 +22,7 @@ WEIGHTS = {
 }
 EMPTY_WEIGHTS = {"packages": 4, "user_tags": 3}
 SHADOW_TAG_SUFFIXES = ("_image",)
+PAIRING_VERSION = 4
 DEFAULT_THRESHOLD = 2
 CATEGORIES = ("correct", "false_determined", "overasked", "justified_confirmation", "missing", "unknown")
 LEGACY_DEFAULTS = {
@@ -83,9 +87,9 @@ def pairing_fingerprint(threshold: int) -> str:
     if not 1 <= threshold <= sum(WEIGHTS.values()):
         raise RegressionError("业务配对阈值超出支持范围。")
     return digest(json_bytes({
-        "version": 3, "weights": WEIGHTS, "empty_weights": EMPTY_WEIGHTS, "threshold": threshold,
+        "version": PAIRING_VERSION, "weights": WEIGHTS, "empty_weights": EMPTY_WEIGHTS, "threshold": threshold,
         "gold_keys": ["included_gold", "reviewed_pairing", "unexcluded_sample_metadata"],
-        "draft_keys": "derived_without_confirmation",
+        "draft_keys": "located_statement_value",
         "ties": "retain_only_pairs_common_to_all_optimal_assignments",
         "user_tags": {
             "normalization": ["NFKC", "casefold", "strip", "remove_one_shadow_suffix_with_nonempty_base", "sorted_set"],
@@ -219,15 +223,37 @@ def key_value(name: str, value):
         return None
 
 
-def _draft_keys(draft, countries: dict[str, str]) -> dict:
-    result = {}
-    for name in PAIR_FIELDS:
-        field = getattr(draft, name, None)
-        if not needs_confirmation(field):
-            result[name] = key_value(name, field.value)
-    country = getattr(draft, "country", None)
-    result["country"] = country.value if not needs_confirmation(country) else countries.get(result.get("company"))
-    return result
+def _draft_keys(draft, countries: dict[str, str], sources: Sources, options: dict) -> dict:
+    keys = {}
+    results = getattr(draft, "field_results", {})
+    for name in ("country", *PAIR_FIELDS):
+        if name in results:
+            statement = results[name].statement
+            if statement.value is None or not statement.evidence or not all(
+                sources.locate_quote(quote.span, quote.text)[0] is not None for quote in statement.evidence
+            ):
+                continue
+            if name == "packages":
+                # 待确认行的卡片投影会省略包名，配对只取声明中的原始行。
+                value = [row.model_dump() for row in statement.value]
+            else:
+                value = _normalized_value(name, statement.value, options)
+        else:
+            # 无声明的旧投影须明确标为原文，避免用查表值或默认值配对。
+            field = getattr(draft, name, None)
+            if getattr(field, "value_source", None) != ValueSource.ORIGINAL or field.value is None:
+                continue
+            if not field.evidence or not all(
+                excerpt.text and excerpt.start is not None and excerpt.start >= 0
+                and sources.blocks["body"].text.startswith(excerpt.text, excerpt.start)
+                for excerpt in field.evidence
+            ):
+                continue
+            value = field.value
+        keys[name] = value if name == "country" else key_value(name, value)
+    if keys.get("country") is None:
+        keys["country"] = countries.get(keys.get("company"))
+    return keys
 
 
 def _gold_keys(pair: dict, sample: dict) -> dict:
@@ -476,8 +502,9 @@ class BusinessScore:
     def __init__(
         self, frozen: dict, threshold: int, countries: dict[str, str], *,
         company_table: CompanyTable | None = None, country_names: dict[str, Pattern[str]] | None = None,
-        country_codes: dict[str, str] | None = None, today: date | None = None,
+        country_codes: dict[str, str] | None = None, today: date | None = None, options: dict | None = None,
     ):
+        self.options = options if options is not None else {"benefit_type": {}}
         self.threshold = threshold
         self.fingerprint = pairing_fingerprint(threshold)
         self.measure_fingerprint = measure_fingerprint(threshold)
@@ -501,7 +528,8 @@ class BusinessScore:
         self.package_denominators = Counter()
 
     def add(self, document: dict, pairs: list[dict], drafts: list) -> dict:
-        draft_keys = [_draft_keys(draft, self.countries) for draft in drafts]
+        sources = Sources([SourceBlock("body", document["body"], "body")])
+        draft_keys = [_draft_keys(draft, self.countries, sources, self.options) for draft in drafts]
         gold_keys = [_gold_keys(pair, self.samples[pair["id"]]) for pair in pairs]
         all_hits = [[_score(gold, draft) for draft in draft_keys] for gold in gold_keys]
         scores = [
@@ -607,7 +635,7 @@ class BusinessScore:
         self.counts["unknown_fields"] = field_totals["unknown"]
         self.counts["reply_parse_failed"] = reply_parse_failed
         return {
-            "pairing_sha256": self.fingerprint,
+            "pairing_version": PAIRING_VERSION, "pairing_sha256": self.fingerprint,
             "measure_sha256": self.measure_fingerprint,
             "rates": rates, "counts": {key: self.counts[key] for key in (*COUNT_LABELS, "ambiguous_drafts")},
             "field_categories": {category: field_totals[category] for category in CATEGORIES},

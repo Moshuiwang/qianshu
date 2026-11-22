@@ -407,6 +407,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
                 "full_document_review", "full_document_review_reasons",
             )}
             report["business"] = {
+                "pairing_version": config["pairing_version"],
                 "counts": {"reply_parse_failed": counts["reply_parse_failed"]},
                 "reply_parse_failure_reasons": reasons,
             }

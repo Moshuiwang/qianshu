@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from qianshu import parse
-from qianshu.draft import DraftField, PackageRow, Uncertainty
+from qianshu.draft import DraftField, PackageRow, SourceExcerpt, Uncertainty
 from qianshu.regression import freeze as freeze_module, runner
 from qianshu.regression.__main__ import main
 from qianshu.regression.compare import FIELD_LABELS, compare_field, normalize
@@ -719,6 +719,7 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
             {"country": {"value": "莫桑比克", "evidence": [SECOND]},
              "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
             {"country": {"value": "赞比亚", "evidence": [FIRST]},
+             "benefit_type": {"value": "赠送时长", "evidence": [FIRST]},
              "user_scope": {"value": "占位不同值", "evidence": ["占位正文甲"]}},
         ], policy_ranges=[(split, len(body)), (0, split)])
 
@@ -730,6 +731,8 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
     output = repo / "run"
     report = get_json(output / "public-report.json")
     assert report["freeze_sha256"] == frozen
+    recorded_config = get_json(output / "recording.json")["configuration"]
+    assert report["business"]["pairing_version"] == recorded_config["pairing_version"] == 4
     assert report["documents"] == {"parsed": 1, "model_failed": 1, "parse_failed": 0}
     assert report["sample_alignment"]["matched"] == 2
     assert report["by_field"]["company"]["match"] == 1
@@ -1376,6 +1379,7 @@ def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, fro
         assert main([*run_args(frozen, f".private/{name}"), "--release"], model=model) == 0
     void = get_json(repo / "void" / "public-report.json")
     assert void["void"] and void["business"] == {
+        "pairing_version": 4,
         "counts": {"reply_parse_failed": 1},
         "reply_parse_failure_reasons": {"reply_parse": 1, "reply_incomplete": 0, "reply_truncated": 0, "reply_refused": 0},
     }
@@ -1416,6 +1420,12 @@ def test_business_pairing_maximizes_whole_assignment(scores, matches, ambiguous_
     assert optimal_pairs(scores) == (matches, ambiguous_policies, ambiguous_drafts)
 
 
+def located_field(value, text="占位"):
+    field = DraftField(value=value, evidence=[SourceExcerpt(text=text, start=0)])
+    field.value_source = "原文"
+    return field
+
+
 @pytest.mark.parametrize("name", ["packages", "user_tags"])
 @pytest.mark.parametrize("excluded", [False, True])
 def test_business_pairing_reliable_key_outweighs_other_matches(name, excluded):
@@ -1444,8 +1454,8 @@ def test_business_pairing_reliable_key_outweighs_other_matches(name, excluded):
         derived = [PackageRow(**row) for row in opposite] if name == "packages" else opposite
         drafts.append(SimpleNamespace(
             to_dict=lambda: {},
-            **{key: DraftField(value=number) for key, number in keys.items()},
-            **{name: DraftField(value=derived)},
+            **{key: located_field(number) for key, number in keys.items()},
+            **{name: located_field(derived)},
         ))
     frozen = {
         "samples": {pair["id"]: {"country": "占位地区", "benefit_type": "赠送时长"} for pair in pairs},
@@ -1468,7 +1478,6 @@ def test_business_pairing_reliable_key_outweighs_other_matches(name, excluded):
     (["　占位ＡＢＣ＿ＩＭＡＧＥ ", "占位beta"], ["占位Abc", "占位Beta"]),
 ])
 def test_business_pairing_normalizes_tags_and_grades_original_values(gold_tags, draft_tags):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, WEIGHTS
 
     pair = {"id": "policy", "configuration": {"user_tags": {"value": sorted(gold_tags)}}}
@@ -1478,7 +1487,7 @@ def test_business_pairing_normalizes_tags_and_grades_original_values(gold_tags, 
     }
     body = "占位原文"
     draft = SimpleNamespace(
-        user_tags=DraftField(value=draft_tags, evidence=[SourceExcerpt(text=body, start=0)]),
+        user_tags=located_field(draft_tags, body),
         to_dict=lambda: {},
     )
 
@@ -1489,6 +1498,42 @@ def test_business_pairing_normalizes_tags_and_grades_original_values(gold_tags, 
     assert policy["positive_scores"] == [{"draft": 0, "score": WEIGHTS["user_tags"], "keys": ["user_tags"]}]
     assert policy["fields"] == {"user_tags": "false_determined"}
     assert draft.user_tags.value == draft_tags
+
+
+@pytest.mark.parametrize(("status", "quotes", "weight"), [
+    ("确定", ["赞比亚"], 4), ("歧义", ["赞比亚"], 4),
+    ("确定", [], 0), ("歧义", ["不存在"], 0),
+    ("确定", ["赞比亚", "不存在"], 0),
+])
+def test_country_pairing_uses_located_model_value(status, quotes, weight):
+    from qianshu.regression.business import BusinessScore
+    from tests.parse.test_names import parse_one
+
+    body = "合成政策适用于赞比亚"
+    reply = fixed_reply(body, [{"country": {"value": "赞比亚", "evidence": quotes}}])
+    reply["policies"][0]["fields"]["country"]["status"] = status
+    draft = parse_one(body, reply)
+    sample = {"country": "赞比亚", "benefit_type": "赠送时长"}
+    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {})
+    policy = score.add({"body": body}, [{"id": "p", "configuration": {}}], [draft])["policies"][0]
+    assert draft.field_results["country"].needs_confirmation == (status != "确定" or weight == 0)
+    assert policy["positive_scores"] == ([{"draft": 0, "score": weight, "keys": ["country_or_company"]}]
+                                         if weight else [])
+
+
+def test_package_pairing_uses_model_rows_before_card_projection():
+    from qianshu.regression.business import BusinessScore
+    from tests.parse.test_names import parse_one
+
+    body = "合成甲包赠乙包"
+    rows = [{"current_package": "甲包", "gift_package": "乙包"}]
+    draft = parse_one(body, fixed_reply(body, [{"packages": {"value": rows, "evidence": [body]}}]))
+    assert draft.packages.uncertainty is not None
+    sample = {"country": "占位", "benefit_type": "升级权益"}
+    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {})
+    pair = {"id": "p", "configuration": {"packages": {"value": rows}}}
+    policy, = score.add({"body": body}, [pair], [draft])["policies"]
+    assert policy["positive_scores"] == [{"draft": 0, "score": 8, "keys": ["packages"]}]
 
 
 def test_tag_pairing_key_removes_only_known_suffix_and_fingerprints_it(monkeypatch):
@@ -1519,7 +1564,6 @@ def test_tag_pairing_key_removes_only_known_suffix_and_fingerprints_it(monkeypat
     ({}, {"inferable": True, "auto_allowed": True}, 30, False, 0, "unknown"),
 ])
 def test_business_grades_all_categories(entry, mark, value, confirmation, start, status):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import grade
 
     field = DraftField(value=value, evidence=[SourceExcerpt(text="占位 30 天", start=start)],
@@ -1561,7 +1605,6 @@ def test_business_keeps_legacy_default_score_without_verification_metadata():
 
 
 def test_business_maps_included_gold_and_separates_extras_from_unknown():
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, grade, pairing_audit
 
     mark = {"inferable": True, "auto_allowed": True}
@@ -1571,8 +1614,8 @@ def test_business_maps_included_gold_and_separates_extras_from_unknown():
 
     def draft(name, value=None):
         return SimpleNamespace(
-            company=DraftField(value=name),
-            recharge_days=DraftField(value=value, evidence=[SourceExcerpt(text="占位 30 天", start=0)]),
+            company=located_field(name),
+            recharge_days=located_field(value, "占位 30 天"),
             to_dict=lambda: {},
         )
 
@@ -1627,7 +1670,7 @@ def test_pairing_audit_caps_ambiguous_groups_in_frozen_order():
         "denominators": {"fields": {}},
     }
     score = BusinessScore(snapshot, 2, {})
-    draft = SimpleNamespace(recharge_days=DraftField(value=30), to_dict=lambda: {})
+    draft = SimpleNamespace(recharge_days=located_field(30), to_dict=lambda: {})
     documents = []
     for token in tokens:
         pairs = [
@@ -1647,7 +1690,6 @@ def test_pairing_audit_caps_ambiguous_groups_in_frozen_order():
 
 @pytest.mark.parametrize("dataset", ["exam", "blind", "packages"])
 def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, G285_MAPPING, measure_fingerprint
 
     values = {
@@ -1672,7 +1714,7 @@ def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
     draft = SimpleNamespace(
         trigger_once=confirmed, effective_multiplier=DraftField(value=2), cancel_on_downgrade=confirmed,
         maintain_mutual_exclusion_group=confirmed, repeat_bonus=default,
-        recharge_days=DraftField(value=30, evidence=[SourceExcerpt(text="占位", start=0)]),
+        recharge_days=located_field(30),
         user_scope=confirmed, gift_days=DraftField(value=90), benefit_type=DraftField(value="赠送时长"),
         to_dict=lambda: {},
     )
@@ -1709,7 +1751,6 @@ def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
     ("historical_rule", "确定", "定向政策", "冲突", True, False),
 ])
 def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, name_status, name_review, type_review):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore
 
     values = {"policy_name": "占位标签甲", "policy_type": policy_type}
@@ -1731,7 +1772,7 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
     score = BusinessScore(frozen, 2, {})
     review = {"policy_name": name_review, "policy_type": type_review}
     for confirmed in (False, True):
-        draft = SimpleNamespace(benefit_type=DraftField(value="赠送时长"), to_dict=lambda: {})
+        draft = SimpleNamespace(benefit_type=located_field("赠送时长"), to_dict=lambda: {})
         for name, value in values.items():
             field = (DraftField(value=value, evidence=[SourceExcerpt(text=document["body"], start=0)]) if confirmed
                      else DraftField(uncertainty=Uncertainty(reason="占位待确认")))
@@ -1747,7 +1788,6 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
     (True, "justified_confirmation"),
 ])
 def test_g285_uses_frozen_pairing_tags_when_tag_gold_is_excluded(confirm, expected):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore
 
     tags = ["占位标签甲", "占位标签乙"]
@@ -1773,7 +1813,7 @@ def test_g285_uses_frozen_pairing_tags_when_tag_gold_is_excluded(confirm, expect
         benefit_type=DraftField(value=sample["benefit_type"]),
         policy_name=DraftField(value=tags[0], evidence=evidence, uncertainty=uncertainty),
         policy_type=DraftField(value="公开政策", evidence=evidence, uncertainty=uncertainty),
-        user_tags=DraftField(value=tags, evidence=evidence),
+        user_tags=located_field(tags, body),
         to_dict=lambda: {},
     )
 
@@ -1822,7 +1862,6 @@ def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
     ("冲突", [], "占位公司甲", True),
 ])
 def test_g285_rates_company_using_r10_table_and_frozen_facts(company_status, keywords, default_name, review):
-    from qianshu.draft import SourceExcerpt
     from qianshu.parse.companies import CompanyRow
     from qianshu.regression.business import BusinessScore
 
@@ -1841,7 +1880,7 @@ def test_g285_rates_company_using_r10_table_and_frozen_facts(company_status, key
     score = BusinessScore(frozen, 2, {}, company_table={sample["country"]: rows})
 
     def rate(field):
-        draft = SimpleNamespace(company=field, benefit_type=DraftField(value="赠送时长"), to_dict=lambda: {})
+        draft = SimpleNamespace(company=field, benefit_type=located_field("赠送时长"), to_dict=lambda: {})
         return score.add({"body": body}, [pair], [draft])["policies"][0]["fields"]["company"]
 
     assert rate(DraftField(uncertainty=Uncertainty(reason="占位人工确认"))) == (
@@ -1946,7 +1985,6 @@ def test_freeze_packages_accepts_any_reviewed_subset_of_targeted_pool(repo, corp
 
 @pytest.mark.parametrize(("ambiguous_benefit", "ambiguous_pairing"), [(False, False), (True, False), (True, True)])
 def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch, ambiguous_benefit, ambiguous_pairing):
-    from qianshu.draft import SourceExcerpt
 
     review = {
         "schema": 1,
@@ -2001,16 +2039,15 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
     def parsed(body, *, model, on_reply, **kwargs):
         on_reply(model(system="占位提示", user=json.dumps({"application": body})))
         base = {name: DraftField() for name in parse.ParsedPolicyDraft.__dataclass_fields__}
-        named_package = DraftField(value=[PackageRow(current_package="占位包甲", gift_package="占位赠包甲")],
-                                   evidence=[SourceExcerpt(text=FIRST, start=BATCH.index(FIRST))])
+        named_package = located_field([PackageRow(current_package="占位包甲", gift_package="占位赠包甲")], FIRST)
         if ambiguous_benefit:
             named_package = DraftField(uncertainty=Uncertainty(reason="占位优惠类型待确认"))
         return [parse.ParsedPolicyDraft(**{
             **base,
-            "company": DraftField(value=company),
-            "benefit_type": DraftField(value="赠送时长"),
+            "company": located_field(company, FIRST),
+            "benefit_type": located_field("赠送时长", FIRST),
             "packages": field,
-            "user_tags": DraftField(value=[tag] if use_reviewed_tags else None),
+            "user_tags": located_field([tag] if use_reviewed_tags else None, FIRST),
         }) for company, field, tag in (
             ("占位默认公司", named_package, "占位标签甲"),
             ("占位默认公司", DraftField(uncertainty=Uncertainty(reason="占位仅档位")), "占位标签乙"),
@@ -2094,7 +2131,7 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
     assert main(_replay_args(checksum)) == 0
     assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
 
-def test_amount_dates_and_candidates_only_count_derived_business_keys(monkeypatch):
+def test_amount_dates_and_candidates_only_count_located_business_keys(monkeypatch):
     from qianshu.draft import Candidate, PackageRow
     from qianshu.regression.business import WEIGHTS, _draft_keys, _gold_keys, _score, pairing_fingerprint
 
@@ -2115,15 +2152,18 @@ def test_amount_dates_and_candidates_only_count_derived_business_keys(monkeypatc
         },
     }, {"country": "占位", "benefit_type": "赠送时长"})
     assert gold["user_tags"] == ["占位标签乙", "占位标签甲"]
+    derived_tags = located_field(gold["user_tags"])
+    derived_tags.value_source = "查表派生"
     draft = SimpleNamespace(
         benefit_type=DraftField(value="赠送时长"),
-        recharge_amount=DraftField(value=19.9),
+        recharge_amount=located_field(19.9),
         gift_days=DraftField(uncertainty=Uncertainty(reason="占位", candidates=[Candidate(value=30)])),
-        user_tags=DraftField(value=gold["user_tags"], uncertainty=Uncertainty(reason="占位")),
+        user_tags=derived_tags,
         packages=DraftField(uncertainty=Uncertainty(reason="占位", candidates=[Candidate(value=packages)])),
-        start_date=DraftField(value="2099-01-15"), end_date=DraftField(value="2099-02-01"),
+        start_date=located_field("2099-01-15"), end_date=located_field("2099-02-01"),
     )
-    assert _score(gold, _draft_keys(draft, {})) == ["recharge_amount", "date_overlap"]
+    sources = parse.Sources([parse.SourceBlock("body", "占位", "body")])
+    assert _score(gold, _draft_keys(draft, {}, sources, {})) == ["recharge_amount", "date_overlap"]
     fingerprint = pairing_fingerprint(2)
     assert fingerprint != pairing_fingerprint(3)
     monkeypatch.setitem(WEIGHTS, "packages", 4)
