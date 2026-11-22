@@ -3,7 +3,7 @@
 import json
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import asdict, fields, replace
-from datetime import date
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -29,6 +29,7 @@ _COMPANY_TABLE_HINT = "公司对照表缺失或无效"
 _OPTIONS = ("policy_type", "benefit_type")
 _BODY_ID = "body"
 _CONFIRM = {
+    **names.CONFIRMATION_REASONS,
     "invalid_unwritten_shape": "「原文未写」须同时满足空值、无证据和无候选。",
     "manual_rule": other_fields.RULE_PENDING_REASON,
     "mutex_opt_out": other_fields.MUTEX_NO_HINT,
@@ -63,10 +64,14 @@ class ParsedPolicyDraft(OfferPolicyDraft):
     scope: dict[str, object] | None = None
     field_results: dict[str, FieldResult]
 
+    @property
+    def policy_name_source(self) -> str | None:
+        result = getattr(self, "field_results", {}).get("policy_name")
+        return names.source_label(result) if result is not None else None
 
     def to_dict(self) -> dict[str, object]:
         return {**super().to_dict(), "hints": getattr(self, "hints", []), "policy_id": self.policy_id,
-                "scope": self.scope,
+                "scope": self.scope, "policy_name_source": self.policy_name_source,
                 "field_results": {
                     name: {
                         **asdict(result),
@@ -114,8 +119,14 @@ def parse_application(
     additional_blocks: Iterable[SourceBlock] = (),
     benefit_catalog: benefits.BenefitCatalog | None = None,
     today: date | None = None,
+    country_codes: Mapping[str, str] | None = None,
+    known_policy_names: Iterable[str] = (),
+    recorded_reply: bool = False,
 ) -> ParseResult:
     """解析正文及已转成文本的附件。on_reply 收到私有重放所需的结构化回复。"""
+    if recorded_reply and model is None:
+        raise ParseError("旧回复投影须提供离线录制。")
+    name_date = today if recorded_reply or today is not None else datetime.now(UTC).date()
     attachments = tuple(additional_blocks)
     if not body.strip() and not any(block.text.strip() for block in attachments):
         return ParseResult(structure_issues=(PolicyStructureIssue(None, "empty_material"),))
@@ -128,6 +139,8 @@ def parse_application(
     except (OSError, UnicodeError, ValueError):
         raise ParseError("申请解析规则不可读或选项表格式无效。") from None
     try:
+        if country_codes is None:
+            country_codes = names.country_codes((rules_dir / "countries.txt").read_text(encoding="utf-8"))
         if company_rules is None:
             company_rules = load_company_rules(
                 rules_dir, companies_file, legacy=legacy_companies, companies_text=companies_text,
@@ -159,7 +172,11 @@ def parse_application(
     review = EvidenceReview(parsed, sources)
     if benefit_catalog is None:
         benefit_catalog = benefits.load_benefit_catalog()
-    drafts = [_draft(policy, review, company_rules, options, benefit_catalog, today) for policy in parsed.policies]
+    resolved = [_resolve_fields(policy, review, company_rules, options, country_codes, name_date, benefit_catalog, today)
+                for policy in parsed.policies]
+    names.check_names([results for results, _ in resolved], known_policy_names)
+    drafts = [_draft(policy, review, options, results, hints)
+              for policy, (results, hints) in zip(parsed.policies, resolved, strict=True)]
     return ParseResult(drafts, structure_issues=review.structure_issues, evidence_locations=review.evidence_locations,
                        unused_passages=parsed.unused_passages or ())
 
@@ -211,10 +228,10 @@ def _normalized_value(name: str, value: object, options: dict[str, dict[str, str
     return value.strip() if isinstance(value, str) else value
 
 
-def _draft(
+def _resolve_fields(
     policy: Policy, review: EvidenceReview, rules: CompanyRules, options: dict[str, dict[str, str]],
-    benefit_catalog: benefits.BenefitCatalog, today: date | None,
-) -> ParsedPolicyDraft:
+    codes: Mapping[str, str], name_date: date | None, benefit_catalog: benefits.BenefitCatalog, today: date | None,
+) -> tuple[dict[str, FieldResult], list[str]]:
     results = {name: review.field(policy, name) for name in policy.fields.__class__.model_fields}
     for name, result in results.items():
         if result.has_value and not result.needs_confirmation:
@@ -230,7 +247,7 @@ def _draft(
     dates.verify_dates(results)
     benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, today, policy.fields.model_fields_set)
     hints = [
-        *names.derive_names(results),
+        *names.derive_names(results, codes, name_date),
         *benefit_hints,
         *other_fields.apply_defaults(results),
     ]
@@ -238,6 +255,13 @@ def _draft(
     if rules.table is None:
         hints.append(_COMPANY_TABLE_HINT)
 
+    return results, hints
+
+
+def _draft(
+    policy: Policy, review: EvidenceReview, options: dict[str, dict[str, str]],
+    results: dict[str, FieldResult], hints: list[str],
+) -> ParsedPolicyDraft:
     draft = ParsedPolicyDraft(**{
         field.name: _project(results, field.name, review, options)
         for field in fields(OfferPolicyDraft)
@@ -252,7 +276,9 @@ def _draft(
     draft.field_results = results
     draft.source_span = _body_offsets(review.main[id(policy)])
     draft.source_evidence_spans = tuple(sorted({
-        span for result in results.values() for quote in result.evidence
+        # 短名参与拼名时，其引文已在 policy_name 中。独立短名不参与位置量尺。
+        span for name, result in results.items() if name != "policy_short_name"
+        for quote in result.evidence
         if (span := _body_offsets(review.sources.locate(quote.span))) is not None
     }))
     return draft
@@ -270,6 +296,11 @@ def _excerpt(quote: Evidence, sources: Sources) -> SourceExcerpt:
 def _project(results: dict[str, FieldResult], name: str, review: EvidenceReview, options) -> DraftField:
     result = results[name]
     evidence = [_excerpt(quote, review.sources) for quote in result.evidence]
+    if name == "policy_name" and names.is_proposal(result):
+        return DraftField(evidence=evidence, uncertainty=Uncertainty(
+            reason="名称建议待产品负责人在群卡片上同意。",
+            candidates=[Candidate(value=result.value, evidence=evidence)],
+        ))
     if not result.needs_confirmation:
         return DraftField(value=result.value if result.has_value else None, evidence=evidence)
 

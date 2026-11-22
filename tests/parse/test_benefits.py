@@ -419,6 +419,14 @@ def test_offer_candidates_mask_fragments_across_card_lines():
         assert f"优惠到期目标包 · 候选 {i}\n值　[已脱敏]" in content
 
 
+def test_card_masks_fragment_spanning_offer_value_and_public_policy_name():
+    body, reply = scenario("升级权益", policy_type=field("公开政策", "公开政策"),
+                           user_tags=field([], "全部用户"), policy_name=field("合成名称", "合成名称"))
+    content = card_text(body, reply, sensitive_values=["占位是合成名示例"])
+    assert "获得优惠后不允许换包\n值　[已脱敏]" in content
+    assert "优惠政策名称\n值　[已脱敏]称" in content
+
+
 @pytest.mark.parametrize("missing", ["value", "evidence", "candidates"])
 def test_incomplete_absence_declaration_cannot_enable_default(missing):
     body, reply = scenario("升级权益")
