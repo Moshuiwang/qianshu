@@ -323,7 +323,8 @@ def evaluate(
         if recording is not None:
             attempts = recording.document["attempts"]
             first_shape_errors += any(recorded_shape_error(attempt) for attempt in attempts)
-            if attempts and attempts[-1].get("retry_result") == "failed" and not failure_reasons:
+            if (status == "model_failed" and not failure_reasons and len(attempts) >= 2
+                    and recorded_shape_error(attempts[-2])):
                 failure_reasons.add("reply_incomplete")
         reply_failed_documents += bool(failure_reasons)
         for reason in failure_reasons:

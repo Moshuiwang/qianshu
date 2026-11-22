@@ -2266,18 +2266,22 @@ def test_package_snapshot_reaches_parser_and_scores_two_rows(repo, monkeypatch):
     assert get_json(repo / "replay/public-report.json")["business"] == business
 
 
-@pytest.mark.parametrize("repaired", [True, False, None])
-def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen, monkeypatch, repaired):
+@pytest.mark.parametrize("outcome", ["repaired", "malformed", "interrupted", "no_response"])
+def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen, monkeypatch, outcome):
     import anthropic
     import httpx
 
+    repaired = outcome == "repaired"
+    interrupted = outcome in {"interrupted", "no_response"}
     requests = []
 
     def reply(request):
         messages = json.loads(request.content)["messages"]
         body = json.loads(messages[0]["content"])["application"]
         requests.append(messages)
-        if repaired is None and len(messages) > 1:
+        if outcome == "no_response" and len(messages) > 1:
+            raise httpx.ReadError("synthetic")
+        if outcome == "interrupted" and len(messages) > 1:
             return httpx.Response(200, headers={"content-type": "text/event-stream"},
                                   content=b"".join(_stream_reply_events("[", interrupted=True)))
         payload = fixed_reply(body, [{}])
@@ -2296,19 +2300,19 @@ def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen
     assert report["documents"]["first_shape_errors"] == 1
     assert report["business"]["counts"]["reply_parse_failed"] == int(not repaired)
     assert report["usage"]["attempts"] == 3
-    total = 2 if repaired is None else 3
+    total = 2 if interrupted else 3
     assert report["usage"]["input_tokens"]["total"] == report["usage"]["output_tokens"]["total"] == total
-    assert report["void"] == (repaired is None)
+    assert report["void"] == interrupted
     first, final = get_json(repo / "run/document-00001.json")["attempts"]
     assert first["first_shape_error"] == final["first_shape_error"] == "missing_evidence"
     assert final["retry_result"] == ("succeeded" if repaired else "failed")
     assert main(_replay_args(frozen)) == 0
     assert len(requests) == 3
     assert_replay(repo)
-    if repaired is True:
+    if repaired or outcome == "no_response":
         from qianshu.regression.storage import digest
 
-        # 每次只去掉一个录制扩展键；重放仍用同一份最终回复出草稿。
+        # 逐个去掉扩展键，成功与未收到纠错回复的计数都应能复原。
         artifact = "document-00001.json"
         for key in ("first_shape_error", "retry_result", "partial_input_tokens", "partial_output_tokens", "request"):
             source = repo / ("without-" + key)
@@ -2322,4 +2326,6 @@ def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen
             put_json(source / "recording.json", manifest)
             output = "replay-" + key
             assert main(_replay_args(frozen, ".private/" + source.name, ".private/" + output)) == 0
-            assert get_json(repo / output / "public-report.json")["documents"] == report["documents"]
+            replay = get_json(repo / output / "public-report.json")
+            assert replay["documents"] == report["documents"]
+            assert replay["business"]["counts"]["reply_parse_failed"] == int(not repaired)

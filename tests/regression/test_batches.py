@@ -133,7 +133,7 @@ def test_deterministic_whole_document_projection():
         tiers.project(snapshot, tiers.select(snapshot, {k: {"required": True} for k in docs}))
 
 
-@pytest.mark.parametrize("fault", ["lost_create", "missing", "conflict", "unknown", "deadline", "disconnect"])
+@pytest.mark.parametrize("fault", ["lost_create", "missing", "conflict", "unknown", "deadline", "disconnect", "partial_usage"])
 def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
     posts = []
     broken = True
@@ -157,6 +157,10 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
                 first = json.loads(rows[0])
                 first["result"]["usage"] = {"input_tokens": 8000000, "output_tokens": 0}
                 rows[0] = json.dumps(first) + "\n"
+            if fault == "partial_usage":
+                first = json.loads(rows[0])
+                first["result"]["usage"] = {"input_tokens": 250000}
+                rows[0] = json.dumps(first) + "\n"
             if broken:
                 if fault == "missing":
                     rows.pop()
@@ -164,7 +168,7 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
                     rows.append(rows[0].replace("expired", "canceled"))
                 elif fault == "unknown":
                     rows.append('{"custom_id":"unknown","result":{"type":"expired"}}\n')
-                elif fault == "disconnect":
+                elif fault in {"disconnect", "partial_usage"}:
                     return httpx.Response(200, stream=BrokenStream(rows[0].encode()))
             return httpx.Response(200, content="".join(rows + [rows[0]]).encode())
         state = "in_progress" if broken and fault == "deadline" else "ended"
@@ -204,6 +208,12 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
                 for mode in ("batch", "instant"):
                     with pytest.raises(RegressionError, match="预算"):
                         ledger.reserve("next", mode, "1", "next")
+    elif fault == "partial_usage":
+        assert main([*args, "--resume"]) == 1
+        row = get_json(repo / ledger_path)["r"]
+        assert Decimal(row["spent_usd"]) == Decimal("0.25")
+        assert Decimal(row["committed_usd"]) == Decimal("1.30")
+        assert row["active"] is True
     else:
         assert get_json(repo / ledger_path)["r"]["committed_usd"] == "1.3"
     assert main(args) == 1
@@ -540,3 +550,5 @@ def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
             ledger.reserve(f"next-{i}", "batch", "1", str(i))
         with pytest.raises(RegressionError, match="名额"):
             ledger.reserve("fourth", "batch", "1", "fourth")
+
+
