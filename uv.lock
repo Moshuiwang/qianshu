@@ -380,6 +380,7 @@ dependencies = [
     { name = "anthropic" },
     { name = "httpx" },
     { name = "lark-oapi" },
+    { name = "pydantic" },
     { name = "python-dotenv" },
 ]
 
@@ -399,6 +400,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28,<1" },
     { name = "lark-oapi", specifier = "==1.8.0" },
     { name = "playwright", marker = "extra == 'mingdao-check'", specifier = ">=1.50,<2" },
+    { name = "pydantic", specifier = ">=2.12,<3" },
     { name = "python-dotenv", specifier = ">=1.0,<2" },
 ]
 provides-extras = ["mingdao-check"]
