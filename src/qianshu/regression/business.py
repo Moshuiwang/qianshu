@@ -2,8 +2,10 @@
 
 from collections import Counter, defaultdict
 from decimal import Decimal, InvalidOperation
+from re import Pattern
 
 from qianshu.parse.companies import CompanyTable
+from qianshu.parse.scope import country_matches
 
 from .compare import compare_field, normalize
 from .storage import RegressionError, digest, json_bytes
@@ -19,7 +21,7 @@ LEGACY_DEFAULTS = {
     "repeat_bonus": "是", "effective_multiplier": 1,
 }
 G285_MAPPING = {
-    "version": "G285",
+    "version": "G285-2",
     "datasets": ["exam", "blind", "packages"],
     "inferable": "included_frozen_fields",
     "excluded": "outside_denominator",
@@ -264,6 +266,7 @@ def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
 
 def _g285_mark(
     name: str, pair: dict, sample: dict, package_style: str | None, company_table: CompanyTable | None,
+    *, country_names: dict[str, Pattern[str]] | None = None,
 ) -> dict:
     """用冻结的取值与原文事实查 G285 规则表。"""
     configuration = pair["configuration"]
@@ -287,18 +290,28 @@ def _g285_mark(
         )
     if name in ("policy_name", "policy_type"):
         tag_field = rule["input"]
-        tags = configuration.get(tag_field, {}).get("value", pair.get("pairing", {}).get(tag_field))
-        needs_review |= source_status.get(tag_field) in unresolved_inputs or tags is None
-        if name == "policy_name":
-            needs_review |= (
-                not tags or len(tags) != rule["required_count"]
-                or (rule["must_match_tag"] and value not in tags)
-            )
-        elif tags is not None:
-            expected = rule["nonempty"] if tags else rule["empty"]
-            needs_review |= value != expected
+        tag_entry = configuration.get(tag_field, {})
+        needs_review |= source_status.get(tag_field) in unresolved_inputs
+        # 金标排除只影响可比性，原文状态独立审定。
+        if "exclude" not in tag_entry:
+            tags = tag_entry.get("value", pair.get("pairing", {}).get(tag_field))
+            if tags is None:
+                needs_review = True
+            elif name == "policy_name":
+                needs_review |= (
+                    len(tags) != rule["required_count"] or (rule["must_match_tag"] and value not in tags)
+                )
+            else:
+                expected = rule["nonempty"] if tags else rule["empty"]
+                needs_review |= value != expected
     elif name == "company":
-        rows = (company_table or {}).get(sample[rule["table_key"]], {})
+        table = company_table or {}
+        country = sample[rule["table_key"]]
+        if country not in table and table and country_names:
+            matches = country_matches([country], country_names, exact=True)
+            if len(matches) == 1:
+                country = matches.pop()
+        rows = table.get(country, {})
         keywords = pair.get(rule["keyword_matches"])
         if keywords is None and status != rules["unwritten_input_status"]:
             # 旧冻结记录可没有独立的关键词审定。
@@ -336,13 +349,14 @@ def ratio(numerator: int, denominator: int | None) -> dict:
 class BusinessScore:
     def __init__(
         self, frozen: dict, threshold: int, countries: dict[str, str], *,
-        company_table: CompanyTable | None = None,
+        company_table: CompanyTable | None = None, country_names: dict[str, Pattern[str]] | None = None,
     ):
         self.threshold = threshold
         self.fingerprint = pairing_fingerprint(threshold)
         self.measure_fingerprint = measure_fingerprint(threshold)
         self.countries = countries
         self.company_table = company_table
+        self.country_names = country_names
         self.samples = frozen["samples"]
         self.dataset = frozen.get("dataset", "exam")
         self.eligible = defaultdict(list)
@@ -379,6 +393,7 @@ class BusinessScore:
             for name in self.eligible[sample_id]:
                 mark = _g285_mark(
                     name, pair, self.samples[sample_id], package_style or document.get("package_style"), self.company_table,
+                    country_names=self.country_names,
                 )
                 status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
                 self.field_counts[name][status] += 1
