@@ -14,7 +14,7 @@ import pytest
 from anthropic.types import TextBlock, ThinkingBlock, ToolUseBlock
 
 from qianshu.__main__ import main as service_main
-from qianshu.config import ConfigError
+from qianshu.config import ConfigError, load_config
 from qianshu.parse import ModelError, parse_application
 from qianshu.parse.__main__ import main
 from qianshu.parse.model import ModelReplyError, configured_model
@@ -35,11 +35,13 @@ def test_service_help_describes_current_offline_input(capsys):
     assert "演练" not in help_text
 
 
-@pytest.mark.parametrize(("model_config", "expected"), [
-    ({}, "claude-sonnet-5-5"),
-    ({"ANTHROPIC_MODEL": "placeholder-model"}, "placeholder-model"),
+@pytest.mark.parametrize(("model_config", "expected", "effort"), [
+    ({}, "claude-sonnet-5-5", "medium"),
+    ({"ANTHROPIC_MODEL": "placeholder-model", "ANTHROPIC_EFFORT": "low"}, "placeholder-model", "low"),
+    *[({"ANTHROPIC_EFFORT": effort}, "claude-sonnet-5-5", effort)
+      for effort in ("medium", "high", "xhigh", "max")],
 ])
-def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, caplog):
+def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, effort, caplog):
     client_type = anthropic.Anthropic
     raw = serialized_empty("占位正文")
 
@@ -50,7 +52,8 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
         assert payload["model"] == expected
         assert payload["system"] == "占位规则"
         assert payload["messages"] == [{"role": "user", "content": "占位正文"}]
-        assert "output_config" not in payload
+        assert payload["output_config"] == {"effort": effort}
+        assert "thinking" not in payload
         assert payload["tools"] == [{
             "name": "submit_application_reply", "description": "提交一份申请解析声明。",
             "input_schema": ApplicationReply.model_json_schema(),
@@ -103,8 +106,12 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
         "ANTHROPIC_BASE_URL": "https://model.example.invalid",
         **model_config,
     }
+    captured = []
     with caplog.at_level(logging.DEBUG):
-        assert json.loads(configured_model(config)(system="占位规则", user="占位正文")) == json.loads(raw)
+        complete = configured_model(config, on_result=captured.append)
+        assert json.loads(complete(system="占位规则", user="占位正文")) == json.loads(raw)
+    result, = captured
+    assert result.effort == effort
     assert "占位正文" not in caplog.text
     assert "model.example.invalid" not in caplog.text
 
@@ -112,6 +119,16 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
 def test_unsupported_platform_is_rejected():
     with pytest.raises(ConfigError, match="只支持 Anthropic"):
         configured_model({"AI_PLATFORM": "placeholder-platform"})
+
+
+@pytest.mark.parametrize("effort", ["", " ", "HIGH", "unsupported"])
+def test_invalid_effort_from_config_file_is_rejected(tmp_path, effort):
+    config_file = tmp_path / "placeholder.env"
+    config_file.write_text(
+        f"ANTHROPIC_API_KEY=placeholder-key\nANTHROPIC_EFFORT='{effort}'\n", encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="ANTHROPIC_EFFORT"):
+        configured_model(load_config(env_file=config_file))
 
 
 @pytest.fixture
@@ -333,9 +350,13 @@ def test_parse_entry_writes_only_to_a_new_private_file(monkeypatch, tmp_path, ca
 ])
 def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp_path, env_file, rules_dir, flags):
     monkeypatch.chdir(tmp_path)
-    Path(".env").write_text("ANTHROPIC_MODEL=placeholder-default\n", encoding="utf-8")
+    Path(".env").write_text(
+        "ANTHROPIC_MODEL=placeholder-default\nANTHROPIC_EFFORT=low\n", encoding="utf-8",
+    )
     if env_file != ".env":
-        Path(env_file).write_text("ANTHROPIC_MODEL=placeholder-custom\n", encoding="utf-8")
+        Path(env_file).write_text(
+            "ANTHROPIC_MODEL=placeholder-custom\nANTHROPIC_EFFORT=xhigh\n", encoding="utf-8",
+        )
     Path(rules_dir).symlink_to(Path(__file__).resolve().parents[2] / "rules", target_is_directory=True)
     configured = Mock(return_value=Mock(return_value=serialized_empty("占位正文")))
     monkeypatch.setattr("qianshu.parse.configured_model", configured)
@@ -344,7 +365,8 @@ def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp
 
     assert main() == 0
     expected_model = "placeholder-default" if env_file == ".env" else "placeholder-custom"
-    configured.assert_called_once_with({"ANTHROPIC_MODEL": expected_model})
+    expected_effort = "low" if env_file == ".env" else "xhigh"
+    configured.assert_called_once_with({"ANTHROPIC_MODEL": expected_model, "ANTHROPIC_EFFORT": expected_effort})
     configured.return_value.assert_called_once()
     assert json.loads(Path("drafts.json").read_text(encoding="utf-8")) == {
         "document": {"status": "经检查无政策", "reason_code": "fixture"},

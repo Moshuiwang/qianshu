@@ -14,6 +14,7 @@ from qianshu.config import ConfigError
 from .protocol import ApplicationReply
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
+DEFAULT_EFFORT = "medium"
 _REPLY_TOOL = "submit_application_reply"
 REPLY_FORMAT_ERRORS = frozenset({
     "reply_tool_missing", "reply_tool_multiple", "reply_tool_unexpected", "reply_schema",
@@ -48,6 +49,7 @@ class CallResult:
     model: str
     reply: str | None = field(repr=False)
     failure_stage: str | None = None
+    effort: str | None = None
 
 
 def _block_length(block) -> int | None:
@@ -69,6 +71,13 @@ def _interrupted_content(reply) -> str | None:
     return "".join(block.text for block in blocks if block.type == "text") or None
 
 
+def configured_effort(config: Mapping[str, str]) -> str:
+    effort = config.get("ANTHROPIC_EFFORT", DEFAULT_EFFORT)
+    if effort not in {"low", "medium", "high", "xhigh", "max"}:
+        raise ConfigError("ANTHROPIC_EFFORT 仅接受 low、medium、high、xhigh 或 max。")
+    return effort
+
+
 def configured_model(
     config: Mapping[str, str], *, on_result: Callable[[CallResult], None] | None = None,
     max_retries: int | None = None,
@@ -81,6 +90,7 @@ def configured_model(
         raise ConfigError("缺少配置，请在 .env 中填写 ANTHROPIC_API_KEY。")
     base_url = config.get("ANTHROPIC_BASE_URL")
     model = config.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+    effort = configured_effort(config)
 
     def complete(*, system: str, user: str) -> str:
         import httpx
@@ -98,7 +108,7 @@ def configured_model(
                 tuple((block.type, _block_length(block)) for block in blocks),
                 getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None),
                 (monotonic_ns() - started) // 1_000_000, getattr(reply, "model", model),
-                raw, failure,
+                raw, failure, effort=effort,
             ))
 
         def format_error(code: str, *, path: tuple = ()) -> ModelReplyError:
@@ -121,6 +131,7 @@ def configured_model(
                     system=system,
                     messages=[{"role": "user", "content": user}],
                     max_tokens=32000,
+                    output_config={"effort": effort},
                     tools=[{
                         "name": _REPLY_TOOL,
                         "description": "提交一份申请解析声明。",

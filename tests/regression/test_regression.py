@@ -914,7 +914,10 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
     ]
     reply = SimpleNamespace(stop_reason="end_turn", content=blocks)
 
+    efforts = []
+
     def stream(**payload):
+        efforts.append(payload["output_config"]["effort"])
         assert "tool_choice" not in payload
         assert "必须调用 `submit_application_reply` 一次" in payload["system"]
         assert "不要用文字回答" in payload["system"]
@@ -924,15 +927,30 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
+    monkeypatch.delenv("ANTHROPIC_EFFORT", raising=False)
     assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert efforts == ["medium", "medium"]
     report = get_json(repo / "run/public-report.json")
     assert report["documents"] == {"model_failed": 0, "parse_failed": 2, "parsed": 0}
     assert report["business"]["counts"]["reply_parse_failed"] == 2
     record = get_json(repo / "run/document-00001.json")
     attempt, = record["attempts"]
+    assert attempt["effort"] == record["configuration"]["effort"] == "medium"
     assert attempt["failure_stage"] == record["reason_code"] == "reply_tool_missing"
     assert json.loads(attempt["reply"]) == [block.model_dump(exclude_unset=True) for block in blocks]
+    monkeypatch.setenv("ANTHROPIC_EFFORT", "high")
+    assert main([*run_args(frozen, ".private/high"), "--live", "--release", "--retries", "1"]) == 0
+    assert efforts == ["medium", "medium", "high", "high"]
+    high_record = get_json(repo / "high/document-00001.json")
+    assert high_record["attempts"][0]["effort"] == high_record["configuration"]["effort"] == "high"
+    high_report = get_json(repo / "high/public-report.json")
+    assert high_report["configuration_sha256"] != report["configuration_sha256"]
+
+    monkeypatch.setenv("ANTHROPIC_EFFORT", "unsupported")
+    assert main([*run_args(frozen, ".private/invalid"), "--live", "--release"]) == 1
+    assert not (repo / "invalid").exists()
     assert main(_replay_args(frozen)) == 0
+    assert efforts == ["medium", "medium", "high", "high"]
     for name in runner.RUN_FILES:
         assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
 
@@ -1128,11 +1146,11 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
             body = json.loads(user)["application"]
             attempts[body] += 1
             if attempts[body] == 1:
-                on_result(CallResult(None, (), None, None, 7, "synthetic-model", None, "model_call"))
+                on_result(CallResult(None, (), None, None, 7, "synthetic-model", None, "model_call", effort="medium"))
                 raise RuntimeError("占位保密失败详情")
             reply = responses[body]
             on_result(CallResult("end_turn", (("thinking", 5), ("text", len(reply))),
-                                 12, 3, 20, "synthetic-model", reply))
+                                 12, 3, 20, "synthetic-model", reply, effort="medium"))
             return reply
         return model
 
@@ -1153,11 +1171,12 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
             assert len(record["configuration"][f"{kind}_sha256"]) == 64
         failed, final = record["attempts"]
         assert failed["failure_stage"] == "model_call"
+        assert failed["effort"] == "medium"
         assert final == {
             "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
                                                  {"type": "text", "length": len(final["reply"])}],
             "input_tokens": 12, "output_tokens": 3, "elapsed_ms": 20,
-            "model": "synthetic-model", "reply": final["reply"], "failure_stage": None,
+            "model": "synthetic-model", "reply": final["reply"], "failure_stage": None, "effort": "medium",
         }
         assert final["reply"] in responses.values()
         assert record["failure_stage"] == ("reply_parse" if final["reply"] == responses["占位单条原稿\n"] else None)

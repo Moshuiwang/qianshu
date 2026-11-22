@@ -38,11 +38,11 @@ def _reply_failure(attempt: dict) -> str | None:
 
 
 def configuration(snapshot: dict, rules_dir: Path, model_id: str, threshold: int, legacy: bool,
-                  release: bool, retries: int) -> dict:
+                  release: bool, retries: int, *, effort: str | None = None) -> dict:
     source = Path(__file__).resolve().parents[1]
     code = {file.relative_to(source).as_posix(): digest(file.read_bytes()) for file in source.rglob("*.py")}
     rules = {name: digest((rules_dir / name).read_bytes()) for name in RULES}
-    return {
+    config = {
         "freeze_sha256": snapshot["fingerprint"],
         "code_sha256": digest(json_bytes(code)),
         "rules_sha256": digest(json_bytes(rules)),
@@ -53,6 +53,9 @@ def configuration(snapshot: dict, rules_dir: Path, model_id: str, threshold: int
         "measure_sha256": measure_fingerprint(threshold),
         "legacy_companies": legacy, "release": release, "retries": retries,
     }
+    if effort is not None:
+        config["effort"] = effort
+    return config
 
 
 def doc_names(snapshot: dict) -> dict[str, str]:

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from qianshu.config import ConfigError
-from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_model
+from qianshu.parse.model import DEFAULT_MODEL, ParseModel, configured_effort, configured_model
 
 from .business import DEFAULT_THRESHOLD
 from .corpus import make_plan
@@ -18,7 +18,9 @@ from .runner import RUN_FILES, evaluate, markdown_report
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json
 from .summary import summarize
 
-_MODEL_SETTINGS = ("AI_PLATFORM", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL")
+_MODEL_SETTINGS = (
+    "AI_PLATFORM", "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL", "ANTHROPIC_BASE_URL", "ANTHROPIC_EFFORT",
+)
 
 
 class _Parser(argparse.ArgumentParser):
@@ -90,7 +92,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
     snapshot = load_freeze(files, files.argument(args.frozen))
     if snapshot["fingerprint"] != args.expect_sha256:
         raise RegressionError("预期冻结指纹与实际冻结指纹不一致。")
-    source = origin_run_id = None
+    source = origin_run_id = effort = None
     settings = {}
     if args.command == "replay":
         saved = SavedReplies(files, files.argument(args.recording))
@@ -104,6 +106,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
         legacy = prior["legacy_companies"] if args.legacy_companies is None else args.legacy_companies
         threshold = manifest["threshold"] if args.threshold is None else args.threshold
         release, retries = prior["release"], prior["retries"]
+        effort = prior.get("effort")
         origin = "replay"
     else:
         legacy = bool(args.legacy_companies)
@@ -121,12 +124,13 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None) -> None
                 raise RegressionError("实际调用模型须显式指定 --live。")
             settings = {key: os.environ[key] for key in _MODEL_SETTINGS if key in os.environ}
             model_id = settings.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+            effort = configured_effort(settings)
             origin = "live"
         else:
             model_id, origin = "injected", "injected"
 
     rules = files.repo / "rules"
-    config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries)
+    config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries, effort=effort)
     replaces_run_id = None
     if getattr(args, "replaces_recording", None):
         prior_dir = files.argument(args.replaces_recording)
