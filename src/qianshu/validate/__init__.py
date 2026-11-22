@@ -130,6 +130,9 @@ def _validate_tags(
             errors.append(Finding("R8", "user_tags", "定向政策须选择用户标签，请申请人补充。"))
         return
 
+    if _value(draft.policy_type) == "公开政策":
+        errors.append(Finding("R8", "user_tags", "公开政策不能选择用户标签，请申请人确认。"))
+
     latest_end = facts.latest_tag_end_date
     if latest_end is None:
         errors.append(Finding("R8", "end_date", "标签最晚结束日期尚未确认，请申请人补充。"))

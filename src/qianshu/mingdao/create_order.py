@@ -18,13 +18,25 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from stat import S_ISREG
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 from uuid import UUID
 
 import httpx
 from dotenv import dotenv_values
+from pydantic import TypeAdapter
 
-from qianshu.draft import PolicyDraft
+from qianshu.config import LOGGABLE_CONFIG_KEYS
+from qianshu.draft import DraftField, OfferPolicyDraft, PolicyDraft
+from qianshu.parse.benefits import (
+    BenefitCatalog, OFFER_FIELD_LABELS, benefit_applicability, benefit_field_format, duration_days, tariff_amount,
+)
+from qianshu.parse.evidence import Sources, intersect
+from qianshu.parse.package_levels import copy_for, decode_package_levels, unique_offer
+from qianshu.parse.scope import company_mentioned
+from qianshu.parse.protocol import Duration, SourceBlock, Span
+from qianshu.pipeline import _CardRedaction
+from qianshu.validate import effective_start_date
 from qianshu.feishu.cards import mention
 from qianshu.feishu.sdk import ApprovalClosed, FeishuService
 from qianshu.feishu.settings import Window, load_settings
@@ -52,6 +64,7 @@ _TEMPLATE_CHECKS = ("user_tags", "packages", "approval_url", "company", "maintai
 _LOG_PAGE_SIZE = 50
 _RELATION_PAGE_SIZE = 50
 _DRAFT_FIELDS = {field.name for field in fields(PolicyDraft)}
+_ORDER_FIELDS = {field.name for field in fields(OfferPolicyDraft)}
 _SELECT = {9, 10, 11}
 _ARRAY = _SELECT | {26, 29, 34}
 
@@ -513,24 +526,279 @@ class Official:
         self._request("delete", current.record_id, body=body)
 
 
-def draft_values(draft):
-    require(isinstance(draft, dict) and draft.keys() <= _DRAFT_FIELDS, "草稿字段无效")
+def calendar_date(value, reason):
+    try:
+        parsed = date.fromisoformat(value)
+    except (TypeError, ValueError):
+        raise Stop(reason) from None
+    require(parsed.isoformat() == value, reason)
+    return parsed
+
+
+def order_material(export, target):
+    reason = "建单草稿缺少整批来源证据"
+    require(isinstance(export, dict) and isinstance(export.get("sources"), list)
+            and export["sources"] and isinstance(export.get("drafts"), list), reason)
+    require(export.get("requires_full_review") is False and export.get("structure_issues") == [],
+            "整批结构尚待核对")
+    try:
+        blocks = [SourceBlock(**block) for block in export["sources"]]
+        require(all(receipt(block.id) and receipt(block.source_id) and isinstance(block.text, str)
+                    and type(block.start) is int for block in blocks), reason)
+        sources = Sources(blocks)
+        scopes = {}
+        mains = []
+        owners = []
+        for draft in export["drafts"]:
+            scope = draft["scope"]
+            policy = draft["policy_id"]
+            require(receipt(policy) and scope["id"] == policy and policy not in scopes, "政策标识无效或重复")
+            scopes[policy] = draft
+            for index, item in enumerate([scope["main"], *scope["continuations"]]):
+                span = Span.model_validate(item)
+                located = sources.locate(span)
+                require(located is not None and (span.text is None or
+                        sources.blocks[span.source_id].text[span.start:span.end] == span.text), "政策锚点无效")
+                if index == 0:
+                    require(not any(intersect(located, other) for other in mains), "政策主段相交")
+                    mains.append(located)
+            for item in scope.get("exclusive_spans", []):
+                located = sources.locate(Span.model_validate(item))
+                require(located is not None, "归属声明坐标无效")
+                owners.append((policy, located))
+        require(target in scopes, "登记目标政策缺失")
+        return scopes[target], sources, owners
+    except (KeyError, AttributeError, TypeError, ValueError):
+        raise Stop(reason) from None
+
+
+_DEFAULTS = {
+    "maintain_mutual_exclusion_group": ("是", "互斥组按默认填是"),
+    "effective_multiplier": (1, "生效倍数按默认填 1"),
+    "trigger_once": ("否", "是否只触发一次按默认填否"),
+    "repeat_bonus": ("是", "多买多送按默认填是"),
+    "approval_attachments": ([], "审批件按默认留空"),
+    "after_offer": ("恢复原包", "优惠后按默认恢复原包"),
+    "forbid_package_change": ("是", "获得优惠后不允许换包按默认填是"),
+    "cancel_on_downgrade": ("是", "降包用户取消优惠按默认填是"),
+}
+
+
+def check_derivation(name, value, result, draft, declared, reason):
+    dependencies = {
+        "policy_type": ["user_tags"], "policy_name": ["user_tags"],
+        "packages": ["benefit_type", "company", "start_date", "packages"],
+        "company": ["country", "company", "company_keyword"],
+        "tariff": ["start_date", "tariff"], "after_offer_package": ["after_offer_package"],
+        "recharge_amount": ["start_date", "amount_mode", "tariff", "tariff_multiplier"],
+    }
+    require(result.get("input_fields") == dependencies.get(name) and name in dependencies, reason)
+    results = draft["field_results"]
+    evidence = list(declared)
+    for key in dependencies[name]:
+        if key != name:
+            evidence.extend(results[key]["evidence"])
+    require(all(q in evidence for q in result["evidence"]), reason)
+    original = result["statement"]["value"]
+    if name in ("policy_name", "policy_type"):
+        tags = draft["user_tags"]["value"]
+        expected = "定向政策" if name == "policy_type" else (tags[0] if len(tags) == 1 else None)
+        require(value == expected and original in (None, expected), reason)
+    elif name == "packages":
+        require(isinstance(original, list) and len(original) == len(value) and draft["scope"]["has_title"] is True,
+                reason)
+        for source, row in zip(original, value, strict=True):
+            current = row["current_package"]
+            gift = row["gift_package"]
+            require(source["current_package"] == current and receipt(gift), reason)
+            if draft["benefit_type"]["value"] == "赠送时长":
+                require(source["gift_package"] in (None, current, current + "_copy"), reason)
+            else:
+                require(receipt(source["gift_package"]) and source["gift_package"] + "_copy" == gift, reason)
+    elif name == "after_offer_package":
+        require(original == value, reason)
+    elif name == "company":
+        require(original is None or original == value, reason)
+
+
+def verify_company_inputs(draft, sources, owners, snapshot, country):
+    result = draft["field_results"]["company"]
+    if result.get("source") != "查表派生":
+        return
+    results = draft["field_results"]
+    reason = "公司主体查表输入未确认"
+    for key in ("country", "company_keyword"):
+        operand = results[key]
+        statement = operand["statement"]
+        require(operand["issues"] == [] and statement.get("candidates") == [], reason)
+        if key == "company_keyword" and statement.get("status") == "原文未写":
+            require(statement["value"] is None and statement["evidence"] == []
+                    and operand["evidence"] == [] and not operand["has_value"], reason)
+            continue
+        require(statement.get("status") == "确定" and operand.get("needs_confirmation") is False
+                and operand["has_value"] is True and operand["evidence"] and statement["evidence"], reason)
+        verified = []
+        for quote in statement["evidence"]:
+            span, _ = sources.locate_quote(Span.model_validate(quote["span"]), quote["text"])
+            require(span is not None and receipt(quote["text"]), reason)
+            located = sources.locate(span)
+            require(not any(policy != draft["policy_id"] and intersect(located, exclusive)
+                            for policy, exclusive in owners), reason)
+            verified.append({"text": quote["text"], "span": span.model_dump(exclude_none=True)})
+        require(verified == operand["evidence"], reason)
+    country_input = results["country"]["statement"]["value"]
+    aliases = snapshot.get("country_aliases", {})
+    require(results["country"]["value"] == country and
+            (country_input == country or aliases.get(country_input) == country), reason)
+    clues = results["company_keyword"]["statement"]["value"]
+    rows = [r for r in snapshot.get("companies", []) if r["country"] == country]
+    if clues is None:
+        require(result["statement"]["status"] == "原文未写", reason)
+        matches = [r for r in rows if not r.get("keyword")]
+    else:
+        require(isinstance(clues, list) and results["company_keyword"]["value"] == clues, reason)
+        matches = [r for r in rows if r.get("keyword") and company_mentioned(r["keyword"], clues)]
+    require(len(matches) == 1 and matches[0]["name"] == result["value"], reason)
+
+
+def order_evidence(values, fields_in, draft, sources, owners):
+    results = draft["field_results"]
+    adjustments = []
+    excerpts = []
+    for name, value in values.items():
+        require(benefit_field_format(name, value), f"优惠字段 {name} 格式无效")
+        result = results.get(name, {})
+        statement = result.get("statement", {})
+        reason = f"草稿字段 {name} 缺少可核证据"
+        require(result.get("has_value") is True and result.get("needs_confirmation") is False
+                and result.get("issues") == [] and result.get("program_status") is None
+                and compact(result.get("value")) == compact(value) and statement.get("candidates") == [], reason)
+        quotes = result.get("evidence")
+        absent = (statement.get("status") == "原文未写" and "value" in statement
+                  and statement["value"] is None and statement.get("evidence") == [])
+        if result.get("source") == "默认规则":
+            require(absent and quotes == [] and name in _DEFAULTS and _DEFAULTS[name][0] == value
+                    and fields_in[name].get("evidence") == []
+                    and not (name == "cancel_on_downgrade" and values["benefit_type"] == "赠送时长"), reason)
+            adjustments.append(_DEFAULTS[name][1])
+            continue
+        require((statement.get("status") == "确定" and "value" in statement and statement.get("evidence"))
+                or (absent and result.get("source") == "查表派生"), reason)
+        require(isinstance(quotes, list) and bool(quotes), reason)
+        if result.get("source") == "原文":
+            original = statement.get("value")
+            if name in ("recharge_days", "gift_days", "watch_days", "penalty_days") and isinstance(original, dict):
+                duration = Duration.model_validate(original)
+                original = duration_days(duration)
+                if duration.unit == "月":
+                    adjustments.append(f"{name} 按 1 月 = 30 天换算")
+            require(compact(original) == compact(value) and statement.get("evidence"), reason)
+        else:
+            require(result.get("source") == "查表派生" and name in ("packages", "company", "policy_type",
+                    "policy_name", "tariff", "recharge_amount", "after_offer_package")
+                    and result.get("input_fields"), reason)
+        declared = []
+        for quote in statement.get("evidence", []):
+            span, _ = sources.locate_quote(Span.model_validate(quote["span"]), quote["text"])
+            require(span is not None, reason)
+            declared.append({"text": quote["text"], "span": span.model_dump(exclude_none=True)})
+        if result.get("source") == "原文":
+            require(declared == quotes, reason)
+        else:
+            require(all(q in quotes for q in declared), reason)
+            check_derivation(name, value, result, draft, declared, reason)
+        projected = []
+        for quote in quotes:
+            span = Span.model_validate(quote["span"])
+            located = sources.locate(span)
+            require(located is not None and receipt(quote["text"]) and
+                    sources.blocks[span.source_id].text[span.start:span.end] == quote["text"], reason)
+            require(not any(policy != draft["policy_id"] and intersect(located, exclusive)
+                            for policy, exclusive in owners), "引文与明确归属声明矛盾")
+            projected.append({"text": quote["text"], "start": located.start if located.source_id == "body" else None})
+            excerpts.append((name, span, quote["text"]))
+        require(fields_in[name].get("evidence") == projected, reason)
+    return excerpts, adjustments
+
+
+def order_fields(draft, sources, owners, today):
+    require(draft.keys() <= _ORDER_FIELDS | {"hints", "scope", "policy_id", "policy_name_source",
+            "package_tier_candidates", "field_results"}, "草稿字段无效")
+    fields_in = {k: v for k, v in draft.items() if k in _ORDER_FIELDS}
+    kind = fields_in.get("benefit_type", {}).get("value")
+    require(kind in ("赠送时长", "升级权益", "特价优惠"), "草稿缺少有效优惠类型")
+    applicability = SimpleNamespace(**{name: DraftField(value=field.get("value"),
+                                    uncertainty=field.get("uncertainty")) for name, field in fields_in.items()})
+    inactive, required = benefit_applicability(applicability)
+    results = draft.get("field_results", {})
+    adjustments = ["政策类型按用户标签判定"]
+    for name in inactive:
+        require(fields_in.get(name, {}).get("value") is None
+                and results.get(name, {}).get("statement", {}).get("value") is None, f"优惠字段 {name} 不适用")
+    for name in ("penalty_days", "first_recharge_day_only"):
+        if name in results and name not in inactive and fields_in.get(name, {}).get("value") is None:
+            statement = results[name]["statement"]
+            require(statement.get("status") in ("确定", "原文未写") and statement["value"] is None
+                    and statement["candidates"] == [] and not results[name].get("issues")
+                    and results[name]["needs_confirmation"] is False,
+                    f"优惠字段 {name} 适用情况待确认")
+    for name in sorted(required):
+        require(fields_in.get(name, {}).get("value") is not None, f"缺少优惠字段 {name}")
+    cancel = "cancel_on_downgrade"
+    pending = False
+    result = results.get(cancel, {})
+    statement = result.get("statement", {})
+    if kind == "赠送时长" and statement.get("status") == "原文未写":
+        require("value" in statement and statement["value"] is None and statement.get("evidence") == []
+                and statement.get("candidates") == [] and result.get("evidence") == []
+                and result.get("issues") == ["downgrade_confirmation"] and result.get("needs_confirmation") is True
+                and result.get("value") is None and result.get("has_value") is False
+                and cancel in fields_in and fields_in[cancel].get("value") is None
+                and not fields_in[cancel].get("evidence") and not (fields_in[cancel].get("uncertainty") or {}).get("candidates"),
+                "降包用户取消优惠尚待核对")
+        pending = True
+        fields_in.pop(cancel, None)
+        adjustments.append("降包用户取消优惠待确认，请选择是或否")
+    # 先保留 X5 共同字段、标签与包行原有的拒绝顺序。
+    values = draft_values(fields_in, order_entry=True)
+    for name in sorted(required | {"benefit_type", "policy_type", "trigger_once", "repeat_bonus",
+                                   "effective_multiplier", "maintain_mutual_exclusion_group"}):
+        require(name in values, f"草稿缺少必填字段 {name}")
+    require(pending or values.get(cancel) in ("是", "否"), "降包用户取消优惠待确认")
+    require(values["maintain_mutual_exclusion_group"] == "是", "互斥组须为是，交人工确认")
+    require(values["policy_type"] == "定向政策", "政策类型与用户标签不一致")
+    require(values["trigger_once"] == "否" and values["repeat_bonus"] in ("是", "否")
+            and type(values["effective_multiplier"]) in (float, int) and values["effective_multiplier"] == 1,
+            "触发次数、多买多送或生效倍数须人工确认")
+    excerpts, hints = order_evidence(values, fields_in, draft, sources, owners)
+    adjustments.extend(hints)
+    original = calendar_date(values["start_date"], "草稿开始日期无效")
+    effective = effective_start_date(original, today)
+    require(effective.isoformat() <= values["end_date"], "开始日期调整后晚于结束日期")
+    if effective != original:
+        adjustments.append(f"开始日期由 {original} 调整至 {effective}")
+    values["start_date"] = effective.isoformat()
+    return values, inactive, adjustments, excerpts, pending
+
+
+def draft_values(draft, *, order_entry=False):
+    require(isinstance(draft, dict) and draft.keys() <= (_ORDER_FIELDS if order_entry else _DRAFT_FIELDS), "草稿字段无效")
     values = {}
     for key, field in draft.items():
         require(isinstance(field, dict) and "value" in field, "草稿取值结构无效")
         require(field.get("uncertainty") is None, f"草稿字段 {key} 待确认，需人工")
         if field["value"] is not None:
             values[key] = field["value"]
-    require(all(key in values for key in (*_VARIABLE, "user_tags", "packages", "company")), "草稿缺少必填字段")
+    common = ("policy_name", "start_date", "end_date", "user_scope") if order_entry else _VARIABLE
+    require(all(key in values for key in (*common, "user_tags", "packages", "company")), "草稿缺少必填字段")
     require(receipt(values["user_scope"]), "草稿用户范围格式无效，需人工")
     name = values["policy_name"]
     require(receipt(name) and len(name) > len(_PREFIX) and not any(c in name for c in "\r\n<>"),
             "草稿政策名称格式无效")
     for key in ("start_date", "end_date"):
-        value = values[key]
-        require(isinstance(value, str) and date.fromisoformat(value).isoformat() == value, "草稿日期格式无效")
+        calendar_date(values[key], "草稿日期格式无效")
     require(values["start_date"] <= values["end_date"], "草稿开始日期晚于结束日期")
-    require(all(type(values[key]) is int and values[key] >= 0 for key in ("recharge_days", "gift_days")),
+    require(all(type(values[key]) is int and values[key] >= 0 for key in ("recharge_days", "gift_days") if key in values),
             "草稿充值或赠送天数无效")
     tags = values["user_tags"]
     require(isinstance(tags, list) and all(receipt(tag) for tag in tags) and len(set(tags)) == len(tags),
@@ -1024,6 +1292,174 @@ class CreateRequest:
             connection.close()
 
 
+def x5_projection(values, config, inactive):
+    # 优惠扩展项仅核对既有模板复制控件。组装器继续使用原有草稿字段集。
+    fields_config = {}
+    names = set()
+    for control, spec in config["fields"].items():
+        name = spec.get("draft")
+        if name is not None:
+            require(name in _ORDER_FIELDS and name not in names, "草稿与模板字段映射不唯一")
+            names.add(name)
+        fields_config[control] = ({k: v for k, v in spec.items() if k != "draft"}
+                                  if name in OFFER_FIELD_LABELS else spec)
+    for name in sorted((values.keys() & OFFER_FIELD_LABELS.keys()) - names):
+        raise Stop(f"当前 X5 无法核对优惠字段 {name}")
+    projected = {k: v for k, v in values.items() if k in _DRAFT_FIELDS}
+    for name in inactive.intersection(_VARIABLE):
+        projected[name] = None
+    return projected, {**config, "fields": fields_config}
+
+
+def check_catalog(values, snapshot, results):
+    if values.get("after_offer") != "指定节目包" and values.get("amount_mode") != "节目包资费":
+        return
+    catalog = TypeAdapter(BenefitCatalog).validate_json(compact(snapshot.get("benefit_catalog", {})), strict=True)
+    if values.get("after_offer") == "指定节目包":
+        require(catalog.package_names.count(values["after_offer_package"]) == 1, "优惠后目标节目包无法唯一核实")
+    if values.get("amount_mode") == "节目包资费":
+        requested = results["tariff"]["statement"]["value"]
+        rate = catalog.rate(requested, date.fromisoformat(values["start_date"]))
+        require(rate and values["tariff"] == {**requested, "version": rate.version}, "关联资费无唯一有效版本")
+        require(values["recharge_amount"] == tariff_amount(rate.amount, values["tariff_multiplier"]),
+                "充值金额与资费计算结果不一致")
+
+
+def verify_order_request(payload, config, template, relations, values, inactive):
+    schema = config["fields"]
+    controls = {s["draft"]: c for c, s in schema.items() if "draft" in s}
+    items = decode(payload)["receiveControls"]
+    actual = {item["controlId"]: item["value"] for item in items}
+    require(len(items) == len(actual) and actual.keys() == schema.keys()
+            and all(item["type"] == schema[item["controlId"]]["type"] for item in items), "请求控件不完整")
+    for name in inactive | (OFFER_FIELD_LABELS.keys() - values.keys()):
+        if name in controls:
+            control = controls[name]
+            require(actual[control] == encode_cell(None, schema[control]), f"请求中的优惠字段 {name} 须为空")
+    option_fields = {"policy_type", "benefit_type", "maintain_mutual_exclusion_group",
+                     "trigger_once", "repeat_bonus", "cancel_on_downgrade"}
+    for name in values.keys() - {"user_tags", "packages", "company"}:
+        control = controls.get(name)
+        require(control is not None, f"草稿字段 {name} 无法核对模板")
+        spec = schema[control]
+        label = "优惠类型" if name == "benefit_type" else spec["label"]
+        reason = f"字段 {label} 的写入值不一致"
+        require(control not in config["fixed"] and control not in config["readback_skip"], reason)
+        if name in option_fields:
+            reason = f"字段 {spec['label']} 的选项标识、显示名或写入值不一致"
+            key, label = single_option(unpack_array(template[control]), reason)
+            mapping = spec.get("draft_values")
+            require(spec["type"] in (9, 11) and label == values[name] and isinstance(mapping, dict)
+                    and mapping.get(compact(label)) == [key] and list(mapping.values()).count([key]) == 1
+                    and actual[control] == compact([key]), reason)
+        else:
+            if name == "effective_multiplier":
+                require(spec["type"] in (6, 8) and "draft_values" not in spec, reason)
+            require(equivalent(actual[control], draft_cell(values[name], spec), spec), reason)
+    snapshot = config.get("order_snapshot", {})
+    require(receipt(snapshot.get("version")), "未登记查表快照版本")
+    deadline = verify_selected_tags(config, controls, actual, relations, values, snapshot)
+    verify_selected_packages(config, controls, actual, relations, values, snapshot)
+    return deadline
+
+
+def verify_selected_tags(config, controls, actual, relations, values, snapshot):
+    tags = decode(actual[controls["user_tags"]])
+    rows = relations[controls["user_tags"]]
+    keys = config["official"]["tag_relation"]["name_keys"]
+    require([item["sid"] for item in tags] == select_tag_ids(rows, keys, values["user_tags"]), "请求标签不一致")
+    dates = []
+    for tag, item in zip(values["user_tags"], tags, strict=True):
+        row, = [r for r in rows if r["rowId"] == item["sid"]]
+        names = {normalize_template_name(n) for n in [tag, *(row.get(k) for k in keys)] if receipt(n)}
+        facts = [f for f in snapshot.get("tags", []) if normalize_template_name(f["name"]) in names]
+        require(facts and all(f["id"] == item["sid"] for f in facts), "标签截止日或记录标识未确认")
+        ends = {calendar_date(f.get("end"), "标签截止日未确认") for f in facts}
+        require(len(ends) == 1, "标签截止日登记冲突")
+        require(all(type(f.get("shadow")) is bool for f in facts),
+                "标签类型未确认")
+        shadow = any(f["shadow"] for f in facts) or any(n.endswith("_image") for n in names)
+        require(not shadow or len(tags) == 1, "影子标签须单选")
+        dates.append(ends.pop())
+    require(values["end_date"] <= max(dates).isoformat(), "政策结束日期晚于标签截止日")
+    return max(dates)
+
+
+def verify_selected_packages(config, controls, actual, relations, values, snapshot):
+    schema = config["fields"]
+    reason = "节目包缺少唯一有效的销售品或请求记录不一致"
+    day = date.fromisoformat(values["start_date"])
+    companies = [r for r in snapshot.get("companies", []) if r["name"] == values["company"]
+                 and r["country"] == config["template"]["country"]["value"]]
+    require(len(companies) == 1 and receipt(companies[0]["id"]), "公司主体未确认")
+    company_control = controls["company"]
+    company_spec = schema[company_control]
+    if company_spec["type"] == 29:
+        company_id = select_company_id(relations[company_control], company_spec, values["company"])
+        require(actual[company_control] == encode_cell([company_id], company_spec), "请求公司与已核主体不一致")
+    else:
+        require(actual[company_control] == encode_cell(values["company"], company_spec), "请求公司与已核主体不一致")
+    levels = decode_package_levels(snapshot.get("package_levels", "").encode())
+    offers = levels.for_company(values["company"], companies[0]["id"])
+    package_control = controls["packages"]
+    spec = schema[package_control]
+    request_rows = decode(actual[package_control])
+    require(len(request_rows) == len(values["packages"]), reason)
+    for cells, package in zip(request_rows, values["packages"], strict=True):
+        current = unique_offer(offers, package["current_package"], "基本", day)
+        gift_name = package["gift_package"]
+        require(current and receipt(gift_name) and gift_name.endswith("_copy"), reason)
+        base = current if values["benefit_type"] == "赠送时长" else unique_offer(offers, gift_name[:-5], "基本", day)
+        gift = copy_for(offers, base, day) if base else None
+        require(gift and gift.name == gift_name, reason)
+        children = {cell["controlId"]: cell["value"] for cell in cells}
+        for role, offer in (("current", current), ("gift", gift)):
+            child = spec[role]["control"]
+            entries = unpack_array(children[child])
+            require(len(entries) == 1 and relation_item(entries[0], "sid",
+                    spec["children"][child].get("relation_id_key", "rowid"))["sid"] == offer.id, reason)
+
+
+def order_summary(values, config, adjustments, excerpts, sources, secrets, deadline):
+    pattern = re.compile("|".join(map(re.escape, sorted(secrets, key=len, reverse=True))))
+    fragments = {value[i:i + 4] for value in secrets for i in range(len(value) - 3)}
+    # 同一来源可拆为多个连续或重叠块。拼回连续区间再判引文与凭据的交集。
+    redactions = {}
+    for origin in {block.source_id for block in sources.blocks.values()}:
+        segments = []
+        for block in sorted((b for b in sources.blocks.values() if b.source_id == origin), key=lambda b: b.start):
+            if segments and block.start <= segments[-1][0] + len(segments[-1][1]):
+                start, text, ids = segments[-1]
+                segments[-1] = start, text + block.text[max(0, start + len(text) - block.start):], [*ids, block]
+            else:
+                segments.append((block.start, block.text, [block]))
+        for start, text, blocks in segments:
+            redact = _CardRedaction(text, pattern, fragments)
+            for block in blocks:
+                redactions[block.id] = (redact, block.start - start)
+    def safe(text):
+        for redact, _ in redactions.values():
+            text, = redact.free_texts([text])
+        return text
+
+    labels = {s["draft"]: s["label"] for s in config["fields"].values() if "draft" in s}
+    visible = dict(values)
+    for name in ("policy_name", "company", "user_scope"):
+        visible[name] = safe(values[name])
+    require(visible["policy_name"] == values["policy_name"], "公告名称与凭据冲突")
+    visible["user_tags"] = [safe(tag) for tag in values["user_tags"]]
+    visible["packages"] = [{k: safe(v) if v else v for k, v in row.items()} for row in values["packages"]]
+    lines = [card_summary(visible), *(f"{labels.get(k, k)}：{safe(str(v))}" for k, v in visible.items()
+             if k not in (*_VARIABLE, "user_tags", "packages")), f"用户范围：{visible['user_scope']}",
+             f"标签最晚截止日：{deadline}", *("自动调整：" + a for a in adjustments)]
+    summary = "\n".join(lines)
+    for name, span, text in excerpts:
+        redact, offset = redactions[span.source_id]
+        summary += f"\n{labels.get(name, name)}依据：" + redact.display(text, offset + span.start)
+    require(not any(secret in summary for secret in secrets), "展示字段与凭据冲突")
+    return summary
+
+
 def card_summary(values, *, default_mutual_exclusion=False):
     tags = "、".join(values["user_tags"]) or "无"
     packages = "；".join(f"{row['current_package']} / {row['gift_package'] or '无赠送包'}"
@@ -1031,7 +1467,7 @@ def card_summary(values, *, default_mutual_exclusion=False):
     adjustment = "自动调整：互斥组按默认填是\n" if default_mutual_exclusion else ""
     return (f"拟建 X5 测试单 1 条\n政策名称：{values['policy_name']}\n"
             f"起止日期：{values['start_date']} 至 {values['end_date']}\n"
-            f"充值 / 赠送天数：{values['recharge_days']} / {values['gift_days']}\n"
+            f"充值 / 赠送天数：{values.get('recharge_days', '不适用')} / {values.get('gift_days', '不适用')}\n"
             f"用户标签：{tags}\n节目包（当前 / 赠送）：{packages}\n"
             f"{adjustment}同意后将建单并触发同国家政策重算。请在测试与清理期间保持该记录状态。")
 
@@ -1212,14 +1648,21 @@ def run(args, directory, *, clock=time.time):
 
     try:
         window = preflight(evidence, recipients, config_data, draft_data, login_data, clock)
+        draft, sources, owners = order_material(decode(draft_data), evidence.get("policy_id"))
+        values, inactive, adjustments, excerpts, pending = order_fields(
+            draft, sources, owners, datetime.fromtimestamp(clock(), UTC).date())
+        require(values["policy_name"].startswith(_PREFIX), "X5 草稿名称缺少测试前缀")
+        snapshot = config.get("order_snapshot", {})
+        verify_company_inputs(draft, sources, owners, snapshot, config["template"]["country"]["value"])
+        check_catalog(values, snapshot, draft["field_results"])
+        projected, assembly_config = x5_projection(values, config, inactive)
     except Stop as error:
         write_preflight_failure(error)
         raise
-    values = draft_values(decode(draft_data))
-    mutex = "maintain_mutual_exclusion_group"
-    default_mutual_exclusion = mutex not in values
-    values.setdefault(mutex, "是")
-    require(values["policy_name"].startswith(_PREFIX), "X5 草稿名称缺少测试前缀")
+    except (KeyError, ValueError, TypeError, AttributeError):
+        error = Stop("草稿字段或来源证据无效")
+        write_preflight_failure(error)
+        raise error from None
 
     token = extract_token(decode(login_data), config["create"]["session_cookie"])
     with args.env_file.open(encoding="utf-8-sig") as stream:
@@ -1237,12 +1680,21 @@ def run(args, directory, *, clock=time.time):
     official_token = official_setting("token_key")
     official_app_id = official_setting("app_id_key")
     contact = mention(config["configurator"]["id"], config["configurator"]["label"])
-    summary = card_summary(values, default_mutual_exclusion=default_mutual_exclusion)
-    tracked = [summary, contact, args.registration, *(spec["label"] for spec in config["fields"].values())]
-    require(not any(secret in item for item in tracked for secret in (token, official_token, official_app_id)),
-            "展示字段与凭据冲突")
+    sensitive = {token, official_token, official_app_id}
+    display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
+    sensitive.update(value for key, value in secrets.items() if key not in display_settings and receipt(value))
+    tracked = [values["policy_name"], args.registration, *(spec["label"] for spec in config["fields"].values())]
+    require(not any(secret in item for item in tracked for secret in sensitive), "展示字段与凭据冲突")
+    require(not any(secret in item for item in (card_summary(values), contact)
+                    for secret in (token, official_token, official_app_id)), "展示字段与凭据冲突")
+
 
     def login_check():
+        require(not pending, "降包用户取消优惠须确认具体取值")
+        today = datetime.fromtimestamp(clock(), UTC).date()
+        approved_start = effective_start_date(date.fromisoformat(draft["start_date"]["value"]), today)
+        require(values["start_date"] == approved_start.isoformat(),
+                "经卡片确认的开始日期已过，需重新审批")
         current = private_bytes(login_path)
         require(digest(current) == evidence["login_sha256"]
                 and extract_token(decode(current), config["create"]["session_cookie"]) == token,
@@ -1263,15 +1715,27 @@ def run(args, directory, *, clock=time.time):
             template_id = config["template"]["row_id"]
             require(uuid_record(template_id), "模板记录编号须为 UUID")
             cells = api.detail(api.read(template_id), template_id)
+            relations = {}
+            def template_rows(control):
+                relations[control] = api.relations(template_id, control)
+                return relations[control]
+
             try:
                 controls, fields_summary = assemble(
-                    values, cells, config, lambda control: api.relations(template_id, control),
+                    projected, cells, assembly_config, template_rows,
                     is_test=evidence["is_test"],
                 )
+                payload = create.payload(controls)
+                deadline = verify_order_request(payload, config, cells, relations, values, inactive)
+                require(decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
+                summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline)
+            except (KeyError, ValueError, TypeError, IndexError, AttributeError):
+                error = Stop("请求字段或查表快照无法核实")
+                write_preflight_failure(error)
+                raise error from None
             except Stop as error:
                 write_preflight_failure(error)
                 raise
-            payload = create.payload(controls)
             require(window.contains(clock()), "验收窗口已关闭")
             ledger.reserve()
             try:

@@ -1557,10 +1557,11 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         platform.template[tag_control] = True
     if mode == "relation_total_mismatch":
         platform.relation_response = lambda rows: platform.response({"rows": rows, "total": len(rows) + 1})
+    draft_inputs = order_fixture(case, platform)
     order.exclusive(config_path, case.config)
-    draft = deepcopy(case.values)
+    draft = {**deepcopy(case.values), **draft_inputs}
     if mode == "template_conflict":
-        draft["maintain_mutual_exclusion_group"] = "否"
+        set_mutex_template(case, platform, "否")
     if mode == "missing_user_scope":
         del draft["user_scope"]
     if mode == "duplicate_draft_package":
@@ -1568,7 +1569,7 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
             {"current_package": "PLACEHOLDER__Basic", "gift_package": "PLACEHOLDER_Gift"},
             {"current_package": " placeholder basic ", "gift_package": "placeholder gift"},
         ]
-    order.exclusive(draft_path, {key: {"value": value} for key, value in draft.items()})
+    order.exclusive(draft_path, private_export(draft))
     order.exclusive(login_path, {"cookies": [{
         "name": case.config["create"]["session_cookie"], "value": case.session_token,
         # 明道云真实下发形态：父域、会话期、未标 secure（2026-11-20 X5 首跑实测）
@@ -1586,6 +1587,7 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         f"FEISHU_APPROVED_FINGERPRINT={'f' * 64}",
     ]))
     env_file.chmod(0o600)
+    case.evidence["policy_id"] = "p1"
     for key, path in (("config", config_path), ("draft", draft_path), ("login", login_path)):
         case.evidence[key + "_sha256"] = order.digest(path.read_bytes())
     if mode == "missing_review":
@@ -1705,3 +1707,434 @@ def test_extract_token_accepts_real_mingdao_cookie_shape_and_keeps_other_checks(
             order.extract_token({"cookies": [{**real, **bad}]}, "md_pss_id")
     with pytest.raises(order.Stop, match="登录会话无法核实"):
         order.extract_token({"cookies": [real, dict(real)]}, "md_pss_id")
+
+
+def order_fixture(case, platform):
+    today = case.window.start.date()
+    values = deepcopy(case.values)
+    values.update(start_date=(today + timedelta(days=1)).isoformat(),
+                  end_date=(today + timedelta(days=4)).isoformat(),
+                  policy_type="定向政策" if values["user_tags"] else "公开政策",
+                  benefit_type="赠送时长", cancel_on_downgrade="否", trigger_once="否",
+                  repeat_bonus="是", effective_multiplier=1)
+    for key, label in (("policy_type", "政策类型"), ("benefit_type", "优惠类型"),
+                       ("cancel_on_downgrade", "降包用户取消优惠"), ("trigger_once", "只触发一次"),
+                       ("repeat_bonus", "多买多送"), ("effective_multiplier", "生效倍数")):
+        control = case.control[key] = str(uuid4())
+        spec = {"type": 6, "label": label, "draft": key}
+        value = values[key]
+        if key != "effective_multiplier":
+            option = str(uuid4())
+            spec.update(type=11, draft_values={order.compact(value): [option]})
+            value = [{"key": option, "value": value}]
+        case.config["fields"][control] = spec
+        platform.template[control] = value
+    set_mutex_template(case, platform, "是")
+    gift = "合成当前包_copy"
+    values["packages"][0]["gift_package"] = gift
+    platform.relations[case.control["packages"]][0][case.child["gift"]][0]["name"] = gift
+    columns = ("record_type,company_id,company_name,offer_id,offer_name,offer_type,is_synchronized,"
+               "parent_offer_id,offer_level_type,offer_level,status,sale_start_date,sale_end_date")
+    package = case.ids["package"]
+    case.config["order_snapshot"] = {
+        "version": "synthetic-1", "companies": [{"id": "01", "name": "合成公司", "country": "合成国家"}],
+        "tags": [{"name": name, "id": case.ids["tag"], "end": values["end_date"], "shadow": False}
+                 for name in values["user_tags"]],
+        "package_levels": "\n".join([columns,
+            f"OFFER,01,合成公司,{package},合成当前包,基本,否,,A,1,在售,2000-01-01,2100-01-01",
+            f"OFFER,01,合成公司,{case.ids['gift_package']},{gift},附属,是,{package},A,1,在售,2000-01-01,2100-01-01"]),
+    }
+    return {key: value for key, value in values.items() if value != case.values.get(key)}
+
+
+def set_mutex_template(case, platform, value):
+    control = case.control["maintain_mutual_exclusion_group"]
+    option, = case.config["fields"][control]["draft_values"][order.compact(value)]
+    platform.template[control] = [{"key": option, "value": value}]
+
+
+def private_export(values):
+    # 独立合成来源，各引文以来源坐标标识。模型字段值可在测试中单独变动。
+    text = ""
+    results = {}
+    fields = {}
+    for name, value in values.items():
+        examples = {"company": "本活动由合成公司办理", "user_scope": "适用于合成召回用户",
+                    "packages": "当前节目包为合成当前包", "recharge_days": "充三十天",
+                    "gift_days": "送三十一天", "benefit_type": "活动赠送时长",
+                    "trigger_once": "允许重复触发", "repeat_bonus": "多买多送",
+                    "effective_multiplier": "生效倍数为一", "cancel_on_downgrade": "降包后保留优惠",
+                    "maintain_mutual_exclusion_group": "需要维护互斥组"}
+        quote_text = examples.get(name, f"{name}（合成申请）{value}")
+        span = {"source_id": "body", "start": len(text), "end": len(text) + len(quote_text)}
+        text += quote_text + "\n"
+        quotes = [{"span": span, "text": quote_text}]
+        fields[name] = {"value": value, "uncertainty": None, "evidence": [
+            {"text": quote_text, "start": span["start"]}]}
+        results[name] = {"value": value, "has_value": True, "needs_confirmation": False,
+                         "issues": [], "source": "原文", "evidence": quotes, "input_fields": [],
+                         "statement": {"value": value, "status": "确定", "evidence": quotes, "candidates": []}}
+    if "policy_type" in results and "user_tags" in results:
+        tag_quote = results["user_tags"]["evidence"]
+        result = results["policy_type"]
+        result.update(source="查表派生", input_fields=["user_tags"], evidence=tag_quote, rule="R8")
+        result["statement"].update(value=None, evidence=[], status="原文未写")
+        fields["policy_type"]["evidence"] = deepcopy(fields["user_tags"]["evidence"])
+    if values.get("packages") and all(row["gift_package"] for row in values["packages"]):
+        results["packages"].update(source="查表派生", rule="6.2.R6",
+                                   input_fields=["benefit_type", "company", "start_date", "packages"])
+        results["packages"]["statement"]["value"] = [
+            {"current_package": row["current_package"],
+             "gift_package": None if values.get("benefit_type") == "赠送时长" else row["gift_package"].removesuffix("_copy")}
+            for row in values["packages"]]
+    scope = {"id": "p1", "main": {"source_id": "body", "start": 0, "end": 1}, "continuations": [],
+             "has_title": True}
+    return {"drafts": [{**fields, "policy_id": "p1", "scope": scope, "field_results": results}],
+            "sources": [{"id": "body", "source_id": "body", "start": 0, "text": text}],
+            "requires_full_review": False, "structure_issues": []}
+
+
+@pytest.fixture
+def business_cli(case, platform, monkeypatch, capsys):
+    private = case.private
+    case.values.update(order_fixture(case, platform))
+    now = [case.window.start.timestamp() + 1]
+    approvals = Approvals(platform)
+    summaries = []
+    publish = approvals.publish_approval
+
+    def record_card(binding, summary):
+        summaries.append(summary)
+        return publish(binding, summary)
+
+    approvals.publish_approval = record_card
+    approvals.run_create = lambda work: work(Event())
+    monkeypatch.chdir(private.parent)
+    monkeypatch.setattr(order, "FeishuService", lambda *args, **kwargs: approvals)
+    monkeypatch.setattr(order, "load_settings", lambda _: None)
+    monkeypatch.setattr(order, "run", partial(order.run, clock=lambda: now[0]))
+    monkeypatch.setattr(order, "run_order", partial(order.run_order, pause=lambda _: None, monotonic=lambda: 0))
+    monkeypatch.setattr(order, "CreateRequest", partial(order.CreateRequest, connect=platform.connection))
+    monkeypatch.setattr(httpx, "Client", partial(httpx.Client, transport=httpx.MockTransport(platform.official)))
+
+    def run(export=None, *, tamper=None):
+        case.evidence["policy_id"] = "p1"
+        login = {"cookies": [{"name": case.config["create"]["session_cookie"], "value": case.session_token,
+                              "domain": ".mingdao.com", "path": "/", "secure": False, "expires": -1}]}
+        for key, filename, material in (("draft", "draft.json", private_export(case.values) if export is None else export),
+                                        ("config", "config.json", case.config), ("login", "mingdao-state.json", login)):
+            path = private / filename
+            order.exclusive(path, material)
+            case.evidence[key + "_sha256"] = order.digest(path.read_bytes())
+            if tamper == key:
+                path.write_bytes(path.read_bytes() + b" ")
+        order.exclusive(private / "create-authorizations.json", {case.ids["registration"]: case.evidence})
+        settings = private / "synthetic-settings"
+        settings.write_text(f"PLACEHOLDER_OFFICIAL_TOKEN={case.official_token}\n"
+                            f"PLACEHOLDER_OFFICIAL_APP={case.ids['official_app']}\n")
+        code = order.main(["--config", str(private / "config.json"), "--registration", case.ids["registration"],
+                           "--env-file", str(settings), str(private / "draft.json")])
+        return code, capsys.readouterr().err
+
+    return SimpleNamespace(run=run, summaries=summaries, now=now, notices=approvals.notices)
+
+
+@pytest.mark.parametrize(("mode", "reason"), [
+    ("legacy", "整批来源证据"), ("missing_type", "优惠类型"), ("mutex_no", "互斥组"),
+    ("public", "政策类型"), ("invalid_date", "日期"), ("expired", "调整后晚于"),
+    ("no_date", "标签截止日"), ("alias_conflict", "截止日登记冲突"), ("late", "晚于标签截止日"),
+    ("bad_quote", "可核证据"), ("no_quote", "可核证据"), ("exclusive", "归属声明矛盾"),
+    ("stale_watch", "watch_days"), ("stale_penalty", "penalty_days"), ("inactive", "watch_days"),
+    ("no_gift", "销售品"), ("wrong_parent", "销售品"), ("duplicate_offer", "销售品"),
+    ("other_gift_id", "销售品"), ("other_tag_id", "记录标识"), ("wrong_label", "优惠类型"),
+    ("wrong_key", "优惠类型"), ("ambiguous_key", "优惠类型"), ("replaced", "优惠类型"),
+    ("upgrade", "after_offer"), ("special", "amount_mode"), ("bad_default", "可核证据"),
+    ("penalty_format", "penalty_days"), ("missing_scope", "整批结构"), ("missing_target", "目标政策"),
+])
+def test_order_business_stops(case, platform, business_cli, mode, reason, monkeypatch):
+    values = case.values
+    snapshot = case.config["order_snapshot"]
+    tag = snapshot["tags"][0]
+    benefit = case.control["benefit_type"]
+    gift = platform.relations[case.control["packages"]][0][case.child["gift"]]
+    if mode == "missing_type":
+        del values["benefit_type"]
+    elif mode == "mutex_no":
+        values["maintain_mutual_exclusion_group"] = "否"
+        set_mutex_template(case, platform, "否")
+    elif mode == "public":
+        values["policy_type"] = "公开政策"
+    elif mode == "invalid_date":
+        values["start_date"] = "2025-02-29"
+    elif mode == "expired":
+        values.update(start_date="2000-01-01", end_date="2000-01-02")
+    elif mode == "no_date":
+        tag.pop("end")
+    elif mode == "late":
+        tag["end"] = values["start_date"]
+    elif mode == "alias_conflict":
+        snapshot["tags"].append({**tag, "name": tag["name"] + " ", "end": values["start_date"]})
+    elif mode in ("stale_watch", "stale_penalty"):
+        name = "watch_days" if mode == "stale_watch" else "penalty_days"
+        control = str(uuid4())
+        case.config["fields"][control] = {"type": 6, "label": name, "draft": name}
+        platform.template[control] = "9"
+    elif mode == "inactive":
+        values["watch_days"] = 12
+    elif mode == "no_gift":
+        gift.clear()
+        values["packages"][0]["gift_package"] = None
+    elif mode == "wrong_parent":
+        snapshot["package_levels"] = snapshot["package_levels"].replace("是," + case.ids["package"], "是,wrong")
+    elif mode == "duplicate_offer":
+        snapshot["package_levels"] += "\n" + snapshot["package_levels"].splitlines()[-1]
+    elif mode == "other_gift_id":
+        gift[0]["sid"] = str(uuid4())
+    elif mode == "other_tag_id":
+        tag["id"] = str(uuid4())
+    elif mode == "wrong_label":
+        platform.template[benefit][0]["value"] += " "
+    elif mode == "wrong_key":
+        platform.template[benefit][0]["key"] = str(uuid4())
+    elif mode == "ambiguous_key":
+        mapping = case.config["fields"][benefit]["draft_values"]
+        mapping[order.compact("其他")] = next(iter(mapping.values()))
+    elif mode == "replaced":
+        payload = order.CreateRequest.func.payload
+        def corrupt(self, controls):
+            cells = deepcopy(controls)
+            next(cell for cell in cells if cell["controlId"] == benefit)["value"] = "[]"
+            return payload(self, cells)
+        monkeypatch.setattr(order.CreateRequest.func, "payload", corrupt)
+    elif mode == "upgrade":
+        values["benefit_type"] = "升级权益"
+    elif mode == "special":
+        values.update(benefit_type="特价优惠", after_offer="恢复原包", forbid_package_change="是",
+                      watch_days=3, recharge_amount=5)
+        del values["recharge_days"], values["gift_days"]
+    elif mode == "penalty_format":
+        values["penalty_days"] = -1
+
+    export = private_export(values)
+    draft = export["drafts"][0]
+    scope = draft["field_results"]["user_scope"]
+    if mode == "legacy":
+        export = {key: {"value": v} for key, v in values.items()}
+    elif mode == "bad_quote":
+        scope["evidence"][0]["span"]["start"] += 1
+    elif mode == "no_quote":
+        scope["evidence"] = []
+    elif mode == "exclusive":
+        other_policy(export, scope["evidence"][0]["span"], exclusive=True)
+    elif mode == "bad_default":
+        draft["field_results"]["maintain_mutual_exclusion_group"]["source"] = "默认规则"
+    elif mode == "missing_scope":
+        export["requires_full_review"] = True
+    elif mode == "missing_target":
+        draft["scope"]["id"] = draft["policy_id"] = "p2"
+    code, error = business_cli.run(export)
+    assert code == 1 and reason in error
+    assert business_cli.summaries == [] and platform.create_count == 0
+
+
+def other_policy(export, span, *, exclusive):
+    scope = {"id": "p2", "main": span, "continuations": []}
+    if exclusive:
+        scope["exclusive_spans"] = [span]
+    export["drafts"].append({"policy_id": "p2", "scope": scope})
+
+
+@pytest.mark.parametrize("end_today", [True, False])
+def test_business_card_and_request(case, platform, business_cli, end_today):
+    today = datetime.fromtimestamp(business_cli.now[0], UTC).date().isoformat()
+    case.values["start_date"] = "2000-01-01"
+    if end_today:
+        case.values["end_date"] = today
+    export = private_export(case.values)
+    results = export["drafts"][0]["field_results"]
+    for key in ("maintain_mutual_exclusion_group", "effective_multiplier"):
+        results[key].update(source="默认规则", evidence=[])
+        results[key]["statement"].update(status="原文未写", evidence=[], value=None)
+        export["drafts"][0][key]["evidence"] = []
+    other_policy(export, results["start_date"]["evidence"][0]["span"], exclusive=False)
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert all(text in card for text in ("政策类型按用户标签判定", "互斥组按默认填是", "生效倍数按默认填 1",
+                                        "优惠类型：赠送时长", "互斥组：是", "政策类型：定向政策",
+                                        f"开始日期由 2000-01-01 调整至 {today}"))
+    for name in ("start_date", "end_date", "user_scope"):
+        assert platform.created_cells[case.control[name]] in card
+
+
+@pytest.mark.parametrize("key", ["config", "draft"])
+def test_registered_order_material_cannot_change(business_cli, platform, key):
+    code, error = business_cli.run(tamper=key)
+    assert code == 1 and "摘要与登记不符" in error
+    assert not platform.actions and platform.create_count == 0
+
+
+@pytest.mark.parametrize("mode", ["downgrade", "midnight"])
+def test_approval_cannot_release_unconfirmed_value(case, platform, business_cli, mode):
+    if mode == "midnight":
+        today = case.window.start.date()
+        case.values["start_date"] = today.isoformat()
+        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time(), UTC)
+        case.evidence["window"]["end"] = (tomorrow + timedelta(days=1)).isoformat()
+        platform.before_search = lambda: business_cli.now.__setitem__(0, tomorrow.timestamp())
+    export = private_export(case.values)
+    if mode == "downgrade":
+        key = "cancel_on_downgrade"
+        draft = export["drafts"][0]
+        draft[key].update(value=None, uncertainty={"reason": "待确认", "candidates": []}, evidence=[])
+        result = draft["field_results"][key]
+        result.update(value=None, source=None, has_value=False, needs_confirmation=True, evidence=[],
+                      issues=["downgrade_confirmation"])
+        result["statement"].update(value=None, status="原文未写", evidence=[])
+    code, _ = business_cli.run(export)
+    assert code == 1 and platform.create_count == 0
+    card, = business_cli.summaries
+    if mode == "downgrade":
+        assert "降包用户取消优惠待确认，请选择是或否" in card
+    reason = "降包用户取消优惠" if mode == "downgrade" else "开始日期"
+    assert any("未建单" in notice and reason in notice for notice in business_cli.notices)
+
+
+def test_order_evidence_masks_intersection_with_loaded_secret(case, platform, business_cli):
+    # 引文只取合成凭据中间一段，字段值是模型概括出的自由文本。
+    secret = case.session_token
+    fragment = secret[4:13]
+    case.values["user_scope"] = "合成范围" + fragment
+    export = private_export(case.values)
+    block = export["sources"][0]
+    start = len(block["text"]) + 4
+    block["text"] += secret
+    draft = export["drafts"][0]
+    quote = {"text": fragment, "span": {"source_id": "body", "start": start, "end": start + len(fragment)}}
+    result = draft["field_results"]["user_scope"]
+    result["evidence"] = result["statement"]["evidence"] = [quote]
+    draft["user_scope"]["evidence"] = [{"text": fragment, "start": start}]
+    code, error = business_cli.run(export)
+    assert code == 0 and platform.create_count == 1
+    card, = business_cli.summaries
+    assert "用户范围依据：[已脱敏]" in card
+    assert fragment not in card + error + "".join(business_cli.notices)
+    assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
+
+
+@pytest.mark.parametrize(("name", "mutate", "reason"), [
+    ("maintain_mutual_exclusion_group", "candidate", "可核证据"),
+    ("user_scope", "uncertain", "待确认"), ("effective_multiplier", "value", "生效倍数"),
+    ("trigger_once", "value", "触发次数"), ("policy_type", "dependency", "可核证据"),
+    ("benefit_type", "fixed", "优惠类型"), ("benefit_type", "skip", "优惠类型"),
+    ("benefit_type", "prefix", "优惠类型"), ("benefit_type", "encoding", "优惠类型"),
+    ("end_date", "calendar", "日期"), ("penalty_days", "required", "penalty_days"),
+])
+def test_business_field_proof(case, platform, business_cli, name, mutate, reason):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    if mutate == "candidate":
+        draft["field_results"][name]["statement"]["candidates"].append({"value": "否", "evidence": []})
+    elif mutate == "uncertain":
+        draft[name]["uncertainty"] = {"reason": "带条件"}
+    elif mutate == "value":
+        draft[name]["value"] = 2 if name == "effective_multiplier" else "是"
+    elif mutate == "dependency":
+        draft["field_results"][name]["input_fields"] = ["company"]
+    elif mutate == "fixed":
+        applicant = case.config["applicant_control"]
+        control = case.control[name]
+        del case.config["fields"][control]["draft"]
+        case.config["fields"][applicant]["draft"] = name
+    elif mutate == "skip":
+        case.config["readback_skip"].append(case.control[name])
+    elif mutate == "prefix":
+        platform.template[case.control[name]][0]["value"] = "赠送"
+    elif mutate == "encoding":
+        case.config["fields"][case.control[name]]["draft_values"][order.compact("赠送时长")] = [str(uuid4())]
+    elif mutate == "calendar":
+        draft[name]["value"] = "2026-13-31"
+    elif mutate == "required":
+        draft["field_results"][name] = {"statement": {"status": "确定", "value": 10, "candidates": []}}
+    code, error = business_cli.run(export)
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize(("kind", "change", "reason"), [
+    ("升级权益", "valid", "after_offer"), ("特价优惠", "valid", "after_offer"),
+    ("升级权益", "inactive", "watch_days"), ("特价优惠", "inactive", "gift_days"),
+    ("特价优惠", "bad_amount", "recharge_amount"), ("特价优惠", "no_rate", "资费"),
+    ("特价优惠", "wrong_total", "充值金额"), ("特价优惠", "rate", "after_offer"),
+    ("升级权益", "missing_target", "目标节目包"),
+])
+def test_conditional_offer_before_projection(case, platform, business_cli, kind, change, reason):
+    values = case.values
+    values.update(benefit_type=kind, after_offer="恢复原包", forbid_package_change="是")
+    if kind == "特价优惠":
+        del values["recharge_days"], values["gift_days"]
+        values.update(watch_days=2, amount_mode="自定义", recharge_amount=8)
+    if change == "inactive":
+        values["watch_days" if kind == "升级权益" else "gift_days"] = 5
+    if change == "bad_amount":
+        values["recharge_amount"] = -1
+    if change == "missing_target":
+        values.update(after_offer="指定节目包", after_offer_package="合成目标包")
+    if change in ("no_rate", "wrong_total", "rate"):
+        ref = {"base_package": "合成当前包", "price_plan": "合成计划", "unit": "月", "version": "1"}
+        values.update(amount_mode="节目包资费", tariff=ref, tariff_multiplier=1.5,
+                      recharge_amount=8 if change == "wrong_total" else 7)
+        if change != "no_rate":
+            case.config["order_snapshot"]["benefit_catalog"] = {
+                "tariffs": [{**ref, "amount": 5, "valid_from": values["start_date"]}]}
+    code, error = business_cli.run()
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_shadow_tag_alias_mixed_with_ordinary_tag(case, platform, business_cli):
+    keys = case.config["official"]["tag_relation"]["name_keys"]
+    control = case.control["user_tags"]
+    selected, = platform.relations[control]
+    selected[keys[1]], selected[keys[0]] = selected[keys[0]], "合成主名_image"
+    ordinary = {**record_identity(str(uuid4())), keys[0]: "合成普通标签"}
+    platform.relations[control].append(ordinary)
+    platform.template[control] = 2
+    case.values["user_tags"].append(ordinary[keys[0]])
+    case.config["order_snapshot"]["tags"].append({
+        "name": ordinary[keys[0]], "id": ordinary["rowId"], "end": case.values["end_date"], "shadow": False})
+    code, error = business_cli.run()
+    assert code == 1 and "影子标签须单选" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_rendered_full_secret_stops_before_card(case, platform, business_cli, monkeypatch):
+    original = order._CardRedaction.display
+
+    def broken_renderer(self, text, start=None, **kwargs):
+        if start is not None:
+            return case.session_token
+        return original(self, text, start, **kwargs)
+
+    monkeypatch.setattr(order._CardRedaction, "display", broken_renderer)
+    code, error = business_cli.run()
+    assert code == 1 and "展示字段与凭据冲突" in error
+    assert not business_cli.summaries and platform.create_count == 0
+    failure, = case.private.glob("create-preflight-*.json")
+    assert case.session_token not in error + failure.read_text() + "".join(business_cli.notices)
+
+
+def test_card_explicit_values_match_selected_options(case, platform, business_cli):
+    code, error = business_cli.run()
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    for name in ("benefit_type", "policy_type", "maintain_mutual_exclusion_group", "cancel_on_downgrade",
+                 "trigger_once", "repeat_bonus"):
+        control = case.control[name]
+        spec = case.config["fields"][control]
+        value = case.values[name]
+        assert json.loads(platform.created_cells[control]) == spec["draft_values"][order.compact(value)]
+        assert f"{spec['label']}：{value}" in card
+    assert "互斥组按默认" not in card and "生效倍数按默认" not in card
+    assert json.loads(platform.created_cells[case.control["user_tags"]]) == [{"sid": case.ids["tag"]}]
+    assert case.values["user_tags"][0] in card
