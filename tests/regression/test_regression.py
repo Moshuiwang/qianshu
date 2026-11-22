@@ -729,6 +729,9 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
         "missing": 0, "anomaly": 1, "match_percent": 33.33,
     }
     assert report["by_field"]["recharge_days"]["uncertain"] == 2
+    grouped = report["business"]["by_benefit_type"]
+    assert grouped["赠送时长"]["user_scope"]["false_determined"] == 1
+    assert grouped["升级权益"]["user_scope"]["missing"] == 1
     assert report["by_benefit_type"]["赠送时长"]["user_scope"]["match_percent"] == 50
     assert report["by_policy_type"]["公开政策"]["user_scope"]["anomaly"] == 1
     assert report["by_country_group"]["1"]["user_scope"]["denominator"] == 2

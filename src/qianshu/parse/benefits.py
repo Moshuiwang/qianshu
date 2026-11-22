@@ -230,7 +230,7 @@ def _resolve_tariff(results: dict[str, FieldResult], catalog: BenefitCatalog, to
 
 def apply_benefit_rules(
     results: dict[str, FieldResult], catalog: BenefitCatalog, today: date | None,
-) -> tuple[list[str], set[str]]:
+) -> list[str]:
     hints = []
     benefit = results["benefit_type"]
     downgrade = results["cancel_on_downgrade"]
@@ -262,7 +262,9 @@ def apply_benefit_rules(
             )
 
     for name in inactive:
-        results[name] = replace(results[name], value=None, has_value=False, source=None)
+        result = results[name]
+        if verified_value(result) or can_use_absence(result):
+            results[name] = replace(result, value=None, has_value=False, source=None, needs_confirmation=False)
     for name in OFFER_FIELD_LABELS.keys() - required - inactive:
         if can_use_absence(results[name]):
             results[name] = replace(results[name], needs_confirmation=False)
@@ -273,4 +275,4 @@ def apply_benefit_rules(
                 _MONTH_HINT if name in ("recharge_days", "gift_days")
                 else f"{OFFER_FIELD_LABELS[name]}按 1 月 = 30 天换算"
             )
-    return list(dict.fromkeys(hints)), inactive
+    return list(dict.fromkeys(hints))

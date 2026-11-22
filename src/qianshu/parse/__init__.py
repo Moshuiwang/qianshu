@@ -228,7 +228,7 @@ def _draft(
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
     country_company.resolve_country_company(results, rules)
     dates.verify_dates(results)
-    benefit_hints, inactive = benefits.apply_benefit_rules(results, benefit_catalog, today)
+    benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, today)
     hints = [
         *names.derive_names(results),
         *benefit_hints,
@@ -239,7 +239,7 @@ def _draft(
         hints.append(_COMPANY_TABLE_HINT)
 
     draft = ParsedPolicyDraft(**{
-        field.name: DraftField() if field.name in inactive else _project(results, field.name, review, options)
+        field.name: _project(results, field.name, review, options)
         for field in fields(OfferPolicyDraft)
     })
     draft.policy_id = policy.id

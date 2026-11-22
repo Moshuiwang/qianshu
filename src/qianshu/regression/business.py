@@ -416,6 +416,7 @@ class BusinessScore:
                 self.eligible[sample_id].append(name)
         self.counts = Counter()
         self.field_counts = defaultdict(Counter)
+        self.benefit_field_counts = defaultdict(lambda: defaultdict(Counter))
         self.rates = Counter()
         self.package_denominators = Counter()
 
@@ -453,6 +454,7 @@ class BusinessScore:
                 )
                 status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
                 self.field_counts[name][status] += 1
+                self.benefit_field_counts[self.samples[sample_id]["benefit_type"]][name][status] += 1
                 by_field[name] = status
             statuses = set(by_field.values())
             all_correct = draft is not None and statuses == {"correct"}
@@ -513,6 +515,11 @@ class BusinessScore:
             "measure_sha256": self.measure_fingerprint,
             "rates": rates, "counts": {key: self.counts[key] for key in (*COUNT_LABELS, "ambiguous_drafts")},
             "field_categories": {category: field_totals[category] for category in CATEGORIES},
+            "by_benefit_type": {
+                kind: {name: {category: counts[category] for category in CATEGORIES}
+                       for name, counts in fields.items()}
+                for kind, fields in self.benefit_field_counts.items()
+            },
             "by_field": {name: {category: counts[category] for category in CATEGORIES}
                          for name, counts in self.field_counts.items()},
         }

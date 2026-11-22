@@ -10,10 +10,9 @@ from qianshu.feishu import Message
 from qianshu.feishu.entrance import Application
 from qianshu.mingdao.create_order import _DRAFT_FIELDS, Stop, draft_values
 from qianshu.mingdao.offer_fields import assemble_offer_fields
-from qianshu.parse.benefits import BenefitCatalog, TariffRate
+from qianshu.parse.benefits import OFFER_FIELD_LABELS, BenefitCatalog, TariffRate
 from qianshu.parse.protocol import StatementStatus, ValueSource
 from qianshu.pipeline import Pipeline
-from qianshu.regression.recording import _project_legacy_reply
 from qianshu.validate import ValidationFacts, validate_draft
 from tests.protocol_fixtures import fixed_reply
 
@@ -70,10 +69,10 @@ def parsed(body, reply, *, catalog=CATALOG, today=TODAY):
     return draft
 
 
-def card_text(body, reply):
+def card_text(body, reply, *, sensitive_values=()):
     pipeline = Pipeline(
         model=lambda **_: json.dumps(reply), today=lambda: TODAY, tag_dates={"占位标签": TAG_END},
-        companies_file=COMPANIES, benefit_catalog=CATALOG,
+        companies_file=COMPANIES, benefit_catalog=CATALOG, sensitive_values=sensitive_values,
     )
     message = Message("占位消息", "占位群", "占位发送者", 0, "text", "")
     return "\n".join(
@@ -275,9 +274,6 @@ def test_legacy_reply_with_new_offer_type_requires_missing_fields(kind):
     fields = reply["policies"][0]["fields"]
     for name in set(fields) - _DRAFT_FIELDS - {"country", "company_keyword"}:
         del fields[name]
-    with pytest.raises(parse.ParseError, match="结构"):
-        parsed(body, reply)
-    _project_legacy_reply(reply)
     draft = parsed(body, reply)
     _, validation = validate_draft(draft, today=TODAY, facts=FACTS)
     assert not validation.can_create
@@ -354,14 +350,88 @@ def test_ambiguous_tariff_multiplier_keeps_candidates_and_blocks_only_dependent_
     assert draft.effective_multiplier.value == 1
 
 
-def test_thin_reply_with_one_missing_required_field():
-    body, reply = scenario("特价优惠")
-    del reply["policies"][0]["fields"]["watch_days"]
-    with pytest.raises(parse.ParseError) as error:
-        parsed(body, reply)
-    assert error.value.path[-1] == "watch_days"
-    _project_legacy_reply(reply)
+@pytest.mark.parametrize("name", OFFER_FIELD_LABELS)
+@pytest.mark.parametrize("shape", ["missing", "null", "invalid_subfield", "null_subfield"])
+def test_optional_offer_field_failure_stays_local(name, shape):
+    body, reply = scenario("升级权益")
+    fields = reply["policies"][0]["fields"]
+    if shape == "missing":
+        del fields[name]
+    elif shape == "null":
+        fields[name] = None
+    else:
+        fields[name]["evidence"] = [None] if shape == "invalid_subfield" else None
     draft = parsed(body, reply)
-    assert draft.watch_days.uncertainty is not None
-    assert draft.field_results["watch_days"].statement.reason_code == "field_not_reported"
-    assert draft.recharge_amount.value == 40
+    assert set(draft.uncertain_fields()) == {name}
+    assert draft.field_results[name].statement.status is StatementStatus.UNSUPPORTED
+    assert draft.gift_days.value == 7
+
+
+@pytest.mark.parametrize("name", ["tariff_multiplier", "recharge_days"])
+def test_custom_amount_inactive_fields_keep_unresolved_declarations(name):
+    body, reply = scenario("特价优惠", tariff_multiplier=field(2, "两倍或三倍"),
+                           recharge_days=field(30, "旧充值天数"))
+    finding = reply["policies"][0]["fields"][name]
+    if name == "tariff_multiplier":
+        finding.update(status="歧义", value=None, candidates=[
+            {"value": n, "evidence": finding["evidence"]} for n in (2, 3)
+        ], evidence=[])
+    else:
+        finding["evidence"][0]["text"] = "并不存在的合成引文"
+    draft = parsed(body, reply)
+    assert set(draft.uncertain_fields()) == {name}
+    assert draft.field_results[name].needs_confirmation
+    _, validation = validate_draft(draft, today=TODAY, facts=FACTS)
+    assert not validation.can_create
+    assert {err.field for err in validation.errors} == {name}
+    content = card_text(body, reply)
+    assert "解析完成，待群卡片同意" not in content
+    if name == "tariff_multiplier":
+        assert "原文状态：歧义" in content
+        for i, n in enumerate((2, 3), 1):
+            assert f"资费倍数 · 候选 {i}\n值　{n}" in content
+    else:
+        assert "invalid_evidence" in draft.field_results[name].issues
+        assert "充值天数 · 待确认\n缺证据" in content
+
+
+def test_certain_null_and_optional_metadata():
+    body, reply = scenario("特价优惠", first_recharge_day_only=field("是", "没有首充日限制"))
+    fields = reply["policies"][0]["fields"]
+    finding = fields["first_recharge_day_only"]
+    fields["first_recharge_day_only"] = {"status": "确定", "value": None, "evidence": finding["evidence"]}
+    assert parsed(body, reply).uncertain_fields() == []
+    assert "仅首充日享受\n值　留空（确定）" in card_text(body, reply)
+    del fields["first_recharge_day_only"]["value"]
+    assert parsed(body, reply).uncertain_fields() == ["first_recharge_day_only"]
+
+
+def test_offer_candidates_mask_fragments_across_card_lines():
+    body, reply = scenario("升级权益", after_offer_package=field("合成目标", "目标包待确认"))
+    finding = reply["policies"][0]["fields"]["after_offer_package"]
+    finding.update(status="歧义", value=None, candidates=[
+        {"value": part, "evidence": finding["evidence"]} for part in ("AB", "CD")
+    ], evidence=[])
+    content = card_text(body, reply, sensitive_values=["xABCDy"])
+    for i in (1, 2):
+        assert f"优惠到期目标包 · 候选 {i}\n值　[已脱敏]" in content
+
+
+@pytest.mark.parametrize("missing", ["value", "evidence", "candidates"])
+def test_incomplete_absence_declaration_cannot_enable_default(missing):
+    body, reply = scenario("升级权益")
+    del reply["policies"][0]["fields"]["after_offer"][missing]
+    draft = parsed(body, reply)
+    assert draft.uncertain_fields() == ["after_offer"]
+    assert draft.field_results["after_offer"].source is None
+    assert draft.after_offer.value is None
+
+
+def test_tariff_candidate_redacts_across_structured_values():
+    reference = {**TARIFF, "base_package": "AB", "price_plan": "CD"}
+    body, reply = tariff_scenario(tariff=field(reference, "合成资费"))
+    finding = reply["policies"][0]["fields"]["tariff"]
+    finding.update(status="歧义", value=None, candidates=[{"value": reference, "evidence": finding["evidence"]}],
+                   evidence=[])
+    content = card_text(body, reply, sensitive_values=["xABCDy"])
+    assert '"base_package": "[已脱敏]", "price_plan": "[已脱敏]"' in content

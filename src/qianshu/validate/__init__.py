@@ -78,11 +78,11 @@ def _required_fields(draft: PolicyDraft, errors: list[Finding]) -> None:
 
     inactive_benefits, required_benefits = benefit_applicability(draft)
     for item in fields(draft):
-        if item.name in inactive_benefits:
-            continue
         field = getattr(draft, item.name)
         if field.uncertainty is not None:
             errors.append(Finding("R5", item.name, "字段尚未确认，请申请人确认。"))
+        elif item.name in inactive_benefits:
+            continue
         elif item.name in OFFER_FIELD_LABELS and item.name not in required_benefits and field.value is None:
             continue
         elif item.name not in {

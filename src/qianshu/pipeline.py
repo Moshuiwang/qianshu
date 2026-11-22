@@ -72,6 +72,19 @@ def _mask_spans(text: str, spans: Iterable[tuple[int, int]]) -> str:
     return "".join((*parts, text[offset:]))
 
 
+@dataclass(frozen=True, repr=False)
+class _ModelText:
+    text: str
+    role: str
+    quoted: bool = False
+    start: int | None = None
+
+
+@dataclass(frozen=True, repr=False)
+class _ModelLine(CardLine):
+    parts: tuple[str | _ModelText, ...] = field(kw_only=True, repr=False)
+
+
 class _CardRedaction:
     def __init__(self, body: str, sensitive: re.Pattern[str] | None, registered_fragments: set[str]) -> None:
         self.body = body
@@ -104,16 +117,16 @@ class _CardRedaction:
                 yield max(0, left - start), min(length, right - start)
 
     def display(
-        self, text: str, start: int | None = None, *, free_text_spans: Iterable[tuple[int, int]] | None = None,
+        self, text: str, start: int | None = None, *, card_spans: Iterable[tuple[int, int]] = (), advisory: bool = False,
     ) -> str:
         if not text or self.sensitive is None:
             return text
         if start is not None and self.body.startswith(text, start):
-            return _mask_spans(text, self._overlaps(start, len(text)))
-        matches = [*self._matches(self.sensitive, text), *self._matches(self.fragments, text)]
-        if free_text_spans is not None:
+            return _mask_spans(text, (*self._overlaps(start, len(text)), *card_spans))
+        matches = [*self._matches(self.sensitive, text), *self._matches(self.fragments, text), *card_spans]
+        if advisory:
             # 自由文本的短公共片段不能只凭同字摘录归到敏感坐标。
-            return _mask_spans(text, (*matches, *free_text_spans))
+            return _mask_spans(text, matches)
         length = len(text)
         for left, right in self.spans:
             # 只检查能与敏感坐标相交的原文匹配，保留单字摘录等短片段的坐标保护。
@@ -124,24 +137,30 @@ class _CardRedaction:
                 offset = self.body.find(text, offset + 1, stop)
         return _mask_spans(text, matches)
 
-    def free_texts(self, texts: Sequence[str]) -> Iterator[str]:
-        if not self.sensitive or not texts:
-            yield from texts
+    def model_texts(self, parts: Sequence[_ModelText]) -> Iterator[str]:
+        if not self.sensitive:
+            yield from (part.text for part in parts)
             return
-        joined = "".join(texts)
-        offsets = list(accumulate(map(len, texts), initial=0))
-        spans: list[list[tuple[int, int]]] = [[] for _ in texts]
-        # 重叠的四字窗口覆盖任意更长的片段，完整值匹配也覆盖短于四字的登记值。
-        matches = [*self._matches(self.sensitive, joined), *(
-            (start, start + 4) for start in range(len(joined) - 3)
-            if joined[start:start + 4] in self.registered_fragments
-        )]
-        for start, end in matches:
-            for index in range(bisect_right(offsets, start) - 1, bisect_left(offsets, end)):
-                left, right = offsets[index], offsets[index + 1]
-                spans[index].append((max(start, left) - left, min(end, right) - left))
-        for text, matches in zip(texts, spans, strict=True):
-            yield self.display(text, free_text_spans=matches)
+        spans: list[list[tuple[int, int]]] = [[] for _ in parts]
+        # 同时检查整卡模型文本和可独立摘出的列（如所有候选值、所有模型说明）。
+        groups = [list(range(len(parts)))]
+        for role in dict.fromkeys(part.role for part in parts):
+            groups.append([i for i, part in enumerate(parts) if part.role == role])
+        groups.append([i for i, part in enumerate(parts) if part.role != "evidence"])
+        for group in groups:
+            texts = [parts[i].text for i in group]
+            joined = "".join(texts)
+            offsets = list(accumulate(map(len, texts), initial=0))
+            matches = [*self._matches(self.sensitive, joined), *(
+                (start, start + 4) for start in range(len(joined) - 3)
+                if joined[start:start + 4] in self.registered_fragments
+            )]
+            for start, end in matches:
+                for index in range(bisect_right(offsets, start) - 1, bisect_left(offsets, end)):
+                    left, right = offsets[index:index + 2]
+                    spans[group[index]].append((max(start, left) - left, min(end, right) - left))
+        for part, matches in zip(parts, spans, strict=True):
+            yield self.display(part.text, part.start, card_spans=matches, advisory=part.role == "advisory")
 
 
 def _rule_pending(draft: PolicyDraft, name: str) -> bool:
@@ -173,46 +192,53 @@ def _facts(draft: PolicyDraft, tag_dates: Mapping[str, date]) -> validate.Valida
     return validate.ValidationFacts()
 
 
-def _value(value: object) -> str:
-    if value is None:
-        return "未确定"
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False, default=_package_row)
+def _value_parts(value: object, *, nested: bool = False) -> Iterator[str | _ModelText]:
+    if isinstance(value, PackageRow):
+        value = {"当前节目包": value.current_package, "赠送节目包": value.gift_package}
+    if isinstance(value, (dict, list)):
+        mapping = isinstance(value, dict)
+        yield "{" if mapping else "["
+        for index, (key, item) in enumerate(value.items() if mapping else enumerate(value)):
+            if index:
+                yield ", "
+            if mapping:
+                yield json.dumps(key, ensure_ascii=False) + ": "
+            yield from _value_parts(item, nested=True)
+        yield "}" if mapping else "]"
+    elif isinstance(value, str):
+        yield _ModelText(value, "value", quoted=nested)
+    else:
+        yield _ModelText(json.dumps(value, ensure_ascii=False), "value")
 
 
-def _package_row(row: PackageRow) -> dict:
-    return {"当前节目包": row.current_package, "赠送节目包": row.gift_package}
+def _value_line(label: str, value: object, evidence: list[SourceExcerpt], *, empty: str = "未确定") -> CardLine:
+    parts = [empty] if value is None else list(_value_parts(value))
+    parts.append("\n原文出处　")
+    for index, excerpt in enumerate(evidence):
+        parts.extend(("\n「" if index else "「", _ModelText(excerpt.text, "evidence", start=excerpt.start), "」"))
+    if not evidence:
+        parts.append("无原文摘录")
+    return _ModelLine(label, "值　", parts=tuple(parts))
 
 
-def _evidence(excerpts: Iterable[SourceExcerpt], redact: _CardRedaction) -> str:
-    return "\n".join(f"「{redact.display(excerpt.text, excerpt.start)}」" for excerpt in excerpts) or "无原文摘录"
+def _advisory(label: str, prefix: str, text: str) -> CardLine:
+    return _ModelLine(label, prefix, parts=(_ModelText(text, "advisory"),))
 
 
-@dataclass(frozen=True, repr=False)
-class _FreeTextLine(CardLine):
-    free_text: str = field(kw_only=True, repr=False)
-
-
-def _field_lines(
-    prefix: str, field: DraftField, explanation: str | None, redact: _CardRedaction,
-) -> Iterable[CardLine]:
-    value = "未确定" if field.value is None else redact.display(_value(field.value))
-    yield CardLine(prefix, f"值　{value}\n原文出处　{_evidence(field.evidence, redact)}")
+def _field_lines(prefix: str, field: DraftField, explanation: str | None) -> Iterable[CardLine]:
+    empty = "留空（确定）" if field.uncertainty is None and field.evidence else "未确定"
+    yield _value_line(prefix, field.value, field.evidence, empty=empty)
     if uncertainty := field.uncertainty:
         if explanation:
-            yield _FreeTextLine(f"{prefix} · 待确认", f"{uncertainty.reason}\n模型说明　", free_text=explanation)
+            yield _advisory(f"{prefix} · 待确认", f"{uncertainty.reason}\n模型说明　", explanation)
         else:
             yield CardLine(f"{prefix} · 待确认", uncertainty.reason)
         if not uncertainty.candidates:
             yield CardLine(f"{prefix} · 候选", "无")
         for index, candidate in enumerate(uncertainty.candidates, 1):
-            yield CardLine(
-                f"{prefix} · 候选 {index}",
-                f"值　{redact.display(_value(candidate.value))}\n原文出处　{_evidence(candidate.evidence, redact)}",
-            )
+            yield _value_line(f"{prefix} · 候选 {index}", candidate.value, candidate.evidence)
     elif explanation:
-        yield _FreeTextLine(f"{prefix} · 模型说明", "", free_text=explanation)
+        yield _advisory(f"{prefix} · 模型说明", "", explanation)
 
 
 @dataclass(frozen=True)
@@ -252,7 +278,7 @@ class _Policy:
             status = "解析完成，待群卡片同意"
         return CardLine(f"{prefix} · 处理状态", status)
 
-    def lines(self, prefix: str, redact: _CardRedaction) -> Iterable[CardLine]:
+    def lines(self, prefix: str) -> Iterable[CardLine]:
         result = self.validation
         hints = self.hints
         # 校验可调整互斥组默认值，保留解析时的所有提示并补上校验产生的默认提示。
@@ -274,7 +300,7 @@ class _Policy:
         inactive, required = benefit_applicability(self.draft)
         for field in fields(self.draft):
             value = getattr(self.draft, field.name)
-            if field.name in inactive or (
+            if (field.name in inactive and value.uncertainty is None) or (
                 field.name in OFFER_FIELD_LABELS and field.name not in required
                 and value.value is None and value.uncertainty is None and not value.evidence
                 and not self.explanations.get(field.name)
@@ -286,12 +312,12 @@ class _Policy:
             if field.name == "approval_url" and self.approval_url_deferred:
                 yield CardLine(title, "建单时填写")
                 if explanation:
-                    yield _FreeTextLine(f"{title} · 模型说明", "", free_text=explanation)
+                    yield _advisory(f"{title} · 模型说明", "", explanation)
             else:
-                yield from _field_lines(title, value, explanation, redact)
+                yield from _field_lines(title, value, explanation)
         for name, label in _INPUT_LABELS.items():
             if explanation := self.explanations.get(name):
-                yield _FreeTextLine(f"{prefix} · {label} · 模型说明", "", free_text=explanation)
+                yield _advisory(f"{prefix} · {label} · 模型说明", "", explanation)
 
 
 class Pipeline:
@@ -355,11 +381,21 @@ class Pipeline:
             yield CardLine(f"政策结构问题 {index}", location, red=True)
 
     def _detail_pages(self, body: str, lines: Sequence[CardLine], redact: _CardRedaction) -> tuple[DetailPage, ...]:
-        free_texts = redact.free_texts([line.free_text for line in lines if isinstance(line, _FreeTextLine)])
-        sections = [
-            CardLine(line.label, line.text + next(free_texts), line.red) if isinstance(line, _FreeTextLine) else line
-            for line in lines
-        ]
+        texts = redact.model_texts([
+            part for line in lines if isinstance(line, _ModelLine) for part in line.parts if isinstance(part, _ModelText)
+        ])
+        sections = []
+        for line in lines:
+            if isinstance(line, _ModelLine):
+                pieces = [line.text]
+                for part in line.parts:
+                    if isinstance(part, _ModelText):
+                        text = next(texts)
+                        pieces.append(json.dumps(text, ensure_ascii=False) if part.quoted else text)
+                    else:
+                        pieces.append(part)
+                line = CardLine(line.label, "".join(pieces), line.red)
+            sections.append(line)
         sections.append(CardLine("申请原文", body))
         if self._sensitive:
             sections = [replace(line, text=self._sensitive.sub("[已脱敏]", line.text)) for line in sections]
@@ -423,10 +459,10 @@ class Pipeline:
 
         lines = [
             CardLine("处理状态", status, red=requires_full_review),
-            *(_FreeTextLine("没用上的原文段落（对照下方申请原文）", "理由　", free_text=item.reason)
+            *(_advisory("没用上的原文段落（对照下方申请原文）", "理由　", item.reason)
               for item in getattr(drafts, "unused_passages", ())),
             *self._structure_reminders(body, getattr(drafts, "structure_issues", ()), redact.spans, redact.display),
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
-            *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}", redact)),
+            *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}")),
         ]
         return self._detail_pages(display_body, lines, redact)
