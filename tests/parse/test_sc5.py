@@ -5,7 +5,7 @@ import pytest
 
 from qianshu.parse import parse_application
 from qianshu.parse.companies import load_company_rules
-from tests.protocol_fixtures import date_use, fixed_reply, serialized_empty
+from tests.protocol_fixtures import fixed_reply, serialized_empty, statement
 
 MONTH_HINT = "充值 / 赠送天数按 1 月 = 30 天换算"
 FIELD_RULE_HINTS = {
@@ -182,7 +182,7 @@ def test_prompt_and_rules_allow_preamble_dates_alongside_non_date_clauses():
         assert "前言只可供起止日期取证" in system
         assert "限定对象" in system
         assert "按 R10 对确定的国家" in system
-        return serialized_empty(json.loads(user)["application"])
+        return serialized_empty()
 
     assert parse_application("占位申请", model=model, companies_file=COMPANIES_FILE) == []
 
@@ -198,70 +198,48 @@ def test_repository_company_example_is_not_a_mapping(monkeypatch, tmp_path):
     assert [hint for hint in draft.hints if hint not in FIELD_RULE_HINTS] == ["互斥组按默认填是", "公司对照表缺失或无效"]
 
 
-@pytest.mark.parametrize(
-    ("targets", "expected"),
-    [
-        ([{"country": "赞比亚", "company": "占位公司甲"}], "2099-03-31"),
-        ([{"country": "ZM", "company": "占位公司甲"}], "2099-03-31"),
-        ([{"country": "Zambia", "company": None}], "2099-03-31"),
-        ([{"country": "未知国家", "company": "占位公司甲"}], None),
-        ([{"country": "赞比亚", "company": "占位公司乙"}], None),
-        ([{"country": "肯尼亚", "company": "占位公司甲"}], None),
-        ([{"country": "肯尼亚", "company": None}, {"country": None, "company": "占位公司甲"}], "2099-03-31"),
-    ],
-)
-def test_country_qualified_preamble_is_checked_against_policy(targets, expected):
-    body = "合成前言日期\n赞比亚占位申请"
-    first = body.index("\n") + 1
+@pytest.mark.parametrize(("country", "expected"), [("赞比亚", "2099-03-31"), ("肯尼亚", None)])
+def test_country_qualified_preamble_preserves_model_field_status(country, expected):
+    preamble = "仅赞比亚：截止 2099-03-31"
+    body = f"{preamble}\n{country}占位申请"
+    reply = fixed_reply(body, [{
+        "country": field(country, country),
+        "end_date": field("2099-03-31", preamble),
+    }], policy_ranges=[(len(preamble) + 1, len(body))])
+    if expected is None:
+        reply["policies"][0]["fields"]["end_date"] = statement("缺证据")
+    draft, = parse_application(body, companies_file=COMPANIES_FILE, model=lambda **_: json.dumps(reply))
+    assert draft.end_date.value == expected
+    assert draft.field_results["country"].value == country
+    assert draft.field_results["end_date"].needs_confirmation == (expected is None)
+
+
+@pytest.mark.parametrize(("company", "expected"), [("占位公司甲", "2099-03-31"), ("占位公司乙", None)])
+def test_company_qualified_shared_date_preserves_model_field_status(company, expected):
+    preamble = "占位公司甲：合成申请周期到 2099-03-31"
+    body = f"{preamble}\n赞比亚，{company}"
     reply = fixed_reply(body, [{
         "country": field("赞比亚", "赞比亚"),
-        "end_date": field("2099-03-31", "合成前言日期"),
-    }], policy_ranges=[(first, len(body))], shared_dates=True)
-    date_clause = next(c for c in reply["clauses"] if c["date"])
-    date_clause.update(kind="前言", date=date_use("止日", targets=targets))
+        "end_date": field("2099-03-31", preamble),
+    }], policy_ranges=[(len(preamble) + 1, len(body))])
+    if expected is None:
+        reply["policies"][0]["fields"]["end_date"] = statement("缺证据")
     draft, = parse_application(body, companies_file=COMPANIES_FILE, model=lambda **_: json.dumps(reply))
     assert draft.end_date.value == expected
     assert draft.company.value == "占位公司甲"
 
 
-@pytest.mark.parametrize(("target", "clue", "expected"), [
-    ("synth-a", "synth-A业务", "2099-03-31"),
-    ("占位 SYNTH A 公司", "synth-A业务", "2099-03-31"),
-    ("SYNTH-B", "synth-A业务", None),
-    ("XSYNTH-A", "synth-A业务", None),
-    ("SYNTH-A", "SYNTH-C", None),
-])
-def test_company_qualified_shared_date_uses_verified_company(target, clue, expected):
-    preamble = f"ZM / {target}：合成申请周期到 2099-03-31"
-    body = f"{preamble}\n赞比亚，{clue}"
-    table = (COMPANY_HEADER + "赞比亚\t\t0001\t占位默认公司\n"
-             "赞比亚\tSYNTH-A\t0002\t占位 Synth A 公司\n赞比亚\tSYNTH-B\t0003\t占位乙公司\n")
-    reply = fixed_reply(body, [{
-        "country": field("赞比亚", "赞比亚"),
-        "company_keyword": field([clue], clue),
-        "end_date": field("2099-03-31", preamble),
-    }], policy_ranges=[(len(preamble) + 1, len(body))], shared_dates=True)
-    date_clause = next(c for c in reply["clauses"] if c["date"])
-    date_clause["date"] = date_use("申请周期", targets=[{"country": "ZM", "company": target}])
-    draft, = parse_application(body, companies_text=table, model=lambda **_: json.dumps(reply))
-    assert draft.end_date.value == expected
-    date_result = draft.field_results["end_date"]
-    assert date_result.needs_confirmation is (expected is None)
-    assert date_result.issues == (("date_target_mismatch",) if expected is None else ())
-
-
-def test_policy_field_in_preamble_allows_dates_but_cannot_supply_its_value():
+def test_model_can_source_date_but_leave_other_fields_unconfirmed():
     body = "合成前言内容\n合成条款"
     first = body.index("\n") + 1
     reply = fixed_reply(body, [{
-        "benefit_type": field("赠送时长", "合成前言内容"),
         "end_date": field("2099-03-31", "合成前言内容"),
-    }], policy_ranges=[(first, len(body))], shared_fields=("benefit_type",), shared_dates=True)
-    for clause in reply["clauses"]:
-        clause["kind"] = "前言"
+    }], policy_ranges=[(first, len(body))])
+    reply["policies"][0]["fields"]["benefit_type"] = statement("缺证据")
     draft, = parse_application(body, companies_file=COMPANIES_FILE, model=lambda **_: json.dumps(reply))
     assert draft.end_date.value == "2099-03-31"
     assert draft.benefit_type.value is None
+    assert draft.benefit_type.uncertainty is not None
 
 
 @pytest.mark.parametrize(("end", "expected"), [("2099-02-29", None), ("2099-01-01", None), ("2099-02-15", "2099-02-15")])
@@ -305,13 +283,11 @@ def test_company_keyword_or_country_default(clues, subject, expected):
         assert result.issues == ("company_lookup_unresolved",)
 
 
-@pytest.mark.parametrize(("scope", "has_title", "accepted"), [
-    ("局部", True, False), ("局部", False, True), ("共享", True, True),
-])
-def test_application_cycle_requires_shared_scope_or_untitled_single_policy(scope, has_title, accepted):
+@pytest.mark.parametrize("accepted", [False, True])
+def test_application_cycle_preserves_model_field_status(accepted):
     body = "合成申请周期"
-    reply = fixed_reply(body, [{"end_date": field("2099-03-31", body)}], shared_dates=scope == "共享")
-    reply["policies"][0]["has_title"] = has_title
-    reply["clauses"][0].update(kind="批次说明", date=date_use("申请周期"))
+    reply = fixed_reply(body, [{"end_date": field("2099-03-31", body)}])
+    if not accepted:
+        reply["policies"][0]["fields"]["end_date"] = statement("缺证据")
     draft, = parse_application(body, model=lambda **_: json.dumps(reply), companies_file=COMPANIES_FILE)
     assert (draft.end_date.value == "2099-03-31") == accepted

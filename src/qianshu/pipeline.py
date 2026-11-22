@@ -13,7 +13,7 @@ from .draft import Candidate, DraftField, PackageRow, PolicyDraft, SourceExcerpt
 from .feishu.cards import CardLine, DetailPage, detail_pages
 from .feishu.entrance import Application
 from .parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
-from .parse.evidence import ReviewRange
+from .parse.evidence import STRUCTURE_REASONS, PolicyStructureIssue
 from .parse.model import ParseModel
 
 _FIELD_LABELS = {
@@ -98,10 +98,11 @@ def _evidence(excerpts: Iterable[SourceExcerpt]) -> str:
     return "\n".join(f"「{excerpt.text}」" for excerpt in excerpts) or "无原文摘录"
 
 
-def _field_lines(prefix: str, field: DraftField) -> Iterable[CardLine]:
+def _field_lines(prefix: str, field: DraftField, explanation: str | None) -> Iterable[CardLine]:
     yield CardLine(prefix, f"值　{_value(field.value)}\n原文出处　{_evidence(field.evidence)}")
     if uncertainty := field.uncertainty:
-        yield CardLine(f"{prefix} · 待确认", uncertainty.reason)
+        reason = f"{uncertainty.reason}\n模型说明　{explanation}" if explanation else uncertainty.reason
+        yield CardLine(f"{prefix} · 待确认", reason)
         if not uncertainty.candidates:
             yield CardLine(f"{prefix} · 候选", "无")
         for index, candidate in enumerate(uncertainty.candidates, 1):
@@ -109,12 +110,15 @@ def _field_lines(prefix: str, field: DraftField) -> Iterable[CardLine]:
                 f"{prefix} · 候选 {index}",
                 f"值　{_value(candidate.value)}\n原文出处　{_evidence(candidate.evidence)}",
             )
+    elif explanation:
+        yield CardLine(f"{prefix} · 模型说明", explanation)
 
 
 @dataclass(frozen=True)
 class _Policy:
     draft: PolicyDraft
     hints: tuple[str, ...]
+    explanations: Mapping[str, str]
     validation: validate.ValidationResult | None = None
 
     @property
@@ -169,10 +173,13 @@ class _Policy:
         for field in fields(self.draft):
             label = _FIELD_LABELS[field.name]
             title = f"{prefix} · {label}"
+            explanation = self.explanations.get(field.name)
             if field.name == "approval_url" and self.approval_url_deferred:
                 yield CardLine(title, "建单时填写")
+                if explanation:
+                    yield CardLine(f"{title} · 模型说明", explanation)
             else:
-                yield from _field_lines(title, getattr(self.draft, field.name))
+                yield from _field_lines(title, getattr(self.draft, field.name), explanation)
 
 
 class Pipeline:
@@ -210,30 +217,43 @@ class Pipeline:
             reminders.append(f"段落 {index}：{preview}…，段落边界未确认，请审批人核对")
         return [CardLine("提醒项", "\n".join(reminders))] if reminders else []
 
-    def _pending_range_reminders(self, body: str, pending: Iterable[ReviewRange]) -> list[CardLine]:
-        reminders = []
-        sensitive_spans = [match.span() for match in self._sensitive.finditer(body)] if self._sensitive else []
-        for index, item in enumerate(pending, 1):
+    def _structure_reminders(
+        self, body: str, issues: Iterable[PolicyStructureIssue], sensitive_spans: Sequence[tuple[int, int]],
+    ) -> Iterable[CardLine]:
+        for index, item in enumerate(issues, 1):
             span = item.span
             location = f"{span.source_id} [{span.start}, {span.end})" if span else "无可定位坐标"
-            if item.block_id is not None:
-                location += f"（输入块 {item.block_id} 缺少覆盖说明）"
-            location += f"\n理由码　{item.code}"
-            if item.reason_code:
-                location += f"（{item.reason_code}）"
+            location += f"\n{STRUCTURE_REASONS[item.code]}（{item.code}）"
             if span and span.source_id == "body" and span.end <= len(body):
                 start, end = span.start, span.end
                 crosses_edge = any(left < start < right or left < end < right for left, right in sensitive_spans)
                 if not crosses_edge:
                     preview, = self._boundary_reminders(body[start:end], [0], {0})
                     location += "\n" + preview.text.removeprefix("段落 1：")
-            reminders.append(CardLine(f"待确认范围 {index}", location, red=True))
-        return reminders
+            yield CardLine(f"政策结构问题 {index}", location, red=True)
+
+    def _detail_pages(self, body: str, lines: Iterable[CardLine]) -> tuple[DetailPage, ...]:
+        sections = [*lines, CardLine("申请原文", body)]
+        if self._sensitive:
+            sections = [replace(line, text=self._sensitive.sub("[已脱敏]", line.text)) for line in sections]
+        return detail_pages("飞书群申请", sections)
 
     def __call__(self, application: Application) -> tuple[DetailPage, ...]:
-        source = "飞书群申请"
+        body = application.text
+        sensitive_spans = [match.span() for match in self._sensitive.finditer(body)] if self._sensitive else []
+
+        def display(text: str) -> str:
+            # 完整值在分页前统一脱敏。逐字片段的任一边切入原文敏感值时，只显示掩码。
+            if sensitive_spans:
+                start = body.find(text)
+                while start >= 0:
+                    end = start + len(text)
+                    if any(left < start < right or left < end < right for left, right in sensitive_spans):
+                        return "[已脱敏]"
+                    start = body.find(text, start + 1)
+            return text
+
         try:
-            body = application.text
             company_rules = load_company_rules(
                 Path("rules"), self.companies_file or DEFAULT_COMPANIES_FILE, legacy=self.legacy_companies,
             )
@@ -245,9 +265,14 @@ class Pipeline:
                 hints = tuple(getattr(parsed, "hints", ()))
                 if parsed.maintain_mutual_exclusion_group.value == "否":
                     hints = (*hints, _MUTEX_NO)
-                policies.append(_Policy(draft, hints))
+                explanations = {
+                    name: display(explanation)
+                    for name, result in getattr(parsed, "field_results", {}).items()
+                    if (explanation := result.statement.explanation) and explanation.strip()
+                }
+                policies.append(_Policy(draft, hints, explanations))
         except Exception:
-            return detail_pages(source, [
+            return self._detail_pages(body, [
                 CardLine(
                     "处理状态",
                     "解析不完整，需人工确认\n停在解析，请核对申请正文或解析配置。未校验。",
@@ -255,18 +280,11 @@ class Pipeline:
                 ),
             ])
 
-        pending = getattr(drafts, "pending", ())
-        document = getattr(drafts, "document", None)
         requires_full_review = getattr(drafts, "requires_full_review", False)
-        reminders = []
-        if document:
-            reminders.append(CardLine("文档判定", document.status.value))
-        reminders.extend(self._pending_range_reminders(body, pending))
-
         if requires_full_review:
-            status = "需人工核对全文\n停在校验。请核对申请全文、待确认范围和已提取的草稿。未校验。"
-        elif document and not policies:
-            status = document.status.value
+            status = "需人工核对全文\n停在校验。请核对申请全文、政策结构问题和已提取的草稿。未校验。"
+        elif not policies:
+            status = parse.EMPTY_DRAFTS_STATUS
         else:
             try:
                 results = validate.validate_batch(
@@ -284,10 +302,10 @@ class Pipeline:
 
         lines = [
             CardLine("处理状态", status, red=requires_full_review),
-            *reminders,
+            *(CardLine("没用上的原文段落", f"{display(item.text)}\n理由　{display(item.reason)}")
+              for item in getattr(drafts, "unused_passages", ())),
+            *self._structure_reminders(body, getattr(drafts, "structure_issues", ()), sensitive_spans),
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
             *(line for index, policy in enumerate(policies, 1) for line in policy.lines(f"政策 {index}")),
         ]
-        if self._sensitive:
-            lines = [replace(line, text=self._sensitive.sub("[已脱敏]", line.text)) for line in lines]
-        return detail_pages(source, lines)
+        return self._detail_pages(body, lines)

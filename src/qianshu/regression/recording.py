@@ -8,7 +8,7 @@ from re import fullmatch
 from uuid import uuid4
 
 from qianshu.parse.model import REPLY_FORMAT_ERRORS, CallResult, ModelError, ModelReplyError, ParseModel
-from qianshu.parse.protocol import PROTOCOL_VERSION
+from qianshu.parse.protocol import PROTOCOL_VERSION, REPLY_STRUCTURE
 
 from .business import measure_fingerprint, pairing_fingerprint
 from .runner import RULES, IncompleteReply
@@ -16,6 +16,7 @@ from .storage import Output, PrivateFiles, RegressionError, digest, json_bytes, 
 
 MANIFEST = "recording.json"
 FAILURES = {None, "model_call", "model_incomplete", "model_invalid", "reply_truncated", *REPLY_FORMAT_ERRORS}
+PARSE_REPLY_ERRORS = {"reply_json", "reply_schema", "reply_document"}
 USAGE_KEYS = ("input_tokens", "output_tokens", "elapsed_ms")
 
 
@@ -44,6 +45,7 @@ def configuration(snapshot: dict, rules_dir: Path, model_id: str, threshold: int
     rules = {name: digest((rules_dir / name).read_bytes()) for name in RULES}
     config = {
         "freeze_sha256": snapshot["fingerprint"],
+        "reply_structure": REPLY_STRUCTURE,
         "code_sha256": digest(json_bytes(code)),
         "rules_sha256": digest(json_bytes(rules)),
         "companies_sha256": digest(snapshot["companies_text"].encode()),
@@ -86,7 +88,9 @@ class SavedReplies:
         if self.manifest["schema"] != 1:
             raise RegressionError("录制清单版本不受支持。")
 
-    def for_attempts(self, token: str, user_sha: str, system_sha: str) -> list[dict]:
+    def for_attempts(
+        self, token: str, user_sha: str, system_sha: str, *, preserve_parse_failure: bool = False,
+    ) -> list[dict]:
         by_document = self.manifest["documents_by_user_sha256"].get(user_sha, {})
         name = by_document.get(digest(token.encode()))
         if not isinstance(name, str) or not fullmatch(r"document-[0-9]{5,}\.json", name):
@@ -100,7 +104,13 @@ class SavedReplies:
         record = read_json(raw)
         if record["user_sha256"] != user_sha or record["system_sha256"] != system_sha:
             raise RegressionError("录制的用户消息或系统消息指纹与本次解析不一致。")
-        return record["attempts"]
+        attempts = record["attempts"]
+        if (preserve_parse_failure and record["failure_stage"] == "reply_parse" and attempts
+            and attempts[-1]["failure_stage"] is None):
+            return [*attempts[:-1], {**attempts[-1], "prior_parse_failure": {
+                "code": record["reason_code"], "path": record["structure_path"],
+            }}]
+        return attempts
 
 
 def probe_replies(files: PrivateFiles, directory: Path, model_id: str) -> Callable:
@@ -172,6 +182,13 @@ class Recording:
                 raise ModelReplyError(
                     result["failure_stage"], result["reply"], "申请解析模型回复解析失败。",
                     path=tuple(result.get("structure_path", ())),
+                )
+            if failure := result.get("prior_parse_failure"):
+                if failure["code"] not in PARSE_REPLY_ERRORS:
+                    raise RegressionError("旧录制的回复解析失败原因无效。")
+                raise ModelReplyError(
+                    failure["code"], result["reply"], "申请解析模型回复解析失败。",
+                    path=tuple(failure["path"]),
                 )
             if reason := _reply_failure(result):
                 raise IncompleteReply(reason)

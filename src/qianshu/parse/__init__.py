@@ -11,15 +11,16 @@ from qianshu.draft import Candidate, DraftField, PolicyDraft, SourceExcerpt, Unc
 
 from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
-from .evidence import EvidenceReview, ReviewRange, Sources, issue
+from .evidence import EvidenceReview, PolicyStructureIssue, Sources, issue
 from .model import ModelError, ModelReplyError, ParseModel, configured_model, validate_reply_json
 from .model import load_model_config as load_config
 from .protocol import (
-    ApplicationReply, DocumentFinding, DocumentStatus, Evidence, FieldResult, Finding, Policy,
-    SourceBlock, Span, ValueSource,
+    ApplicationReply, Evidence, FieldResult, Finding, Policy, SourceBlock, Span, UnusedPassage,
 )
 
 __all__ = ["ModelError", "ParseError", "parse_application"]
+
+EMPTY_DRAFTS_STATUS = "未提取到可办理的政策，请核对原文"
 
 _ATTACHMENTS_HINT = other_fields.ATTACHMENTS_HINT
 _POLICY_TYPE_HINT = names._POLICY_TYPE_HINT
@@ -27,6 +28,7 @@ _COMPANY_TABLE_HINT = "公司对照表缺失或无效"
 _OPTIONS = ("policy_type", "benefit_type")
 _BODY_ID = "body"
 _CONFIRM = {
+    "invalid_unwritten_shape": "「原文未写」须同时满足空值、无证据和无候选。",
     "manual_rule": other_fields.RULE_PENDING_REASON,
     "mutex_opt_out": other_fields.MUTEX_NO_HINT,
     "downgrade_confirmation": benefits._DOWNGRADE_HINT,
@@ -37,12 +39,7 @@ _CONFIRM = {
     "company_lookup_unresolved": "公司对照表无法唯一确定公司。",
     "company_subject_conflict": "明示的公司主体与公司对照表不一致。",
 }
-_STRUCTURAL_ISSUES = {
-    "invalid_clause", "local_remark_overlap", "unsupported_coverage_use", "coverage_gap",
-    "invalid_pending_reference",
-    "unbound_pending_coverage", "invalid_evidence", "invalid_checked_range", "invalid_certain_evidence",
-    "invalid_date_use", "date_target_mismatch", "tag_evidence_mismatch",
-}
+_STRUCTURAL_ISSUES = {"invalid_evidence", "invalid_certain_evidence", "tag_evidence_mismatch"}
 
 
 class ParseError(ValueError):
@@ -85,21 +82,17 @@ class ParsedPolicyDraft(PolicyDraft):
 class ParseResult(list[ParsedPolicyDraft]):
     def __init__(
         self, drafts: Iterable[ParsedPolicyDraft] = (), *,
-        pending: Iterable[ReviewRange] = (), document: DocumentFinding | None = None,
-        declaration: ApplicationReply | None = None, evidence_locations: Mapping[str, int] | None = None,
+        structure_issues: Iterable[PolicyStructureIssue] = (), evidence_locations: Mapping[str, int] | None = None,
+        unused_passages: Iterable[UnusedPassage] = (),
     ):
         super().__init__(drafts)
-        self.pending = tuple(pending)
-        self.document = document
-        self.declaration = declaration
+        self.structure_issues = tuple(structure_issues)
         self.evidence_locations = dict(evidence_locations or {})
+        self.unused_passages = tuple(unused_passages)
 
     @property
     def requires_full_review(self) -> bool:
-        return (
-            (self.document is not None and self.document.status is not DocumentStatus.NO_POLICY)
-            or any(item.requires_full_review for item in self.pending)
-        )
+        return bool(self.structure_issues)
 
 
 def parse_application(
@@ -114,15 +107,14 @@ def parse_application(
     on_reply: Callable[[str], None] | None = None,
     company_rules: CompanyRules | None = None,
     additional_blocks: Iterable[SourceBlock] = (),
+    legacy_recording: bool = False,
 ) -> ParseResult:
     """解析正文及已转成文本的附件。on_reply 收到私有重放所需的结构化回复。"""
+    if legacy_recording and model is None:
+        raise ParseError("旧回复投影须提供离线录制。")
     attachments = tuple(additional_blocks)
     if not body.strip() and not any(block.text.strip() for block in attachments):
-        document = DocumentFinding(status=DocumentStatus.INSUFFICIENT, reason_code="empty_material")
-        return ParseResult(
-            pending=(ReviewRange(None, "document_pending", reason_code=document.reason_code),),
-            document=document,
-        )
+        return ParseResult(structure_issues=(PolicyStructureIssue(None, "empty_material"),))
 
     try:
         prompt = (rules_dir / "parse-prompt.md").read_text(encoding="utf-8")
@@ -159,26 +151,54 @@ def parse_application(
         raise
     if on_reply is not None and isinstance(reply, str):
         on_reply(reply)
-    parsed = _decode(reply)
+    parsed = _decode(reply, legacy_recording=legacy_recording)
     review = EvidenceReview(parsed, sources)
     drafts = [_draft(policy, review, company_rules, options) for policy in parsed.policies]
-    return ParseResult(drafts, pending=review.pending, document=parsed.document, declaration=parsed,
-                       evidence_locations=review.evidence_locations)
+    return ParseResult(drafts, structure_issues=review.structure_issues, evidence_locations=review.evidence_locations,
+                       unused_passages=parsed.unused_passages or ())
 
 
-def _decode(reply: str) -> ApplicationReply:
+def _items(value: object, key: str) -> list:
+    if isinstance(value, dict) and isinstance(items := value.get(key), list):
+        return items
+    return []
+
+
+def _project_legacy_reply(data: object) -> None:
+    if not isinstance(data, dict):
+        return
+    for key in ("clauses", "coverage", "pending", "document"):
+        data.pop(key, None)
+    for policy in _items(data, "policies"):
+        if not isinstance(policy, dict):
+            continue
+        policy.pop("shared_clause_ids", None)
+        fields = policy.get("fields")
+        if not isinstance(fields, dict):
+            continue
+        for statement in fields.values():
+            if not isinstance(statement, dict):
+                continue
+            statement.pop("checked", None)
+            for item in (statement, *_items(statement, "candidates")):
+                for quote in _items(item, "evidence"):
+                    if isinstance(quote, dict):
+                        quote.pop("clause_id", None)
+
+
+def _decode(reply: str, *, legacy_recording: bool = False) -> ApplicationReply:
     try:
-        validate_reply_json(reply)
+        data = validate_reply_json(reply)
+        if legacy_recording:
+            _project_legacy_reply(data)
+            reply = json.dumps(data, allow_nan=False)
     except (ValueError, TypeError, RecursionError):
         raise ParseError("申请解析模型回复不是有效的政策 JSON。", code="reply_json") from None
     try:
-        result = ApplicationReply.model_validate_json(reply)
+        return ApplicationReply.model_validate_json(reply)
     except ValidationError as error:
         path = error.errors(include_input=False, include_context=False, include_url=False)[0]["loc"]
         raise ParseError("申请解析模型回复结构不符合协议。", code="reply_schema", path=path) from None
-    if not result.policies and result.document is None:
-        raise ParseError("空政策清单缺少文档级判定。", code="reply_document", path=("document",))
-    return result
 
 
 def _read_options(table: str) -> dict[str, dict[str, str]]:
@@ -231,7 +251,7 @@ def _draft(
 
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
     country_company.resolve_country_company(results, rules)
-    dates.verify_dates(policy, results, review, rules)
+    dates.verify_dates(results)
     hints = [
         *names.derive_names(results),
         *benefits.apply_benefit_rules(results),
@@ -242,7 +262,7 @@ def _draft(
         hints.append(_COMPANY_TABLE_HINT)
 
     draft = ParsedPolicyDraft(**{
-        field.name: _project(results, field.name, policy, review, options)
+        field.name: _project(results, field.name, review, options)
         for field in fields(PolicyDraft)
     })
     draft.policy_id = policy.id
@@ -250,10 +270,7 @@ def _draft(
         "main": review.corrected_span(policy.main) or policy.main,
         "continuations": [review.corrected_span(span) or span for span in policy.continuations],
     })
-    draft.scope = {
-        **corrected.model_dump(mode="json", exclude={"fields"}),
-        "clauses": [clause.model_dump(mode="json") for clause in review.applicable[policy.id]],
-    }
+    draft.scope = corrected.model_dump(mode="json", exclude={"fields"})
     draft.hints = hints
     draft.field_results = results
     draft.source_span = _body_offsets(review.main[id(policy)])
@@ -273,7 +290,7 @@ def _excerpt(quote: Evidence, sources: Sources) -> SourceExcerpt:
     return SourceExcerpt(text=quote.text, start=offsets[0] if offsets is not None else None)
 
 
-def _project(results: dict[str, FieldResult], name: str, policy, review: EvidenceReview, options) -> DraftField:
+def _project(results: dict[str, FieldResult], name: str, review: EvidenceReview, options) -> DraftField:
     result = results[name]
     evidence = [_excerpt(quote, review.sources) for quote in result.evidence]
     if not result.needs_confirmation:
@@ -283,7 +300,7 @@ def _project(results: dict[str, FieldResult], name: str, policy, review: Evidenc
     statement: Finding = result.statement
     for candidate in statement.candidates:
         value = _normalized_value(name, candidate.value, options)
-        verified = [review.verified_quote(policy, name, quote) for quote in candidate.evidence]
+        verified = [review.verified_quote(quote) for quote in candidate.evidence]
         if value is not None and verified and None not in verified:
             candidates.append(Candidate(value=value, evidence=[_excerpt(q, review.sources) for q in verified]))
     if statement.value is not None and evidence:
@@ -296,7 +313,7 @@ def _project(results: dict[str, FieldResult], name: str, policy, review: Evidenc
     reason = next((_CONFIRM[code] for code in result.issues if code in _CONFIRM), None)
     if reason is None:
         if _STRUCTURAL_ISSUES.intersection(result.issues):
-            reason = "缺证据：原文坐标、引用或范围核对未通过。"
+            reason = "缺证据：逐字引文核对未通过。"
         elif result.issues:
             reason = "需核对字段取值及适用范围。"
         else:

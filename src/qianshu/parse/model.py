@@ -4,6 +4,7 @@ import json
 import logging
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from math import isfinite
 from pathlib import Path
 from time import monotonic_ns
 from typing import Protocol, get_args
@@ -119,8 +120,15 @@ def _reject_constant(_: str) -> None:
     raise ValueError
 
 
-def validate_reply_json(reply: str) -> None:
-    json.loads(reply, object_pairs_hook=_unique_object, parse_constant=_reject_constant)
+def _finite_float(text: str) -> float:
+    value = float(text)
+    if not isfinite(value):
+        raise ValueError
+    return value
+
+
+def validate_reply_json(reply: str) -> object:
+    return json.loads(reply, object_pairs_hook=_unique_object, parse_constant=_reject_constant, parse_float=_finite_float)
 
 
 def load_model_config(*, env_file: Path = Path(".env"), config: Config | None = None) -> Config:

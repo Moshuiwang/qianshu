@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 
 from qianshu.parse import parse_application
-from tests.protocol_fixtures import clause, document, fixed_reply, policy, quote, span, statement
+from tests.protocol_fixtures import fixed_reply, policy, quote, span, statement
 
 
 COMPANIES_FILE = Path(__file__).parent / "fixtures" / "companies.tsv"
@@ -88,10 +88,10 @@ def test_explicit_trigger_and_multiplier_obey_product_rules(
 
 def test_unrelated_reference_url_is_left_for_the_create_stage():
     body = "本批没有存档链接。参考链接：https://source.example.invalid/"
-    source = quote(body, "本批没有存档链接", "url")
+    source = quote(body, "本批没有存档链接")
     main = span(0, len(body))
     p = policy("p1", main, {"approval_url": statement("确定", evidence=[source])})
-    reply = document(body, [p], [clause("url", [source["span"]], ["approval_url"], ["p1"])])
+    reply = {"policies": [p]}
     draft, = parse_application(body, model=lambda **_: json.dumps(reply), companies_file=COMPANIES_FILE)
     assert draft.approval_url.value is None
     assert draft.approval_url.uncertainty is None

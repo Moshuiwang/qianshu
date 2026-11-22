@@ -4,12 +4,14 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 from pydantic.json_schema import SkipJsonSchema
 
 from qianshu.draft import YesNo
 
 PROTOCOL_VERSION = "0.3.0"
+REPLY_STRUCTURE = "thin"
+LEGACY_REPLY_STRUCTURE = "w1d"
 
 type Identifier = Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.-]+$")]
 
@@ -29,16 +31,6 @@ class ValueSource(StrEnum):
     LOOKUP = "查表派生"
 
 
-class DocumentStatus(StrEnum):
-    NO_POLICY = "经检查无政策"
-    UNSPLIT = "可能有政策但无法切分"
-    INSUFFICIENT = "材料不足"
-
-
-type ClauseStatus = Literal["确定", "歧义", "冲突", "带条件", "缺证据"]
-type CoverageUse = Literal["政策条款", "续行", "前言", "批次说明", "备注", "其他文本", "待确认范围"]
-
-
 class Declaration(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True, allow_inf_nan=False, hide_input_in_errors=True)
 
@@ -48,19 +40,16 @@ class Span(Declaration, frozen=True):
     source_id: Identifier
     start: int
     end: int
-    # 解析端接受带引文的范围。条款范围另在工具结构中声明引文字段。
     text: SkipJsonSchema[str | None] = Field(default=None, exclude_if=lambda value: value is None)
 
 
-class ClauseSpan(Span):
+class PolicyAnchor(Span):
     text: str | None = Field(
-        default=None, exclude_if=lambda value: value is None,
-        description="逐字抄录这一段条款原文，保留空格、标点和换行。",
+        default=None, exclude_if=lambda value: value is None, description="逐字抄录政策主段或续行。",
     )
 
 
 class Evidence(Declaration):
-    clause_id: Identifier
     span: Span
     text: str
 
@@ -76,7 +65,7 @@ class Finding[T](Declaration):
     value: T | None
     candidates: list[ProposedValue[T]]
     evidence: list[Evidence]
-    checked: list[Span]
+    explanation: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class Duration(Declaration):
@@ -114,64 +103,35 @@ class Findings(Declaration):
 
 class Policy(Declaration):
     id: Identifier
-    main: Span
-    continuations: list[Span]
-    shared_clause_ids: list[Identifier]
+    main: PolicyAnchor
+    continuations: list[PolicyAnchor]
     has_title: bool
     fields: Findings
 
 
-class DateTarget(Declaration):
-    country: str | None
-    company: str | None
-
-
-class DateUse(Declaration):
-    role: Literal["起日", "止日", "申请周期", "其他"]
-    usable: bool
-    targets: list[DateTarget] | None
-
-
-class Clause(Declaration):
-    id: Identifier
-    kind: Literal["正文", "续行", "备注", "前言", "批次说明"]
-    spans: list[ClauseSpan]
-    field_ids: list[Identifier]
-    status: ClauseStatus
-    disposition: Literal["生效", "询问", "备选", "带条件", "作废", "冲突", "不明"]
-    scope: Literal["局部", "共享"]
-    policy_ids: list[Identifier]
-    date: DateUse | None
-
-
-class Coverage(Declaration):
-    span: Span
-    use: CoverageUse
-
-
-class FieldImpact(Declaration):
-    policy_id: Identifier
-    field_ids: list[Identifier]
-
-
-class PendingRange(Declaration):
-    span: Span
-    reason_code: Identifier
-    policy_ids: list[Identifier]
-    fields_by_policy: list[FieldImpact]
-
-
-class DocumentFinding(Declaration):
-    status: DocumentStatus
-    reason_code: Identifier
+class UnusedPassage(Declaration):
+    text: str = Field(min_length=1, repr=False)
+    reason: str = Field(min_length=1, repr=False)
 
 
 class ApplicationReply(Declaration):
     policies: list[Policy]
-    clauses: list[Clause]
-    coverage: list[Coverage]
-    pending: list[PendingRange]
-    document: DocumentFinding | None
+    unused_passages: list[UnusedPassage] | None = None
+
+    @field_validator("unused_passages", mode="before")
+    @classmethod
+    def _display_passages(cls, value: object) -> list[UnusedPassage] | None:
+        if not isinstance(value, list):
+            return None
+        passages = []
+        for item in value:
+            try:
+                passage = UnusedPassage.model_validate(item)
+            except ValidationError:
+                continue
+            if passage.text.strip() and passage.reason.strip():
+                passages.append(passage)
+        return passages
 
 
 @dataclass(frozen=True, repr=False)

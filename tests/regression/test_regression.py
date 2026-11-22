@@ -21,7 +21,7 @@ from qianshu.regression.compare import FIELD_LABELS, compare_field, normalize
 from qianshu.regression.corpus import CANDIDATES, DOCUMENTS, FIELDS, PAIRS, SEED, body_hashes, make_plan, select
 from qianshu.regression.runner import align
 from qianshu.regression.storage import PrivateFiles, RegressionError, digest, json_bytes
-from tests.protocol_fixtures import document, fixed_reply, quote, serialized_empty
+from tests.protocol_fixtures import fixed_reply, quote, serialized_empty
 
 RULES = Path(__file__).resolve().parents[2] / "rules"
 CORPUS = Path("archive")
@@ -37,7 +37,7 @@ FREEZE = [
 
 
 def no_policies(*, system, user):
-    return serialized_empty(json.loads(user)["application"])
+    return serialized_empty()
 
 
 def shaped_reply(body, rows, **options):
@@ -664,9 +664,8 @@ def test_broad_real_draft_checks_repeated_evidence_in_sampled_paragraph(first_du
         "recharge_days": {"value": 20, "evidence": ["充值 20 天"]},
     }])
     if first_duration == later_duration:
-        extra = quote(body, "充值 20 天", "p1-recharge_days", occurrence=1)
+        extra = quote(body, "充值 20 天", occurrence=1)
         reply["policies"][0]["fields"]["recharge_days"]["evidence"].append(extra)
-        next(c for c in reply["clauses"] if c["id"] == "p1-recharge_days")["spans"].append(extra["span"])
     drafts = parse.parse_application(body, rules_dir=RULES, companies_text="", model=lambda **_: json.dumps(reply))
     assert drafts[0].source_span == (0, len(body))
     assert drafts[0].recharge_days.value == 20
@@ -758,24 +757,24 @@ def test_full_document_review_counts_cards_and_keeps_field_scores(repo, corpus, 
     def model(*, system, user):
         body = json.loads(user)["application"]
         if body != BATCH:
-            return json.dumps(document(body, status="材料不足"), ensure_ascii=False)
+            return serialized_empty()
         reply = fixed_reply(body, [
             {"country": {"value": "赞比亚", "evidence": [FIRST]},
              "user_scope": {"value": "占位金标甲", "evidence": ["占位正文甲"]}},
             {"country": {"value": "莫桑比克", "evidence": [SECOND]},
              "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
         ], policy_ranges=[(0, BATCH.index(SECOND)), (BATCH.index(SECOND), len(body))])
-        reply["document"] = {"status": "材料不足", "reason_code": "missing_image"}
+        reply["policies"][0]["continuations"] = [{"source_id": "body", "start": len(body), "end": len(body) + 1}]
         return json.dumps(reply, ensure_ascii=False)
 
     assert main(run_args(frozen), model=model) == 0
     report = get_json(repo / "run/public-report.json")
-    assert report["full_document_review"] == {"cards": 2, "policies": 2}
+    assert report["full_document_review"] == {"cards": 1, "policies": 2}
     assert report["by_field"]["user_scope"]["match"] == 2
     assert report["business"]["by_field"]["user_scope"]["correct"] == 2
     markdown = (repo / "run/public-report.md").read_text()
-    assert "需核对全文的卡片数 2（政策数 2）" in markdown
-    assert "missing_image" not in markdown
+    assert "需核对全文的卡片数 1（政策数 2）" in markdown
+    assert report["full_document_review_reasons"]["unlocated_policy_continuation"] == 1
 
 
 def test_no_live_flag_never_constructs_a_model(repo, frozen, monkeypatch):
@@ -790,7 +789,7 @@ def test_frozen_baseline_runs_with_an_expanded_parser_and_reports_new_field_coun
     def model(*, system, user):
         body = json.loads(user)["application"]
         if body != BATCH:
-            return serialized_empty(body)
+            return serialized_empty()
         return shaped_reply(body, [
             {"country": {"value": "赞比亚", "evidence": [FIRST]}},
             {"country": {"value": "莫桑比克", "evidence": [SECOND]}},
@@ -925,7 +924,7 @@ def test_output_moved_during_model_run_is_not_written(repo, frozen):
         if not moved.exists():
             (repo / "run").rename(moved)
             (repo / "run").mkdir(mode=0o700)
-        return serialized_empty(json.loads(kwargs["user"])["application"])
+        return serialized_empty()
 
     assert main(run_args(frozen), model=model) == 1
     assert moved.is_dir()
@@ -943,7 +942,7 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
 
     blocks = [
         ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
-        TextBlock(type="text", text=serialized_empty(BATCH)),
+        TextBlock(type="text", text=serialized_empty()),
     ]
     reply = SimpleNamespace(stop_reason="end_turn", content=blocks)
 
@@ -1084,7 +1083,7 @@ def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, froze
     import anthropic
     import httpx
 
-    valid = serialized_empty(BATCH)
+    valid = serialized_empty()
     invalid = {
         "missing_brace": valid.removesuffix("}"),
         "duplicate_key": valid.removesuffix("}") + ', "policies": []}',
@@ -1095,7 +1094,7 @@ def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, froze
     def reply(request):
         user = json.loads(request.content)["messages"][0]["content"]
         body = json.loads(user)["application"]
-        text = invalid if body == BATCH else serialized_empty(body)
+        text = invalid if body == BATCH else serialized_empty()
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               content=b"".join(_stream_reply_events(text)))
 
@@ -1146,8 +1145,8 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         user = json.loads(request.content)["messages"][0]["content"]
         body = json.loads(user)["application"]
         requests[body] += 1
-        final_reply = {None: None, "valid": serialized_empty(body), "invalid": "{}"}[retry_reply]
-        text = (final_reply if requests[body] > 1 else None) if body == BATCH else serialized_empty(body)
+        final_reply = {None: None, "valid": serialized_empty(), "invalid": "{}"}[retry_reply]
+        text = (final_reply if requests[body] > 1 else None) if body == BATCH else serialized_empty()
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=ReplyStream("[" if text is None else text, text is None))
 
@@ -1178,7 +1177,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         assert (second["failure_stage"], second["reply"]) == (partial_stage, "[")
     elif retry_reply == "valid":
         assert second["failure_stage"] is None
-        assert json.loads(second["reply"]) == json.loads(serialized_empty(BATCH))
+        assert json.loads(second["reply"]) == json.loads(serialized_empty())
     else:
         assert second["failure_stage"] == record["reason_code"] == "reply_schema"
         assert record["structure_path"] == ["policies"]
@@ -1218,13 +1217,11 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
     attempts = Counter()
     batch = fixed_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST, "占位正文甲", "包", "占位缺失引文"]}}])
     _, shifted, tied, _ = batch["policies"][0]["fields"]["country"]["evidence"]
-    clause_span = batch["clauses"][0]["spans"][1]
-    batch["clauses"][0]["spans"][1] = {**clause_span, "start": clause_span["start"] + 1, "text": shifted["text"]}
     shifted["span"]["start"] += 1
     tied["span"]["start"] = (BATCH.index("包") + BATCH.rindex("包")) // 2
     expected_locations = {
-        "numerator": 3, "denominator": 5, "percent": 60.0,
-        "counts": {"exact": 1, "relocated": 2, "ambiguous": 1, "not_found": 1},
+        "numerator": 2, "denominator": 4, "percent": 50.0,
+        "counts": {"exact": 1, "relocated": 1, "ambiguous": 1, "not_found": 1},
     }
     responses = {
         BATCH: json.dumps(batch, ensure_ascii=False),
@@ -1294,8 +1291,8 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
     assert report["usage"]["elapsed_ms"] == {"captured_attempts": 4, "total": 54}
     public = (repo / "run" / "public-report.md").read_text() + (repo / "run" / "public-report.json").read_text()
     assert "唯一对齐" in public and "可比字段全对率" in public
-    assert "证据定位成功率 3/5（60.00%），含条款引文" in public
-    assert "程序重新定位 2" in public
+    assert "证据定位成功率 2/4（50.00%），计字段、候选及带引文的政策锚点" in public
+    assert "程序重新定位 1" in public
     for label in ("模型坐标原样正确", "多处不可分", "引文不存在"):
         assert f"{label} 1" in public
     for private in ("占位无效回包", "占位保密失败详情", "占位缺失引文", FIRST, "synthetic-model"):
@@ -1310,7 +1307,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
 def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     def probe(*, system, user):
         user_sha = digest(user.encode())
-        reply = serialized_empty(json.loads(user)["application"])
+        reply = serialized_empty()
         put_json(repo / "probe" / f"{user_sha}.json", {
             "system_sha": digest(system.encode()), "user_sha": user_sha,
             "reply": reply, "error": None, "secs": 0.2,
@@ -1325,9 +1322,8 @@ def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     assert imported["origin"] == "probe" and imported["source_code_measured"] is False
     for name in imported["artifact_sha256"]:
         record = get_json(repo / "imported" / name)
-        body = BATCH if record["user_sha256"] == digest(json.dumps({"application": BATCH}, ensure_ascii=False).encode()) else "占位单条原稿\n"
         assert record["attempts"] == [{
-            "reply": serialized_empty(body), "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
+            "reply": serialized_empty(), "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
             "input_tokens": None, "output_tokens": None, "elapsed_ms": None,
         }]
     assert "未采集" in (repo / "imported" / "public-report.md").read_text()
@@ -2074,3 +2070,91 @@ def test_amount_dates_and_candidates_only_count_derived_business_keys(monkeypatc
     assert fingerprint != pairing_fingerprint(3)
     monkeypatch.setitem(WEIGHTS, "packages", 4)
     assert fingerprint != pairing_fingerprint(2)
+
+
+def test_legacy_replay_projects_only_retired_shape(repo, frozen, monkeypatch, capsys):
+    reply = fixed_reply(BATCH, [{"country": {"value": "赞比亚", "evidence": [FIRST]}}])
+    fields = reply["policies"][0]["fields"]
+    source_quote = fields["country"]["evidence"][0]
+    source_quote["clause_id"] = "legacy"
+    fields["user_scope"].update(status="歧义", candidates=[{
+        "value": "合成范围", "evidence": [{**source_quote}],
+    }], checked=[])
+    reply["policies"][0]["shared_clause_ids"] = ["legacy"]
+    reply.update(clauses=[], coverage=[], pending=[], document={"status": "材料不足", "reason_code": "fixture"})
+    raw = json.dumps(reply, ensure_ascii=False)
+
+    def model(*, system, user):
+        return raw if json.loads(user)["application"] == BATCH else json.dumps({"policies": [], "document": None})
+
+    assert main(run_args(frozen), model=model) == 0
+    recording = repo / "run"
+    manifest_path = recording / "recording.json"
+    manifest = get_json(manifest_path)
+    manifest["configuration"].pop("reply_structure")
+    names = {get_json(recording / name)["user_sha256"]: name for name in manifest["artifact_sha256"]}
+    batch_name = names[digest(json.dumps({"application": BATCH}, ensure_ascii=False).encode())]
+    batch_path = recording / batch_name
+    batch = get_json(batch_path)
+    second_name, = set(manifest["artifact_sha256"]) - {batch_name}
+    second_path = recording / second_name
+    second = get_json(second_path)
+    second.update(reason_code="reply_document", structure_path=["document"])
+
+    def save(path, record, source):
+        record["attempts"][-1]["reply"] = source
+        record["configuration"] = manifest["configuration"]
+        put_json(path, record)
+        manifest["artifact_sha256"][path.name] = digest(path.read_bytes())
+        put_json(manifest_path, manifest)
+
+    batch.update(failure_stage=None, reason_code=None, structure_path=[])
+    save(batch_path, batch, raw)
+    save(second_path, second, second["attempts"][-1]["reply"])
+    source_bytes = batch_path.read_bytes()
+    denominators = (repo / "frozen" / "denominators.json").read_bytes()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline replay attempted model access")
+
+    monkeypatch.setattr("qianshu.regression.__main__.configured_model", forbidden)
+    assert main(_replay_args(frozen, out=".private/strict"), model=forbidden) == 0
+    assert get_json(repo / "strict" / "public-report.json")["documents"]["parse_failed"] == 2
+
+    assert main([*_replay_args(frozen), "--legacy-recording"], model=forbidden) == 0
+    diagnostic = repo / "replay"
+    report = get_json(diagnostic / "public-report.json")
+    assert report["documents"] == {"parsed": 1, "parse_failed": 1, "model_failed": 0}
+    assert report["samples"] == 3
+    assert report["diagnostic_replay"] == {
+        "reply_structure": "thin", "source_reply_structure": "w1d",
+        "source_configuration_sha256": digest(json_bytes(manifest["configuration"])),
+    }
+    replay_manifest = get_json(diagnostic / "recording.json")
+    assert replay_manifest["origin"] == "replay" and replay_manifest["origin_run_id"] == manifest["run_id"]
+    assert get_json(diagnostic / batch_name)["attempts"][-1]["reply"] == raw
+    assert get_json(diagnostic / second_name)["reason_code"] == "reply_document"
+    assert batch_path.read_bytes() == source_bytes
+    assert (repo / "frozen" / "denominators.json").read_bytes() == denominators
+    args = ["summarize", "--recording", ".private/replay", "--out", ".private/diagnostic"]
+    assert main(args) == 1
+    assert main([*args, "--diagnostic-replay"]) == 0
+    assert get_json(repo / "diagnostic" / "public-summary.json")["diagnostic_replay"] is True
+
+    wrong_core = json.loads(raw)
+    wrong_core["policies"][0]["fields"]["country"]["value"] = 42
+    for index, (response, code) in enumerate([
+        (raw.removesuffix("}") + ', "extra": 1}', "reply_schema"),
+        (raw.replace('"checked": []', '"checked": [], "checked": []'), "reply_json"),
+        (raw.replace('"checked": []', '"checked": [1e999]'), "reply_json"),
+        (json.dumps(wrong_core), "reply_schema"),
+    ]):
+        save(batch_path, batch, response)
+        output = f"malformed-{index}"
+        assert main([*_replay_args(frozen, out=f".private/{output}"), "--legacy-recording"], model=forbidden) == 0
+        assert get_json(repo / output / batch_name)["reason_code"] == code
+
+    prompt = repo.parent / "rules" / "parse-prompt.md"
+    prompt.write_text(prompt.read_text() + "\n合成规则变更\n")
+    assert main([*_replay_args(frozen, out=".private/changed-rules"), "--legacy-recording"], model=forbidden) == 1
+    assert "录制时的规则文件" in capsys.readouterr().err

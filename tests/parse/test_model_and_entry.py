@@ -19,7 +19,7 @@ from qianshu.parse import ModelError, parse_application
 from qianshu.parse.__main__ import main
 from qianshu.parse.model import ModelReplyError, configured_model, load_model_config
 from qianshu.parse.protocol import ApplicationReply
-from tests.protocol_fixtures import document, fixed_reply, serialized_empty, span
+from tests.protocol_fixtures import fixed_reply, serialized_empty
 
 
 def test_service_help_describes_current_offline_input(capsys):
@@ -43,7 +43,7 @@ def test_service_help_describes_current_offline_input(capsys):
 ])
 def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, effort, caplog):
     client_type = anthropic.Anthropic
-    raw = "  \r\n" + serialized_empty("占位正文") + "\r\n"
+    raw = "  \r\n" + serialized_empty() + "\r\n"
 
     def mocked_reply(request):
         assert request.url.host == "model.example.invalid"
@@ -59,10 +59,13 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
             "input_schema": ApplicationReply.model_json_schema(),
         }]
         definitions = payload["tools"][0]["input_schema"]["$defs"]
-        clause_span_ref = definitions["Clause"]["properties"]["spans"]["items"]["$ref"]
-        clause_span = definitions[clause_span_ref.removeprefix("#/$defs/")]
-        assert {"source_id", "start", "end", "text"} == set(clause_span["properties"])
-        assert "text" not in clause_span["required"]
+        schema = payload["tools"][0]["input_schema"]
+        assert set(schema["properties"]) == {"policies", "unused_passages"}
+        assert schema["required"] == ["policies"]
+        anchor = definitions["PolicyAnchor"]
+        assert {"source_id", "start", "end", "text"} == set(anchor["properties"])
+        assert "text" not in anchor["required"]
+        assert set(definitions["UnusedPassage"]["required"]) == {"text", "reason"}
         assert "tool_choice" not in payload
         assert payload["stream"] is True
         assert payload["max_tokens"] == 32000
@@ -162,7 +165,7 @@ def _reply_tool(input, *, name="submit_application_reply"):
 
 def test_stream_returns_only_tool_input(stub_stream):
     _, get_reply = stub_stream
-    payload = json.loads(serialized_empty("占位正文"))
+    payload = json.loads(serialized_empty())
     get_reply.return_value = SimpleNamespace(
         stop_reason="tool_use",
         content=[
@@ -183,12 +186,12 @@ def test_stream_returns_only_tool_input(stub_stream):
     ("missing", "reply_tool_missing", ()),
     ("multiple", "reply_tool_multiple", ()),
     ("unexpected", "reply_tool_unexpected", ()),
-    ("invalid", "reply_schema", ("document", "status")),
+    ("invalid", "reply_schema", ("policies",)),
 ])
 def test_stream_rejects_bad_tool_reply_and_records_content(stub_stream, case, code, path):
     _, get_reply = stub_stream
-    payload = json.loads(serialized_empty("占位正文"))
-    invalid = {**payload, "document": {"status": "无效状态", "reason_code": "synthetic"}}
+    payload = json.loads(serialized_empty())
+    invalid = {**payload, "policies": "占位非法政策清单"}
     tools = {
         "missing": [], "multiple": [_reply_tool(payload), _reply_tool(invalid)],
         "unexpected": [_reply_tool(payload, name="unexpected_tool")], "invalid": [_reply_tool(invalid)],
@@ -219,7 +222,7 @@ def test_stream_rejects_bad_tool_reply_and_records_content(stub_stream, case, co
 @pytest.mark.parametrize("stop_reason", ["tool_use", "max_tokens"])
 def test_result_callback_records_blocks_and_use_without_changing_return(stub_stream, stop_reason):
     _, get_reply = stub_stream
-    payload = json.loads(serialized_empty("占位正文"))
+    payload = json.loads(serialized_empty())
     blocks = [
         TextBlock(type="text", text="占位说明"),
         ThinkingBlock(type="thinking", thinking="占位思考", signature="placeholder"),
@@ -386,7 +389,7 @@ def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp
             "ANTHROPIC_MODEL=placeholder-custom\nANTHROPIC_EFFORT=xhigh\n", encoding="utf-8",
         )
     Path(rules_dir).symlink_to(Path(__file__).resolve().parents[2] / "rules", target_is_directory=True)
-    configured = Mock(return_value=Mock(return_value=serialized_empty("占位正文")))
+    configured = Mock(return_value=Mock(return_value=serialized_empty()))
     monkeypatch.setattr("qianshu.parse.configured_model", configured)
     monkeypatch.setattr(sys, "argv", ["qianshu.parse", "--output", "drafts.json", *flags])
     monkeypatch.setattr(sys, "stdin", io.StringIO("占位正文"))
@@ -396,10 +399,7 @@ def test_parse_entry_loads_config_and_rules_from_selected_paths(monkeypatch, tmp
     expected_effort = "low" if env_file == ".env" else "xhigh"
     configured.assert_called_once_with({"ANTHROPIC_MODEL": expected_model, "ANTHROPIC_EFFORT": expected_effort})
     configured.return_value.assert_called_once()
-    assert json.loads(Path("drafts.json").read_text(encoding="utf-8")) == {
-        "document": {"status": "经检查无政策", "reason_code": "fixture"},
-        "drafts": [],
-    }
+    assert json.loads(Path("drafts.json").read_text(encoding="utf-8")) == []
 
 
 @pytest.mark.parametrize("legacy", [False, True])
@@ -526,13 +526,13 @@ def test_replay_matches_direct_stub_without_reading_api_config(monkeypatch, tmp_
     config.assert_not_called()
 
 
-@pytest.mark.parametrize("status", ["经检查无政策", "可能有政策但无法切分", "材料不足"])
-def test_replay_writes_document_finding(monkeypatch, tmp_path, capsys, status):
+@pytest.mark.parametrize("passages", [None, [{"text": "合成申请材料", "reason": "占位说明"}]])
+def test_replay_writes_empty_drafts_and_optional_passages(monkeypatch, tmp_path, capsys, passages):
     body = "合成申请材料"
     replay = tmp_path / "reply.json"
     output = tmp_path / "drafts.json"
     raw = tmp_path / "raw.json"
-    reply = "  \r\n" + json.dumps(document(body, status=status), ensure_ascii=False) + "\r\n"
+    reply = "  \r\n" + json.dumps({"policies": [], "unused_passages": passages}, ensure_ascii=False) + "\r\n"
     replay.write_bytes(reply.encode())
     monkeypatch.setattr(sys, "argv", [
         "qianshu.parse", "--replay", str(replay), "--output", str(output), "--raw-output", str(raw),
@@ -541,24 +541,17 @@ def test_replay_writes_document_finding(monkeypatch, tmp_path, capsys, status):
     monkeypatch.setattr(sys, "stdin", io.StringIO(body))
 
     assert main() == 0
-    expected = {
-        "document": {"status": status, "reason_code": "fixture"},
-        "drafts": [],
-    }
-    if status != "经检查无政策":
-        expected.update(requires_full_review=True, pending=[
-            {"span": None, "code": "document_pending", "reason_code": "fixture", "block_id": None},
-        ])
+    expected = {"drafts": [], "unused_passages": passages} if passages else []
     assert json.loads(output.read_text(encoding="utf-8")) == expected
     assert raw.read_bytes() == reply.encode()
     assert raw.stat().st_mode & 0o777 == 0o600
     assert capsys.readouterr() == ("", "")
 
 
-def test_replay_writes_full_review_for_unbound_coverage_gap(monkeypatch, tmp_path):
-    covered, tail = "合成申请", "其余材料"
-    body = covered + tail
-    reply = fixed_reply(covered, [{}])
+def test_replay_writes_full_review_for_unlocated_policy_anchor(monkeypatch, tmp_path):
+    body = "合成申请"
+    reply = fixed_reply(body, [{}])
+    reply["policies"][0]["main"]["text"] = "合成未找到的引文"
     replay = tmp_path / "reply.json"
     output = tmp_path / "drafts.json"
     replay.write_text(json.dumps(reply, ensure_ascii=False), encoding="utf-8")
@@ -567,10 +560,9 @@ def test_replay_writes_full_review_for_unbound_coverage_gap(monkeypatch, tmp_pat
 
     assert main() == 0
     parsed = json.loads(output.read_text(encoding="utf-8"))
-    assert parsed["document"] is None
     assert parsed["requires_full_review"] is True
-    assert [(item["span"], item["reason_code"]) for item in parsed["pending"]] == [
-        (span(len(covered), len(body)), "coverage_gap"),
+    assert parsed["structure_issues"] == [
+        {"span": None, "code": "unlocated_policy_main", "policy_ids": ["p1"]},
     ]
     assert parsed["drafts"][0]["repeat_bonus"]["value"] == "是"
 
