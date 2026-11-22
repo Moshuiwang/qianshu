@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 from lark_oapi.core.http import Transport as SDKTransport
@@ -202,6 +203,33 @@ def test_resident_rejects_invalid_raw_reply_directory(tmp_path, monkeypatch, cap
     assert capsys.readouterr() == ("", "原始回复目录须为可访问的 0700 目录，请检查 --raw-output-dir。\n")
 
 
+def _resident_cards(monkeypatch, body, model, *, message_count=1):
+    settings = SimpleNamespace(
+        app_id="<占位应用>", tenant_key="<占位租户>", chat_id="<占位群>",
+        bot_open_id="<占位机器人>", allowed_senders=("<占位申请人>",), approved_fingerprint=fingerprint(body),
+    )
+    cards = []
+
+    def fake_service(settings, window, state_path, processor):
+        def run():
+            for index in range(message_count):
+                message = Message(f"<占位消息-{index}>", settings.chat_id, "<占位申请人>", 0, "text", "")
+                processor(Application(message, body, ()))
+
+        return SimpleNamespace(run=run, entrance=SimpleNamespace(), transport=SimpleNamespace(
+            react=None, reply=None, download=None,
+        ))
+
+    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
+    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    monkeypatch.setattr(service_entry, "load_settings", lambda _: settings)
+    monkeypatch.setattr(service_entry, "setup_logging", lambda _: None)
+    monkeypatch.setattr(service_entry, "configured_model", lambda _: model)
+    monkeypatch.setattr(service_entry, "FeishuService", fake_service)
+    monkeypatch.setattr(service_entry, "_send_report_card", lambda _, card, *args: cards.append(card))
+    return cards
+
+
 @pytest.mark.parametrize("save_raw", [False, True], ids=["disabled", "enabled"])
 def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
     tmp_path, single_policy, monkeypatch, capsys, caplog, save_raw,
@@ -229,30 +257,8 @@ def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
     if save_raw:
         args.extend(("--raw-output-dir", str(output)))
 
-    settings = SimpleNamespace(
-        app_id="<占位应用>", tenant_key="<占位租户>", chat_id="<占位群>",
-        bot_open_id="<占位机器人>", allowed_senders=("<占位申请人>",), approved_fingerprint=fingerprint(body),
-    )
-    cards = []
     pending = iter(replies)
-
-    def fake_service(settings, window, state_path, processor):
-        def run():
-            for index in range(len(replies)):
-                message = Message(f"<占位消息-{index}>", settings.chat_id, "<占位申请人>", 0, "text", "")
-                processor(Application(message, body, ()))
-
-        return SimpleNamespace(run=run, entrance=SimpleNamespace(), transport=SimpleNamespace(
-            react=None, reply=None, download=None,
-        ))
-
-    monkeypatch.delenv("ANTHROPIC_CUSTOM_HEADERS", raising=False)
-    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
-    monkeypatch.setattr(service_entry, "load_settings", lambda _: settings)
-    monkeypatch.setattr(service_entry, "setup_logging", lambda _: None)
-    monkeypatch.setattr(service_entry, "configured_model", lambda _: lambda **kwargs: next(pending))
-    monkeypatch.setattr(service_entry, "FeishuService", fake_service)
-    monkeypatch.setattr(service_entry, "_send_report_card", lambda _, card, *args: cards.append(card))
+    cards = _resident_cards(monkeypatch, body, lambda **kwargs: next(pending), message_count=len(replies))
     monkeypatch.setattr(service_entry.time, "time_ns", lambda: 1_900_000_000_000_000_000)
 
     assert service_entry.main(args) == 0
@@ -730,6 +736,43 @@ def test_command_reports_parse_failure(tmp_path, single_policy):
     assert "<font color='red'>处理状态\n解析不完整，需人工确认\n停在解析" in content
     assert "未校验" in content
     assert "待群卡片同意" not in content
+
+
+def _assert_manual_review_without_draft(cards):
+    content = "\n".join(_contents(cards))
+    assert "解析不完整，需人工确认" in content
+    assert "未校验" in content
+    assert "待群卡片同意" not in content
+    assert "政策 1" not in content
+
+
+@pytest.mark.parametrize("missing_key", ["text", "evidence"])
+def test_shape_error_reply_goes_to_manual_review(tmp_path, single_policy, missing_key):
+    body, rows = single_policy
+    rows[0]["country"] = rows[0].pop("company")
+    reply = fixed_reply(" " + body, rows)
+    field = reply["policies"][0]["fields"]["user_scope"]
+    if missing_key == "text":
+        del field["evidence"][0]["text"]
+    else:
+        del field["evidence"]
+
+    _assert_manual_review_without_draft(_run(tmp_path, body, reply))
+
+
+def test_multiple_tool_calls_go_to_manual_review(tmp_path, single_policy, monkeypatch):
+    body, _ = single_policy
+
+    multiple_tool_calls = Mock(side_effect=parse.ModelReplyError(
+        "reply_tool_multiple", None, "合成回复重复调用提交工具",
+    ))
+
+    cards = _resident_cards(monkeypatch, body, multiple_tool_calls)
+    args = [*_resident_args(tmp_path), "--companies-file", str(COMPANIES_FIXTURE),
+            "--env-file", str(tmp_path / ".env")]
+    assert service_entry.main(args) == 0
+    multiple_tool_calls.assert_called_once()
+    _assert_manual_review_without_draft(cards)
 
 
 def test_command_preserves_long_evidence(tmp_path, single_policy):

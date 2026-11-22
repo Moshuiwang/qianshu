@@ -129,8 +129,37 @@ class RequestedTariff(Declaration):
     version: str | None
 
 
+# 缺少完整候选或坐标时，Findings 将短名降为缺证据。
+# 工具允许模型省略这些子项，其他字段仍使用原有的必填证据结构。
+def _optional_properties(schema: dict) -> None:
+    schema.pop("required", None)
+
+
+class ShortNameSpan(Span):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+
+
+class ShortNameEvidence(Evidence):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+    span: ShortNameSpan
+
+
+class ShortNameCandidate(ProposedValue[str]):
+    model_config = ConfigDict(json_schema_extra=_optional_properties)
+    evidence: list[ShortNameEvidence]
+
+
+class ShortNameFinding(Finding[str]):
+    status: StatementStatus = StatementStatus.UNSUPPORTED
+    reason_code: Identifier = "short_name"
+    value: str | None = None
+    candidates: list[ShortNameCandidate] = Field(default_factory=list)
+    evidence: list[ShortNameEvidence] = Field(default_factory=list)
+
+
 class Findings(Declaration):
     policy_name: Finding[str]
+    policy_short_name: ShortNameFinding = Field(default_factory=ShortNameFinding)
     maintain_mutual_exclusion_group: Finding[YesNo]
     country: Finding[str]
     company: Finding[str]
@@ -161,6 +190,14 @@ class Findings(Declaration):
     after_offer_package: OptionalOffer[str] = Field(default_factory=OfferFinding)
     forbid_package_change: OptionalOffer[YesNo] = Field(default_factory=OfferFinding)
     first_recharge_day_only: OptionalOffer[Literal["是"]] = Field(default_factory=OfferFinding)
+
+    @field_validator("policy_short_name", mode="wrap")
+    @classmethod
+    def _optional_short_name(cls, value, handler):
+        try:
+            return handler(value)
+        except ValidationError:
+            return ShortNameFinding()
 
 
 class Policy(Declaration):

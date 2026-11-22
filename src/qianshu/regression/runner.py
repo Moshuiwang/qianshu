@@ -9,6 +9,7 @@ from typing import get_origin
 from qianshu.draft import DraftField, OfferPolicyDraft
 from qianshu.parse import ModelError, ParseError, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
+from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
 from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
 from qianshu.parse.package_levels import PackageLevels, load_package_levels
@@ -163,7 +164,7 @@ def _new_field_status(draft, name: str) -> str:
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
     threshold: int = DEFAULT_THRESHOLD, recording=None, package_levels: PackageLevels | None = None,
-    today: date | None = None,
+    today: date | None = None, package_run_day: date | None = None,
 ) -> tuple[dict, dict]:
     if package_levels is None:
         package_levels = load_package_levels()
@@ -205,10 +206,12 @@ def evaluate(
     for country, names in company_names.items():
         for name in names:
             common_countries[name].add(country)
+    codes = country_codes((rules_dir / "countries.txt").read_text(encoding="utf-8"))
     business = BusinessScore(frozen, threshold, {
         name: next(iter(countries)) for name, countries in common_countries.items() if len(countries) == 1
     }, company_table=company_rules.table if company_rules is not None else None,
-        country_names=company_rules.countries if company_rules is not None else None)
+        country_names=company_rules.countries if company_rules is not None else None,
+        country_codes=codes, today=today)
     business_details = []
     evidence_locations = Counter()
     full_review_cards = full_review_policies = 0
@@ -231,7 +234,9 @@ def evaluate(
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
-                package_levels=package_levels, today=today,
+                package_levels=package_levels, package_run_day=package_run_day,
+                today=today, country_codes=codes,
+                recorded_reply=getattr(recording, "origin", None) in ("replay", "probe"),
             )
         except IncompleteReply as error:
             received = True
@@ -466,6 +471,15 @@ def markdown_report(report: dict) -> bytes:
         for name, counts in field_counts.items():
             label = FIELD_LABELS[name][0] if name in FIELD_LABELS else name
             result.append("| " + " | ".join([kind, label, *(str(counts[key]) for key in CATEGORIES)]) + " |")
+    if name_counts := report["business"].get("policy_names"):
+        result.extend(["", "## #58 政策名称计数", ""])
+        for policy_type, counts in (name_counts | report["business"].get("public_name_sources", {})).items():
+            result.append(
+                f"- {policy_type} 可比 {counts['comparable']}，正确建议 {counts['correct_proposal']}，"
+                f"错误建议 {counts['incorrect_proposal']}，正确确定 {counts['correct']}，错判确定 {counts['false_determined']}，"
+                f"多问 {counts['overasked']}，合理需确认 {counts['justified_confirmation']}，"
+                f"缺草稿 {counts['missing']}，未知 {counts['unknown']}"
+            )
     if "configuration_sha256" in report:
         result.extend(["", f"- 运行配置指纹 `{report['configuration_sha256']}`"])
         for key, label in (("input_tokens", "输入 token"), ("output_tokens", "输出 token"), ("elapsed_ms", "耗时毫秒")):
