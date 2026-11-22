@@ -296,3 +296,20 @@ def test_missing_role_evidence_changes_only_country_company_and_their_derivation
     assert not packages.needs_confirmation and [q.text for q in packages.evidence] == ["占位甲包"]
     packages = after["packages"]
     assert (packages.value, packages.evidence, packages.needs_confirmation) == (None, before["packages"].evidence, True)
+
+
+@pytest.mark.parametrize(("excluded", "pending"), [
+    ("赤道几内亚", False), ("排除赤道几内亚", False), ("排除赤道几内亚和几内亚", True),
+])
+def test_role_lookup_counts_only_complete_country_names(excluded, pending):
+    body = "适用几内亚；" + excluded
+    reply = fixed_reply(body, [{"country": _field("几内亚", "适用几内亚")}])
+    reply["policies"][0]["fields"]["country"]["mentions"].append(mention("排除对象", excluded))
+    draft, = _parse(body, reply, HEADER + "几内亚\t\t0001\t占位公司\n")
+    if pending:
+        assert "适用地是否也被排除" in draft.company.uncertainty.reason
+    for name, value in [("country", "几内亚"), ("company", "占位公司")]:
+        result = draft.field_results[name]
+        assert result.needs_confirmation is pending
+        if not pending:
+            assert result.value == value

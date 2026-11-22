@@ -32,6 +32,7 @@ _OPTIONS = ("policy_type", "benefit_type")
 _BODY_ID = "body"
 _CONFIRM = {
     **names.CONFIRMATION_REASONS,
+    **country_company.ROLE_CONFIRMATION_REASONS,
     "invalid_unwritten_shape": "「原文未写」须同时满足空值、无证据和无候选。",
     "manual_rule": other_fields.RULE_PENDING_REASON,
     "mutex_opt_out": other_fields.MUTEX_NO_HINT,
@@ -193,10 +194,12 @@ def parse_application(
         # 冻结录制没有提供销售品快照时，不能混入当前目录的私有表。
         return PackageLevels() if companies_text is not None else load_package_levels()
 
+    withheld_names: set[str] = set()
     resolved = [_resolve_fields(policy, review, company_rules, options, country_codes, reference_date,
-                                benefit_catalog, levels_snapshot, package_run_day or reference_date)
+                                benefit_catalog, levels_snapshot, package_run_day or reference_date, withheld_names)
                 for policy in parsed.policies]
-    names.check_names([results for results, _, _ in resolved], known_policy_names)
+    rows = [results for results, _, _ in resolved]
+    names.check_names(rows, (*known_policy_names, *withheld_names))
     drafts = [_draft(policy, review, options, results, hints, candidates)
               for policy, (results, hints, candidates) in zip(parsed.policies, resolved, strict=True)]
     return ParseResult(drafts, structure_issues=review.structure_issues, evidence_locations=review.evidence_locations,
@@ -256,6 +259,7 @@ def _resolve_fields(
     policy: Policy, review: EvidenceReview, rules: CompanyRules, options: dict[str, dict[str, str]],
     codes: Mapping[str, str], reference_date: date | None, benefit_catalog: benefits.BenefitCatalog,
     levels_snapshot: Callable[[], PackageLevels], package_run_day: date | None,
+    withheld_names: set[str],
 ) -> tuple[dict[str, FieldResult], list[str], tuple[str, ...]]:
     results = {name: review.field(policy, name) for name in policy.fields.__class__.model_fields
                if name != "package_tiers" or name in policy.fields.model_fields_set}
@@ -269,7 +273,7 @@ def _resolve_fields(
                 results[name] = replace(result, value=value)
 
     results["user_tags"] = names.verify_tags(results["user_tags"], review.sources)
-    country_company.resolve_country_company(results, rules, review.sources)
+    pending_country = country_company.resolve_country_company(results, rules, review.sources)
     dates.verify_dates(results)
     benefit_hints = benefits.apply_benefit_rules(results, benefit_catalog, reference_date, policy.fields.model_fields_set)
     hints = [
@@ -277,6 +281,10 @@ def _resolve_fields(
         *benefit_hints,
         *other_fields.apply_defaults(results),
     ]
+    if pending_country and "public_name_inputs_pending" in results["policy_name"].issues:
+        candidate = names.composed_candidate(results, codes.get(pending_country), reference_date)
+        if candidate is not None:
+            withheld_names.add(candidate)
     tier_candidates = packages.resolve_packages(results, has_title=policy.has_title, levels_snapshot=levels_snapshot,
                                                 rules=rules, today=package_run_day)
     if rules.table is None:
@@ -349,7 +357,10 @@ def _project(results: dict[str, FieldResult], name: str, review: EvidenceReview,
     if "policy_type_conflict" in result.issues:
         tag_evidence = [_excerpt(quote, review.sources) for quote in results["user_tags"].evidence]
         candidates.append(Candidate(value=result.value, evidence=tag_evidence))
-    reason = next((_CONFIRM[code] for code in result.issues if code in _CONFIRM), None)
+    issues = result.issues
+    if name == "company" and "company_inputs_pending" in issues:
+        issues = (*issues, *results["country"].issues)
+    reason = next((_CONFIRM[code] for code in issues if code in _CONFIRM), None)
     if reason is None:
         if _STRUCTURAL_ISSUES.intersection(result.issues):
             reason = "缺证据：逐字引文核对未通过。"

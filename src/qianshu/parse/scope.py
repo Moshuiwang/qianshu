@@ -24,7 +24,7 @@ def read_countries(table: str) -> dict[str, re.Pattern[str]]:
         if not _HAN.search(name) or name in countries or any(not alias for alias in aliases):
             raise ValueError
         terms = []
-        for term in map(_normalize_country_text, (name, *aliases)):
+        for term in sorted(map(_normalize_country_text, (name, *aliases)), key=len, reverse=True):
             escaped = re.escape(term)
             if _HAN.search(term):
                 terms.append(escaped)
@@ -41,11 +41,22 @@ def read_countries(table: str) -> dict[str, re.Pattern[str]]:
 def country_matches(
     texts: Iterable[str], countries: dict[str, re.Pattern[str]], *, exact: bool = False,
 ) -> set[str]:
-    texts = tuple(map(_normalize_country_text, texts))
-    return {
-        name for name, pattern in countries.items()
-        if any((pattern.fullmatch if exact else pattern.search)(text) for text in texts)
-    }
+    matched = set()
+    for text in map(_normalize_country_text, texts):
+        if exact:
+            matched.update(name for name, pattern in countries.items() if pattern.fullmatch(text))
+            continue
+        # 同起点先看长名；已被完整国名包含的匹配不单独计入。
+        spans = sorted((match.start(), -match.end(), name)
+                       for name, pattern in countries.items() for match in pattern.finditer(text))
+        outer_span = None
+        for start, negative_end, name in spans:
+            span = (start, -negative_end)
+            if outer_span is None or span[1] > outer_span[1]:
+                outer_span = span
+            if span == outer_span:
+                matched.add(name)
+    return matched
 
 
 def company_mentioned(name: str, texts: Iterable[str]) -> bool:

@@ -9,6 +9,14 @@ from .scope import company_mentioned, country_matches
 FIELDS = ("country", "company", "company_keyword")
 
 
+ROLE_CONFIRMATION_REASONS = {
+    "country_role_incomplete": "请补齐国家角色、来源块和短引文，并核对本条适用地。",
+    "country_evidence_unlocated": "请核对国家支持引文和角色短引文，每段引文都须能在指定来源块中唯一定位。",
+    "country_role_mismatch": "请核对适用地短引文，它须唯一查到本条所报国家。",
+    "country_role_conflict": "请核对适用地、背景与排除引文，检查适用地是否也被排除，或支持引文是否与非适用地引文重叠。",
+}
+
+
 def _unique_location(sources: Sources, block_id: str | None, text: str | None) -> Span | None:
     block = sources.blocks.get(block_id)
     if block is None or not text:
@@ -40,8 +48,7 @@ def _role_issue(country: CountryFinding, canonical: str, rules: CompanyRules, so
             other_locations.append(location)
         if mention.role == "比较或背景":
             continue
-        matches = (country_matches([evidence.text], rules.countries, exact=True)
-                   or country_matches([evidence.text], rules.countries))
+        matches = country_matches([evidence.text], rules.countries)
         if mention.role == "适用地":
             if matches != {canonical}:
                 return "country_role_mismatch"
@@ -57,7 +64,9 @@ def _role_issue(country: CountryFinding, canonical: str, rules: CompanyRules, so
     return None
 
 
-def resolve_country_company(results: dict[str, FieldResult], rules: CompanyRules, sources: Sources) -> None:
+def resolve_country_company(results: dict[str, FieldResult], rules: CompanyRules, sources: Sources) -> str | None:
+    """返回仅因角色核对而待确认的规范国名，供同批名称查重。"""
+    pending_country = None
     country, subject, clues = (results[name] for name in FIELDS)
     if verified_value(country):
         matches = country_matches([country.value], rules.countries, exact=True)
@@ -66,12 +75,16 @@ def resolve_country_company(results: dict[str, FieldResult], rules: CompanyRules
         else:
             canonical = matches.pop()
             problem = _role_issue(country.statement, canonical, rules, sources)
-            country = issue(country, problem) if problem else accept(country, canonical, ValueSource.LOOKUP, rule="R10")
+            if problem:
+                pending_country = canonical
+                country = issue(country, problem)
+            else:
+                country = accept(country, canonical, ValueSource.LOOKUP, rule="R10")
         results["country"] = country
 
     if not verified_value(country) or not (verified_value(clues) or can_use_absence(clues)):
         results["company"] = issue(subject, "company_inputs_pending")
-        return
+        return pending_country
     rows = (rules.table or {}).get(country.value, {})
     keywords = clues.value if verified_value(clues) else ()
     matches = [row for keyword, row in rows.items()
@@ -82,7 +95,7 @@ def resolve_country_company(results: dict[str, FieldResult], rules: CompanyRules
         row, rule = rows.get(""), "R10.default_company"
     else:
         results["company"] = issue(subject, "company_lookup_unresolved")
-        return
+        return None
     if row is None:
         results["company"] = issue(subject, "company_lookup_unresolved")
     elif verified_value(subject) and subject.value.casefold() != row.display_name.casefold():
@@ -91,3 +104,4 @@ def resolve_country_company(results: dict[str, FieldResult], rules: CompanyRules
         subject_evidence = (*subject.evidence, *clues.evidence, *country.evidence)
         results["company"] = accept(subject, row.display_name, ValueSource.LOOKUP,
                                     rule=rule, inputs=FIELDS, evidence=subject_evidence)
+    return None

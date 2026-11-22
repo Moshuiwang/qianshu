@@ -169,6 +169,12 @@ def test_batch_detects_collision_between_copied_and_composed_names():
         assert draft.policy_name.value is None and draft.policy_name.uncertainty
         assert "policy_name_duplicate" in draft.field_results["policy_name"].issues
 
+    del reply["policies"][1]["fields"]["country"]["mentions"]
+    copied, withheld = parse_application(body, model=model_reply(reply), companies_file=COMPANIES, today=TODAY)
+    assert withheld.field_results["policy_name"].value is None
+    assert withheld.policy_name.uncertainty and withheld.policy_name_source is None
+    assert copied.field_results == drafts[0].field_results
+
 
 @pytest.mark.parametrize("tags", [["标签甲"], ["标签甲", "标签乙"]])
 def test_targeted_names_require_one_tag(tags):

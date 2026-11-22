@@ -122,13 +122,20 @@ def _public_name(results: dict[str, FieldResult], codes: Mapping[str, str], toda
         return issue(name, "public_name_short_name_pending")
     country, start = results["country"], results["start_date"]
     code = codes.get(country.value) if verified_value(country) else None
-    if today is None or not code or not verified_value(start):
+    value = composed_candidate(results, code, today)
+    if value is None:
         return issue(name, "public_name_inputs_pending")
-    value = compose_public_name(code, short_name.value, date.fromisoformat(start.value), today)
     proposal = accept(name, value, ValueSource.LOOKUP, rule=_PUBLIC_NAME_RULE,
                       inputs=("user_tags", "policy_type", "country", "policy_short_name", "start_date"),
                       evidence=(*results["policy_type"].evidence, *short_name.evidence, *country.evidence, *start.evidence))
     return replace(proposal, needs_confirmation=True)
+
+
+def composed_candidate(results: dict[str, FieldResult], code: str | None, today: date | None) -> str | None:
+    start = results["start_date"]
+    if today is None or not code or not verified_value(start):
+        return None
+    return compose_public_name(code, results["policy_short_name"].value, date.fromisoformat(start.value), today)
 
 
 def compose_public_name(country_code: str, short_name: str, start: date, today: date) -> str:
