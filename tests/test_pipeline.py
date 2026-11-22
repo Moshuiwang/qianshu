@@ -823,22 +823,23 @@ def test_unused_passages_are_display_only(tmp_path, single_policy, passages):
     reply["unused_passages"] = passages
     assert _contents(_run(tmp_path, body, reply, tag_dates=tag_dates)) == baseline
 
-    long_text = "合成占位\n" * 1800
+    long_text = "合成占位摘录\n" * 1800
+    long_reason = "分页理由\n" * 1800
     reply["unused_passages"] = [
-        {"text": long_text, "reason": "合成理由甲"},
+        {"text": long_text, "reason": long_reason + "合成理由甲"},
         {"text": {"bad": True}, "reason": "坏项"},
         {"text": "额外键坏项", "reason": "无", "extra": True},
         {"text": "合成段落乙", "reason": "合成理由乙"},
     ]
     lines = _contents(_run(tmp_path, body, reply, tag_dates=tag_dates))
-    advisory = "没用上的原文段落"
+    advisory = "没用上的原文段落（对照下方申请原文）"
     assert lines[2].startswith(advisory + "\n")
     assert any(line.startswith(advisory + "（续）") for line in lines)
     assert [line for line in lines if line.startswith("政策 ")] == [
         line for line in baseline if line.startswith("政策 ")
     ]
     chunks = "".join(line.split("\n", 1)[1] for line in lines if line.startswith(advisory))
-    assert chunks == long_text + "\n理由　合成理由甲合成段落乙\n理由　合成理由乙"
+    assert chunks == "理由　" + long_reason + "合成理由甲理由　合成理由乙"
     assert "政策 1 · 处理状态\n解析完成，待群卡片同意" in lines
 
 
@@ -861,7 +862,7 @@ def test_application_source_and_advisories_are_redacted():
     assert SECRET not in content
     assert SECRET[:5] not in content and SECRET[-5:] not in content
     assert "模型说明　合成说明 [已脱敏]" in content
-    assert "没用上的原文段落\n[已脱敏]\n理由　[已脱敏]" in lines
+    assert "没用上的原文段落（对照下方申请原文）\n理由　[已脱敏]" in lines
     assert lines[-1].startswith("申请原文（续）\n")
     assert "".join(line.split("\n", 1)[1] for line in lines if line.startswith("申请原文")) == body.replace(SECRET, "[已脱敏]")
     summary = "\n".join(_contents(list(map(result_card, _mail_summary(pages, True)))))
@@ -886,7 +887,7 @@ def test_partial_sensitive_value_is_redacted_before_paginating(size):
     lines = _contents(list(map(result_card, pages)))
     assert len(pages) > 1
     assert "原文出处　「[已脱敏]」" in "\n".join(lines)
-    assert f"没用上的原文段落\n[已脱敏]\n理由　{reason.replace(suffix, '[已脱敏]')}" in lines
+    assert f"没用上的原文段落（对照下方申请原文）\n理由　{reason.replace(suffix, '[已脱敏]')}" in lines
     for label, expected in (
         ("申请原文", body.replace(secret, "[已脱敏]")),
         ("政策 1 · 用户范围 · 待确认", "模型说明　" + explanation.replace(suffix, "[已脱敏]")),
@@ -898,7 +899,8 @@ def test_partial_sensitive_value_is_redacted_before_paginating(size):
 
 
 @pytest.mark.parametrize("secret_in_body", [False, True])
-def test_split_sensitive_value_is_redacted_across_advisories_and_pages(secret_in_body):
+def test_split_sensitive_value_is_redacted_across_advisories_and_pages(secret_in_body, monkeypatch):
+    monkeypatch.setattr("qianshu.feishu.cards._PAGE_ELEMENTS", 3)
     pieces = ("充", "值赠", "送用户", "范围")
     fragment = "".join(pieces)
     secret = f"甲{fragment}乙" if secret_in_body else fragment
@@ -932,6 +934,27 @@ def test_split_sensitive_value_is_redacted_across_advisories_and_pages(secret_in
     assert [text for _, text in displayed] == ["[已脱敏]"] * len(pieces)
 
 
+def test_unused_passage_excerpt_cannot_recombine_with_reason():
+    secret = "A12B34"
+    body = "样例A12、B34。"
+    excerpt = "样例A12"
+    reply = json.dumps({"policies": [], "unused_passages": [{"text": excerpt, "reason": "B34"}]})
+    pipeline = Pipeline(model=lambda **_: reply, tag_dates={}, sensitive_values=[secret])
+
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+    free_text = "".join(
+        part.removeprefix("理由　")
+        for line in lines if line.startswith("没用上的原文段落")
+        for part in line.split("\n")[1:]
+    )
+
+    assert secret not in free_text
+    assert all(secret[start:start + 4] not in free_text for start in range(len(secret) - 3))
+    assert all(excerpt not in line for line in lines if not line.startswith("申请原文\n"))
+    assert "没用上的原文段落（对照下方申请原文）\n理由　B34" in lines
+    assert f"申请原文\n{body}" in lines
+
+
 def test_advisories_redact_registered_fragments_absent_from_the_source():
     body = "充、值。合成申请。"
     long_secret = "甲合成隔离占位值乙"
@@ -946,8 +969,8 @@ def test_advisories_redact_registered_fragments_absent_from_the_source():
 
     lines = _contents(list(map(result_card, pipeline(_application(body)))))
 
-    assert "没用上的原文段落\n合成段落甲\n理由　核对[已脱敏]。" in lines
-    assert "没用上的原文段落\n合成段落乙\n理由　[已脱敏]" in lines
+    assert "没用上的原文段落（对照下方申请原文）\n理由　核对[已脱敏]。" in lines
+    assert "没用上的原文段落（对照下方申请原文）\n理由　[已脱敏]" in lines
     assert "模型说明　[已脱敏]" in "\n".join(lines)
     assert "政策 1 · 国家 · 模型说明\n需核对[已脱敏]。" in lines
 
@@ -963,7 +986,7 @@ def test_advisories_keep_public_business_words_shared_with_a_sensitive_value():
 
     lines = _contents(list(map(result_card, pipeline(_application(body)))))
 
-    assert "没用上的原文段落\n合成段落\n理由　已充值" in lines
+    assert "没用上的原文段落（对照下方申请原文）\n理由　已充值" in lines
     assert "模型说明　赠送" in "\n".join(lines)
     assert "政策 1 · 国家 · 模型说明\n用户" in lines
     assert "申请原文\n已充值、赠送、用户。\n[已脱敏]" in lines
@@ -994,7 +1017,7 @@ def test_zero_drafts_keep_advisories_and_original_without_validating(monkeypatch
     lines = _contents(list(map(result_card, pipeline(_application(body)))))
     assert lines[1:] == [
         "处理状态\n未提取到可办理的政策，请核对原文",
-        "没用上的原文段落\n合成原文\n理由　合成说明",
+        "没用上的原文段落（对照下方申请原文）\n理由　合成说明",
         "申请原文\n合成原文",
     ]
 

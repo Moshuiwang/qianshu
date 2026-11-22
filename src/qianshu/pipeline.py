@@ -408,7 +408,7 @@ class Pipeline:
 
         lines = [
             CardLine("处理状态", status, red=requires_full_review),
-            *(_FreeTextLine("没用上的原文段落", f"{redact.display(item.text)}\n理由　", free_text=item.reason)
+            *(_FreeTextLine("没用上的原文段落（对照下方申请原文）", "理由　", free_text=item.reason)
               for item in getattr(drafts, "unused_passages", ())),
             *self._structure_reminders(body, getattr(drafts, "structure_issues", ()), redact.spans, redact.display),
             *(policy.status_line(f"政策 {index}") for index, policy in enumerate(policies, 1)),
