@@ -147,7 +147,9 @@ def test_late_summary_ack_cannot_thaw_unknown(setup):
     stub.pause = "Public"
     with ThreadPoolExecutor(1) as pool:
         owner = pool.submit(run)
-        assert stub.landed.wait(3)
+        while not owner.done() and not stub.landed.wait(0.1):
+            continue
+        assert stub.landed.is_set()
         try:
             result = run()
             assert isinstance(result, a.ArchiveUnknown) and not hasattr(result, "url")
