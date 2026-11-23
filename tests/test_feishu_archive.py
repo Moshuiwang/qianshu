@@ -657,3 +657,64 @@ def test_scenario_adjacent_to_folded_header_stops_publication(setup, context):
     transport = Mock(wraps=stub)
     assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
     transport.request.assert_not_called()
+
+
+_NEIGHBOR_LINES = {
+    "start": (),
+    "end": (),
+    "single": ("> From: 甲",),
+    "fold-last": ("> Subject: 乙", "> \t合成续行"),
+    "fold-first": ("> Subject: 乙", "> \t合成续行"),
+    "blank": ("",),
+    "prose": ("合成正文",),
+}
+_ABOVE = ("start", "blank", "prose", "single", "fold-last")
+_BELOW = ("end", "blank", "prose", "single", "fold-first")
+_MATRIX_FIELD = "Extra: 合成内部字段值"
+
+
+def _neighbor_body(above, below):
+    lines = (*_NEIGHBOR_LINES[above], _MATRIX_FIELD, *_NEIGHBOR_LINES[below])
+    return "\r\n".join(lines) + ("\r\n" if below == "blank" else "")
+
+
+# ec8917f 实测遮盖区间，行与列分别对应 _ABOVE 和 _BELOW。
+_NEIGHBOR_BASELINE = (
+    ((), (), (), ((0, 25),), ((0, 37),)),
+    ((), (), (), ((2, 27),), ((2, 39),)),
+    ((), (), (), ((6, 31),), ((6, 43),)),
+    (((0, 25),), ((0, 25),), ((0, 25),), ((0, 36),), ((0, 48),)),
+    (((0, 37),), ((0, 37),), ((0, 37),), ((0, 48),), ((0, 60),)),
+)
+
+
+@pytest.mark.parametrize("below", _BELOW)
+@pytest.mark.parametrize("above", _ABOVE)
+def test_required_field_neighbor_matrix(setup, above, below):
+    body = _neighbor_body(above, below)
+    start = body.index(_MATRIX_FIELD)
+    field_positions = set(range(start, start + len(_MATRIX_FIELD)))
+    baseline = _NEIGHBOR_BASELINE[_ABOVE.index(above)][_BELOW.index(below)]
+    old_mask = {i for left, right in baseline for i in range(left, right)}
+    allowed = ((above == "single" and below in ("blank", "prose", "end"))
+               or (below == "single" and above in ("blank", "prose", "start")))
+    expected_mask = old_mask - field_positions if allowed else old_mask
+
+    batch, _, cfg, stub, register, run = setup
+    excerpt = SourceExcerpt(start=start, text=_MATRIX_FIELD)
+    group = dict.fromkeys(a._FIELDS, excerpt)
+    batch = replace(batch, body=body, policies=(a.ArchivePolicy("定向政策", (group,)),))
+    if expected_mask & field_positions:
+        register(batch)
+        transport = Mock(wraps=stub)
+        assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
+        transport.request.assert_not_called()
+    else:
+        preview = a.preview_archive_batch(batch, config=cfg)
+        assert preview.blocks[3].split("　", 1)[1] == _MATRIX_FIELD
+        register(batch, preview_fingerprint=preview.fingerprint)
+        assert isinstance(run(batch), a.ArchiveSuccess)
+        assert published_paragraphs(stub) == preview.blocks
+
+    actual_mask = {i for left, right in a._header_blocks(body) for i in range(left, right)}
+    assert actual_mask == expected_mask

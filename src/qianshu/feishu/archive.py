@@ -278,6 +278,8 @@ def _header_blocks(body):
             field.first_line for field in fields
             if field.depth and field.known and field.first_line == field.last_line
         }
+        known_starts = {field.first_line for field in fields if field.known}
+        known_ends = {field.last_line for field in fields if field.known}
         cursor = start
         for depth, group in groupby(fields, key=lambda field: field.depth):
             if depth:
@@ -286,7 +288,10 @@ def _header_blocks(body):
             if any(field.known for field in unquoted):
                 continue
             for field in unquoted:
-                if field.first_line - 1 in single_line_headers or field.first_line + 1 in single_line_headers:
+                above = field.first_line - 1
+                below = field.first_line + 1
+                if ((above in single_line_headers and below not in known_starts)
+                        or (below in single_line_headers and above not in known_ends)):
                     if cursor < field.start:
                         yield cursor, field.start
                     cursor = field.stop
