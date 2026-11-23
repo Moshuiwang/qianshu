@@ -97,11 +97,11 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 
 ## 050 的字段、授权与回读
 
-原格式 X5 启动时读取运行配置和授权登记。以下任一信号存在即返回固定原因「050 配置已禁用原格式 X5 入口」，此时明道云请求和写入均为零。判据按键或文件是否存在判断，空名单也生效。
+原格式 X5 启动时读取运行配置和授权登记。以下任一信号存在即返回固定原因「050 配置已禁用原格式 X5 入口」，此时明道云请求和写入均为零。标记优先于目录权限检查。只有明确的文件不存在才算缺席，探测权限错误、配置或登记不可读、格式错误均拒绝启动。空名单也生效。
 
 - 代码所在仓库根目录或当前运行目录内存在 `.private/trial-config.json`，或命令指定的配置含 `trial`。
-- 配置含 `official.tag_search`、`official.tariffs`、`official.tasks`、050 网页字段标签，或 `order_snapshot` 中的 `web_rules`、`verified_combinations`、`concurrent_policies`、`condition_scenario`、`tariffs`、`upgrade_tasks`、`upgrade_task_id`、`template_sources`、`member_names`。
-- 私有授权登记中任一条含 `tag_scope`、`concurrent_scope`、`tariffs_scope`、`tasks_scope` 或 `web_rules_sha256`。
+- 配置含 `official.tag_search`、`official.tariffs`、`official.tasks`、`official.products`、`official.plans`、`official.company_rows`、050 网页字段标签，或 `order_snapshot` 中的 `web_rules`、`verified_combinations`、`concurrent_policies`、`condition_scenario`、`tariffs`、`upgrade_tasks`、`upgrade_task_id`、`template_sources`、`member_names`。
+- 私有授权登记中任一条含 `tag_scope`、`concurrent_scope`、`tariffs_scope`、`tasks_scope`、`products_scope`、`plans_scope`、`company_rows_scope` 或 `web_rules_sha256`。
 
 序 2a 和正式单由 #154 共同核验邮件审批、绑定预览、确认有效同意、存档并交接建单。序 2a 不能调用旧 X5 或复制模板审批链接。X7 删除另验当次授权与通知登记。
 
@@ -111,9 +111,24 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 - 标签读权限由当次授权的 `tag_scope` 给出。应用指纹、来源、表路径、覆盖全表的视图和全名控件均须与配置一致。读取每页必须返回同一 `snapshotVersion` 和可核对的总数。`unique_until` 须来自覆盖写入时间的独立唯一性证明。部署端若无此能力，应保持未登记。各页同时核对全表、名称列、版本、有效期一致的 `uniqueConstraint`。这些是合成验收的证明字段，部署端实际协议待单独核实。普通配置摘要不能扩大读权限。
 - 群卡片绑定当次登记、最终请求字节、展示及来源清单。050 合成验收在 `prepare` 和传输交接前按同一清单重读授权、配置、放行名单、整批草稿和原文、解析选项表、客户端设置、登录态、当前模板及关联行、同期候选及标签。任一来源变化或读不到就关闭旧卡。非 050 配置的原格式验收保留历史平台读序。
 - `concurrent_scope` 独立登记应用指纹、来源、政策表列表路径、全表视图、快照版本，以及名称、公司、结束日和创建时刻四列。每次使用无筛选列表读完登记视图，核对各页总数、快照版本及每条候选。空集也要有平台完整读取的证据。单凭私有清单的有效期不能放行。
-- 适用条件选项键和显示名须与当前模板相同。展示和资费定位共用已核实的计划。关联计划取平台关联行的标识和全名，资费行须有对应的 `price_plan_id`、业务全名及生效区间。标量计划直接核模板关联行内的值。
+- 适用条件选项键和显示名须与当前模板相同。展示和资费定位共用已核实的计划。关联计划取平台关联行的标识和全名，资费行须有对应的 `price_plan_id`、业务全名及生效区间。标量或选项计划须由模板关联行中独立登记的 `price_plan_id_column` 提供计划记录 ID。
 - 交接前在登录态读取之后复核所选标签标识、全名及全名唯一性。最后一次查询和写入间仍可能发生改名。逐条官方回读同时核实际关联标识及标签表当前全名，差异写入私有报告，建单资格保持锁定，保留记录交人工。关联分页仅有总数、首屏未达总数且缺少页码和续页信号时记为未确认。
 - `template_sources` 登记模板复制及工作流控件的类型与显示名，`member_names` 登记成员标识对应的业务名。逐项确认后才进入 D15。真实组合放行、工作流回填、同期命中率及平台完整读取能力须另行取证。
-- 出卡和交接均从当次登记的 `tariffs_scope` 核对当前资费表。全表视图、分页版本和列绑定须能证明节目包、计划标识与全名、生效区间和周期。按资费计算金额时同时核对价格和版本。指定目标包的升包任务从 `tasks_scope` 登记的行和状态列回读，并核对公司与目标包。
+- 出卡和交接均从当次登记的 `tariffs_scope` 核对当前资费表。全表视图、分页版本和列绑定须能证明节目包、计划标识与全名、生效区间和周期。按计划 ID、生效日和适用单位选出唯一行后，对该行发起 GET 详情。单价、单位、版本、起止日和周期都须与候选一致。资费模式下，关联控件须写入此行 ID，充值金额从同行单价和倍数计算。指定目标包的升包任务从 `tasks_scope` 登记的行和状态列回读，并核对公司与目标包。
 - 全表唯一性核实后，交接前按所选标签 ID 逐条读取全名。最后一条平台查询返回后，再检查本地授权、配置（含放行名单）及其余本地来源。
 - 卡片预览在私有目录保存请求值与业务显示值。申请人成员名先与模板官方成员对象核对。回读逐字段比较选项键与显示名、关联 ID 与名称、价格计划及成员。确认与卡片不同记「写错」，缺证或无法解析记「未确认」。单内任一字段写错即整单写错。私有回读报告、台账和返回对象的 `conclusion` 提供整单结论，供 #154 接入停写和告警。
+
+
+050 的出卡、交接和写后回读遵循以下读取约定。
+
+| 登记 | 平台详情与用途 |
+|---|---|
+| `tag_scope.columns` | 按 ID 读取 `name/end/shadow/complete`，与标签候选逐值比对。完成状态须明确为真。全表另证全名唯一。 |
+| `products_scope`、`plans_scope` | 按模板关联提供的记录 ID 读取 `name`，逐字核对当前包、赠送包与计划全名。 |
+| `company_rows_scope` | 按公司记录 ID 读取 `name/number`，核对模板公司关联和业务编号列。 |
+| `tariffs_scope` | 全表及详情均保留行 ID，登记列为 `package/price_plan/price_plan_id/unit/start/end/amount/version/cycle`。 |
+| `concurrent_scope`、`tasks_scope` | 对同期全表中命中的政策按 ID 核对四列详情。适用的升包任务按登记 ID 核对公司、目标包及状态列。 |
+
+`verified_order_rows` 保存各次详情投影及其读取方法。出卡使用该投影生成业务显示值、请求和回读期望。交接前按原 ID 重读，逐项核对。部署端缺少已登记的列或详情读取能力时，该组合停单。
+数字证据按原文坐标核对，数值记号本身和前后各四个 Unicode 码点内出现减号或连字符即转人工。
+写后独立核对所选标签详情，全表不可读时仍保留已经证实的异名。050 先写私有报告和台账，再返回逐单结论；回读公告由 #154 取得结论后处理。D15 的删除公告和删除核验仍按原授权执行。

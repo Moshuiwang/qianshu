@@ -52,7 +52,7 @@ _WEB_COPY = {
 }
 
 
-def web_value(name, rule, values, company_row, plans, snapshot):
+def web_value(name, rule, values, company_row, snapshot):
     """仅从已核的本条申请、网页定义和有版本的上游材料派生。"""
     def need(condition):
         if not condition:
@@ -89,15 +89,7 @@ def web_value(name, rule, values, company_row, plans, snapshot):
         cycles = rule["cycles"]
         need(cycles.get("日") == 1 and all(type(value) is int and value == int(unit == "日")
                                           for unit, value in cycles.items()))
-        day = date.fromisoformat(values["start_date"])
-        selected = set()
-        for package, identifier, plan in plans:
-            rates = [row for row in snapshot["tariffs"] if row["package"] == package
-                     and row.get("price_plan_id") == identifier and row["price_plan"] == plan
-                     and date.fromisoformat(row["start"]) <= day
-                     <= date.fromisoformat(row["end"])]
-            need(len(rates) == 1 and rates[0]["unit"] in cycles)
-            selected.add(cycles[rates[0]["unit"]])
+        selected = {row["cycle"] for row in snapshot["tariffs"]}
         need(len(selected) == 1)
         return selected.pop()
     if name == "同期有效优惠政策":

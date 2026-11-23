@@ -198,6 +198,12 @@ def web_order(case, platform, business_cli, monkeypatch, registered_entry):
         **case.evidence["tag_scope"], "path": case.config["official"]["search"]["path"], "view": "all-policies",
         "columns": {name: name for name in ("name", "company", "end", "created_at")},
     }
+    snapshot["tags"][0]["complete"] = True
+    rows[0].update(end=snapshot["tags"][0]["end"], shadow=False, complete=True)
+    case.evidence["tag_scope"]["columns"] = {"name": "全名", "end": "end", "shadow": "shadow", "complete": "complete"}
+    case.config["fields"][case.control["packages"]]["price_plan_id_column"] = "计划记录"
+    platform.relations[case.control["packages"]][0]["计划记录"] = case.ids["template"]
+    snapshot["tariffs"][0].update(id=case.ids["package"], price_plan_id=case.ids["template"], amount=3, version="第一版", cycle=1)
     case.rate_rows = deepcopy(snapshot["tariffs"])
     case.task_rows = {}
     case.readback_change = lambda row: None
@@ -210,7 +216,13 @@ def web_order(case, platform, business_cli, monkeypatch, registered_entry):
         case.evidence[table + "_scope"] = {"path": path, "origin": scope["origin"], "app_sha256": scope["app_sha256"]}
     case.evidence["tariffs_scope"].update(view="全部资费", snapshot="第一版", coverage="full_table",
         columns={k: k for k in ("package", "price_plan", "price_plan_id", "start", "end", "unit")})
-    case.rate_rows[0]["price_plan_id"] = None
+    case.evidence["tariffs_scope"]["columns"].update(amount="amount", version="version", cycle="cycle")
+    for action, columns in (("products", {"name": "name"}), ("plans", {"name": "name"}),
+                            ("company_rows", {"name": display, "number": "企业编号"})):
+        path = f"/v3/app/worksheets/{action}/rows/{{record_id}}"
+        case.config["official"][action] = {"path": path}
+        case.evidence[action + "_scope"] = {"path": path, "origin": scope["origin"],
+                                             "app_sha256": scope["app_sha256"], "columns": columns}
     case.tag_version = "第一版"
     queries = []
     check_cards = []
@@ -222,13 +234,29 @@ def web_order(case, platform, business_cli, monkeypatch, registered_entry):
     base = platform.official
     def exchange(request):
         path = request.url.path
+        row_id = path.split("/")[-1]
+        if "/products/rows/" in path:
+            product, = [entry for r in platform.relations[case.control["packages"]]
+                        for role in ("current", "gift") for entry in r[case.child[role]] if entry["sid"] == row_id]
+            return platform.response({"rowId": row_id, "name": product["name"]})
+        if "/plans/rows/" in path:
+            rate = next(r for r in case.rate_rows if r["price_plan_id"] == row_id)
+            return platform.response({"rowId": row_id, "name": rate["price_plan"]})
+        if "/company_rows/rows/" in path:
+            return platform.response(matched)
+        if "/tariffs/rows/" in path and row_id != "list":
+            rate, = [r for r in case.rate_rows if r["id"] == row_id]
+            return platform.response({"rowId": row_id, **rate})
+        for policy in snapshot["concurrent_policies"]["rows"]:
+            if path == case.config["official"]["read"]["path"].replace("{record_id}", policy["id"]) and policy["company"] == case.values["company"]:
+                return platform.response({"rowId": policy["id"], **policy})
         if path == case.config["official"]["tariffs"]["path"]:
-            return platform.response({"rows": [{"rowId": case.ids["package"], **r} for r in case.rate_rows],
+            return platform.response({"rows": [{"rowId": r["id"], **r} for r in case.rate_rows],
                                       "total": len(case.rate_rows), "snapshotVersion": "第一版"})
         if path.startswith("/v3/app/worksheets/tasks/rows/"):
             return platform.response(case.task_rows[path.split("/")[-1]])
         if path == case.config["official"]["tag_search"]["path"].removesuffix("list") + case.ids["tag"]:
-            case.target_reads.append((events(case)[-1], platform.create_count))
+            case.target_reads.append(((events(case) or ["preflight"])[-1], platform.create_count))
             return platform.response(rows[0])
         if (request.url.path == case.config["official"]["search"]["path"]
                 and json.loads(request.content)["viewId"] == "all-policies"):
@@ -692,6 +720,8 @@ def test_billing_uses_platform_plan(case, platform, business_cli, web_order, reg
     case.config["fields"][control]["children"][price] = field
     platform.relations[control][0][price] = [{"sid": plan, "name": "月计划"}]
     rate, = case.config["order_snapshot"]["tariffs"]
+    rate["cycle"] = int(registered[0] == "日")
+    case.rate_rows[0]["cycle"] = 0
     rate.update(price_plan=registered, price_plan_id=plan if matched_id else case.ids["tag"], unit=registered[0])
     case.rate_rows[0].update(price_plan="月计划", price_plan_id=plan, unit="月")
     code, _ = business_cli.run()
@@ -842,7 +872,8 @@ def test_confirmed_business_readback(case, platform, business_cli, web_order, mo
         case.config["fields"][key]["children"][price] = {
             "type": 29, "business_names": {order.compact([{"sid": plan}]): "月计划"}}
         platform.relations[key][0][price] = [{"sid": plan, "name": "月计划"}]
-        case.config["order_snapshot"]["tariffs"][0].update(price_plan="月计划", price_plan_id=plan, unit="月")
+        case.rate_rows[0]["cycle"] = 0
+        case.config["order_snapshot"]["tariffs"][0].update(cycle=0, price_plan="月计划", price_plan_id=plan, unit="月")
         case.rate_rows[0].update(price_plan="月计划", price_plan_id=plan, unit="月")
         def changed(control, rows):
             if control == key:
@@ -892,3 +923,144 @@ def test_number_token_at_original_coordinates(text, excerpt, value, complete):
     start = text.index(excerpt)
     quote = {"span": {"source_id": "body", "start": start, "end": start + len(excerpt)}, "text": excerpt}
     assert order.complete_number_in_source(value, quote, sources) is complete
+
+
+def test_unreadable_marker_stops_before_client(case, platform, business_cli, monkeypatch):
+    original = order.os.lstat
+    def denied(path, *args, **kwargs):
+        if order.Path(path).name == "trial-config.json":
+            raise PermissionError(13, "合成拒绝")
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(order.os, "lstat", denied)
+    assert business_cli.run() == (1, "已停止：050 配置已禁用原格式 X5 入口\n")
+    assert platform.actions == []
+
+
+@pytest.mark.parametrize("symbol", ["－ ", "﹣", "– ", "∸ "])
+def test_negative_near_quote(case, platform, business_cli, web_order, symbol):
+    export = offer_export(case, platform, "特价优惠")
+    text = "固定实付" + symbol + "8元"
+    start = text.index("8")
+    replace_order_quotes(export, "recharge_amount", text, [(start, start + 1)])
+    assert business_cli.run(export)[0] == 1 and platform.create_count == 0
+
+
+@pytest.mark.parametrize("change", [{"end": "2000-01-01"}, {"shadow": True}, {"complete": False}])
+def test_official_tag_facts_before_card(case, platform, business_cli, web_order, change):
+    web_order[1][0].update(change)
+    assert business_cli.run()[0] == 1 and not business_cli.summaries and platform.create_count == 0
+
+
+def test_official_package_spelling_before_card(case, platform, business_cli, web_order):
+    row = platform.relations[case.control["packages"]][0]
+    row[case.child["gift"]][0]["name"] = "合成当前包 copy"
+    assert business_cli.run()[0] == 1 and not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("fault", ["list", "notice"])
+def test_persistent_result_with_second_failure(case, platform, business_cli, web_order, monkeypatch, fault):
+    if fault == "list":
+        platform.before_handoff = lambda: web_order[1][0].update(全名="已改名")
+        original = order.Official.tag_index
+        def index(api, *args, **kwargs):
+            if platform.create_count:
+                raise order.Stop("全表未确认")
+            return original(api, *args, **kwargs)
+        monkeypatch.setattr(order.Official, "tag_index", index)
+    else:
+        case.readback_change = lambda row: row.update({web_order[0]["billingCycle"]["control"]: "0"})
+        def unavailable(*args):
+            raise RuntimeError("公告失败")
+        monkeypatch.setattr(Approvals, "announce", unavailable, raising=False)
+    results = []
+    original_run = order.run_order
+    def capture(*args, **kwargs):
+        if fault == "notice":
+            args[3].transport.announce = unavailable
+        result = original_run(*args, **kwargs)
+        results.append(result.conclusion)
+        return result
+    monkeypatch.setattr(order, "run_order", capture)
+    assert business_cli.run()[0] == 1
+    assert results == ["写错"] and "delete" not in platform.actions
+    assert json.loads(next(case.private.glob("create-readback-*")).read_bytes())["结论"] == "写错"
+    assert json.loads((case.private / "trial-orders.jsonl").read_text().splitlines()[-1])["结论"] == "写错"
+
+
+def test_tariff_detail_wrong_plan_before_card(case, platform, business_cli, web_order, monkeypatch):
+    request = order.Official._request
+    def changed(api, action, *args, **kwargs):
+        result = request(api, action, *args, **kwargs)
+        if action == "tariffs" and kwargs.get("row_path"):
+            result["price_plan_id"] = case.ids["gift_package"]
+        return result
+    monkeypatch.setattr(order.Official, "_request", changed)
+    assert business_cli.run()[0] == 1 and not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("fault", ["same_name", "wrong_relation", None])
+def test_amount_and_cycle_use_selected_rate(case, platform, business_cli, web_order, fault):
+    snapshot = case.config["order_snapshot"]
+    values = case.values
+    ref = {"base_package": "合成当前包", "price_plan": "3.00", "unit": "月", "version": "第一版"}
+    values.update(tariff=ref, tariff_multiplier=1)
+    offer_export(case, platform, "特价优惠")
+    values["amount_mode"] = "节目包资费"
+    mode = case.control["amount_mode"]
+    platform.template[mode][0]["value"] = values["amount_mode"]
+    case.config["fields"][mode]["draft_values"] = {order.compact(values["amount_mode"]): [platform.template[mode][0]["key"]]}
+    snapshot["benefit_catalog"] = {"tariffs": [{**ref, "amount": 8, "valid_from": "2000-01-01", "valid_until": "2100-01-01"}]}
+    rate = {**case.rate_rows[0], "id": case.ids["tag"], "unit": "月", "amount": 8, "cycle": 0}
+    if fault == "same_name":
+        rate["price_plan_id"] = case.ids["gift_package"]
+        case.rate_rows.append(rate)
+    else:
+        case.rate_rows[:] = [rate]
+    snapshot["tariffs"] = deepcopy(case.rate_rows)
+    control = case.control["tariff"]
+    row_id = case.ids["template"] if fault == "wrong_relation" else rate["id"]
+    case.config["fields"][control].update(type=29, draft_values={order.compact(ref): [row_id]})
+    platform.template[control] = [{"sid": row_id, "name": str(ref)}]
+    export = private_export(values)
+    text = "合成当前包可获合成受赠包"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    case.readback_change = lambda row: row.update({control: platform.template[control]})
+    code, error = business_cli.run(export)
+    if fault:
+        assert code == 1 and not business_cli.summaries and platform.create_count == 0
+    else:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert platform.created_cells[control] == order.compact([{"sid": rate["id"]}])
+        assert platform.created_cells[case.control["recharge_amount"]] == "8"
+        assert platform.created_cells[web_order[0]["billingCycle"]["control"]] == "0"
+
+
+def test_trial_marker_precedes_directory_mode(case, platform, business_cli, monkeypatch):
+    root = case.private.parent / "deployment"
+    (root / ".private").mkdir(parents=True)
+    (root / ".private" / "trial-config.json").touch()
+    monkeypatch.setattr(order, "__file__", str(root / "src/qianshu/mingdao/create_order.py"))
+    case.private.chmod(0o750)
+    assert business_cli.run() == (1, "已停止：050 配置已禁用原格式 X5 入口\n")
+    assert platform.actions == []
+
+
+@pytest.mark.parametrize("action", ["products", "plans", "company_rows", "tariffs", "tag_search"])
+def test_detail_change_after_approval_stops(case, platform, business_cli, web_order, monkeypatch, action):
+    read = order.Official._request
+    def changed(api, name, row_id="", **kwargs):
+        row = read(api, name, row_id, **kwargs)
+        if name == action and row_id and "create_attempt" in events(case):
+            if action == "company_rows":
+                row["企业编号"] = "13"
+            elif action == "tag_search":
+                row["complete"] = False
+            elif action == "tariffs":
+                row["amount"] += 1
+            else:
+                row["name"] = "另一个名称"
+        return row
+    monkeypatch.setattr(order.Official, "_request", changed)
+    assert business_cli.run()[0] == 1
+    assert len(business_cli.summaries) == 1 and platform.create_count == 0
+    assert events(case)[-1] == "approval_closed"
