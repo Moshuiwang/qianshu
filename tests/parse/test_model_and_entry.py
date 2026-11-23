@@ -107,7 +107,7 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
             text="".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events),
         )
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport, **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(mocked_reply), **kw))
     for name in ("anthropic", "httpx", "httpcore"):
         monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
@@ -336,7 +336,7 @@ def test_stream_interrupted_midway_is_sanitized(monkeypatch, error, block_type):
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=_BrokenStream(error, block_type))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport, **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(interrupted), **kw))
     config = {"ANTHROPIC_API_KEY": "placeholder-key", "ANTHROPIC_BASE_URL": "https://model.example.invalid"}
     captured = []
@@ -792,7 +792,7 @@ def test_shape_correction_network_failure_has_no_sdk_retry(monkeypatch):
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport, **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(reply), **kw))
     results = []
     model = configured_model({"ANTHROPIC_API_KEY": "synthetic"}, on_result=results.append)
@@ -903,7 +903,7 @@ def test_backup_uses_only_configured_endpoint_and_key(monkeypatch, tmp_path):
         requests.append(request)
         return httpx.Response(307, headers={"Location": "https://other.invalid"})
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport, **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(redirect), **kw))
     model = configured_model(load_model_config(env_file=settings))
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "x-test: synthetic")
@@ -1176,3 +1176,13 @@ def test_default_request_matches_baseline_bytes(monkeypatch, transport_requests,
             ]
     _, reference = transport_requests
     assert _request_bytes(actual) == _request_bytes(reference)
+
+
+@pytest.mark.parametrize("endpoint", ["http://model.invalid", "https:///path", "https://user@model.invalid",
+                                      "https://@model.invalid"])
+def test_streaming_adapter_rejects_invalid_endpoint(endpoint):
+    from qianshu.ai.anthropic import streaming_model
+
+    with pytest.raises(ConfigError, match="HTTPS"):
+        streaming_model(api_key="fixture", base_url=endpoint, model="fixture", effort="medium",
+                        on_result=None, max_retries=0, follow_redirects=False)

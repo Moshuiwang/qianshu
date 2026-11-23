@@ -15,7 +15,8 @@ from pydantic import ValidationError
 
 from qianshu.config import ConfigError
 from qianshu.parse.model import (
-    _REPLY_TOOL, CallResult, ModelError, ModelReplyError, StreamingModel, _missing_shape, validate_reply_json,
+    _REPLY_TOOL, CallResult, ModelError, ModelReplyError, StreamingModel, _missing_shape, _validate_endpoint,
+    validate_reply_json,
 )
 from qianshu.parse.protocol import ApplicationReply
 
@@ -114,6 +115,7 @@ def _direct_transport(limits: httpx.Limits) -> httpx.HTTPTransport:
 def streaming_model(*, api_key, base_url, model, effort, on_result, max_retries, follow_redirects) -> StreamingModel:
     # 显式传入默认端点，防止 SDK 在解析 CLI 中另从进程环境取址。
     endpoint = base_url if base_url is not None else "https://api.anthropic.com"
+    _validate_endpoint(endpoint, "模型")
 
     def attempt(system: str, messages: list, on_result, first_shape_error: str | None = None) -> str:
         from anthropic import DEFAULT_CONNECTION_LIMITS, Anthropic, AnthropicError, DefaultHttpxClient, omit

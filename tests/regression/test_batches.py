@@ -552,3 +552,16 @@ def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
             ledger.reserve("fourth", "batch", "1", "fourth")
 
 
+
+
+def test_capture_requests_accepts_v040_client_signature(monkeypatch):
+    def historical_model(settings, *, max_retries):
+        def send(*, system, user):
+            with anthropic.DefaultHttpxClient(follow_redirects=False) as client:
+                client.post("https://model.invalid/messages", content=user.encode())
+        return send
+
+    monkeypatch.setattr(batches, "configured_model", historical_model)
+    snapshot = {"documents": {"fixture": {"body": "合成正文"}}, "companies_text": ""}
+    rules = Path(__file__).resolve().parents[2] / "rules"
+    assert batches.capture_requests(snapshot, rules, False, {}) == {"fixture": '{"application": "合成正文"}'}
