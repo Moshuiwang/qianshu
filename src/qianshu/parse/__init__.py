@@ -37,7 +37,6 @@ _CONFIRM = {
     "mutex_opt_out": other_fields.MUTEX_NO_HINT,
     **benefits.CONFIRMATION_REASONS,
     "policy_type_conflict": "原文政策类型与用户标签判定冲突。",
-    "package_title_required": "缺少本条政策的标题，请补充标题并确认当前节目包（R5）。",
     "package_tier_pending": "档位需要人工核对，候选仅供查阅。",
     "package_lookup_pending": "销售品级别表无法唯一核实当前包、主体或有效期，请核对所有行。",
     "package_copy_pending": "受赠基本包或其有效同步附属包未能唯一查实（R6）。",
@@ -277,7 +276,7 @@ def _resolve_fields(
         *benefit_hints,
         *other_fields.apply_defaults(results),
     ]
-    tier_candidates = packages.resolve_packages(results, has_title=policy.has_title, levels_snapshot=levels_snapshot,
+    tier_candidates = packages.resolve_packages(results, levels_snapshot=levels_snapshot,
                                                 rules=rules, today=package_run_day)
     if rules.table is None:
         hints.append(_COMPANY_TABLE_HINT)

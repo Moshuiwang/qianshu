@@ -74,7 +74,7 @@ def _candidates(rows: tuple[Offer, ...], tiers: list[RequestedTier], day: date) 
     return tuple(dict.fromkeys(candidates))
 
 
-def resolve_packages(results: dict[str, FieldResult], *, has_title: bool, levels_snapshot: Callable[[], PackageLevels],
+def resolve_packages(results: dict[str, FieldResult], *, levels_snapshot: Callable[[], PackageLevels],
                      rules: CompanyRules, today: date | None) -> tuple[str, ...]:
     result = results["packages"]
     candidates = ()
@@ -84,8 +84,6 @@ def resolve_packages(results: dict[str, FieldResult], *, has_title: bool, levels
         results["packages"] = issue(_unlooked_up(cleared) if unlooked_up else cleared, code)
         return candidates
 
-    if not has_title:
-        return pending("package_title_required", unlooked_up=True)
     tiers = results.get("package_tiers")
     verified_tier = tiers is not None and verified_value(tiers)
     company = results["company"]

@@ -1075,16 +1075,17 @@ def test_zero_drafts_keep_advisories_and_original_without_validating(monkeypatch
 
 
 @pytest.mark.parametrize("has_title", [True, False])
-def test_command_requires_package_confirmation_when_model_reports_no_title(tmp_path, single_policy, has_title):
+def test_command_waits_for_card_consent_regardless_of_title(tmp_path, single_policy, has_title):
     body, rows = single_policy
     rows[0]["country"] = rows[0].pop("company")
     reply = fixed_reply(" " + body, rows)
     reply["policies"][0]["has_title"] = has_title
     cards = _run(tmp_path, body, reply, tag_dates={"占位标签甲": "2099-02-15"})
     content = "\n".join(_contents(cards))
-    assert ("政策 1 · 节目包 · 待确认" in content) is not has_title
-    assert ("缺少本条政策的标题" in content) is not has_title
-    assert ("待群卡片同意" in content) is has_title
+    assert '政策 1 · 节目包\n值　[{"当前节目包": "占位甲", "赠送节目包": "占位甲_copy"}]\n原文出处　「占位甲包用户」' in content
+    assert "政策 1 · 节目包 · 待确认" not in content
+    assert "缺少本条政策的标题" not in content
+    assert "待群卡片同意" in content
 
 
 def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy):

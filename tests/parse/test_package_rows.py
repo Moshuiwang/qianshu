@@ -62,7 +62,7 @@ def test_multiple_explicit_package_rows_keep_verified_pairs(tmp_path, kind, coun
     ]
 
 
-@pytest.mark.parametrize("case", ["duplicate", "conflict", "target_missing", "no_title"])
+@pytest.mark.parametrize("case", ["duplicate", "conflict", "target_missing"])
 def test_unresolved_row_blocks_all_rows(tmp_path, case):
     kind = "升级权益" if case == "target_missing" else "赠送时长"
     pairs = [(NAMES[0], NAMES[0]), (NAMES[1], None)]
@@ -71,7 +71,45 @@ def test_unresolved_row_blocks_all_rows(tmp_path, case):
     elif case == "conflict":
         pairs[1] = (NAMES[1], NAMES[2])
     body, reply = example(kind, pairs)
-    reply["policies"][0]["has_title"] = case != "no_title"
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.packages.value is None and draft.packages.uncertainty
+
+
+def test_titleless_package_rows_follow_source_order(tmp_path):
+    names = NAMES[1::-1]
+    rows = [dict(current_package=name, gift_package=None) for name in names]
+    passages = [f"本条适用于{name}" for name in names]
+    body, reply = scenario("赠送时长", packages=field(rows, *passages))
+    policy = reply["policies"][0]
+    policy["has_title"] = False
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert [(row.current_package, row.gift_package) for row in draft.packages.value] == [
+        (name, name + "_copy") for name in names
+    ]
+    assert [item.text for item in draft.field_results["packages"].evidence] == passages
+
+
+def test_titleless_ambiguous_package_keeps_evidenced_candidate(tmp_path):
+    rows = [dict(current_package=NAMES[0], gift_package=None)]
+    passage = f"本条可能适用于{NAMES[0]}"
+    body, reply = scenario("赠送时长", packages=field(rows, passage))
+    policy = reply["policies"][0]
+    policy["has_title"] = False
+    policy["fields"]["packages"] = statement("歧义", candidates=[dict(value=rows, evidence=[quote(body, passage)])])
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.packages.value is None
+    candidate, = draft.packages.uncertainty.candidates
+    assert candidate.value == [{"节目包行": "1", "当前包": NAMES[0], "状态": "未查表、不可建单"}]
+    assert [item.text for item in candidate.evidence] == [passage]
+
+
+@pytest.mark.parametrize("status,passage", [("确定", None), ("确定", "原文没有的引文"), ("缺证据", None)])
+def test_titleless_package_without_verified_evidence_stays_pending(tmp_path, status, passage):
+    rows = [dict(current_package=NAMES[0], gift_package=None)]
+    body, reply = scenario("赠送时长", packages=field(rows))
+    policy = reply["policies"][0]
+    policy["has_title"] = False
+    policy["fields"]["packages"] = statement(status, value=rows, evidence=[quote(body, passage)] if passage else [])
     draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
     assert draft.packages.value is None and draft.packages.uncertainty
 
