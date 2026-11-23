@@ -28,6 +28,7 @@ from pydantic import TypeAdapter
 
 from qianshu.config import LOGGABLE_CONFIG_KEYS
 from qianshu.draft import DraftField, OfferPolicyDraft, PolicyDraft
+from qianshu.parse import _normalized_value, _read_options
 from qianshu.parse.benefits import (
     BenefitCatalog, OFFER_FIELD_LABELS, _CHOICES, benefit_applicability, benefit_field_format,
     duration_days, tariff_amount,
@@ -693,6 +694,10 @@ def order_evidence(values, fields_in, draft, sources, owners):
         require(isinstance(quotes, list) and bool(quotes), reason)
         if result.get("source") == "原文":
             original = statement.get("value")
+            if name == "benefit_type":
+                require(isinstance(original, str), reason)
+                table = Path(__file__).resolve().parents[3] / "rules" / "parse-options.tsv"
+                original = _normalized_value(name, original, _read_options(table.read_text(encoding="utf-8")))
             if name in ("recharge_days", "gift_days", "watch_days", "penalty_days") and isinstance(original, dict):
                 duration = Duration.model_validate(original)
                 original = duration_days(duration)
@@ -1371,6 +1376,8 @@ def verify_order_request(payload, config, template, relations, values, inactive,
         label = "优惠类型" if name == "benefit_type" else spec["label"]
         reason = f"字段 {label} 的写入值不一致"
         require(control not in config["fixed"] and control not in config["readback_skip"], reason)
+        if type(values[name]) in (int, float):
+            require(spec["type"] in (6, 8), reason)
         if name == "effective_multiplier":
             require(spec["type"] in (6, 8) and "draft_values" not in spec, reason)
         if name in option_fields or name in _CHOICES or spec["type"] in (9, 11):
@@ -1383,6 +1390,10 @@ def verify_order_request(payload, config, template, relations, values, inactive,
                     and all(isinstance(keys, list) and all(receipt(k) for k in keys) and key not in keys
                             for other, keys in mapping.items() if other != compact(label))
                     and actual[control] == compact([key]), reason)
+        elif spec["type"] not in _ARRAY:
+            expected = encode_cell(values[name], spec)
+            require(equivalent(actual[control], expected, spec)
+                    and equivalent(draft_cell(values[name], spec), expected, spec), reason)
         else:
             require(equivalent(actual[control], draft_cell(values[name], spec), spec), reason)
     snapshot = config.get("order_snapshot", {})
@@ -1516,11 +1527,17 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
     visible_package_text = []
     for name, _, text, declared in excerpts:
         shown = grouped.display(text, offset)
-        offset += len(text)
         require(not any(secret in shown for secret in secrets), "展示字段与凭据冲突", CredentialConflict)
         evidence_lines.append(f"{labels.get(name, name)}依据：" + shown)
         if name == "packages" and declared:
-            visible_package_text.extend(shown.split("[已脱敏]"))
+            # 重叠的脱敏窗口只按被覆盖的原文字符数计一次。
+            hidden = end = 0
+            for left, right in sorted(grouped._overlaps(offset, len(text))):
+                hidden += max(0, right - max(left, end))
+                end = max(end, right)
+            if hidden * 2 <= len(text):
+                visible_package_text.extend(shown.split("[已脱敏]"))
+        offset += len(text)
     require(all(any(name in part for part in visible_package_text) for name in package_names),
             "节目包原文归属依据已脱敏", CredentialConflict)
     for name in ("policy_name", "user_scope"):
@@ -1764,7 +1781,9 @@ def run(args, directory, *, clock=time.time):
     contact = mention(configurator["id"], configurator["label"])
     sensitive = {token, official_token, official_app_id}
     display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
-    sensitive.update(value for key, value in secrets.items() if key not in display_settings and receipt(value))
+    for key, value in secrets.items():
+        if key not in display_settings and receipt(value):
+            sensitive.update((value, value.strip()))
 
     def login_check():
         require(not pending, "降包用户取消优惠须确认具体取值")

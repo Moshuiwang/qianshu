@@ -2590,3 +2590,68 @@ def test_order_package_rows_require_unique_current_offer(case, platform, busines
     reason = "当前销售品重复" if duplicate else "节目包缺少原文归属依据"
     assert code == 1 and reason in error
     assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("name", ["recharge_amount", "watch_days", "approval_url"])
+def test_scalar_mapping_cannot_change_approved_value(case, platform, business_cli, name):
+    if name == "approval_url":
+        control = case.control[name]
+        value = platform.template[control].replace("placeholder", "sample")
+        case.values[name] = value
+        replacement = value + "/other"
+        export = private_export(case.values)
+    else:
+        export = offer_export(case, platform, "特价优惠")
+        control = case.control[name]
+        value = case.values[name]
+        replacement = 9
+    spec = case.config["fields"][control]
+    spec["draft_values"] = {order.compact(value): replacement}
+    platform.template[control] = replacement
+    code, error = business_cli.run(export)
+    assert code == 1 and f"字段 {spec['label']} 的写入值不一致" in error
+    assert business_cli.summaries == [] and platform.create_count == 0
+
+
+@pytest.mark.parametrize("hidden,allowed", [("本政策唯一适用的当前包为", False), ("末尾标记", True), ("五字整一半", True)])
+def test_package_quote_retains_at_least_half(case, platform, business_cli, monkeypatch, hidden, allowed):
+    export = private_export(case.values)
+    export["drafts"][0]["scope"]["has_title"] = False
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": hidden})
+    name = case.values["packages"][0]["current_package"]
+    text = hidden + name if not allowed else name + hidden
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    code, error = business_cli.run(export)
+    if allowed:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert "节目包依据：" + name + "[已脱敏]" in business_cli.summaries[0].splitlines()
+    else:
+        assert code == 1 and "节目包原文归属依据已脱敏" in error
+        assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_trimmed_tenant_key_cannot_appear_in_contact(case, platform, business_cli, monkeypatch):
+    secret = "synthetic-tenant-check"
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values",
+                        lambda **kw: {**read_settings(**kw), "FEISHU_TENANT_KEY": " " + secret + " "})
+    case.config["configurator"]["label"] = secret
+    code, error = business_cli.run()
+    assert code == 1 and "凭据冲突" in error and secret not in error
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("declared", ["充一送一", "赠送时长"])
+def test_benefit_declaration_uses_trusted_option(case, platform, business_cli, declared):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    draft["scope"]["has_title"] = False
+    draft["field_results"]["benefit_type"]["statement"]["value"] = declared
+    replace_order_quotes(export, "benefit_type", declared, [(0, len(declared))])
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    control = case.control["benefit_type"]
+    assert "优惠类型：赠送时长" in business_cli.summaries[0].splitlines()
+    assert json.loads(platform.created_cells[control]) == [platform.template[control][0]["key"]]
