@@ -151,13 +151,21 @@ class Outlet:
             if url.startswith(prefix + chat + "/members?"):
                 spans = self.credential_span(chat, "FEISHU_CHAT_ID", len(prefix))
         self.check_text(url, spans)
-        for raw_key, raw_value in request.headers.raw:
-            self.check(raw_key)
+        # HTTP/1.1 先发送 Host；整块检查同时覆盖行内及跨行的片段。
+        lines = []
+        spans = []
+        offset = 0
+        for raw_key, raw_value in sorted(request.headers.raw, key=lambda pair: pair[0].lower() != b"host"):
             key = raw_key.decode("ascii")
             value = raw_value.decode("utf-8", "surrogateescape")
             owner, prefix = (headers or {}).get(key.lower(), (None, ""))
-            spans = self.credential_span(value[len(prefix):], owner, len(prefix)) if value.startswith(prefix) else []
-            self.check_text(value, spans)
+            line = key + ": " + value + "\r\n"
+            if value.startswith(prefix):
+                start = offset + len(key) + 2 + len(prefix)
+                spans.extend(self.credential_span(value[len(prefix):], owner, start))
+            lines.append(line)
+            offset += len(line)
+        self.check_text("".join(lines) + "\r\n", spans)
         body = request.content.decode("utf-8", "surrogateescape")
         if not fields or not body:
             self.check_text(body)

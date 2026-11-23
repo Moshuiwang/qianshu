@@ -1709,6 +1709,16 @@ def test_extract_token_accepts_real_mingdao_cookie_shape_and_keeps_other_checks(
         order.extract_token({"cookies": [real, dict(real)]}, "md_pss_id")
 
 
+@pytest.fixture(autouse=True)
+def synthetic_uuids(monkeypatch):
+    from random import Random
+    from uuid import UUID
+
+    # 每个用例重放同一组合成凭据和字段 ID，使两者的片段检查与运行顺序无关。
+    random = Random(57)
+    monkeypatch.setitem(globals(), "uuid4", lambda: UUID(int=random.getrandbits(128), version=4))
+
+
 def order_fixture(case, platform):
     # X5 名称与标签共同使用测试前缀；保留模拟主名、别名及歧义关系。
     tags = ["【测试】" + tag for tag in case.values["user_tags"]]
@@ -3399,3 +3409,20 @@ def test_final_header_name_preserves_wire_case(runtime_case, business_cli, platf
     monkeypatch.setattr(httpx.Client.func, "send", attach)
     assert business_cli.run() == (1, "E-CRED-STOP\n")
     assert platform.actions == [] and platform.create_count == 0
+
+
+def test_response_cookie_checked_across_header_separator(case):
+    sent = []
+    def respond(request):
+        sent.append(request)
+        return httpx.Response(200, headers={"Set-Cookie": "QZX=value; Path=/"})
+
+    guard = order.Outlet()
+    guard.configure({"EXTRA": "kie: QZX"})
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        order.CheckedHTTPTransport(client, guard.check_http)
+        url = case.config["official"]["origin"]
+        client.get(url)
+        with pytest.raises(order.OutletConflict):
+            client.get(url)
+    assert len(sent) == 1
