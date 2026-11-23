@@ -6,6 +6,9 @@ from decimal import Decimal, InvalidOperation
 from re import Pattern
 from unicodedata import normalize as unicode_normalize
 
+from qianshu.parse import _normalized_value
+from qianshu.parse.evidence import Sources
+from qianshu.parse.protocol import SourceBlock, ValueSource
 from qianshu.parse.companies import CompanyTable
 from qianshu.parse.names import MAX_NAME_LENGTH, ORIGINAL_NAME_LABEL, PROPOSED_NAME_LABEL, compose_public_name
 from qianshu.parse.scope import country_matches
@@ -19,6 +22,7 @@ WEIGHTS = {
 }
 EMPTY_WEIGHTS = {"packages": 4, "user_tags": 3}
 SHADOW_TAG_SUFFIXES = ("_image",)
+PAIRING_VERSION = 4
 DEFAULT_THRESHOLD = 2
 CATEGORIES = ("correct", "false_determined", "overasked", "justified_confirmation", "missing", "unknown")
 LEGACY_DEFAULTS = {
@@ -83,9 +87,9 @@ def pairing_fingerprint(threshold: int) -> str:
     if not 1 <= threshold <= sum(WEIGHTS.values()):
         raise RegressionError("业务配对阈值超出支持范围。")
     return digest(json_bytes({
-        "version": 3, "weights": WEIGHTS, "empty_weights": EMPTY_WEIGHTS, "threshold": threshold,
+        "version": PAIRING_VERSION, "weights": WEIGHTS, "empty_weights": EMPTY_WEIGHTS, "threshold": threshold,
         "gold_keys": ["included_gold", "reviewed_pairing", "unexcluded_sample_metadata"],
-        "draft_keys": "derived_without_confirmation",
+        "draft_keys": "v3_then_located_pending_on_unmatched_unambiguous_remainder",
         "ties": "retain_only_pairs_common_to_all_optimal_assignments",
         "user_tags": {
             "normalization": ["NFKC", "casefold", "strip", "remove_one_shadow_suffix_with_nonempty_base", "sorted_set"],
@@ -220,14 +224,53 @@ def key_value(name: str, value):
 
 
 def _draft_keys(draft, countries: dict[str, str]) -> dict:
-    result = {}
+    # v3 先按卡片投影取键，包括已确认的 R10 公司和它唯一映射的国家。
+    keys = {}
     for name in PAIR_FIELDS:
         field = getattr(draft, name, None)
         if not needs_confirmation(field):
-            result[name] = key_value(name, field.value)
+            keys[name] = key_value(name, field.value)
     country = getattr(draft, "country", None)
-    result["country"] = country.value if not needs_confirmation(country) else countries.get(result.get("company"))
-    return result
+    keys["country"] = country.value if not needs_confirmation(country) else countries.get(keys.get("company"))
+
+    return keys
+
+
+def _with_pending_keys(draft, confirmed: dict, sources: Sources, options: dict) -> dict:
+    keys = confirmed.copy()
+    results = getattr(draft, "field_results", {})
+    for name in ("country", *PAIR_FIELDS):
+        field = getattr(draft, name, None)
+        result = results.get(name)
+        if not needs_confirmation(field if field is not None else result):
+            continue
+        if result is not None:
+            statement = result.statement
+            if statement.value is None or not statement.evidence or not all(
+                sources.locate_quote(quote.span, quote.text)[0] is not None for quote in statement.evidence
+            ):
+                continue
+            if name == "packages":
+                # 待确认行的卡片投影会省略包名，配对只取声明中的原始行。
+                value = [row.model_dump() for row in statement.value]
+            else:
+                value = _normalized_value(name, statement.value, options)
+        else:
+            # 无声明的旧投影须明确标为原文，避免用查表值或默认值配对。
+            if getattr(field, "value_source", None) != ValueSource.ORIGINAL or field.value is None:
+                continue
+            if not field.evidence or not all(
+                excerpt.text and excerpt.start is not None and excerpt.start >= 0
+                and sources.blocks["body"].text.startswith(excerpt.text, excerpt.start)
+                for excerpt in field.evidence
+            ):
+                continue
+            value = field.value
+        if name == "country":
+            keys["pending_country"] = value
+        else:
+            keys[name] = key_value(name, value)
+    return keys
 
 
 def _gold_keys(pair: dict, sample: dict) -> dict:
@@ -246,7 +289,8 @@ def _score(gold: dict, draft: dict) -> list[str]:
         return value is not None and value == key_value(name, gold.get(name))
 
     hits = []
-    if equal("company") or (draft["country"] is not None and draft["country"] == gold["country"]):
+    countries = (draft["country"], draft.get("pending_country"))
+    if equal("company") or (gold["country"] is not None and gold["country"] in countries):
         hits.append("country_or_company")
     hits.extend(name for name in (
         "benefit_type", "packages", "recharge_days", "gift_days", "recharge_amount", "user_tags",
@@ -472,12 +516,26 @@ def _review_name_grade(draft) -> str:
     return "justified_confirmation" if needs_confirmation(getattr(draft, "policy_name", None)) else "false_determined"
 
 
+def _pair_round(gold_keys: list, draft_keys: list, threshold: int):
+    all_hits = [[_score(gold, draft) for draft in draft_keys] for gold in gold_keys]
+    scores = [
+        [sum(EMPTY_WEIGHTS[key] if key in EMPTY_WEIGHTS and not draft[key] else WEIGHTS[key] for key in hits)
+         for draft, hits in zip(draft_keys, row, strict=True)]
+        for row in all_hits
+    ]
+    matches, ambiguous_policies, ambiguous_drafts = optimal_pairs([
+        [score if score >= threshold else None for score in row] for row in scores
+    ])
+    return matches, ambiguous_policies, ambiguous_drafts, all_hits, scores
+
+
 class BusinessScore:
     def __init__(
         self, frozen: dict, threshold: int, countries: dict[str, str], *,
         company_table: CompanyTable | None = None, country_names: dict[str, Pattern[str]] | None = None,
-        country_codes: dict[str, str] | None = None, today: date | None = None,
+        country_codes: dict[str, str] | None = None, today: date | None = None, options: dict | None = None,
     ):
+        self.options = options if options is not None else {"benefit_type": {}}
         self.threshold = threshold
         self.fingerprint = pairing_fingerprint(threshold)
         self.measure_fingerprint = measure_fingerprint(threshold)
@@ -503,15 +561,25 @@ class BusinessScore:
     def add(self, document: dict, pairs: list[dict], drafts: list) -> dict:
         draft_keys = [_draft_keys(draft, self.countries) for draft in drafts]
         gold_keys = [_gold_keys(pair, self.samples[pair["id"]]) for pair in pairs]
-        all_hits = [[_score(gold, draft) for draft in draft_keys] for gold in gold_keys]
-        scores = [
-            [sum(EMPTY_WEIGHTS[key] if key in EMPTY_WEIGHTS and not draft[key] else WEIGHTS[key] for key in hits)
-             for draft, hits in zip(draft_keys, row, strict=True)]
-            for row in all_hits
-        ]
-        matches, ambiguous_policies, ambiguous_drafts = optimal_pairs([
-            [score if score >= self.threshold else None for score in row] for row in scores
-        ])
+        matches, ambiguous_policies, ambiguous_drafts, all_hits, scores = _pair_round(
+            gold_keys, draft_keys, self.threshold,
+        )
+        remaining_rows = sorted(set(range(len(pairs))) - matches.keys() - ambiguous_policies)
+        remaining_cols = sorted(set(range(len(drafts))) - set(matches.values()) - ambiguous_drafts)
+        if remaining_rows and remaining_cols:
+            sources = Sources([SourceBlock("body", document["body"], "body")])
+            added, tied_rows, tied_cols, hits, points = _pair_round(
+                [gold_keys[i] for i in remaining_rows],
+                [_with_pending_keys(drafts[j], draft_keys[j], sources, self.options) for j in remaining_cols],
+                self.threshold,
+            )
+            matches.update((remaining_rows[i], remaining_cols[j]) for i, j in added.items())
+            ambiguous_policies.update(remaining_rows[i] for i in tied_rows)
+            ambiguous_drafts.update(remaining_cols[j] for j in tied_cols)
+            for i, row in enumerate(remaining_rows):
+                for j, col in enumerate(remaining_cols):
+                    all_hits[row][col] = hits[i][j]
+                    scores[row][col] = points[i][j]
         self.counts["tied_pairs"] += len(ambiguous_policies)
         self.counts["ambiguous_drafts"] += len(ambiguous_drafts)
         self.counts["matched_policies"] += len(matches)
@@ -607,7 +675,7 @@ class BusinessScore:
         self.counts["unknown_fields"] = field_totals["unknown"]
         self.counts["reply_parse_failed"] = reply_parse_failed
         return {
-            "pairing_sha256": self.fingerprint,
+            "pairing_version": PAIRING_VERSION, "pairing_sha256": self.fingerprint,
             "measure_sha256": self.measure_fingerprint,
             "rates": rates, "counts": {key: self.counts[key] for key in (*COUNT_LABELS, "ambiguous_drafts")},
             "field_categories": {category: field_totals[category] for category in CATEGORIES},

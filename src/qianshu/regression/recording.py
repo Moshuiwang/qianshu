@@ -14,7 +14,7 @@ from qianshu.parse.model import (
 )
 from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE, PROTOCOL_VERSION, REPLY_STRUCTURE
 
-from .business import measure_fingerprint, pairing_fingerprint
+from .business import PAIRING_VERSION, measure_fingerprint, pairing_fingerprint
 from .runner import RULES, IncompleteReply
 from .storage import Output, PrivateFiles, RegressionError, digest, json_bytes, read_json
 
@@ -55,6 +55,7 @@ def configuration(snapshot: dict, rules_dir: Path, model_id: str, threshold: int
         "companies_sha256": digest(snapshot["companies_text"].encode()),
         "prompt_sha256": rules["parse-prompt.md"],
         "model_sha256": digest(model_id.encode()),
+        "pairing_version": PAIRING_VERSION,
         "pairing_sha256": pairing_fingerprint(threshold),
         "measure_sha256": measure_fingerprint(threshold),
         "legacy_companies": legacy, "release": release, "retries": retries,
