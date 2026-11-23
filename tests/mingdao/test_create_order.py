@@ -2352,3 +2352,241 @@ def test_only_evidence_intersects_secret_and_stays_masked(case, platform, busine
     assert "用户范围依据：[已脱敏]" in card
     assert fragment not in card + "".join(business_cli.notices)
     assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
+
+
+def replace_order_quotes(export, field, text, parts):
+    block = export["sources"][0]
+    start = len(block["text"])
+    block["text"] += text + "\n"
+    quotes = [{"text": text[left:right], "span": {"source_id": "body", "start": start + left,
+                                                  "end": start + right}} for left, right in parts]
+    draft = export["drafts"][0]
+    result = draft["field_results"][field]
+    result["statement"]["evidence"] = result["evidence"] = quotes
+    draft[field]["evidence"] = [{"text": q["text"], "start": q["span"]["start"]} for q in quotes]
+
+
+def offer_export(case, platform, kind, option_type=11):
+    values = case.values
+    values.update(benefit_type=kind, after_offer="恢复原包", forbid_package_change="是")
+    if kind == "特价优惠":
+        del values["recharge_days"], values["gift_days"]
+        values.update(watch_days=3, amount_mode="自定义", recharge_amount=8, first_recharge_day_only="是")
+    benefit = case.control["benefit_type"]
+    key = platform.template[benefit][0]["key"]
+    platform.template[benefit][0]["value"] = kind
+    case.config["fields"][benefit]["draft_values"] = {order.compact(kind): [key]}
+    for name in values.keys() & order.OFFER_FIELD_LABELS.keys():
+        value = values[name]
+        control = case.control[name] = str(uuid4())
+        spec = {"draft": name, "label": order.OFFER_FIELD_LABELS[name], "type": 6}
+        if isinstance(value, str):
+            key = str(uuid4())
+            spec.update(type=option_type, draft_values={order.compact(value): [key]})
+            value = [{"key": key, "value": value}]
+        case.config["fields"][control] = spec
+        platform.template[control] = value
+    snapshot = case.config["order_snapshot"]
+    base_id = str(uuid4())
+    header, current, gift = snapshot["package_levels"].splitlines()
+    base = current.replace("合成当前包", "合成受赠包").replace(case.ids["package"], base_id)
+    gift = gift.replace("合成当前包", "合成受赠包").replace(case.ids["package"], base_id)
+    snapshot["package_levels"] = "\n".join((header, current, base, gift))
+    gift_name = "合成受赠包_copy"
+    values["packages"][0]["gift_package"] = gift_name
+    platform.relations[case.control["packages"]][0][case.child["gift"]][0]["name"] = gift_name
+    export = private_export(values)
+    text = "合成当前包可获合成受赠包"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    return export
+
+
+@pytest.mark.parametrize("name", ["after_offer", "forbid_package_change", "amount_mode", "first_recharge_day_only"])
+@pytest.mark.parametrize("change", ["label", "shared_key", "wrong_type", "payload"])
+def test_extended_single_option_requires_template_label_key_and_type(
+        case, platform, business_cli, monkeypatch, name, change):
+    export = offer_export(case, platform, "特价优惠")
+    control = case.control[name]
+    spec = case.config["fields"][control]
+    if change == "label":
+        platform.template[control][0]["value"] = "指定节目包"
+    elif change == "shared_key":
+        spec["draft_values"][order.compact("其他")] = [platform.template[control][0]["key"], str(uuid4())]
+    elif change == "wrong_type":
+        spec["type"] = 2
+        del spec["draft_values"]
+        platform.template[control] = case.values[name]
+    else:
+        payload = order.CreateRequest.func.payload
+
+        def corrupt(self, controls):
+            cells = deepcopy(controls)
+            next(c for c in cells if c["controlId"] == control)["value"] = order.compact([str(uuid4())])
+            return payload(self, cells)
+
+        monkeypatch.setattr(order.CreateRequest.func, "payload", corrupt)
+    code, error = business_cli.run(export)
+    assert code == 1 and spec["label"] in error
+    assert business_cli.summaries == [] and platform.create_count == 0
+
+
+@pytest.mark.parametrize("option_type", [9, 11])
+def test_extended_single_option_card_matches_created_key(case, platform, business_cli, option_type):
+    export = offer_export(case, platform, "特价优惠", option_type)
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    for name in ("after_offer", "forbid_package_change", "amount_mode", "first_recharge_day_only"):
+        control = case.control[name]
+        option, = platform.template[control]
+        assert json.loads(platform.created_cells[control]) == [option["key"]]
+        assert f"{order.OFFER_FIELD_LABELS[name]}：{option['value']}" in card.splitlines()
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 4, 9, "split"])
+def test_order_evidence_masks_registered_fragment_without_full_secret(case, platform, business_cli, size):
+    export = private_export(case.values)
+    text = case.session_token[1:]
+    if size == "split":
+        text = text[:2] + "隔开" + text[2:4]
+        parts = [(0, 2), (4, 6)]
+    else:
+        parts = [(3, 3 + size)]
+    replace_order_quotes(export, "user_scope", text, parts)
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert [line for line in card.splitlines() if line.startswith("用户范围依据：")] == ["用户范围依据：[已脱敏]"] * len(parts)
+    if isinstance(size, int) and size >= 4:
+        assert text[3:3 + size] not in card + error + "".join(business_cli.notices)
+    assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
+
+
+@pytest.mark.parametrize("source", ["查表派生", "原文", "升级权益"])
+def test_titleless_package_card_matches_approved_request(case, platform, business_cli, source):
+    export = offer_export(case, platform, source) if source == "升级权益" else private_export(case.values)
+    draft = export["drafts"][0]
+    draft["scope"]["has_title"] = False
+    result = draft["field_results"]["packages"]
+    if source == "原文":
+        result.update(source=source, input_fields=[])
+        result["statement"]["value"] = result["value"]
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert "节目包依据：" + result["statement"]["evidence"][0]["text"] in card.splitlines()
+    control = case.control["packages"]
+    names = {entry["sid"]: entry["name"] for row in platform.relations[control]
+             for role in ("current", "gift") for entry in row[case.child[role]]}
+    row, = json.loads(platform.created_cells[control])
+    pair = {cell["controlId"]: json.loads(cell["value"]) for cell in row if cell["controlId"] in
+            (case.child["current"], case.child["gift"])}
+    assert "节目包（当前 / 赠送）：" + " / ".join(names[pair[case.child[k]][0]["sid"]]
+                                              for k in ("current", "gift")) in card.splitlines()
+
+
+@pytest.mark.parametrize("mode", ["original", "derived", "dependency", "missing", "coordinates", "exclusive"])
+def test_order_packages_require_names_in_own_verified_quotes(case, platform, business_cli, mode):
+    export = offer_export(case, platform, "升级权益") if mode == "dependency" else private_export(case.values)
+    draft = export["drafts"][0]
+    result = draft["field_results"]["packages"]
+    text = "合成当前包" if mode == "dependency" else "本次活动"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    reason = "节目包缺少原文归属依据"
+    if mode == "original":
+        draft["scope"]["has_title"] = False
+        result.update(source="原文", input_fields=[])
+        result["statement"]["value"] = result["value"]
+    elif mode == "dependency":
+        replace_order_quotes(export, "benefit_type", "合成受赠包", [(0, 5)])
+        result["evidence"] = result["evidence"] + draft["field_results"]["benefit_type"]["evidence"]
+        draft["packages"]["evidence"] += draft["benefit_type"]["evidence"]
+    elif mode == "missing":
+        result["evidence"] = []
+        reason = "可核证据"
+    elif mode == "coordinates":
+        result["evidence"][0]["span"]["end"] -= 1
+        reason = "可核证据"
+    elif mode == "exclusive":
+        other_policy(export, result["evidence"][0]["span"], exclusive=True)
+        reason = "归属声明矛盾"
+    code, error = business_cli.run(export)
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+@pytest.mark.parametrize("has_title", [True, False])
+def test_package_proof_survives_card_redaction(case, platform, business_cli, monkeypatch, hidden, has_title):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    draft["scope"]["has_title"] = has_title
+    fragment = case.session_token[4:13]
+    if hidden:
+        read_settings = order.dotenv_values
+        monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": "密文合成当前包后缀"})
+    text = "本政策适用于合成当前包，联系编号 " + fragment
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    code, error = business_cli.run(export)
+    if hidden:
+        assert code == 1 and "节目包原文归属依据已脱敏" in error
+        assert not business_cli.summaries and platform.create_count == 0
+    else:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        card, = business_cli.summaries
+        assert "节目包依据：本政策适用于合成当前包，联系编号 [已脱敏]" in card.splitlines()
+        assert fragment not in card + "".join(business_cli.notices)
+
+
+@pytest.mark.parametrize("key", ["id", "label"])
+def test_contact_credential_collision_announces_fixed_handoff(case, platform, business_cli, monkeypatch, key):
+    secret = "synthetic<&>credential" if key == "id" else "synthetic-contact-credential"
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": secret})
+    case.config["configurator"][key] = secret
+    code, error = business_cli.run()
+    assert code == 1 and "凭据冲突" in error
+    assert not business_cli.summaries and platform.create_count == 0
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert secret not in error + "".join(business_cli.notices)
+
+
+def test_same_tag_id_conflicting_deadline_stops_before_card(case, platform, business_cli):
+    tags = case.config["order_snapshot"]["tags"]
+    tags.append({**tags[0], "name": "合成另一标签", "end": case.values["start_date"]})
+    code, error = business_cli.run()
+    assert code == 1 and "标签截止日登记冲突" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_order_package_rows_require_unique_current_offer(case, platform, business_cli, duplicate):
+    offer_export(case, platform, "升级权益")
+    control = case.control["packages"]
+    row = deepcopy(platform.relations[control][0])
+    row.update(record_identity(str(uuid4())))
+    snapshot = case.config["order_snapshot"]
+    _, current, base, gift = snapshot["package_levels"].splitlines()
+    base_id, gift_id = str(uuid4()), str(uuid4())
+    old_base = base.split(",")[3]
+    base = base.replace("合成受赠包", "合成另一受赠包").replace(old_base, base_id)
+    gift = gift.replace("合成受赠包", "合成另一受赠包").replace(old_base, base_id).replace(case.ids["gift_package"], gift_id)
+    snapshot["package_levels"] += "\n" + base + "\n" + gift
+    current_name = "合成当前包"
+    if not duplicate:
+        current_id = str(uuid4())
+        current_name = "合成另一当前包"
+        snapshot["package_levels"] += "\n" + current.replace("合成当前包", current_name).replace(case.ids["package"], current_id)
+        row[case.child["current"]] = [{"sid": current_id, "name": current_name}]
+    gift_name = "合成另一受赠包_copy"
+    row[case.child["gift"]] = [{"sid": gift_id, "name": gift_name}]
+    platform.relations[control].append(row)
+    platform.template[control] = 2
+    case.values["packages"].append({"current_package": current_name, "gift_package": gift_name})
+    export = private_export(case.values)
+    text = "合成当前包可获合成受赠包或合成另一受赠包"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    code, error = business_cli.run(export)
+    reason = "当前销售品重复" if duplicate else "节目包缺少原文归属依据"
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0

@@ -29,7 +29,8 @@ from pydantic import TypeAdapter
 from qianshu.config import LOGGABLE_CONFIG_KEYS
 from qianshu.draft import DraftField, OfferPolicyDraft, PolicyDraft
 from qianshu.parse.benefits import (
-    BenefitCatalog, OFFER_FIELD_LABELS, benefit_applicability, benefit_field_format, duration_days, tariff_amount,
+    BenefitCatalog, OFFER_FIELD_LABELS, _CHOICES, benefit_applicability, benefit_field_format,
+    duration_days, tariff_amount,
 )
 from qianshu.parse.evidence import Sources, intersect
 from qianshu.parse.names import _tag_boundary
@@ -610,9 +611,10 @@ def check_derivation(name, value, result, draft, declared, reason):
         expected = "定向政策" if name == "policy_type" else (tags[0] if len(tags) == 1 else None)
         require(value == expected and original in (None, expected), reason)
     elif name == "packages":
-        require(isinstance(original, list) and len(original) == len(value) and draft["scope"]["has_title"] is True,
-                reason)
+        require(isinstance(draft["scope"].get("has_title"), bool)
+                and isinstance(original, list) and len(original) == len(value), reason)
         for source, row in zip(original, value, strict=True):
+            require(isinstance(source, dict) and source.keys() == row.keys(), reason)
             current = row["current_package"]
             gift = row["gift_package"]
             require(source["current_package"] == current and receipt(gift), reason)
@@ -720,7 +722,7 @@ def order_evidence(values, fields_in, draft, sources, owners):
             require(not any(policy != draft["policy_id"] and intersect(located, exclusive)
                             for policy, exclusive in owners), "引文与明确归属声明矛盾")
             projected.append({"text": quote["text"], "start": located.start if located.source_id == "body" else None})
-            excerpts.append((name, span, quote["text"]))
+            excerpts.append((name, span, quote["text"], quote in declared))
         require(fields_in[name].get("evidence") == projected, reason)
         if name == "user_tags":
             require(all(any(q["text"] == tag and _tag_boundary(Span.model_validate(q["span"]), sources)
@@ -1345,7 +1347,7 @@ def check_write_credentials(encoded, spec, sensitive):
             require(not any(secret in value for value in values for secret in sensitive), reason, CredentialConflict)
 
 
-def verify_order_request(payload, config, template, relations, values, inactive, sensitive):
+def verify_order_request(payload, config, template, relations, values, inactive, sensitive, package_statement):
     schema = config["fields"]
     controls = {s["draft"]: c for c, s in schema.items() if "draft" in s}
     items = decode(payload)["receiveControls"]
@@ -1369,22 +1371,25 @@ def verify_order_request(payload, config, template, relations, values, inactive,
         label = "优惠类型" if name == "benefit_type" else spec["label"]
         reason = f"字段 {label} 的写入值不一致"
         require(control not in config["fixed"] and control not in config["readback_skip"], reason)
-        if name in option_fields:
+        if name == "effective_multiplier":
+            require(spec["type"] in (6, 8) and "draft_values" not in spec, reason)
+        if name in option_fields or name in _CHOICES or spec["type"] in (9, 11):
             reason = f"字段 {spec['label']} 的选项标识、显示名或写入值不一致"
+            require(spec["type"] in (9, 11), reason)
             key, label = single_option(unpack_array(template[control]), reason)
             mapping = spec.get("draft_values")
-            require(spec["type"] in (9, 11) and label == values[name] and isinstance(mapping, dict)
-                    and mapping.get(compact(label)) == [key] and list(mapping.values()).count([key]) == 1
+            require(label == values[name] and isinstance(mapping, dict)
+                    and mapping.get(compact(label)) == [key]
+                    and all(isinstance(keys, list) and all(receipt(k) for k in keys) and key not in keys
+                            for other, keys in mapping.items() if other != compact(label))
                     and actual[control] == compact([key]), reason)
         else:
-            if name == "effective_multiplier":
-                require(spec["type"] in (6, 8) and "draft_values" not in spec, reason)
             require(equivalent(actual[control], draft_cell(values[name], spec), spec), reason)
     snapshot = config.get("order_snapshot", {})
     require(receipt(snapshot.get("version")), "未登记查表快照版本")
     deadline = verify_selected_tags(config, controls, actual, relations, values, snapshot)
-    verify_selected_packages(config, controls, actual, relations, values, snapshot)
-    return deadline
+    names = verify_selected_packages(config, controls, actual, relations, values, snapshot, package_statement)
+    return deadline, names
 
 
 def verify_selected_tags(config, controls, actual, relations, values, snapshot):
@@ -1396,12 +1401,14 @@ def verify_selected_tags(config, controls, actual, relations, values, snapshot):
     for tag, item in zip(values["user_tags"], tags, strict=True):
         row, = [r for r in rows if r["rowId"] == item["sid"]]
         names = {normalize_template_name(n) for n in [tag, *(row.get(k) for k in keys)] if receipt(n)}
-        facts = [f for f in snapshot.get("tags", []) if normalize_template_name(f["name"]) in names]
-        require(facts and all(f["id"] == item["sid"] for f in facts), "标签截止日或记录标识未确认")
+        by_name = [f for f in snapshot.get("tags", []) if normalize_template_name(f["name"]) in names]
+        require(by_name and all(f["id"] == item["sid"] for f in by_name), "标签截止日或记录标识未确认")
+        facts = [f for f in snapshot["tags"] if receipt(f.get("id")) and f["id"].lower() == item["sid"].lower()]
         ends = {calendar_date(f.get("end"), "标签截止日未确认") for f in facts}
         require(len(ends) == 1, "标签截止日登记冲突")
         require(all(type(f.get("shadow")) is bool for f in facts),
                 "标签类型未确认")
+        names.update(normalize_template_name(f["name"]) for f in facts)
         shadow = any(f["shadow"] for f in facts) or any(n.endswith("_image") for n in names)
         require(not shadow or len(tags) == 1, "影子标签须单选")
         dates.append(ends.pop())
@@ -1410,7 +1417,7 @@ def verify_selected_tags(config, controls, actual, relations, values, snapshot):
     return max(dates)
 
 
-def verify_selected_packages(config, controls, actual, relations, values, snapshot):
+def verify_selected_packages(config, controls, actual, relations, values, snapshot, statement):
     schema = config["fields"]
     reason = "节目包缺少唯一有效的销售品或请求记录不一致"
     day = date.fromisoformat(values["start_date"])
@@ -1430,11 +1437,29 @@ def verify_selected_packages(config, controls, actual, relations, values, snapsh
     spec = schema[package_control]
     request_rows = decode(actual[package_control])
     require(len(request_rows) == len(values["packages"]), reason)
-    for cells, package in zip(request_rows, values["packages"], strict=True):
-        current = unique_offer(offers, package["current_package"], "基本", day)
+    proof = "节目包缺少原文归属依据"
+    declared = statement["value"]
+    require(isinstance(declared, list) and len(declared) == len(request_rows), proof)
+    required_names = set()
+    current_ids = set()
+    for cells, package, original in zip(request_rows, values["packages"], declared, strict=True):
+        require(isinstance(original, dict) and original.keys() == package.keys(), proof)
+        name = original["current_package"]
+        require(name == package["current_package"], reason)
+        current = unique_offer(offers, name, "基本", day)
         gift_name = package["gift_package"]
         require(current and receipt(gift_name) and gift_name.endswith("_copy"), reason)
-        base = current if values["benefit_type"] == "赠送时长" else unique_offer(offers, gift_name[:-5], "基本", day)
+        required_names.add(name)
+        base_name = original["gift_package"]
+        if values["benefit_type"] == "赠送时长":
+            require(base_name in (None, name, name + "_copy"), reason)
+            base = current
+        else:
+            require(receipt(base_name), proof)
+            required_names.add(base_name)
+            base = unique_offer(offers, base_name, "基本", day)
+        require(current.id.lower() not in current_ids, "节目包当前销售品重复")
+        current_ids.add(current.id.lower())
         gift = copy_for(offers, base, day) if base else None
         require(gift and gift.name == gift_name, reason)
         children = {cell["controlId"]: cell["value"] for cell in cells}
@@ -1443,9 +1468,16 @@ def verify_selected_packages(config, controls, actual, relations, values, snapsh
             entries = unpack_array(children[child])
             require(len(entries) == 1 and relation_item(entries[0], "sid",
                     spec["children"][child].get("relation_id_key", "rowid"))["sid"] == offer.id, reason)
+    require(all(name == name.strip() and any(name in quote["text"] for quote in statement["evidence"])
+                for name in required_names), proof)
+    return required_names
 
 
-def order_summary(values, config, adjustments, excerpts, sources, secrets, deadline):
+def registered_windows(text, fragments):
+    return ((i, i + 4) for i in range(len(text) - 3) if text[i:i + 4] in fragments)
+
+
+def order_summary(values, config, adjustments, excerpts, sources, secrets, deadline, package_names):
     pattern = re.compile("|".join(map(re.escape, sorted(secrets, key=len, reverse=True))))
     fragments = {value[i:i + 4] for value in secrets for i in range(len(value) - 3)}
     # 同一来源可拆为多个连续或重叠块。拼回连续区间再判引文与凭据的交集。
@@ -1459,7 +1491,7 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
             else:
                 segments.append((block.start, block.text, [block]))
         for start, text, blocks in segments:
-            redact = _CardRedaction(text, pattern, fragments)
+            redact = _CardRedaction(text, pattern, fragments, source_spans=registered_windows(text, fragments))
             for block in blocks:
                 redactions[block.id] = (redact, block.start - start)
     def checked_display_value(text):
@@ -1469,6 +1501,28 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
         return text
 
     labels = {s["draft"]: s["label"] for s in config["fields"].values() if "draft" in s}
+    # 原文坐标保护短摘录；引文拼接坐标补上跨条目出现的登记片段。
+    joined = "".join(text for _, _, text, _ in excerpts)
+    spans = list(registered_windows(joined, fragments))
+    offset = 0
+    for _, span, text, _ in excerpts:
+        redact, block_offset = redactions[span.source_id]
+        spans.extend((offset + left, offset + right)
+                     for left, right in redact._overlaps(block_offset + span.start, len(text)))
+        offset += len(text)
+    grouped = _CardRedaction(joined, pattern, fragments, source_spans=spans)
+    offset = 0
+    evidence_lines = []
+    visible_package_text = []
+    for name, _, text, declared in excerpts:
+        shown = grouped.display(text, offset)
+        offset += len(text)
+        require(not any(secret in shown for secret in secrets), "展示字段与凭据冲突", CredentialConflict)
+        evidence_lines.append(f"{labels.get(name, name)}依据：" + shown)
+        if name == "packages" and declared:
+            visible_package_text.extend(shown.split("[已脱敏]"))
+    require(all(any(name in part for part in visible_package_text) for name in package_names),
+            "节目包原文归属依据已脱敏", CredentialConflict)
     for name in ("policy_name", "user_scope"):
         checked_display_value(values[name])
     for tag in values["user_tags"]:
@@ -1480,10 +1534,7 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
     lines = [card_summary(values), *(f"{labels.get(k, k)}：{checked_display_value(str(v))}" for k, v in values.items()
              if k not in (*_VARIABLE, "user_tags", "packages")), f"用户范围：{values['user_scope']}",
              f"标签最晚截止日：{deadline}", *("自动调整：" + a for a in adjustments)]
-    summary = "\n".join(lines)
-    for name, span, text in excerpts:
-        redact, offset = redactions[span.source_id]
-        summary += f"\n{labels.get(name, name)}依据：" + redact.display(text, offset + span.start)
+    summary = "\n".join([*lines, *evidence_lines])
     require(not any(secret in summary for secret in secrets), "展示字段与凭据冲突", CredentialConflict)
     return summary
 
@@ -1709,7 +1760,8 @@ def run(args, directory, *, clock=time.time):
 
     official_token = official_setting("token_key")
     official_app_id = official_setting("app_id_key")
-    contact = mention(config["configurator"]["id"], config["configurator"]["label"])
+    configurator = config["configurator"]
+    contact = mention(configurator["id"], configurator["label"])
     sensitive = {token, official_token, official_app_id}
     display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
     sensitive.update(value for key, value in secrets.items() if key not in display_settings and receipt(value))
@@ -1736,10 +1788,12 @@ def run(args, directory, *, clock=time.time):
     settings = load_settings(args.env_file)
     with ledger_open(directory, args.registration, values["policy_name"]) as ledger:
         ledger.check_available()
-        tracked = [values["policy_name"], args.registration, *(spec["label"] for spec in config["fields"].values())]
+        tracked = [values["policy_name"], args.registration, configurator["id"], configurator["label"], contact,
+                   *(spec["label"] for spec in config["fields"].values())]
         require(not any(secret in item for item in tracked for secret in sensitive), "展示字段与凭据冲突", CredentialConflict)
-        require(not any(secret in item for item in (card_summary(values), contact)
-                        for secret in (token, official_token, official_app_id)), "展示字段与凭据冲突", CredentialConflict)
+        summary = card_summary(values)
+        require(not any(secret in summary for secret in (token, official_token, official_app_id)),
+                "展示字段与凭据冲突", CredentialConflict)
         timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
         with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             api = Official(official, official_token, official_app_id, client)
@@ -1757,9 +1811,12 @@ def run(args, directory, *, clock=time.time):
                     is_test=evidence["is_test"],
                 )
                 payload = create.payload(controls)
-                deadline = verify_order_request(payload, config, cells, relations, values, inactive, sensitive)
+                deadline, package_names = verify_order_request(
+                    payload, config, cells, relations, values, inactive, sensitive,
+                    draft["field_results"]["packages"]["statement"],
+                )
                 require(decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
-                summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline)
+                summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline, package_names)
             except (KeyError, ValueError, TypeError, IndexError, AttributeError):
                 error = Stop("请求字段或查表快照无法核实")
                 write_preflight_failure(error)
