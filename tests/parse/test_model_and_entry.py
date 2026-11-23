@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import ssl
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -1123,6 +1124,17 @@ def test_client_ignores_credentialed_environment_proxy(scheme, monkeypatch, tran
     assert configured_model(_endpoint_config("primary"))(system="", user="") == serialized_empty()
     assert not proxies
     assert len(transport_requests) == 1
+
+
+def test_direct_transport_ignores_environment_keylog(monkeypatch):
+    from qianshu.ai.anthropic import _direct_transport
+
+    assigned = []
+    monkeypatch.setattr(ssl.SSLContext, "keylog_filename",
+                        property(lambda self: None, lambda self, value: assigned.append(value)))
+    monkeypatch.setenv("SSLKEYLOGFILE", "fixture-keylog")
+    with _direct_transport(httpx.Limits()):
+        assert not assigned
 
 
 def test_client_construction_error_is_sanitized(monkeypatch, transport_requests):

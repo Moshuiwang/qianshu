@@ -4,10 +4,12 @@ import json
 import logging
 import os
 import socket
+import ssl
 import sys
 from time import monotonic_ns
 from typing import get_args
 
+import certifi
 import httpx
 from pydantic import ValidationError
 
@@ -103,7 +105,10 @@ def _direct_transport(limits: httpx.Limits) -> httpx.HTTPTransport:
                           (getattr(socket, "TCP_KEEPIDLE", None), 60)):
         if option is not None:
             options.append((socket.IPPROTO_TCP, option, value))
-    return httpx.HTTPTransport(limits=limits, trust_env=False, socket_options=options)
+    # 直接构造客户端上下文，避免默认上下文从环境启用 TLS 会话密钥日志。
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.load_verify_locations(cafile=certifi.where())
+    return httpx.HTTPTransport(verify=context, limits=limits, trust_env=False, socket_options=options)
 
 
 def streaming_model(*, api_key, base_url, model, effort, on_result, max_retries, follow_redirects) -> StreamingModel:
