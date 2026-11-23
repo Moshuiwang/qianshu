@@ -88,11 +88,14 @@ class _ModelLine(CardLine):
 
 
 class _CardRedaction:
-    def __init__(self, body: str, sensitive: re.Pattern[str] | None, registered_fragments: set[str]) -> None:
+    def __init__(
+        self, body: str, sensitive: re.Pattern[str] | None, registered_fragments: set[str],
+        *, source_spans: Iterable[tuple[int, int]] = (),
+    ) -> None:
         self.body = body
         self.sensitive = re.compile(f"(?=({sensitive.pattern}))") if sensitive else None
         self.registered_fragments = registered_fragments
-        self.spans = self._matches(self.sensitive, body)
+        self.spans = (*self._matches(self.sensitive, body), *source_spans)
         self.fragments = None
         if self.spans:
             # 自由文本没有坐标。短而又出现在非敏感原文里的字面值无法仅凭字面归属。
@@ -583,4 +586,10 @@ class Pipeline:
             for index, excerpt in enumerate(entry.evidence, 1):
                 lines.append(_ModelLine(f"{title} · 原文出处 {index}", "",
                                         parts=(_ModelText(excerpt.text, "name_evidence", start=excerpt.start),)))
+        # 追加到既有引文之后，使既有片段仍按原顺序连续参与整卡脱敏。
+        for index, policy in enumerate(policies, 1):
+            if policy.approval_url_deferred:
+                for number, excerpt in enumerate(policy.draft.approval_url.evidence, 1):
+                    lines.append(_ModelLine(f"政策 {index} · 任务审批链接 · 原文出处 {number}", "",
+                                            parts=(_ModelText(excerpt.text, "evidence", start=excerpt.start),)))
         return self._detail_pages(display_body, lines, redact)

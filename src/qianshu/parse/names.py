@@ -51,14 +51,21 @@ def verify_tags(result: FieldResult, sources: Sources) -> FieldResult:
 
 def _tag_boundary(span, sources: Sources) -> bool:
     location = sources.locate(span)
-    for block in sources.blocks.values():
-        if block.source_id != location.source_id:
-            continue
-        for offset in (location.start - 1, location.end):
+
+    def character(offset):
+        for block in sources.blocks.values():
             pos = offset - block.start
-            if 0 <= pos < len(block.text) and _TAG_CHAR.fullmatch(block.text[pos]):
-                return False
-    return True
+            if block.source_id == location.source_id and 0 <= pos < len(block.text):
+                return block.text[pos]
+        return ""
+
+    if _TAG_CHAR.fullmatch(character(location.start - 1)):
+        return False
+    following = character(location.end)
+    if following == ".":
+        after_dot = character(location.end + 1)
+        return not after_dot or after_dot.isspace()
+    return not _TAG_CHAR.fullmatch(following)
 
 
 def policy_option(value: str, options: dict[str, str]) -> str | None:

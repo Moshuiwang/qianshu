@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PARSE_FIXTURES = ROOT / "tests" / "parse" / "fixtures"
 COMPANIES_FIXTURE = PARSE_FIXTURES / "companies.tsv"
 SECRET = "合成占位凭据-仅用于测试"
+BACKUP_SECRET = "合成备用凭据示例"
 
 _CHILD_SETUP = """
 import os
@@ -117,6 +118,7 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None, sep
     })
     config = {
         "FEISHU_APP_ID": placeholder["app"], "FEISHU_APP_SECRET": SECRET,
+        "AI_BACKUP_API_KEY": BACKUP_SECRET,
         "FEISHU_CHAT_ID": placeholder["chat"], "FEISHU_BOT_OPEN_ID": placeholder["bot"],
         "FEISHU_ALLOWED_SENDER_IDS": placeholder["sender"],
         "FEISHU_APPROVED_FINGERPRINT": fingerprint(body if approved_body is None else approved_body),
@@ -143,6 +145,7 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None, sep
     )
     assert run.returncode == 0, run.stderr
     assert SECRET not in run.stdout + run.stderr
+    assert BACKUP_SECRET not in run.stdout + run.stderr
     return [json.loads(line) for line in run.stdout.splitlines()]
 
 
@@ -280,7 +283,7 @@ def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
 
 def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path, single_policy):
     body, model = single_policy
-    scope = f"占位休眠用户 {SECRET}"
+    scope = f"占位休眠用户 {SECRET} {BACKUP_SECRET}"
     body = body.replace("占位休眠用户", scope)
     model[0]["user_scope"] = {"value": scope, "evidence": [f"用户范围：{scope}"]}
     cards = _run(
@@ -294,7 +297,8 @@ def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path
         if name == "company":
             continue
         for excerpt in raw["evidence"]:
-            assert any(f"「{excerpt.replace(SECRET, '[已脱敏]')}」" in row for row in fields)
+            redacted = excerpt.replace(SECRET, "[已脱敏]").replace(BACKUP_SECRET, "[已脱敏]")
+            assert any(f"「{redacted}」" in row for row in fields)
     assert any("是否需要维护互斥组\n值　是\n原文出处　无原文摘录" in row for row in fields)
     assert "政策 1 · 公司\n值　占位公司甲\n原文出处　「 赞比亚占位申请。」" in content
     assert '政策 1 · 节目包\n值　[{"当前节目包": "占位甲", "赠送节目包": "占位甲_copy"}]\n原文出处　「占位甲包用户」' in content
@@ -1071,16 +1075,17 @@ def test_zero_drafts_keep_advisories_and_original_without_validating(monkeypatch
 
 
 @pytest.mark.parametrize("has_title", [True, False])
-def test_command_requires_package_confirmation_when_model_reports_no_title(tmp_path, single_policy, has_title):
+def test_command_waits_for_card_consent_regardless_of_title(tmp_path, single_policy, has_title):
     body, rows = single_policy
     rows[0]["country"] = rows[0].pop("company")
     reply = fixed_reply(" " + body, rows)
     reply["policies"][0]["has_title"] = has_title
     cards = _run(tmp_path, body, reply, tag_dates={"占位标签甲": "2099-02-15"})
     content = "\n".join(_contents(cards))
-    assert ("政策 1 · 节目包 · 待确认" in content) is not has_title
-    assert ("缺少本条政策的标题" in content) is not has_title
-    assert ("待群卡片同意" in content) is has_title
+    assert '政策 1 · 节目包\n值　[{"当前节目包": "占位甲", "赠送节目包": "占位甲_copy"}]\n原文出处　「占位甲包用户」' in content
+    assert "政策 1 · 节目包 · 待确认" not in content
+    assert "缺少本条政策的标题" not in content
+    assert "待群卡片同意" in content
 
 
 def test_command_marks_mutex_no_red_and_shows_candidate(tmp_path, single_policy):
@@ -1108,3 +1113,30 @@ def test_command_blocks_overlapping_policy_anchors(tmp_path, single_policy):
     assert "未校验" in content
     assert "待群卡片同意" not in content
     assert "政策 1 · 用户范围\n值　占位休眠用户" in content
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_deferred_archive_card_shows_only_verified_evidence(tmp_path, explicit):
+    body = "合成申请，本批未附存档链接。"
+    reply = fixed_reply(body, [{}])
+    if explicit:
+        reply["policies"][0]["fields"]["approval_url"] = statement(
+            "确定", evidence=[quote(body, "本批未附存档链接")],
+        )
+    lines = _contents(_run(tmp_path, body, reply, separator=""))
+    assert "政策 1 · 任务审批链接\n建单时填写" in lines
+    assert ("政策 1 · 任务审批链接 · 原文出处 1\n本批未附存档链接" in lines) == explicit
+
+
+def test_deferred_archive_excerpt_respects_source_redaction():
+    secret = "A1B2C3D4"
+    body = "合成无链接说明" + secret
+    reply = fixed_reply(body, [{}])
+    reply["policies"][0]["fields"]["approval_url"] = statement(
+        "确定", evidence=[quote(body, "合成无链接说明A1")],
+    )
+    pipeline = Pipeline(model=lambda **_: json.dumps(reply), tag_dates={}, companies_file=COMPANIES_FIXTURE,
+                        sensitive_values=[secret])
+    lines = _contents(list(map(result_card, pipeline(_application(body)))))
+    assert "政策 1 · 任务审批链接 · 原文出处 1\n合成无链接说明[已脱敏]" in lines
+    assert "A1" not in "\n".join(lines)

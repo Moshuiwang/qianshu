@@ -1,20 +1,21 @@
 """申请解析的模型调用边界。"""
 
 import json
-import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
-from time import monotonic_ns
-from typing import Protocol, get_args
+from typing import Protocol
+from urllib.parse import urlsplit
 
+import httpx
 from dotenv import dotenv_values
 from pydantic import ValidationError
 
 from qianshu.config import Config, ConfigError, load_config
 
-from .protocol import ApplicationReply
+from .protocol import ApplicationReply, Findings
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
 DEFAULT_EFFORT = "medium"
@@ -54,59 +55,59 @@ class CallResult:
     reply: str | None = field(repr=False)
     failure_stage: str | None = None
     effort: str | None = None
+    first_shape_error: str | None = None
+    retry_result: str | None = None
+    partial_input_tokens: int | None = None
+    partial_output_tokens: int | None = None
 
 
-def _block_length(block) -> int | None:
-    for name in ("text", "thinking"):
-        if isinstance(value := getattr(block, name, None), str):
-            return len(value)
-    serialize = getattr(block, "model_dump_json", None)
-    return len(serialize()) if callable(serialize) else None
+@dataclass(frozen=True)
+class StreamingModel:
+    send: Callable
+    on_result: Callable[[CallResult], None] | None
+
+    def __call__(self, *, system: str, user: str) -> str:
+        return self.send(system, [{"role": "user", "content": user}], self.on_result)
 
 
-def _raw_content(blocks, tool_inputs: dict[int, list[str]]) -> str:
-    content = []
-    for index, block in enumerate(blocks):
-        entry = block.model_dump(exclude_unset=True)
-        if block.type == "tool_use":
-            entry["input"] = "".join(tool_inputs.get(index, ()))
-        content.append(entry)
-    return json.dumps(content, ensure_ascii=False)
+def _missing_shape(error: ValidationError) -> tuple[str, tuple] | None:
+    # 只回传 schema 中的固定键和数组下标。
+    for detail in error.errors(include_input=False, include_context=False, include_url=False):
+        if detail["type"] != "missing":
+            continue
+        match detail["loc"]:
+            case ("policies", int(), "fields", name, *tail) if name in Findings.model_fields:
+                match tail:
+                    case ["evidence"]:
+                        return "missing_evidence", detail["loc"]
+                    case ["evidence", int(), "text"] | ["candidates", int(), "evidence", int(), "text"]:
+                        return "missing_quote_text", detail["loc"]
+    return None
 
 
-def _interrupted_content(reply, tool_inputs: dict[int, list[str]]) -> str | None:
-    blocks = getattr(reply, "content", ())
-    if any(block.type == "tool_use" for block in blocks):
-        return _raw_content(blocks, tool_inputs)
-    return "".join(block.text for block in blocks if block.type == "text") or None
-
-
-def _accumulate_event(reply, event, tool_inputs: dict[int, list[str]]):
-    if event.type == "message_start":
-        return event.message
-    if reply is None:
-        raise ValueError("缺少回复起始事件。")
-    if event.type == "content_block_start":
-        reply.content.append(event.content_block)
-    elif event.type == "content_block_delta":
-        block = reply.content[event.index]
-        delta = event.delta
-        if delta.type == "input_json_delta":
-            tool_inputs.setdefault(event.index, []).append(delta.partial_json)
-        elif delta.type == "text_delta" and block.type == "text":
-            block.text += delta.text
-        elif delta.type == "thinking_delta" and block.type == "thinking":
-            block.thinking += delta.thinking
-        elif delta.type == "signature_delta" and block.type == "thinking":
-            block.signature = delta.signature
-        elif delta.type == "citations_delta" and block.type == "text":
-            block.citations = [*(block.citations or ()), delta.citation]
-    elif event.type == "message_delta":
-        reply.stop_reason = event.delta.stop_reason
-        reply.usage.output_tokens = event.usage.output_tokens
-        if event.usage.input_tokens is not None:
-            reply.usage.input_tokens = event.usage.input_tokens
-    return reply
+def recorded_shape_error(attempt: dict) -> str | None:
+    """从旧录制或单次批量结果复核形状，保持新录制字段可选。"""
+    if reason := attempt.get("first_shape_error"):
+        return reason
+    raw = attempt.get("reply")
+    if not isinstance(raw, str):
+        return None
+    if attempt["failure_stage"] == "reply_schema":
+        try:
+            ApplicationReply.model_validate_json(raw)
+        except ValidationError as error:
+            if missing := _missing_shape(error):
+                return missing[0]
+    elif attempt["failure_stage"] == "reply_tool_multiple":
+        try:
+            blocks = validate_reply_json(raw)
+        except (ValueError, RecursionError):
+            return None
+        if isinstance(blocks, list):
+            tools = [b.get("name") for b in blocks if isinstance(b, dict) and b.get("type") == "tool_use"]
+            if tools == [_REPLY_TOOL, _REPLY_TOOL]:
+                return "reply_tool_multiple"
+    return None
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -135,6 +136,10 @@ def load_model_config(*, env_file: Path = Path(".env"), config: Config | None = 
     """为申请解析补充模型专用的配置项。"""
     if config is None:
         config = load_config(env_file=env_file)
+    if "ANTHROPIC_CUSTOM_HEADERS" in os.environ or (
+        "ANTHROPIC_BASE_URL" in os.environ and not config.get("ANTHROPIC_BASE_URL")
+    ):
+        raise ConfigError("请通过 .env 配置 AI 接口，并移除 SDK 的进程环境覆盖。")
     try:
         with env_file.open(encoding="utf-8-sig") as stream:
             values = dotenv_values(stream=stream, interpolate=False)
@@ -154,118 +159,51 @@ def configured_effort(config: Mapping[str, str]) -> str:
     return effort
 
 
+def _validate_endpoint(value: str, profile: str) -> None:
+    message = f"{profile}端点必须是有效的 HTTPS 地址。"
+    try:
+        endpoint = httpx.URL(value)
+        # HTTPX 会在规范化时丢弃空的用户名分隔符。
+        has_userinfo = urlsplit(value).username is not None
+    except (ValueError, httpx.InvalidURL):
+        raise ConfigError(message) from None
+    if endpoint.scheme != "https" or not endpoint.host or endpoint.userinfo or has_userinfo:
+        raise ConfigError(message)
+
+
 def configured_model(
     config: Mapping[str, str], *, on_result: Callable[[CallResult], None] | None = None,
     max_retries: int | None = None,
 ) -> ParseModel:
-    """要求模型通过提交工具返回解析声明，再在本地校验。"""
-    if config.get("AI_PLATFORM", "anthropic") != "anthropic":
-        raise ConfigError("AI_PLATFORM 配置不受支持，申请解析目前只支持 Anthropic（anthropic）。")
-    api_key = config.get("ANTHROPIC_API_KEY")
+    """按配置选择一个平台。适配器交回原始 JSON，业务层统一核对。"""
+    from qianshu.ai import ADAPTERS
+
+    profile = config.get("AI_ACTIVE_PROFILE", "primary")
+    if profile == "primary":
+        platform = config.get("AI_PLATFORM", "anthropic")
+        key_name = "ANTHROPIC_API_KEY"
+        base_url = config.get("ANTHROPIC_BASE_URL")
+        if base_url is not None:
+            _validate_endpoint(base_url, "主用")
+        model = config.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
+        effort = configured_effort(config)
+    elif profile == "backup":
+        platform = config.get("AI_BACKUP_PLATFORM")
+        key_name = "AI_BACKUP_API_KEY"
+        model = config.get("AI_BACKUP_MODEL")
+        base_url = config.get("AI_BACKUP_BASE_URL")
+        if not (platform and model and base_url):
+            raise ConfigError("备用平台须填写 AI_BACKUP_PLATFORM、AI_BACKUP_MODEL 和 AI_BACKUP_BASE_URL。")
+        _validate_endpoint(base_url, "备用")
+        effort = DEFAULT_EFFORT
+    else:
+        raise ConfigError("AI_ACTIVE_PROFILE 仅接受 primary 或 backup。")
+    if platform not in ADAPTERS:
+        raise ConfigError("AI_PLATFORM 或 AI_BACKUP_PLATFORM 配置不受支持。")
+    api_key = config.get(key_name)
     if not api_key:
-        raise ConfigError("缺少配置，请在 .env 中填写 ANTHROPIC_API_KEY。")
-    base_url = config.get("ANTHROPIC_BASE_URL")
-    model = config.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
-    effort = configured_effort(config)
-
-    def complete(*, system: str, user: str) -> str:
-        import httpx
-        from anthropic import Anthropic, AnthropicError, DefaultHttpxClient
-        from anthropic.types import StopReason
-
-        tool_inputs: dict[int, list[str]] = {}
-
-        def record(reply, raw: str | None, failure: str | None = None) -> None:
-            if on_result is None:
-                return
-            blocks = getattr(reply, "content", ())
-            usage = getattr(reply, "usage", None)
-            stop = getattr(reply, "stop_reason", None)
-            on_result(CallResult(
-                stop if stop is None or stop in get_args(StopReason) else "unknown",
-                tuple(
-                    (block.type, sum(map(len, tool_inputs.get(index, ()))))
-                    if block.type == "tool_use" else (block.type, _block_length(block))
-                    for index, block in enumerate(blocks)
-                ),
-                getattr(usage, "input_tokens", None), getattr(usage, "output_tokens", None),
-                (monotonic_ns() - started) // 1_000_000, getattr(reply, "model", model),
-                raw, failure, effort=effort,
-            ))
-
-        def format_error(code: str, *, raw: str | None = None, path: tuple = ()) -> ModelReplyError:
-            if raw is None:
-                raw = _raw_content(reply.content, tool_inputs)
-            record(reply, raw, code)
-            return ModelReplyError(code, raw, "申请解析模型回复解析失败。", path=path)
-
-        # SDK 的调试日志会展开申请正文，HTTP 日志会记录服务地址。
-        for logger_name in ("anthropic", "httpx", "httpcore"):
-            logging.getLogger(logger_name).setLevel(logging.WARNING)
-        started = monotonic_ns() if on_result is not None else 0
-        options = {}
-        if max_retries is not None:
-            options.update(max_retries=max_retries, http_client=DefaultHttpxClient(follow_redirects=False))
-        reply = None
-        try:
-            with Anthropic(api_key=api_key, base_url=base_url, **options) as client:
-                # 使用原始事件，避免 SDK 的部分 JSON 解码先补全或拒绝工具参数。
-                with client.messages.create(
-                    model=model,
-                    system=system,
-                    messages=[{"role": "user", "content": user}],
-                    max_tokens=128000,
-                    output_config={"effort": effort},
-                    tools=[{
-                        "name": _REPLY_TOOL,
-                        "description": "提交一份申请解析声明。",
-                        "input_schema": ApplicationReply.model_json_schema(),
-                    }],
-                    stream=True,
-                ) as stream:
-                    for event in stream:
-                        reply = _accumulate_event(reply, event, tool_inputs)
-                    if reply is None:
-                        raise ValueError("缺少回复起始事件。")
-        # 流式读取中途断开或超时时，SDK 不包装传输层异常。
-        except (AnthropicError, ValueError, httpx.HTTPError):
-            raw = _interrupted_content(reply, tool_inputs)
-            if raw is not None:
-                record(reply, raw, "reply_truncated")
-                raise ModelReplyError("reply_truncated", raw, "申请解析模型调用失败。") from None
-            record(None, None, "model_call")
-            raise ModelError("申请解析模型调用失败。") from None
-
-        if reply.stop_reason not in {"tool_use", "end_turn"}:
-            stop_reason = reply.stop_reason if reply.stop_reason in get_args(StopReason) else "unknown"
-            output_tokens = getattr(getattr(reply, "usage", None), "output_tokens", None)
-            token_count = output_tokens if type(output_tokens) is int and output_tokens >= 0 else "未知"
-            code = {"max_tokens": "reply_truncated", "refusal": "reply_refused"}.get(stop_reason, "reply_incomplete")
-            raw = _interrupted_content(reply, tool_inputs)
-            record(reply, raw, "model_incomplete")
-            raise ModelReplyError(code, raw,
-                                  f"申请解析模型回复不完整（stop_reason={stop_reason}，输出 {token_count} token）。")
-
-        tool_uses = [(index, block) for index, block in enumerate(reply.content) if block.type == "tool_use"]
-        if not tool_uses:
-            raise format_error("reply_tool_missing")
-        if len(tool_uses) > 1:
-            raise format_error("reply_tool_multiple")
-        (index, tool), = tool_uses
-        if tool.name != _REPLY_TOOL:
-            raise format_error("reply_tool_unexpected")
-        result = "".join(tool_inputs.get(index, ()))
-        try:
-            validate_reply_json(result)
-        except (ValueError, TypeError, RecursionError):
-            raise format_error("tool_input_json", raw=result) from None
-        try:
-            # 严格模式按 JSON 校验，以同样的方式接受工具与重放中的枚举字符串。
-            ApplicationReply.model_validate_json(result)
-        except ValidationError as error:
-            path = error.errors(include_input=False, include_context=False, include_url=False)[0]["loc"]
-            raise format_error("reply_schema", raw=result, path=path) from None
-        record(reply, result)
-        return result
-
-    return complete
+        raise ConfigError(f"缺少配置，请在 .env 中填写 {key_name}。")
+    return ADAPTERS[platform](
+        api_key=api_key, base_url=base_url, model=model, effort=effort, on_result=on_result,
+        max_retries=max_retries, follow_redirects=profile == "primary" and max_retries is None,
+    )

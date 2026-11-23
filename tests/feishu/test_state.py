@@ -110,3 +110,161 @@ def test_closed_approval_cannot_grant_or_reuse_create_claim(tmp_path, settings, 
         assert sent == ([200] if close_at == "after_dispatch" else [])
     finally:
         state.close()
+
+
+@pytest.mark.parametrize("stage", [1, 2, 3])
+@pytest.mark.parametrize("clock", ["processing", "business"])
+@pytest.mark.parametrize("overrun", [0, 0.001])
+def test_commit_return_must_precede_both_deadlines(tmp_path, settings, monkeypatch, stage, clock, overrun):
+    from types import SimpleNamespace
+    from qianshu.feishu import state as storage
+
+    path = tmp_path / "private.sqlite"
+    state = State(path, settings)
+    state.bind("approval", "card", "record", 200)
+    assert state.claim_callback("event")
+    sample = SimpleNamespace(mono=0, business=150)
+    monkeypatch.setattr(storage, "time", SimpleNamespace(monotonic=lambda: sample.mono))
+    commits = 0
+
+    def at_commit(statement):
+        nonlocal commits
+        if statement == "COMMIT":
+            commits += 1
+            if commits == stage:
+                if clock == "processing":
+                    sample.mono = 10 + overrun
+                else:
+                    sample.business = 200 + overrun
+
+    state._writer.set_trace_callback(at_commit)
+    args = ("approval", "card", "record", "approve", "event", "member", lambda: sample.business)
+    try:
+        assert not state.decide(*args, deadline=10)
+    finally:
+        state.close()
+
+    with closing_state(path, settings) as reopened:
+        assert not reopened.claim_callback("event")
+        assert not reopened.decide(*args)
+        assert reopened.approval_status("approval", "record") not in ("approve", "claimed")
+        assert reopened.claim_create("approval", "record") is None
+        assert not reopened.dispatch_create("approval", "record", pytest.fail)
+        # 仅首次明确晚到、业务仍有效的卡可重新点击。
+        assert reopened.claim_callback("new-event")
+        assert reopened.decide(*args[:4], "new-event", *args[5:]) == (stage == 1 and clock == "processing")
+
+
+def closing_state(path, settings):
+    from contextlib import closing
+
+    return closing(State(path, settings))
+
+
+@pytest.mark.parametrize("commit", [1, 2, 3])
+def test_interrupted_attempt_cannot_be_completed_on_reopen(tmp_path, settings, monkeypatch, commit):
+    from contextlib import contextmanager
+
+    path = tmp_path / "private.sqlite"
+    with closing_state(path, settings) as state:
+        state.bind("approval", "card", "record", 200)
+        assert state.claim_callback("event")
+        write = state._write
+        count = 0
+
+        @contextmanager
+        def interrupted(**kwargs):
+            nonlocal count
+            with write(**kwargs) as db:
+                yield db
+            count += 1
+            if count == commit:
+                raise RuntimeError("合成提交返回中断")
+
+        monkeypatch.setattr(state, "_write", interrupted)
+        with pytest.raises(RuntimeError, match="合成提交返回中断"):
+            state.decide("approval", "card", "record", "approve", "event", "member", lambda: 150)
+
+    with closing_state(path, settings) as reopened:
+        for event in ("event", "new-event"):
+            assert reopened.claim_callback(event) == (event == "new-event")
+            assert not reopened.decide("approval", "card", "record", "approve", event, "member", lambda: 150)
+        assert reopened.claim_create("approval", "record") is None
+        assert not reopened.dispatch_create("approval", "record", pytest.fail)
+
+
+@pytest.mark.parametrize("prior", ["approve", "claimed", "used", "reject", "closed"])
+def test_migration_without_proof_preserves_dedup_and_terminal_states(tmp_path, settings, prior):
+    path = tmp_path / "private.sqlite"
+    with closing_state(path, settings) as state:
+        state.bind("approval", "card", "record", 200)
+        with state._write() as db:
+            db.execute("DROP TABLE feishu_callback_events")
+            db.execute("DROP TABLE feishu_decision_proofs")
+            db.execute("UPDATE feishu_approvals SET event_id = 'old', status = ?", (prior,))
+    with closing_state(path, settings) as reopened:
+        assert not reopened.claim_callback("old")
+        assert reopened.approval_status("approval", "record") == (
+            "closed" if prior in ("approve", "claimed") else prior
+        )
+        assert reopened.claim_create("approval", "record") is None
+        assert not reopened.dispatch_create("approval", "record", pytest.fail)
+
+
+def test_reopened_connections_race_for_one_proven_decision(tmp_path, settings):
+    from contextlib import ExitStack
+
+    path = tmp_path / "private.sqlite"
+    with closing_state(path, settings) as writer:
+        writer.bind("approval", "card", "record", 200)
+        assert writer.claim_callback("event")
+        assert writer.decide("approval", "card", "record", "approve", "event", "member", lambda: 150)
+
+    with ExitStack() as stack:
+        readers = [stack.enter_context(closing_state(path, settings)) for _ in range(4)]
+        start = Barrier(len(readers))
+
+        def race(reader):
+            start.wait(timeout=3)
+            return reader.claim_create("approval", "record")
+
+        with ThreadPoolExecutor(len(readers)) as pool:
+            assert list(pool.map(race, readers)).count(200) == 1
+        sent = []
+        for reader in readers:
+            reader.dispatch_create("approval", "record", sent.append)
+        assert sent == [200]
+
+
+def test_close_while_late_candidate_is_being_cleaned_up(tmp_path, settings):
+    from threading import Event
+
+    path = tmp_path / "private.sqlite"
+    sampled, resume = Event(), Event()
+    with closing_state(path, settings) as writer, closing_state(path, settings) as closer:
+        writer.bind("approval", "card", "record", 200)
+        assert writer.claim_callback("event")
+        calls = 0
+
+        def business_clock():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                sampled.set()
+                assert resume.wait(2)
+                return None
+            return 150
+
+        with ThreadPoolExecutor(1) as pool:
+            result = pool.submit(writer.decide, "approval", "card", "record", "approve",
+                                 "event", "member", business_clock)
+            try:
+                assert sampled.wait(2)
+                closer.close_approvals()
+            finally:
+                resume.set()
+            assert not result.result()
+        assert closer.approval_status("approval", "record") == "closed"
+        assert closer.claim_callback("next-event")
+        assert not closer.decide("approval", "card", "record", "approve", "next-event", "member", lambda: 150)
+        assert closer.claim_create("approval", "record") is None

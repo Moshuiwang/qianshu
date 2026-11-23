@@ -62,7 +62,7 @@ def test_multiple_explicit_package_rows_keep_verified_pairs(tmp_path, kind, coun
     ]
 
 
-@pytest.mark.parametrize("case", ["duplicate", "conflict", "target_missing", "no_title"])
+@pytest.mark.parametrize("case", ["duplicate", "conflict", "target_missing"])
 def test_unresolved_row_blocks_all_rows(tmp_path, case):
     kind = "升级权益" if case == "target_missing" else "赠送时长"
     pairs = [(NAMES[0], NAMES[0]), (NAMES[1], None)]
@@ -71,7 +71,45 @@ def test_unresolved_row_blocks_all_rows(tmp_path, case):
     elif case == "conflict":
         pairs[1] = (NAMES[1], NAMES[2])
     body, reply = example(kind, pairs)
-    reply["policies"][0]["has_title"] = case != "no_title"
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.packages.value is None and draft.packages.uncertainty
+
+
+def test_titleless_package_rows_follow_source_order(tmp_path):
+    names = NAMES[1::-1]
+    rows = [dict(current_package=name, gift_package=None) for name in names]
+    passages = [f"本条适用于{name}" for name in names]
+    body, reply = scenario("赠送时长", packages=field(rows, *passages))
+    policy = reply["policies"][0]
+    policy["has_title"] = False
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert [(row.current_package, row.gift_package) for row in draft.packages.value] == [
+        (name, name + "_copy") for name in names
+    ]
+    assert [item.text for item in draft.field_results["packages"].evidence] == passages
+
+
+def test_titleless_ambiguous_package_keeps_evidenced_candidate(tmp_path):
+    rows = [dict(current_package=NAMES[0], gift_package=None)]
+    passage = f"本条可能适用于{NAMES[0]}"
+    body, reply = scenario("赠送时长", packages=field(rows, passage))
+    policy = reply["policies"][0]
+    policy["has_title"] = False
+    policy["fields"]["packages"] = statement("歧义", candidates=[dict(value=rows, evidence=[quote(body, passage)])])
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.packages.value is None
+    candidate, = draft.packages.uncertainty.candidates
+    assert candidate.value == [{"节目包行": "1", "当前包": NAMES[0], "状态": "未查表、不可建单"}]
+    assert [item.text for item in candidate.evidence] == [passage]
+
+
+@pytest.mark.parametrize("status,passage", [("确定", None), ("确定", "原文没有的引文"), ("缺证据", None)])
+def test_titleless_package_without_verified_evidence_stays_pending(tmp_path, status, passage):
+    rows = [dict(current_package=NAMES[0], gift_package=None)]
+    body, reply = scenario("赠送时长", packages=field(rows))
+    policy = reply["policies"][0]
+    policy["has_title"] = False
+    policy["fields"]["packages"] = statement(status, value=rows, evidence=[quote(body, passage)] if passage else [])
     draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
     assert draft.packages.value is None and draft.packages.uncertainty
 
@@ -312,3 +350,85 @@ def test_two_catalog_candidates_share_card_fragment_check(tmp_path, monkeypatch)
     text = card_text(body, reply, sensitive_values=["xAB当前y"])
     assert "占位AB" not in text
     assert "占位[已脱敏]" in text and "[已脱敏]包 · 高档" in text
+
+
+@pytest.mark.parametrize("role,expected", [("当前包", NAMES[:2]), ("受赠目标", NAMES[1:2])])
+def test_only_gift_tier_requires_a_synchronized_copy(tmp_path, role, expected):
+    levels = load(tmp_path / "levels.csv", [details()[0], *details()[2:4]])
+    body, reply = scenario("升级权益", packages=field(None, "仅列出档位"))
+    reply["policies"][0]["fields"]["package_tiers"] = statement(
+        "确定", value=[dict(role=role, tier="低")], evidence=[quote(body, "仅列出档位")],
+    )
+    draft = parse_one(body, reply, levels)
+    assert tuple(item.split(" · ")[-1] for item in draft.package_tier_candidates) == expected
+    assert draft.packages.value is None
+
+
+@pytest.mark.parametrize("missing", ["company", "start_date", "benefit_type"])
+@pytest.mark.parametrize("certain", [True, False])
+def test_unresolved_inputs_keep_only_evidenced_names_without_lookup(monkeypatch, missing, certain):
+    current, gift, expiry = NAMES
+    body, reply = example("升级权益", [(current, gift)],
+                          after_offer=field("指定节目包", "到期转包"),
+                          after_offer_package=field(expiry, f"到期转入{expiry}"))
+    fields = reply["policies"][0]["fields"]
+    fields[missing] = statement("歧义")
+    fields["package_tiers"] = statement("确定", value=[dict(role="当前包", tier="高")],
+                                         evidence=[quote(body, current)])
+    rows = [dict(current_package=current, gift_package=gift),
+            dict(current_package="合成无引文包", gift_package=None)]
+    evidence = [quote(body, f"当前{current}，受赠{gift}")]
+    if certain:
+        fields["packages"] = statement("确定", value=rows, evidence=evidence)
+    else:
+        fields["packages"] = statement("歧义", candidates=[
+            dict(value=rows, evidence=evidence),
+            dict(value=[dict(current_package=expiry, gift_package=None)], evidence=[quote(body, "无效摘录")]),
+        ])
+
+    monkeypatch.setattr(parse, "load_package_levels", lambda: pytest.fail("前提未定时不得加载销售品表"))
+    draft = parse_one(body, reply, None)
+    result = draft.field_results["packages"]
+    assert not result.has_value and result.value is None and result.source is None
+    assert result.statement.model_dump(mode="json", exclude_unset=True) == fields["packages"]
+    assert not draft.package_tier_candidates and draft.packages.value is None
+    candidate, = draft.packages.uncertainty.candidates
+    assert candidate.value == [{"节目包行": "1", "当前包": current, "活动期受赠包": gift, "状态": "未查表、不可建单"}]
+    assert [item.text for item in candidate.evidence] == [evidence[0]["text"]]
+    assert "未查表、不可建单" in card_text(body, reply)
+    with pytest.raises(ValueError):
+        assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)
+
+
+@pytest.mark.parametrize("quote_second", [False, True])
+def test_titleless_package_rows_require_each_current_name_in_field_evidence(tmp_path, quote_second):
+    rows = [dict(current_package=name, gift_package=name + "_copy") for name in NAMES[:2]]
+    passages = list(NAMES[:2] if quote_second else NAMES[:1])
+    body, reply = scenario("赠送时长", packages=field(rows, *passages),
+                           cancel_on_downgrade=field("是", "降包取消"))
+    reply["policies"][0]["has_title"] = False
+    assert "_copy" not in body
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    if quote_second:
+        assert [(row.current_package, row.gift_package) for row in draft.packages.value] == [
+            (name, name + "_copy") for name in NAMES[:2]]
+        assert assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)
+    else:
+        assert NAMES[1] not in body
+        assert draft.packages.value is None
+        candidate, = draft.packages.uncertainty.candidates
+        assert candidate.value == [{"节目包行": "1", "当前包": NAMES[0], "状态": "未查表、不可建单"}]
+        with pytest.raises(ValueError, match="待确认"):
+            assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)
+
+
+@pytest.mark.parametrize("kind", ["升级权益", "特价优惠"])
+def test_gift_name_in_another_field_does_not_verify_package_row(tmp_path, kind):
+    current, gift = NAMES[:2]
+    body, reply = scenario(kind, packages=field([dict(current_package=current, gift_package=gift)], current))
+    assert gift in body
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.packages.value is None
+    assert draft.field_results["packages"].issues == ("package_name_missing_evidence",)
+    with pytest.raises(ValueError, match="待确认"):
+        assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)

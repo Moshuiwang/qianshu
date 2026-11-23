@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import get_origin
 
 from qianshu.draft import DraftField, OfferPolicyDraft
-from qianshu.parse import ModelError, ParseError, parse_application
+from qianshu.parse import ModelError, ParseError, _read_options, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
-from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel
-from qianshu.parse.package_levels import PackageLevels, load_package_levels
+from qianshu.parse.model import REPLY_FORMAT_ERRORS, ModelReplyError, ParseModel, StreamingModel, recorded_shape_error
+from qianshu.parse.package_levels import PackageLevels
 
 from .business import CATEGORIES, COUNT_LABELS, DEFAULT_THRESHOLD, METRIC_LABELS, BusinessScore, pairing_audit
 from .compare import BENEFIT_TYPES, EXCLUSIONS, FIELD_LABELS, POLICY_TYPES, STATUSES, compare_field
@@ -161,13 +161,59 @@ def _new_field_status(draft, name: str) -> str:
     return "determined" if field.value is not None else "missing"
 
 
+def _document_model(recording, token):
+    recorded = recording.for_document(token)
+    model = recording.model
+    if recording.source is not None or not isinstance(model, StreamingModel):
+        return recorded
+
+    def call(*, system, user):
+        # 使用和批量/重放相同的 attempts 入口，使每次物理请求独立计费和落盘。
+        from .recording import _call_data, _retryable
+
+        def source(_token, _user_sha, _system_sha):
+            attempts = []
+            first_request = {}
+
+            def collect(result):
+                attempt = _call_data(result)
+                if result.retry_result and "request" in recording.document:
+                    attempt["request"] = recording.document["request"]
+                elif not first_request and "request" in recording.document:
+                    first_request.update({key: recording.document[key] for key in ("request", "request_sha256")})
+                attempts.append(attempt)
+
+            observed = StreamingModel(model.send, collect)
+            for _ in range(recording.config["retries"] + 1):
+                try:
+                    observed(system=system, user=user)
+                except ModelReplyError as error:
+                    attempts[-1]["structure_path"] = error.path
+                except ModelError:
+                    pass
+                last = attempts[-1]
+                if last.get("retry_result") or not _retryable(last):
+                    break
+            recording.document.update(first_request)
+            return attempts
+
+        recording.source = source
+        try:
+            return recorded(system=system, user=user)
+        finally:
+            recording.source = None
+
+    return call
+
+
 def evaluate(
     frozen: dict, model: ParseModel | None, rules_dir: Path, *, legacy_companies: bool = False,
     threshold: int = DEFAULT_THRESHOLD, recording=None, package_levels: PackageLevels | None = None,
-    today: date | None = None, package_run_day: date | None = None,
+    today: date | None = None, package_run_day: date | None = None, benefit_catalog=None,
 ) -> tuple[dict, dict]:
+    snapshot_supplied = package_levels is not None
     if package_levels is None:
-        package_levels = load_package_levels()
+        package_levels = PackageLevels()
     samples = frozen["samples"]
     pairs = defaultdict(list)
     for pair in frozen["pairs"].values():
@@ -207,20 +253,25 @@ def evaluate(
         for name in names:
             common_countries[name].add(country)
     codes = country_codes((rules_dir / "countries.txt").read_text(encoding="utf-8"))
+    try:
+        options = _read_options((rules_dir / "parse-options.tsv").read_text(encoding="utf-8"))
+    except ValueError:
+        options = {}  # 解析入口按篇登记选项表错误。
     business = BusinessScore(frozen, threshold, {
         name: next(iter(countries)) for name, countries in common_countries.items() if len(countries) == 1
     }, company_table=company_rules.table if company_rules is not None else None,
         country_names=company_rules.countries if company_rules is not None else None,
-        country_codes=codes, today=today)
+        country_codes=codes, today=today, options=options)
     business_details = []
     evidence_locations = Counter()
     full_review_cards = full_review_policies = 0
     full_review_reasons = Counter()
-    reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated"), 0)
+    reply_failures = dict.fromkeys(("reply_parse", "reply_incomplete", "reply_truncated", "reply_refused"), 0)
     reply_failed_documents = 0
+    first_shape_errors = 0
 
     for token, document in frozen["documents"].items():
-        call = recording.for_document(token) if recording is not None else model
+        call = _document_model(recording, token) if recording is not None else model
         received = False
 
         def on_reply(_reply: str) -> None:
@@ -234,7 +285,7 @@ def evaluate(
             drafts = parse_application(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
-                package_levels=package_levels, package_run_day=package_run_day,
+                package_levels=package_levels, package_run_day=package_run_day, benefit_catalog=benefit_catalog,
                 today=today, country_codes=codes,
                 recorded_reply=getattr(recording, "origin", None) in ("replay", "probe"),
             )
@@ -274,6 +325,12 @@ def evaluate(
             evidence_location=_evidence_location_report(location_counts),
         ):
             failure_reasons.add("reply_truncated")
+        if recording is not None:
+            attempts = recording.document["attempts"]
+            first_shape_errors += any(recorded_shape_error(attempt) for attempt in attempts)
+            if (status == "model_failed" and not failure_reasons and len(attempts) >= 2
+                    and recorded_shape_error(attempts[-2])):
+                failure_reasons.add("reply_incomplete")
         reply_failed_documents += bool(failure_reasons)
         for reason in failure_reasons:
             reply_failures[reason] = reply_failures.get(reason, 0) + 1
@@ -329,6 +386,7 @@ def evaluate(
         counts = Counter(entry["excluded"].values())
         excluded[name] = {reason: counts[reason] for reason in EXCLUSIONS}
     report = {
+        "package_levels_supplied": snapshot_supplied,
         "freeze_sha256": frozen["fingerprint"],
         "rules_sha256": rules_hash,
         "samples": len(samples),
@@ -365,6 +423,8 @@ def evaluate(
     }
     report["business"] = business.report(reply_failed_documents)
     report["business"]["reply_parse_failure_reasons"] = reply_failures
+    if first_shape_errors:
+        report["documents"]["first_shape_errors"] = first_shape_errors
     details["business"] = business_details
     details["pairing_audit"] = pairing_audit(business_details)
     return report, details
@@ -372,7 +432,7 @@ def evaluate(
 
 def markdown_report(report: dict) -> bytes:
     failures = report["business"]["reply_parse_failure_reasons"]
-    breakdown = f"（截断 {failures['reply_truncated']}，其他未完整结束 {failures['reply_incomplete']}，解码或解析 {failures['reply_parse']}）"
+    breakdown = f"（截断 {failures['reply_truncated']}，其他未完整结束 {failures['reply_incomplete']}，拒答 {failures.get('reply_refused', 0)}，解码或解析 {failures['reply_parse']}）"
     locations = report["evidence_location"]
     percent = locations["percent"]
     rate = f"{percent:.2f}%" if percent is not None else "不可判定"
@@ -384,14 +444,38 @@ def markdown_report(report: dict) -> bytes:
     review_line = f"- 需核对全文的卡片数 {review['cards']}（政策数 {review['policies']}），按政策结构与空材料计"
     reasons = report["full_document_review_reasons"]
     review_lines = [review_line, *(f"  - {label} {reasons[code]} 篇" for code, label in STRUCTURE_REASONS.items())]
+    review_lines.append(f"- 首次形状错误 {report['documents'].get('first_shape_errors', 0)} 篇，"
+                        f"最终回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇")
+    if report.get("package_levels_supplied") is False:
+        review_lines.append("- 未提供销售品快照，按空表核对。")
+    if cost := report.get("cost"):
+        usage = report["usage"]
+        def shown(value):
+            return "未采集" if value is None else str(value)
+        review_lines.append(f"- {cost['mode']} 输入 / 输出 token {shown(usage['input_tokens']['total'])} / "
+                            f"{shown(usage['output_tokens']['total'])}，每百万单价 {shown(cost['input_per_million'])} / "
+                            f"{shown(cost['output_per_million'])} 美元，已知费用 {shown(cost['known_usd'])} 美元，"
+                            f"本次新增 {shown(cost['new_known_usd'])} 美元，待核 {cost['missing_attempts']} 次")
+        if cost["missing_attempts"]:
+            review_lines.append("- 用量部分未知，已知费用仅含已录得的用量。")
+    if diagnostics := report.get("attempt_failures"):
+        review_lines.append("- 全部尝试的失败诊断：" + "、".join(f"{k} {v} 次" for k, v in sorted(diagnostics.items())))
+    if report.get("batch_seconds") is not None:
+        review_lines.append(f"- 提交至首次观测批次结束 {report['batch_seconds']:.1f} 秒（含轮询间隔）")
     if diagnostic := report.get("diagnostic_replay"):
         review_lines.insert(0, f"- 离线诊断，源回复结构 `{diagnostic['source_reply_structure']}`，"
                                f"当前结构 `{diagnostic['reply_structure']}`。")
+    business = report["business"]
+    pairing_lines = [
+        f"- 配对配置指纹 `{business['pairing_sha256']}`",
+        f"- 业务配对版本 {business['pairing_version']}，量尺指纹 `{business['measure_sha256']}`",
+    ]
     if report.get("void"):
         return "\n".join([
             "# 解析回归计数", "",
             f"- 冻结指纹 `{report['freeze_sha256']}`",
             f"- 运行配置指纹 `{report['configuration_sha256']}`",
+            *pairing_lines,
             f"- 模型调用失败 {report['documents']['model_failed']} 篇",
             f"- 回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇{breakdown}",
             *review_lines, *location_lines, "", "本次放行运行作废。", "",
@@ -455,8 +539,7 @@ def markdown_report(report: dict) -> bytes:
                 counts.update({status: field[status] for status in STATUSES})
             groups[label] = _rate_counts(counts)
         result.extend(lines(f"{title}（按字段项汇总）", groups))
-    result.extend(["## 业务配对量尺", "", f"- 配对配置指纹 `{report['business']['pairing_sha256']}`"])
-    result.append(f"- 量尺指纹 `{report['business']['measure_sha256']}`")
+    result.extend(["## 业务配对量尺", "", *pairing_lines])
     for key, metric in report["business"].get("rates", {}).items():
         numerator, denominator, percent = (metric[key] for key in ("numerator", "denominator", "percent"))
         fraction = f"{numerator}/{denominator}" if denominator is not None else "—"

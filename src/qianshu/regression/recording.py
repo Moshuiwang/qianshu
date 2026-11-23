@@ -4,6 +4,7 @@ import json
 from collections import Counter
 from collections.abc import Callable
 from dataclasses import asdict
+from decimal import Decimal
 from pathlib import Path
 from re import fullmatch
 from uuid import uuid4
@@ -13,7 +14,7 @@ from qianshu.parse.model import (
 )
 from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE, PROTOCOL_VERSION, REPLY_STRUCTURE
 
-from .business import measure_fingerprint, pairing_fingerprint
+from .business import PAIRING_VERSION, measure_fingerprint, pairing_fingerprint
 from .runner import RULES, IncompleteReply
 from .storage import Output, PrivateFiles, RegressionError, digest, json_bytes, read_json
 
@@ -54,6 +55,7 @@ def configuration(snapshot: dict, rules_dir: Path, model_id: str, threshold: int
         "companies_sha256": digest(snapshot["companies_text"].encode()),
         "prompt_sha256": rules["parse-prompt.md"],
         "model_sha256": digest(model_id.encode()),
+        "pairing_version": PAIRING_VERSION,
         "pairing_sha256": pairing_fingerprint(threshold),
         "measure_sha256": measure_fingerprint(threshold),
         "legacy_companies": legacy, "release": release, "retries": retries,
@@ -138,6 +140,17 @@ class SavedReplies:
         record = read_json(raw)
         if record["user_sha256"] != user_sha or record["system_sha256"] != system_sha:
             raise RegressionError("录制的用户消息或系统消息指纹与本次解析不一致。")
+        self.request = record.get("request")
+        self.request_sha256 = record.get("request_sha256")
+        if self.request is not None:
+            from .batches import common_body
+            wire = json.loads(self.request)
+            if (digest(common_body(self.request).encode()) != self.request_sha256
+                or digest(wire["messages"][0]["content"].encode()) != user_sha
+                or digest(wire["system"].encode()) != system_sha):
+                raise RegressionError("录制的请求正文或业务字节指纹不同。")
+        if record.get("document_sha256", digest(token.encode())) != digest(token.encode()):
+            raise RegressionError("录制的篇目标识不同。")
         attempts = record["attempts"]
         if (self.legacy_recording and record["failure_stage"] == "reply_parse" and attempts
             and attempts[-1]["failure_stage"] is None):
@@ -182,10 +195,18 @@ class Recording:
         self.origin_run_id = origin_run_id
         self.replaces_run_id = replaces_run_id
         self.run_id = uuid4().hex
+        self.reconstruction_sha256 = None
+        self.ledger = None
+        self.extra_hashes = {}
+        self.batch_seconds = None
+        self.requests = {}
+        self.request_hashes = {}
         self.by_user = {}
         self.artifacts = {}
         self.unfinished_calls = False
         self.attempt_count = 0
+        self.missing_usage = 0
+        self.attempt_failures = Counter()
         self.usage_counts = Counter()
         self.usage_totals = Counter()
         self.probe_fingerprints = []
@@ -202,6 +223,8 @@ class Recording:
             saved = self.source if isinstance(self.source, SavedReplies) else None
             if saved is not None:
                 self.document["attempts"] = saved.for_attempts(token, user_sha, system_sha)
+                if saved.request is not None:
+                    self.document.update(request=saved.request, request_sha256=saved.request_sha256)
             elif self.source is not None:
                 self.document["attempts"] = self.source(token, user_sha, system_sha)
             else:
@@ -268,7 +291,17 @@ class Recording:
         code: str | None = None, path: tuple = (), evidence_location: dict | None = None,
     ) -> bool:
         """写入本篇录制，返回是否有传输中断造成的截断。"""
+        if token in self.requests:
+            from .batches import common_body
+            raw = self.requests[token]
+            self.document.update(request=raw, request_sha256=digest(common_body(raw).encode()))
+        if self.document.get("request_sha256"):
+            self.request_hashes[digest(token.encode())] = self.document["request_sha256"]
         attempts = self.document["attempts"]
+        if self.origin == "live" and self.mode == "batch" and len(attempts) != 1:
+            raise RegressionError("批量结果未逐篇录制，保留预占并停止结算。")
+        for attempt in attempts:
+            attempt.setdefault("batch_outcome", None)
         if status == "model_failed":
             failure = attempts[-1]["failure_stage"] if attempts else "model_call"
         elif status == "parse_failed":
@@ -279,7 +312,7 @@ class Recording:
             failure = None
         self.unfinished_calls |= status == "model_failed" or failure == "parse_setup"
         record = {
-            **self.document, "run_id": self.run_id, "configuration": self.config,
+            **self.document, "run_id": self.run_id, "configuration": self.config, "document_sha256": digest(token.encode()),
             "model": self.model_id, "failure_stage": failure, "protocol_version": PROTOCOL_VERSION,
             "reason_code": code, "structure_path": path, "evidence_location": evidence_location,
         }
@@ -296,24 +329,40 @@ class Recording:
                 ])))
         self.attempt_count += len(attempts)
         for attempt in attempts:
+            if attempt["failure_stage"] is not None:
+                self.attempt_failures[_reply_failure(attempt) or attempt["failure_stage"]] += 1
+            self.missing_usage += any(type(attempt.get(k)) is not int for k in USAGE_KEYS[:2])
             for key in USAGE_KEYS:
-                if type(attempt[key]) is int:
+                if type(attempt.get(key)) is int:
                     self.usage_counts[key] += 1
                     self.usage_totals[key] += attempt[key]
-        return any(_interrupted_with_text(attempt) for attempt in attempts)
+        if self.ledger and self.mode == "instant" and len(self.artifacts) == len(self.names):
+            self.ledger.record_cost(self.run_id, reference_cost(
+                self.model_id, self.mode, self.usage_totals, self.missing_usage, live=True))
+        return bool(attempts and _interrupted_with_text(attempts[-1]))
 
     def complete(self, report_digest: str, threshold: int, *, run_day: str) -> None:
         origin_run_id = self.origin_run_id
         if self.origin == "probe":
             origin_run_id = digest(json_bytes(sorted(self.probe_fingerprints)))
         self.output.write(MANIFEST, json_bytes({
-            "schema": 1, "run_id": self.run_id, "origin": self.origin, "origin_run_id": origin_run_id,
+            **({"ledger": self.ledger.evidence()} if self.ledger else {}),
+            "schema": 1, "mode": self.mode, "tier": self.tier, "run_id": self.run_id, "origin": self.origin, "origin_run_id": origin_run_id,
             "replaces_run_id": self.replaces_run_id,
             "source_code_measured": self.origin == "live", "model": self.model_id, "configuration": self.config,
             "threshold": threshold, "run_day": run_day,
             "artifact_sha256": self.artifacts, "documents_by_user_sha256": self.by_user,
             "public_report_sha256": report_digest,
+            "request_set_sha256": self.request_set_sha256(),
+            "reconstruction_sha256": self.reconstruction_sha256,
+            "batch_seconds": self.batch_seconds, "extra_sha256": self.extra_hashes,
+            "effective_retries": 0 if self.mode == "batch" else self.config["retries"],
         }))
+
+    def request_set_sha256(self):
+        if len(self.request_hashes) == len(self.names):
+            return digest(json_bytes(self.request_hashes))
+        return None
 
     def public_usage(self) -> dict:
         return {
@@ -323,3 +372,48 @@ class Recording:
                 "total": self.usage_totals[key] if self.usage_counts[key] else None,
             } for key in USAGE_KEYS},
         }
+
+
+def reference_cost(model_id, mode, usage, missing, *, live):
+    prices = {"claude-sonnet-5-5": Decimal("2"), "claude-haiku-5-5": Decimal("0.10")}
+    price = prices.get(model_id)
+    rate = cost = None
+    if price is not None:
+        rate = price / (2 if mode == "batch" else 1)
+        cost = rate * (usage["input_tokens"] + 5 * usage["output_tokens"]) / 1000000
+    known = str(cost) if cost is not None else None
+    return {"mode": mode, "input_per_million": str(rate) if rate is not None else None,
+            "output_per_million": str(rate * 5) if rate is not None else None,
+            "known_usd": known, "missing_attempts": missing, "usage_status": "用量部分未知" if missing else "用量完整",
+            "new_known_usd": known if live else "0"}
+
+
+def historical_cost(files, directory, expected_sha):
+    raw = files.read(directory / MANIFEST)
+    if digest(raw) != expected_sha:
+        raise RegressionError("历史运行清单与登记指纹不同。")
+    manifest = SavedReplies(files, directory).manifest
+    report = files.read(directory / "public-report.json")
+    if digest(report) != manifest["public_report_sha256"]:
+        raise RegressionError("历史用量报告指纹不同。")
+    usage = Counter()
+    attempts = missing = 0
+    for name, checksum in manifest["artifact_sha256"].items():
+        raw = files.read(directory / name)
+        if digest(raw) != checksum:
+            raise RegressionError("历史逐篇用量证据指纹不同。")
+        for attempt in read_json(raw)["attempts"]:
+            attempts += 1
+            missing += any(attempt.get(k) is None for k in USAGE_KEYS[:2])
+            for k in USAGE_KEYS[:2]:
+                value = attempt.get(k)
+                if value is not None:
+                    if type(value) is not int or value < 0:
+                        raise RegressionError("历史用量无效。")
+                    usage[k] += value
+    if read_json(report)["usage"]["attempts"] != attempts:
+        raise RegressionError("历史尝试次数与原报告不一致。")
+    mode = manifest.get("mode", "instant")
+    if mode not in {"instant", "batch"}:
+        raise RegressionError("历史调用方式不明。")
+    return manifest, reference_cost(manifest["model"], mode, usage, missing, live=True)

@@ -58,7 +58,7 @@ def test_ai_platform_is_loaded_and_redacted(tmp_path):
     config = load_config("AI_PLATFORM", env_file=env_file)
     assert config["AI_PLATFORM"] == "placeholder-platform"
     assert "AI_PLATFORM=[已脱敏]" in repr(config)
-    with pytest.raises(ConfigError, match="AI_PLATFORM.*只支持 Anthropic") as error:
+    with pytest.raises(ConfigError, match="AI_PLATFORM.*不受支持") as error:
         configured_model(config)
     assert "placeholder-platform" not in str(error.value)
 

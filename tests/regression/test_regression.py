@@ -8,13 +8,14 @@ from collections import Counter
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
 from datetime import datetime, timedelta
+from itertools import combinations
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from qianshu import parse
-from qianshu.draft import DraftField, PackageRow, Uncertainty
+from qianshu.draft import DraftField, PackageRow, SourceExcerpt, Uncertainty
 from qianshu.regression import freeze as freeze_module, runner
 from qianshu.regression.__main__ import main
 from qianshu.regression.compare import FIELD_LABELS, compare_field, normalize
@@ -170,6 +171,18 @@ def frozen(repo, corpus, capsys):
     checksum = output.splitlines()[-1]
     assert len(checksum) == 64
     return checksum
+
+
+def assert_replay(repo):
+    source = get_json(repo / "run/public-report.json")
+    replay = get_json(repo / "replay/public-report.json")
+    assert replay["cost"]["new_known_usd"] == "0"
+    charge = source["cost"]["new_known_usd"]
+    source["cost"]["new_known_usd"] = "0"
+    assert source == replay
+    assert (repo / "replay/public-report.md").read_text() == (repo / "run/public-report.md").read_text().replace(
+        f"本次新增 {charge} 美元", "本次新增 0 美元")
+    assert (repo / "replay/mismatches.json").read_bytes() == (repo / "run/mismatches.json").read_bytes()
 
 
 def run_args(fingerprint, output=".private/run"):
@@ -707,6 +720,7 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
             {"country": {"value": "莫桑比克", "evidence": [SECOND]},
              "user_scope": {"value": "占位金标乙", "evidence": ["占位正文乙"]}},
             {"country": {"value": "赞比亚", "evidence": [FIRST]},
+             "benefit_type": {"value": "赠送时长", "evidence": [FIRST]},
              "user_scope": {"value": "占位不同值", "evidence": ["占位正文甲"]}},
         ], policy_ranges=[(split, len(body)), (0, split)])
 
@@ -718,6 +732,8 @@ def test_cli_uses_real_parser_once_per_frozen_original_and_never_shrinks_denomin
     output = repo / "run"
     report = get_json(output / "public-report.json")
     assert report["freeze_sha256"] == frozen
+    recorded_config = get_json(output / "recording.json")["configuration"]
+    assert report["business"]["pairing_version"] == recorded_config["pairing_version"] == 4
     assert report["documents"] == {"parsed": 1, "model_failed": 1, "parse_failed": 0}
     assert report["sample_alignment"]["matched"] == 2
     assert report["by_field"]["company"]["match"] == 1
@@ -957,14 +973,14 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
         assert "tool_choice" not in payload
         assert "必须调用 `submit_application_reply` 一次" in payload["system"]
         assert "不要用文字回答" in payload["system"]
-        return nullcontext([SimpleNamespace(type="message_start", message=reply)])
+        return nullcontext([SimpleNamespace(type="message_start", message=reply), SimpleNamespace(type="message_stop")])
 
     client = SimpleNamespace(messages=SimpleNamespace(create=stream))
     monkeypatch.setattr(anthropic, "Anthropic", lambda **_: nullcontext(client))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.delenv("ANTHROPIC_EFFORT", raising=False)
-    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     assert efforts == ["medium", "medium"]
     report = get_json(repo / "run/public-report.json")
     assert report["documents"] == {"model_failed": 0, "parse_failed": 2, "parsed": 0}
@@ -975,7 +991,7 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
     assert attempt["failure_stage"] == record["reason_code"] == "reply_tool_missing"
     assert json.loads(attempt["reply"]) == [block.model_dump(exclude_unset=True) for block in blocks]
     monkeypatch.setenv("ANTHROPIC_EFFORT", "high")
-    assert main([*run_args(frozen, ".private/high"), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen, ".private/high"), "--live", "--mode", "instant", "--run-id", "high", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     assert efforts == ["medium", "medium", "high", "high"]
     high_record = get_json(repo / "high/document-00001.json")
     assert high_record["attempts"][0]["effort"] == high_record["configuration"]["effort"] == "high"
@@ -983,17 +999,17 @@ def test_release_records_and_replays_reply_without_tool_use(repo, frozen, monkey
     assert high_report["configuration_sha256"] != report["configuration_sha256"]
 
     monkeypatch.setenv("ANTHROPIC_EFFORT", "unsupported")
-    assert main([*run_args(frozen, ".private/invalid"), "--live", "--release"]) == 1
+    assert main([*run_args(frozen, ".private/invalid"), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release"]) == 1
     assert not (repo / "invalid").exists()
     assert main(_replay_args(frozen)) == 0
     assert efforts == ["medium", "medium", "high", "high"]
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 @pytest.mark.parametrize(("stop", "reason"), [
     ("max_tokens", "reply_truncated"),
     ("stop_sequence", "reply_incomplete"),
+    ("refusal", "reply_refused"),
 ])
 def test_incomplete_reply_is_counted_even_when_release_is_void(repo, frozen, monkeypatch, stop, reason):
     from qianshu.parse.model import CallResult, ModelError
@@ -1010,19 +1026,19 @@ def test_incomplete_reply_is_counted_even_when_release_is_void(repo, frozen, mon
         return model
 
     monkeypatch.setattr("qianshu.regression.__main__.configured_model", configured)
-    assert main([*run_args(frozen), "--live", "--release"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release"]) == 0
     report = get_json(repo / "run/public-report.json")
     assert report["void"] is True
     assert report["documents"] == {"model_failed": 1, "parse_failed": 1, "parsed": 0}
     assert report["business"]["counts"]["reply_parse_failed"] == 1
     assert report["business"]["reply_parse_failure_reasons"][reason] == 1
     record = get_json(repo / "run/document-00001.json")
+    assert f"拒答 {int(stop == 'refusal')}" in (repo / "run/public-report.md").read_text()
     assert record["failure_stage"] == reason
     attempt, = record["attempts"]
     assert (attempt["reply"], attempt["stop_reason"]) == ("[", stop)
     assert main(_replay_args(frozen)) == 0
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 @pytest.mark.parametrize("status", [503, 307])
@@ -1036,13 +1052,13 @@ def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monk
         requests[json.loads(request.content)["messages"][0]["content"]] += 1
         return httpx.Response(status, headers={"Location": "/redirected"})
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kwargs: httpx.Client(
         transport=httpx.MockTransport(reply), **kwargs,
     ))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
-    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     report = get_json(repo / "run/public-report.json")
     assert len(requests) == 2 and set(requests.values()) == {2}
     assert report["usage"]["attempts"] == sum(requests.values())
@@ -1102,13 +1118,13 @@ def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, froze
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               content=b"".join(_stream_reply_events(text)))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kwargs: httpx.Client(
         transport=httpx.MockTransport(reply), **kwargs,
     ))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
-    assert main([*run_args(frozen), "--live", "--release"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release"]) == 0
     report = get_json(repo / "run/public-report.json")
     assert report["void"] is False
     assert report["documents"] == {"model_failed": 0, "parse_failed": 1, "parsed": 1}
@@ -1119,8 +1135,7 @@ def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, froze
     assert attempt["failure_stage"] == record["reason_code"] == "tool_input_json"
     assert (attempt["reply"], attempt["stop_reason"]) == (invalid, "tool_use")
     assert main(_replay_args(frozen)) == 0
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 @pytest.mark.parametrize(("interruption", "retry_reply"), [
@@ -1154,13 +1169,13 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=ReplyStream("[" if text is None else text, text is None))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kwargs: httpx.Client(
         transport=httpx.MockTransport(reply), **kwargs,
     ))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "placeholder-key")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.example.invalid")
-    assert main([*run_args(frozen), "--live", "--release", "--retries", "1"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
     report = get_json(repo / "run/public-report.json")
     assert report["usage"]["attempts"] == 3
@@ -1169,13 +1184,14 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         "model_failed": int(retry_reply is None), "parse_failed": int(retry_reply == "invalid"),
         "parsed": 1 + int(retry_reply == "valid"),
     }
-    assert report["business"]["counts"]["reply_parse_failed"] == 1
+    assert report["business"]["counts"]["reply_parse_failed"] == int(retry_reply != "valid")
     assert report["business"]["reply_parse_failure_reasons"] == {
-        "reply_truncated": 1, "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0,
+        "reply_truncated": int(retry_reply is None), "reply_parse": int(retry_reply == "invalid"), "reply_incomplete": 0, "reply_refused": 0,
     }
     record = get_json(repo / "run/document-00001.json")
     first, second = record["attempts"]
-    partial_stage = "model_incomplete" if interruption == "eof" else "reply_truncated"
+    assert sum(report["attempt_failures"].values()) == 1 + int(second["failure_stage"] is not None)
+    partial_stage = "reply_truncated"
     assert (first["failure_stage"], first["reply"]) == (partial_stage, "[")
     if retry_reply is None:
         assert (second["failure_stage"], second["reply"]) == (partial_stage, "[")
@@ -1188,8 +1204,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         assert second["reply"] == "{}"
     assert main(_replay_args(frozen)) == 0
     assert requests == {BATCH: 2, "占位单条原稿\n": 1}
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
 
 
 class LaterClock(datetime):
@@ -1255,7 +1270,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         return model
 
     monkeypatch.setattr("qianshu.regression.__main__.configured_model", configured)
-    assert main([*run_args(frozen), "--live", "--release", "--threshold", "3"]) == 0
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "first", "--estimate-usd", "1", "--release", "--threshold", "3"]) == 0
     assert attempts == {BATCH: 2, "占位单条原稿\n": 2}
     recording = get_json(repo / "run" / "recording.json")
     assert recording["threshold"] == 3
@@ -1273,7 +1288,8 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
         assert failed["failure_stage"] == "model_call"
         assert failed["effort"] == "medium"
         assert final == {
-            "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
+            "first_shape_error": None, "retry_result": None, "partial_input_tokens": None, "partial_output_tokens": None,
+            "batch_outcome": None, "stop_reason": "end_turn", "blocks": [{"type": "thinking", "length": 5},
                                                  {"type": "text", "length": len(final["reply"])}],
             "input_tokens": 12, "output_tokens": 3, "elapsed_ms": 20,
             "model": "synthetic-model", "reply": final["reply"], "failure_stage": None, "effort": "medium",
@@ -1293,8 +1309,7 @@ def test_recorded_calls_replay_byte_for_byte_without_model_access(repo, frozen, 
 
     monkeypatch.setattr("qianshu.regression.__main__.configured_model", forbidden)
     assert main(_replay_args(frozen), model=forbidden) == 0
-    for name in runner.RUN_FILES:
-        assert (repo / "replay" / name).read_bytes() == (repo / "run" / name).read_bytes()
+    assert_replay(repo)
     report = get_json(repo / "run" / "public-report.json")
     assert report["evidence_location"] == expected_locations
     assert report["business"]["counts"]["reply_parse_failed"] == 1
@@ -1335,6 +1350,7 @@ def test_import_uses_probe_format_and_private_paths(repo, frozen, capsys):
     for name in imported["artifact_sha256"]:
         record = get_json(repo / "imported" / name)
         assert record["attempts"] == [{
+            "batch_outcome": None,
             "reply": serialized_empty(), "failure_stage": None, "model": "synthetic", "stop_reason": None, "blocks": None,
             "input_tokens": None, "output_tokens": None, "elapsed_ms": None,
         }]
@@ -1363,17 +1379,21 @@ def test_summarize_uses_exact_ratios_and_does_not_count_replay_or_void(repo, fro
     for name, model in (("first", no_policies), ("second", no_policies), ("void", one_failed_reply)):
         assert main([*run_args(frozen, f".private/{name}"), "--release"], model=model) == 0
     void = get_json(repo / "void" / "public-report.json")
+    config = get_json(repo / "void" / "recording.json")["configuration"]
     assert void["void"] and void["business"] == {
+        "pairing_version": 4, "pairing_sha256": config["pairing_sha256"], "measure_sha256": config["measure_sha256"],
         "counts": {"reply_parse_failed": 1},
-        "reply_parse_failure_reasons": {"reply_parse": 1, "reply_incomplete": 0, "reply_truncated": 0},
+        "reply_parse_failure_reasons": {"reply_parse": 1, "reply_incomplete": 0, "reply_truncated": 0, "reply_refused": 0},
     }
+    markdown = (repo / "void" / "public-report.md").read_text()
+    assert all(config[key] in markdown for key in ("pairing_sha256", "measure_sha256"))
     assert "sample_alignment" not in void
     args = ["summarize", "--recording", ".private/first", "--recording", ".private/second",
             "--recording", ".private/void", "--out", ".private/summary"]
     assert main(args) == 0
     summary = get_json(repo / "summary" / "public-summary.json")
     assert (summary["runs"], summary["valid_runs"], summary["void_runs"]) == (3, 2, 1)
-    assert summary["business_counts"]["reply_parse_failed"] == {"values": [0, 0, 1], "mean": 1 / 3, "min": 0, "max": 1}
+    assert summary["business_counts"]["reply_parse_failed"] == {"values": [0, 0], "mean": 0, "min": 0, "max": 0}
     assert summary["old_alignment"]["unmatched"] == {"values": [3, 3], "mean": 3, "min": 3, "max": 3}
     assert summary["business_rates_percent"]["all_correct"]["fractions"] == [
         {"numerator": 0, "denominator": 3}, {"numerator": 0, "denominator": 3},
@@ -1404,6 +1424,12 @@ def test_business_pairing_maximizes_whole_assignment(scores, matches, ambiguous_
     assert optimal_pairs(scores) == (matches, ambiguous_policies, ambiguous_drafts)
 
 
+def located_field(value, text="占位"):
+    field = DraftField(value=value, evidence=[SourceExcerpt(text=text, start=0)])
+    field.value_source = "原文"
+    return field
+
+
 @pytest.mark.parametrize("name", ["packages", "user_tags"])
 @pytest.mark.parametrize("excluded", [False, True])
 def test_business_pairing_reliable_key_outweighs_other_matches(name, excluded):
@@ -1432,8 +1458,8 @@ def test_business_pairing_reliable_key_outweighs_other_matches(name, excluded):
         derived = [PackageRow(**row) for row in opposite] if name == "packages" else opposite
         drafts.append(SimpleNamespace(
             to_dict=lambda: {},
-            **{key: DraftField(value=number) for key, number in keys.items()},
-            **{name: DraftField(value=derived)},
+            **{key: located_field(number) for key, number in keys.items()},
+            **{name: located_field(derived)},
         ))
     frozen = {
         "samples": {pair["id"]: {"country": "占位地区", "benefit_type": "赠送时长"} for pair in pairs},
@@ -1456,7 +1482,6 @@ def test_business_pairing_reliable_key_outweighs_other_matches(name, excluded):
     (["　占位ＡＢＣ＿ＩＭＡＧＥ ", "占位beta"], ["占位Abc", "占位Beta"]),
 ])
 def test_business_pairing_normalizes_tags_and_grades_original_values(gold_tags, draft_tags):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, WEIGHTS
 
     pair = {"id": "policy", "configuration": {"user_tags": {"value": sorted(gold_tags)}}}
@@ -1466,7 +1491,7 @@ def test_business_pairing_normalizes_tags_and_grades_original_values(gold_tags, 
     }
     body = "占位原文"
     draft = SimpleNamespace(
-        user_tags=DraftField(value=draft_tags, evidence=[SourceExcerpt(text=body, start=0)]),
+        user_tags=located_field(draft_tags, body),
         to_dict=lambda: {},
     )
 
@@ -1477,6 +1502,132 @@ def test_business_pairing_normalizes_tags_and_grades_original_values(gold_tags, 
     assert policy["positive_scores"] == [{"draft": 0, "score": WEIGHTS["user_tags"], "keys": ["user_tags"]}]
     assert policy["fields"] == {"user_tags": "false_determined"}
     assert draft.user_tags.value == draft_tags
+
+
+@pytest.mark.parametrize(("status", "quotes", "weight"), [
+    ("确定", ["赞比亚"], 4), ("歧义", ["赞比亚"], 4),
+    ("确定", [], 0), ("歧义", ["不存在"], 0),
+    ("确定", ["赞比亚", "不存在"], 0),
+])
+def test_country_pairing_uses_located_model_value(status, quotes, weight):
+    from qianshu.regression.business import BusinessScore
+    from tests.parse.test_names import parse_one
+
+    body = "合成政策适用于赞比亚"
+    reply = fixed_reply(body, [{"country": {"value": "赞比亚", "evidence": quotes}}])
+    reply["policies"][0]["fields"]["country"]["status"] = status
+    draft = parse_one(body, reply)
+    sample = {"country": "赞比亚", "benefit_type": "赠送时长"}
+    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {"占位公司甲": "赞比亚"})
+    policy = score.add({"body": body}, [{"id": "p", "configuration": {}}], [draft])["policies"][0]
+    assert draft.field_results["country"].needs_confirmation == (status != "确定" or weight == 0)
+    assert policy["positive_scores"] == ([{"draft": 0, "score": weight, "keys": ["country_or_company"]}]
+                                         if weight else [])
+
+
+@pytest.mark.parametrize("explicit_company", [False, True])
+def test_pairing_preserves_r10_company_and_its_country_mapping(explicit_company):
+    from qianshu.regression.business import BusinessScore
+    from tests.parse.test_names import parse_one
+
+    body = "Mozambique 占位 TMT 公司"
+    fields = {"country": {"value": "Mozambique", "evidence": ["Mozambique"]}}
+    if explicit_company:
+        company = "占位 TMT 公司"
+        fields["company"] = {"value": company, "evidence": [company]}
+        fields["company_keyword"] = {"value": ["TMT"], "evidence": ["TMT"]}
+        # 只有映射回中文国家才能得分。
+        sample, configuration = {"country": "莫桑比克"}, {}
+    else:
+        company = "占位莫桑比克默认公司"
+        # 独立验证 R10 默认公司本身的得分。
+        sample, configuration = {"country": "合成其他地区"}, {"company": {"value": company}}
+    draft = parse_one(body, fixed_reply(body, [fields]))
+    assert draft.field_results["company"].source == "查表派生"
+    assert draft.company.value == company
+    sample["benefit_type"] = "赠送时长"
+    frozen = {"samples": {"p": sample}, "denominators": {"fields": {}}}
+    score = BusinessScore(frozen, 2, {company: "莫桑比克"})
+    pair = {"id": "p", "configuration": configuration}
+    policy, = score.add({"body": body}, [pair], [draft])["policies"]
+    assert policy["positive_scores"] == [{"draft": 0, "score": 4, "keys": ["country_or_company"]}]
+
+
+def test_first_round_preserves_v3_scores_for_every_nonempty_subset_of_confirmed_keys():
+    from qianshu.regression.business import BusinessScore
+
+    # 各组在 v3 中的独立贡献，覆盖复合日期键与两个空集合的权重。
+    groups = [
+        ({"company": "合成公司"}, 4), ({"benefit_type": "赠送时长"}, 2),
+        ({"packages": []}, 4), ({"recharge_days": 10}, 2), ({"gift_days": 5}, 2),
+        ({"recharge_amount": 20}, 2), ({"user_tags": []}, 3),
+        ({"start_date": "2099-01-01", "end_date": "2099-01-15"}, 2),
+    ]
+    values = {name: value for group, _ in groups for name, value in group.items()}
+    sample = {"country": "合成国家", "benefit_type": "赠送时长"}
+    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {})
+    pair = {"id": "p", "configuration": {name: {"value": value} for name, value in values.items()}}
+    for size in range(1, len(groups) + 1):
+        for subset in combinations(groups, size):
+            fields = {name: DraftField(value=value) for group, _ in subset for name, value in group.items()}
+            expected_v3 = sum(weight for _, weight in subset)
+            pending_gift = "gift_days" not in fields
+            if pending_gift:
+                fields["gift_days"] = located_field(5)
+                fields["gift_days"].uncertainty = Uncertainty(reason="合成待确认")
+            draft = SimpleNamespace(**fields, to_dict=lambda: {})
+            policy, = score.add({"body": "占位"}, [pair], [draft])["policies"]
+            assert policy["draft"] == 0
+            assert policy["positive_scores"][0]["score"] == expected_v3
+
+
+@pytest.mark.parametrize("first_round_tie", [False, True])
+def test_second_round_only_pairs_remaining_policies_and_drafts(first_round_tie):
+    from qianshu.regression.business import BusinessScore
+
+    def pending(value):
+        field = located_field(value)
+        field.uncertainty = Uncertainty(reason="合成待确认")
+        return field
+
+    pairs = [
+        {"id": "remaining", "configuration": {"gift_days": {"value": 5}}},
+        {"id": "first", "configuration": {"recharge_days": {"value": 10}}},
+    ]
+    frozen = {
+        "samples": {p["id"]: {"country": "合成地区", "benefit_type": "赠送时长"} for p in pairs},
+        "denominators": {"fields": {}},
+    }
+    # 全表补分会使两个草稿对两条政策都得 2 分，抹掉首轮唯一配对。
+    drafts = [
+        SimpleNamespace(recharge_days=pending(10), gift_days=pending(5), to_dict=dict),
+        SimpleNamespace(recharge_days=located_field(10), gift_days=pending(5), to_dict=dict),
+    ]
+    if first_round_tie:
+        drafts.append(SimpleNamespace(recharge_days=located_field(10), to_dict=dict))
+    result = BusinessScore(frozen, 2, {}).add({"body": "占位"}, pairs, drafts)
+    remaining, first = result["policies"]
+    assert remaining["draft"] == 0 and not remaining["tie"]
+    assert remaining["positive_scores"] == [{"draft": 0, "score": 2, "keys": ["gift_days"]}]
+    assert first["tie"] == first_round_tie
+    assert first["draft"] == (None if first_round_tie else 1)
+    assert [row["draft"] for row in result["ambiguous_drafts"]] == ([1, 2] if first_round_tie else [])
+    assert result["unpaired_drafts"] == []
+
+
+def test_package_pairing_uses_model_rows_before_card_projection():
+    from qianshu.regression.business import BusinessScore
+    from tests.parse.test_names import parse_one
+
+    body = "合成甲包赠乙包"
+    rows = [{"current_package": "甲包", "gift_package": "乙包"}]
+    draft = parse_one(body, fixed_reply(body, [{"packages": {"value": rows, "evidence": [body]}}]))
+    assert draft.packages.uncertainty is not None
+    sample = {"country": "占位", "benefit_type": "升级权益"}
+    score = BusinessScore({"samples": {"p": sample}, "denominators": {"fields": {}}}, 2, {})
+    pair = {"id": "p", "configuration": {"packages": {"value": rows}}}
+    policy, = score.add({"body": body}, [pair], [draft])["policies"]
+    assert policy["positive_scores"] == [{"draft": 0, "score": 8, "keys": ["packages"]}]
 
 
 def test_tag_pairing_key_removes_only_known_suffix_and_fingerprints_it(monkeypatch):
@@ -1507,7 +1658,6 @@ def test_tag_pairing_key_removes_only_known_suffix_and_fingerprints_it(monkeypat
     ({}, {"inferable": True, "auto_allowed": True}, 30, False, 0, "unknown"),
 ])
 def test_business_grades_all_categories(entry, mark, value, confirmation, start, status):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import grade
 
     field = DraftField(value=value, evidence=[SourceExcerpt(text="占位 30 天", start=start)],
@@ -1549,7 +1699,6 @@ def test_business_keeps_legacy_default_score_without_verification_metadata():
 
 
 def test_business_maps_included_gold_and_separates_extras_from_unknown():
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, grade, pairing_audit
 
     mark = {"inferable": True, "auto_allowed": True}
@@ -1559,8 +1708,8 @@ def test_business_maps_included_gold_and_separates_extras_from_unknown():
 
     def draft(name, value=None):
         return SimpleNamespace(
-            company=DraftField(value=name),
-            recharge_days=DraftField(value=value, evidence=[SourceExcerpt(text="占位 30 天", start=0)]),
+            company=located_field(name),
+            recharge_days=located_field(value, "占位 30 天"),
             to_dict=lambda: {},
         )
 
@@ -1615,7 +1764,7 @@ def test_pairing_audit_caps_ambiguous_groups_in_frozen_order():
         "denominators": {"fields": {}},
     }
     score = BusinessScore(snapshot, 2, {})
-    draft = SimpleNamespace(recharge_days=DraftField(value=30), to_dict=lambda: {})
+    draft = SimpleNamespace(recharge_days=located_field(30), to_dict=lambda: {})
     documents = []
     for token in tokens:
         pairs = [
@@ -1635,7 +1784,6 @@ def test_pairing_audit_caps_ambiguous_groups_in_frozen_order():
 
 @pytest.mark.parametrize("dataset", ["exam", "blind", "packages"])
 def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore, G285_MAPPING, measure_fingerprint
 
     values = {
@@ -1660,7 +1808,7 @@ def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
     draft = SimpleNamespace(
         trigger_once=confirmed, effective_multiplier=DraftField(value=2), cancel_on_downgrade=confirmed,
         maintain_mutual_exclusion_group=confirmed, repeat_bonus=default,
-        recharge_days=DraftField(value=30, evidence=[SourceExcerpt(text="占位", start=0)]),
+        recharge_days=located_field(30),
         user_scope=confirmed, gift_days=DraftField(value=90), benefit_type=DraftField(value="赠送时长"),
         to_dict=lambda: {},
     )
@@ -1697,7 +1845,6 @@ def test_g285_uses_frozen_facts_defaults_and_denominators(dataset, monkeypatch):
     ("historical_rule", "确定", "定向政策", "冲突", True, False),
 ])
 def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, name_status, name_review, type_review):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore
 
     values = {"policy_name": "占位标签甲", "policy_type": policy_type}
@@ -1719,7 +1866,7 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
     score = BusinessScore(frozen, 2, {})
     review = {"policy_name": name_review, "policy_type": type_review}
     for confirmed in (False, True):
-        draft = SimpleNamespace(benefit_type=DraftField(value="赠送时长"), to_dict=lambda: {})
+        draft = SimpleNamespace(benefit_type=located_field("赠送时长"), to_dict=lambda: {})
         for name, value in values.items():
             field = (DraftField(value=value, evidence=[SourceExcerpt(text=document["body"], start=0)]) if confirmed
                      else DraftField(uncertainty=Uncertainty(reason="占位待确认")))
@@ -1735,7 +1882,6 @@ def test_g285_rates_name_and_type_by_frozen_tags(tags, tag_status, policy_type, 
     (True, "justified_confirmation"),
 ])
 def test_g285_uses_frozen_pairing_tags_when_tag_gold_is_excluded(confirm, expected):
-    from qianshu.draft import SourceExcerpt
     from qianshu.regression.business import BusinessScore
 
     tags = ["占位标签甲", "占位标签乙"]
@@ -1761,7 +1907,7 @@ def test_g285_uses_frozen_pairing_tags_when_tag_gold_is_excluded(confirm, expect
         benefit_type=DraftField(value=sample["benefit_type"]),
         policy_name=DraftField(value=tags[0], evidence=evidence, uncertainty=uncertainty),
         policy_type=DraftField(value="公开政策", evidence=evidence, uncertainty=uncertainty),
-        user_tags=DraftField(value=tags, evidence=evidence),
+        user_tags=located_field(tags, body),
         to_dict=lambda: {},
     )
 
@@ -1810,7 +1956,6 @@ def test_g285_rates_derived_company_packages_and_downgrade_by_frozen_inputs():
     ("冲突", [], "占位公司甲", True),
 ])
 def test_g285_rates_company_using_r10_table_and_frozen_facts(company_status, keywords, default_name, review):
-    from qianshu.draft import SourceExcerpt
     from qianshu.parse.companies import CompanyRow
     from qianshu.regression.business import BusinessScore
 
@@ -1829,7 +1974,7 @@ def test_g285_rates_company_using_r10_table_and_frozen_facts(company_status, key
     score = BusinessScore(frozen, 2, {}, company_table={sample["country"]: rows})
 
     def rate(field):
-        draft = SimpleNamespace(company=field, benefit_type=DraftField(value="赠送时长"), to_dict=lambda: {})
+        draft = SimpleNamespace(company=field, benefit_type=located_field("赠送时长"), to_dict=lambda: {})
         return score.add({"body": body}, [pair], [draft])["policies"][0]["fields"]["company"]
 
     assert rate(DraftField(uncertainty=Uncertainty(reason="占位人工确认"))) == (
@@ -1934,7 +2079,6 @@ def test_freeze_packages_accepts_any_reviewed_subset_of_targeted_pool(repo, corp
 
 @pytest.mark.parametrize(("ambiguous_benefit", "ambiguous_pairing"), [(False, False), (True, False), (True, True)])
 def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch, ambiguous_benefit, ambiguous_pairing):
-    from qianshu.draft import SourceExcerpt
 
     review = {
         "schema": 1,
@@ -1989,16 +2133,15 @@ def test_freeze_and_replay_two_package_styles(repo, corpus, capsys, monkeypatch,
     def parsed(body, *, model, on_reply, **kwargs):
         on_reply(model(system="占位提示", user=json.dumps({"application": body})))
         base = {name: DraftField() for name in parse.ParsedPolicyDraft.__dataclass_fields__}
-        named_package = DraftField(value=[PackageRow(current_package="占位包甲", gift_package="占位赠包甲")],
-                                   evidence=[SourceExcerpt(text=FIRST, start=BATCH.index(FIRST))])
+        named_package = located_field([PackageRow(current_package="占位包甲", gift_package="占位赠包甲")], FIRST)
         if ambiguous_benefit:
             named_package = DraftField(uncertainty=Uncertainty(reason="占位优惠类型待确认"))
         return [parse.ParsedPolicyDraft(**{
             **base,
-            "company": DraftField(value=company),
-            "benefit_type": DraftField(value="赠送时长"),
+            "company": located_field(company, FIRST),
+            "benefit_type": located_field("赠送时长", FIRST),
             "packages": field,
-            "user_tags": DraftField(value=[tag] if use_reviewed_tags else None),
+            "user_tags": located_field([tag] if use_reviewed_tags else None, FIRST),
         }) for company, field, tag in (
             ("占位默认公司", named_package, "占位标签甲"),
             ("占位默认公司", DraftField(uncertainty=Uncertainty(reason="占位仅档位")), "占位标签乙"),
@@ -2082,9 +2225,9 @@ def test_blind_freeze_persists_reviewed_business_marks_and_excludes_duplicate_do
     assert main(_replay_args(checksum)) == 0
     assert (repo / "run/public-report.json").read_bytes() == (repo / "replay/public-report.json").read_bytes()
 
-def test_amount_dates_and_candidates_only_count_derived_business_keys(monkeypatch):
+def test_confirmed_keys_include_derived_tags_and_pending_candidates_do_not_score(monkeypatch):
     from qianshu.draft import Candidate, PackageRow
-    from qianshu.regression.business import WEIGHTS, _draft_keys, _gold_keys, _score, pairing_fingerprint
+    from qianshu.regression.business import WEIGHTS, _draft_keys, _gold_keys, _score, _with_pending_keys, pairing_fingerprint
 
     packages = [PackageRow(current_package="占位包甲")]
     gold = _gold_keys({
@@ -2103,15 +2246,19 @@ def test_amount_dates_and_candidates_only_count_derived_business_keys(monkeypatc
         },
     }, {"country": "占位", "benefit_type": "赠送时长"})
     assert gold["user_tags"] == ["占位标签乙", "占位标签甲"]
+    derived_tags = located_field(gold["user_tags"])
+    derived_tags.value_source = "查表派生"
     draft = SimpleNamespace(
         benefit_type=DraftField(value="赠送时长"),
-        recharge_amount=DraftField(value=19.9),
+        recharge_amount=located_field(19.9),
         gift_days=DraftField(uncertainty=Uncertainty(reason="占位", candidates=[Candidate(value=30)])),
-        user_tags=DraftField(value=gold["user_tags"], uncertainty=Uncertainty(reason="占位")),
+        user_tags=derived_tags,
         packages=DraftField(uncertainty=Uncertainty(reason="占位", candidates=[Candidate(value=packages)])),
-        start_date=DraftField(value="2099-01-15"), end_date=DraftField(value="2099-02-01"),
+        start_date=located_field("2099-01-15"), end_date=located_field("2099-02-01"),
     )
-    assert _score(gold, _draft_keys(draft, {})) == ["recharge_amount", "date_overlap"]
+    sources = parse.Sources([parse.SourceBlock("body", "占位", "body")])
+    keys = _with_pending_keys(draft, _draft_keys(draft, {}), sources, {})
+    assert _score(gold, keys) == ["recharge_amount", "user_tags", "date_overlap"]
     fingerprint = pairing_fingerprint(2)
     assert fingerprint != pairing_fingerprint(3)
     monkeypatch.setitem(WEIGHTS, "packages", 4)
@@ -2252,3 +2399,110 @@ def test_package_snapshot_reaches_parser_and_scores_two_rows(repo, monkeypatch):
     assert main([*replay, "--package-levels", ".private/synthetic.csv"]) == 1
     assert main(replay) == 0
     assert get_json(repo / "replay/public-report.json")["business"] == business
+
+
+@pytest.mark.parametrize("outcome", ["repaired", "malformed", "interrupted", "no_response"])
+def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen, monkeypatch, outcome):
+    import anthropic
+    import httpx
+
+    repaired = outcome == "repaired"
+    interrupted = outcome in {"interrupted", "no_response"}
+    requests = []
+
+    def reply(request):
+        messages = json.loads(request.content)["messages"]
+        body = json.loads(messages[0]["content"])["application"]
+        requests.append(messages)
+        if outcome == "no_response" and len(messages) > 1:
+            raise httpx.ReadError("synthetic")
+        if outcome == "interrupted" and len(messages) > 1:
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content=b"".join(_stream_reply_events("[", interrupted=True)))
+        payload = fixed_reply(body, [{}])
+        if body == BATCH and (len(messages) == 1 or not repaired):
+            del payload["policies"][0]["fields"]["country"]["evidence"]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              content=b"".join(_stream_reply_events(json.dumps(payload))))
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(reply), **kw))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "shape",
+                 "--estimate-usd", "1", "--release", "--retries", "1"]) == 0
+    assert len(requests) == 3
+    report = get_json(repo / "run/public-report.json")
+    assert report["documents"]["first_shape_errors"] == 1
+    assert report["business"]["counts"]["reply_parse_failed"] == int(not repaired)
+    assert report["usage"]["attempts"] == 3
+    total = 2 if interrupted else 3
+    assert report["usage"]["input_tokens"]["total"] == report["usage"]["output_tokens"]["total"] == total
+    assert report["void"] == interrupted
+    first, final = get_json(repo / "run/document-00001.json")["attempts"]
+    assert first["first_shape_error"] == final["first_shape_error"] == "missing_evidence"
+    assert final["retry_result"] == ("succeeded" if repaired else "failed")
+    assert main(_replay_args(frozen)) == 0
+    assert len(requests) == 3
+    assert_replay(repo)
+    if repaired or outcome == "no_response":
+        from qianshu.regression.storage import digest
+
+        # 逐个去掉扩展键，成功与未收到纠错回复的计数都应能复原。
+        artifact = "document-00001.json"
+        for key in ("first_shape_error", "retry_result", "partial_input_tokens", "partial_output_tokens", "request"):
+            source = repo / ("without-" + key)
+            shutil.copytree(repo / "run", source)
+            document = get_json(source / artifact)
+            for attempt in document["attempts"]:
+                attempt.pop(key, None)
+            put_json(source / artifact, document)
+            manifest = get_json(source / "recording.json")
+            manifest["artifact_sha256"][artifact] = digest((source / artifact).read_bytes())
+            put_json(source / "recording.json", manifest)
+            output = "replay-" + key
+            assert main(_replay_args(frozen, ".private/" + source.name, ".private/" + output)) == 0
+            replay = get_json(repo / output / "public-report.json")
+            assert replay["documents"] == report["documents"]
+            assert replay["business"]["counts"]["reply_parse_failed"] == int(not repaired)
+
+
+@pytest.mark.parametrize("supplied", [False, True])
+def test_regression_uses_only_the_supplied_package_snapshot(repo, frozen, supplied, monkeypatch):
+    from tests.parse.test_package_rows import COMPANIES
+
+    table = repo / "package-levels.csv"
+    shutil.copyfile(COMPANIES.with_name(table.name), table)
+    parse_application = runner.parse_application
+
+    def check_levels(*args, package_levels, **kwargs):
+        assert bool(package_levels.offers) is supplied
+        return parse_application(*args, package_levels=package_levels, **kwargs)
+
+    monkeypatch.setattr(runner, "parse_application", check_levels)
+    args = run_args(frozen)
+    if supplied:
+        args.extend(["--package-levels", ".private/package-levels.csv"])
+    assert main(args, model=no_policies) == 0
+    result = repo / "run"
+    assert get_json(result / "public-report.json")["package_levels_supplied"] is supplied
+    assert ("未提供销售品快照" in (result / "public-report.md").read_text()) is (not supplied)
+    assert get_json(result / "public-report.json")["documents"]["parsed"] == 2
+    assert (result / table.name).exists() is supplied
+    assert main(_replay_args(frozen)) == 0
+    assert get_json(repo / "replay/public-report.json")["package_levels_supplied"] is supplied
+
+
+@pytest.mark.parametrize("corrupt", [False, True])
+def test_explicit_empty_or_invalid_package_snapshot(repo, frozen, corrupt):
+    from tests.parse.test_package_rows import details
+
+    table = repo / "supplied.csv"
+    with table.open("w", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=details()[0].keys())
+        writer.writeheader()
+        if corrupt:
+            writer.writerow(dict(details()[0], sale_start_date="错误日期"))
+    args = [*run_args(frozen), "--package-levels", ".private/supplied.csv"]
+    model = (lambda **_: pytest.fail("损坏快照应先于模型中止")) if corrupt else no_policies
+    assert main(args, model=model) == int(corrupt)
+    assert (repo / "run/recording.json").exists() is (not corrupt)
