@@ -1,0 +1,411 @@
+"""单租约的试运行轮询与交接。邮件正文仅在本轮内存中保留。"""
+
+import json
+import logging
+from contextlib import closing, contextmanager
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
+from uuid import uuid4
+from functools import partial
+
+from qianshu.config import ConfigError
+from qianshu.feishu.cards import CardLine, detail_pages, result_card
+from qianshu.feishu.entrance import Application
+from qianshu.pipeline import Pipeline
+
+from . import _fingerprint
+from .imap import MailError, TrialMailbox, connect
+from .message import body_parts, request_text
+from .triage import MailItem, classify, inspect_mail, input_limit, trial_model
+from .trial_state import Hold, Store
+
+_LOG = logging.getLogger(__name__)
+_NOTICES = {
+    "received": "收到，待核对 1 封。",
+    "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
+    "conflict": "身份冲突，已冻结 {n} 封，待人工核对。",
+    "duplicate": "疑似重复，{n} 封待人工核对。",
+    "freeze": "邮箱水位已冻结，本账户已登记 {n} 封，待人工对账。",
+    "fee15": "开发与试运行已花及已预占费用合计达到 15 美元报告线。",
+    "parse8": "试运行解析已花及已预占费用合计超过 8 美元报告线。",
+    "stop20": "费用停线，请守望者核对预算及开关。",
+}
+
+
+class Trial:
+    def __init__(self, store, config, switches, send, stop, *, connector=partial(connect, mailbox_type=TrialMailbox),
+                 clock=lambda: datetime.now(UTC),
+                 companies=None, sensitive=(), legacy_path=None):
+        self.store, self.config, self.switches, self.send = store, config, switches, send
+        self.stop, self.connector, self.clock = stop, connector, clock
+        self.companies, self.sensitive = companies, sensitive
+        self.scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"])
+        self.legacy_path = legacy_path
+        self.input_limits = {}
+        self.folder = config.get("MAIL_FOLDER", "INBOX")
+
+    def enabled(self, card=False):
+        settings = self.switches()
+        return (not self.stop.is_set() and settings["MAIL_TRIAL_RECEIVE_ENABLED"] == "true"
+                and (not card or settings["MAIL_TRIAL_CARD_ENABLED"] == "true"))
+
+    def require_enabled(self, card=False):
+        if not self.enabled(card):
+            raise Hold()
+
+    def box(self):
+        return self.store.row("SELECT * FROM mailbox WHERE scope=?", self.scope)
+
+    def read(self, mailbox, uid, *, parse=False):
+        before = mailbox.read_seen(uid)
+        if self.seen.setdefault(uid, before) != before:
+            self.store.freeze(self.scope, "seen")
+            raise Hold()
+        try:
+            raw = mailbox.complete_message(uid)
+            item = inspect_mail(raw)
+            text = None
+            if parse:
+                header = raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
+                text = request_text(body_parts(mailbox, uid, header))
+            return item, text
+        finally:
+            if mailbox.read_seen(uid) != before:
+                self.store.freeze(self.scope, "seen")
+                raise Hold()
+
+    def poll(self):
+        if not self.enabled():
+            return
+        if self.legacy_path is not None:
+            self.store.import_legacy(self.legacy_path)
+        state = self.store.begin(self.scope, _fingerprint(self.folder))
+        if state == "folder_conflict":
+            self.flush()
+            return
+        with self.connector(self.config) as mailbox:
+            self.seen = {}
+            try:
+                self.scan(mailbox, state)
+            finally:
+                for uid, seen in self.seen.items():
+                    if mailbox.read_seen(uid) != seen:
+                        self.store.freeze(self.scope, "seen")
+                        break
+
+    def scan(self, mailbox, state):
+        validity, next_uid, history = mailbox.snapshot(self.folder)
+        if state == "initializing":
+            self.store.activate(self.scope, validity, next_uid, history)
+            return
+        box = self.box()
+        if (box["state"] == "frozen" and box["reason"] == "reconciling"
+                and (validity, next_uid) == (box["validity"], box["cursor"])):
+            self.flush()
+            return
+        if validity == box["validity"] and next_uid >= box["peak"]:
+            if box["reason"] == "legacy":
+                self.flush()
+                return
+            if box["state"] == "active" and self.store.row("SELECT 1 FROM legacy WHERE status='pending' LIMIT 1"):
+                self.store.freeze_legacy(self.scope, box["generation"])
+                self.flush()
+                return
+        if box["state"] == "frozen" or validity != box["validity"] or next_uid < box["peak"]:
+            if box["state"] != "frozen":
+                self.store.freeze(self.scope, "generation")
+            entries = []
+            for uid in mailbox.interval(1, next_uid - 1):
+                if not self.enabled():
+                    return
+                try:
+                    item, _ = self.read(mailbox, uid)
+                except MailError:
+                    item = MailItem(None, None, None, None, {})
+                entries.append((uid, replace(item, fields={})))
+            if mailbox.snapshot(self.folder)[:2] == (validity, next_uid):
+                self.store.rebuild(self.scope, validity, next_uid, history, entries)
+            self.flush()
+            return
+        gen = box["generation"]
+        self.store.peak(self.scope, next_uid)
+        if box["cursor"] < next_uid:
+            self.store.searching(self.scope, gen, box["cursor"], next_uid - 1)
+            uids = mailbox.interval(box["cursor"], next_uid - 1)
+            self.store.observe(self.scope, gen, box["cursor"], next_uid, uids)
+        for uid in self.store.pending(self.scope, gen):
+            if not self.enabled():
+                return
+            try:
+                item, _ = self.read(mailbox, uid)
+            except MailError:
+                # 无法确定已经观察到的定位指向谁，整代待对账。
+                self.store.freeze(self.scope, "missing")
+                self.flush()
+                return
+            if not self.verify_generation(mailbox):
+                return
+            self.store.register(self.scope, gen, uid, item)
+        budget = self.store.row("SELECT stopped FROM budget")
+        if not budget or budget[0]:
+            self.flush()
+            return
+        rows = list(self.store.db.execute("""SELECT r.*,min(l.uid) uid FROM registration r
+            JOIN location l ON l.registration=r.id WHERE r.scope=? AND l.generation=?
+            AND r.status IN ('triage','parse') GROUP BY r.id ORDER BY r.id""", (self.scope, gen)))
+        for row in rows:
+            card = row["status"] == "parse"
+            if not self.enabled(card) or (card and row["due"] and row["due"] > self.clock().astimezone(UTC).date().isoformat()):
+                continue
+            try:
+                item, text = self.read(mailbox, row["uid"], parse=card)
+            except MailError:
+                self.store.freeze(self.scope, "mapping")
+                break
+            if not self.verify_generation(mailbox):
+                break
+            if (item.key, item.digest, item.candidate) != (row["msgkey"], row["digest"], row["candidate"]):
+                self.store.freeze(self.scope, "mapping")
+                break
+            if card:
+                self.parse(row, gen, text)
+            else:
+                self.triage(row, gen, item)
+        self.flush()
+
+    def verify_generation(self, mailbox):
+        validity, next_uid, _ = mailbox.snapshot(self.folder)
+        row = self.box()
+        if validity == row["validity"] and next_uid >= row["peak"] and row["state"] == "active":
+            self.store.peak(self.scope, next_uid)
+            return True
+        self.store.freeze(self.scope, "generation")
+        return False
+
+    def status(self, reg, status):
+        with self.store.write() as db:
+            db.execute("UPDATE registration SET status=? WHERE id=? AND status!='frozen'", (status, reg))
+
+    def charge_limits(self, req, family):
+        data = json.loads(req.content)
+        model = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5"}[family]
+        budget = self.store.row("SELECT stopped FROM budget")
+        if not budget or budget[0] or data["model"] != model:
+            raise Hold()
+        if model not in self.input_limits:
+            self.input_limits[model] = input_limit(self.config, model)
+        return data["max_tokens"], self.input_limits[model]
+
+    def triage(self, row, gen, item):
+        reg = row["id"]
+        attempt = None
+
+        @contextmanager
+        def reserve(req):
+            nonlocal attempt
+            with self.store.dispatch(self.scope, gen, reg, "haiku", self.enabled):
+                maximum, bound = self.charge_limits(req, "haiku")
+                self.require_enabled()
+                attempt = self.store.reserve("haiku", maximum, bound, reg, stage="haiku")
+                yield
+
+        verdict, reason, inputs, outputs = classify(self.config, item, reserve)
+        if attempt is None:
+            return
+        self.store.settle(attempt, inputs, outputs)
+        with self.store.write() as db:
+            changed = db.execute("UPDATE registration SET verdict=?,failure=?,status=? WHERE id=? AND status='classifying'",
+                       (verdict, reason, "no" if verdict == "否" else "parse", reg))
+            if changed.rowcount and verdict != "否" and not self.enabled(True):
+                self.store.notice(f"received:{reg}", self.scope, reg, "received")
+
+    def parse(self, row, gen, text):
+        reg = row["id"]
+        attempt = None
+        refused = False
+        unknown = False
+
+        @contextmanager
+        def reserve(req):
+            nonlocal attempt, refused
+            refused = True
+            stage = "sonnet" if attempt is None else "correction"
+            with self.store.dispatch(self.scope, gen, reg, stage, lambda: self.enabled(True)):
+                maximum, bound = self.charge_limits(req, "sonnet")
+                self.require_enabled(True)
+                day = self.clock().astimezone(UTC).date()
+                if stage == "sonnet":
+                    if row["due"] and row["due"] > day.isoformat():
+                        raise Hold()
+                    limit = int(self.switches()["MAIL_TRIAL_DAILY_PARSE_LIMIT"])
+                    used = self.store.row("SELECT count(*) FROM registration WHERE parse_day=?", day.isoformat())[0]
+                    if used >= limit:
+                        with self.store.write() as db:
+                            db.execute("UPDATE registration SET due=? WHERE id=?",
+                                       ((day + timedelta(days=1)).isoformat(), reg))
+                            self.store.notice(f"defer:{reg}:{day}", self.scope, reg, "deferred")
+                        raise Hold()
+                attempt = self.store.reserve("sonnet", maximum, bound, reg, stage=stage, day=day.isoformat())
+                refused = False
+                yield
+
+        def result(call):
+            nonlocal unknown
+            if attempt is not None and not refused:
+                complete = self.store.settle(attempt, call.input_tokens, call.output_tokens,
+                                             partial_inputs=call.partial_input_tokens,
+                                             partial_outputs=call.partial_output_tokens)
+                unknown = bool(call.failure_stage) or not complete
+
+        model = trial_model(self.config, reserve, result)
+        pages = Pipeline(model=model, tag_dates={}, sensitive_values=self.sensitive,
+                         companies_file=self.companies)(Application(None, text, ()))
+        if refused or (text and attempt is None):
+            if attempt is not None:
+                self.status(reg, "correction_pending")
+            return
+        with self.store.write() as db:
+            expected = "parsing" if attempt else "parse"
+            if not db.execute("UPDATE registration SET status='sending' WHERE id=? AND status=?",
+                              (reg, expected)).rowcount:
+                return
+        if row["attachments"]:
+            hint = f"含 {row['attachments']} 个附件未解析，请对照原件核对"
+            pages = (*detail_pages("收信", [CardLine("附件", hint)]), *pages)
+        heading = detail_pages("试运行邮件", [])[0].elements
+        try:
+            for index, page in enumerate(pages, 1):
+                page = replace(page, elements=(*heading, *page.elements[1:]), number=index, total=len(pages))
+                with self.store.dispatch(self.scope, gen, reg, "card", lambda: self.enabled(True)):
+                    request_id = str(uuid4())
+                    with self.store.write() as db:
+                        db.execute("INSERT INTO card_intent VALUES(?,?,?,?,'unknown',?)",
+                                   (request_id, reg, row["version"], index, self.clock().isoformat()))
+                    self.send(result_card(page), request_id, True, lambda: self.require_enabled(True))
+                    with self.store.write() as db:
+                        db.execute("UPDATE card_intent SET status='sent' WHERE uuid=?", (request_id,))
+        except Exception:
+            self.status(reg, "manual")
+            return
+        self.status(reg, "manual" if unknown or attempt is None else "done")
+
+    def flush(self):
+        rows = list(self.store.db.execute("""SELECT * FROM notice WHERE status='pending'
+            AND (scope=? OR scope IS NULL) ORDER BY rowid""", (self.scope,)))
+        for row in rows:
+            if not self.enabled():
+                return
+            kind = row["kind"]
+            card = kind == "deferred"
+            if card and not row["event"].endswith(self.clock().astimezone(UTC).date().isoformat()):
+                with self.store.write() as db:
+                    db.execute("UPDATE notice SET status='expired' WHERE event=? AND status='pending'", (row["event"],))
+                continue
+            gate = self.store.gate()
+            if kind in {"received", "deferred"}:
+                gate = self.store.dispatch(self.scope, row["generation"], row["registration"], kind,
+                                           lambda: self.enabled(card))
+            try:
+                with gate:
+                    self.require_enabled(card)
+                    with self.store.write() as db:
+                        if not db.execute("""UPDATE notice SET status='unknown' WHERE event=?
+                            AND status='pending'""", (row["event"],)).rowcount:
+                            continue
+                    self.send(_NOTICES[kind].format(n=row["quantity"]), row["uuid"], False,
+                              lambda: self.require_enabled(card))
+                    with self.store.write() as db:
+                        db.execute("UPDATE notice SET status='sent' WHERE event=?", (row["event"],))
+            except Hold:
+                continue
+            except Exception:
+                self.uncertain_notices()
+
+    def uncertain_notices(self):
+        with self.store.write() as db:
+            db.execute("""UPDATE registration SET status='manual',reason='notice_unknown' WHERE scope=?
+                AND status='parse' AND id IN (SELECT registration FROM notice WHERE status='unknown'
+                AND kind IN ('received','deferred'))""", (self.scope,))
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                self.uncertain_notices()
+                with self.store.write() as db:
+                    db.execute("""UPDATE registration SET status='manual',reason='unknown' WHERE scope=?
+                        AND status IN ('parsing','sending','classifying')""", (self.scope,))
+                self.poll()
+            except (Hold, ConfigError, MailError):
+                pass
+            except Exception:
+                _LOG.warning("试运行收信轮询中断，请核对私有登记。")
+            try:
+                self.flush()
+            except Exception:
+                _LOG.warning("试运行群通知待核对。")
+            self.stop.wait(30)
+
+
+def run_service(args, settings, path, switches):
+    from threading import Event, Thread
+
+    from dotenv import dotenv_values
+    from qianshu.config import load_config
+    from qianshu.feishu.handoff import HandoffService, MentionLog
+    from qianshu.parse._output import check_output_path
+    from qianshu.parse.model import load_model_config
+    from qianshu.__main__ import _send_trial_message
+    from . import _private_dir
+
+    business = args.business_env_file
+    if business is None:
+        raise ConfigError("试运行收信须显式指定业务私有配置。")
+    config = dict(load_model_config(env_file=business, config=load_config("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD",
+                                                                          env_file=business)))
+    config.setdefault("MAIL_PORT", "993")
+    with business.open(encoding="utf-8-sig") as stream:
+        private_dir = dotenv_values(stream=stream, interpolate=False).get("MAIL_PRIVATE_DIR")
+    if private_dir:
+        config["MAIL_PRIVATE_DIR"] = private_dir
+    if config.get("FEISHU_CHAT_ID") != settings.chat_id:
+        raise ConfigError("试运行汇报群与业务登记不符。")
+    state = path.with_name("trial-050.sqlite3")
+    check_output_path(state)
+    legacy = _private_dir(config) / "mail-poll.sqlite3"
+    stop = Event()
+
+    def poll():
+        store = Store(state)
+        try:
+            with store.write() as db:
+                target = _fingerprint(settings.app_id, settings.chat_id, settings.tenant_key or "")
+                db.execute("INSERT OR IGNORE INTO trial_target VALUES(1,?)", (target,))
+                if store.row("SELECT fingerprint FROM trial_target")[0] != target:
+                    raise ConfigError("试运行登记与汇报群不匹配。")
+            trial = Trial(store, config, switches, send, stop, legacy_path=legacy, sensitive=(
+                *settings.handoff_sensitive_values, *settings.handoff_sensitive_urls,
+            ))
+            trial.run()
+        except Exception:
+            _LOG.error("试运行收信已停止，请核对私有登记。")
+        finally:
+            store.db.close()
+
+    class TrialLog(MentionLog):
+        @contextmanager
+        def listener(self):
+            with super().listener():
+                thread = Thread(target=poll, name="trial-mail")
+                thread.start()
+                try:
+                    yield
+                finally:
+                    stop.set()
+                    thread.join()
+
+    def send(content, request_id, card, check):
+        _send_trial_message(service.transport, content, request_id, card, check)
+
+    with closing(TrialLog(path, settings, create=True)) as log:
+        service = HandoffService(log)
+        service.run()

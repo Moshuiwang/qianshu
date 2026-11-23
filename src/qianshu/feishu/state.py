@@ -455,3 +455,21 @@ class State:
                 return False
             dispatch(row[0])
             return True
+
+
+def trial_batch(db: sqlite3.Connection, registration: int, version: int):
+    """按卡片绑定的登记版本读取整批人工原因。连接指向 050 私有登记库。"""
+    row = db.execute("""SELECT r.attachments,r.status,m.state FROM registration r JOIN mailbox m USING(scope)
+        WHERE r.id=? AND r.version=?""", (registration, version)).fetchone()
+    if not row:
+        return registration, version, None, "登记缺失或版本失效"
+    count, status, state = row
+    if state != "active" or status in ("manual", "frozen"):
+        reason = "登记冻结或待人工"
+    elif count is None or count > 0:
+        reason = "附件未解析"
+    elif status != "done":
+        reason = "草稿尚未确认送达"
+    else:
+        reason = None
+    return registration, version, count, reason

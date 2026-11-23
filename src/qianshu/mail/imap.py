@@ -132,6 +132,50 @@ class ReadOnlyMailbox:
             raise MailError("IMAP 搜索返回的 UID 无效。")
         return tuple(sorted({int(uid) for uid in uids}))
 
+    def snapshot(self, folder):
+        exists = self.select(folder)
+        def number(key):
+            name, values = self._connection.response(key)
+            if name != key or len(values) != 1 or not isinstance(values[0], bytes) or not re.fullmatch(
+                rb"[1-9][0-9]{0,9}", values[0]
+            ) or int(values[0]) > 2**32 - 1:
+                raise MailError("邮箱代次或水位不可读。")
+            return int(values[0])
+        return number("UIDVALIDITY"), number("UIDNEXT"), exists
+
+    def interval(self, first, last):
+        if first > last:
+            return ()
+        uids = self._search("UID", f"{first}:{last}")
+        if any(not first <= uid <= last for uid in uids):
+            raise MailError("邮箱返回区间外的定位。")
+        return uids
+
+    def read_seen(self, uid):
+        matches = self._search("UID", str(uid), "SEEN")
+        if matches not in ((), (uid,)):
+            raise MailError("已读位置无效。")
+        return bool(matches)
+
+    def checked_section(self, uid, section):
+        data = self._read_uid("FETCH", str(uid), f"(BODY.PEEK[{section}])")
+        # UID 可以出现在 literal 前面或后面，只接受单个完整 FETCH。
+        if len(data) != 2 or not isinstance(data[0], tuple) or not isinstance(data[1], bytes):
+            raise MailError("取信响应不完整。")
+        prefix, raw = data[0]
+        pattern = (rb"[0-9]+ \((?:UID ([0-9]+) )?BODY\[" + re.escape(section.encode("ascii"))
+                   + rb"\] \{([0-9]+)\}(?: UID ([0-9]+))?\)")
+        match = re.fullmatch(pattern, prefix + data[1], re.I)
+        if not match or [v for v in (match[1], match[3]) if v] != [str(uid).encode()] or len(raw) != int(match[2]):
+            raise MailError("取信响应与位置或段长度不符。")
+        return raw
+
+    def complete_message(self, uid):
+        header = self.checked_section(uid, "HEADER")
+        if not header.endswith((b"\r\n\r\n", b"\n\n")):
+            raise MailError("邮件头未完整结束。")
+        return header + self.checked_section(uid, "TEXT")
+
     def marked(self, marker: str, approver: str) -> tuple[int, ...]:
         # 部分服务器（X7 实测）的 SUBJECT / FROM / HEADER 搜索恒返回空，只有日期条件可用。
         # 这里只按日期取近两天的候选，标题、发件人和回复头由调用方逐封解码核对。
@@ -162,7 +206,7 @@ class ReadOnlyMailbox:
             raise MailError("IMAP 没有返回请求的邮件段。")
         return literals[0]
 
-    def structure(self, uid: int) -> list:
+    def structure(self, uid: int, *, strict_uid: bool = False) -> list:
         data = self._read_uid("FETCH", str(uid), "(BODYSTRUCTURE)")
         # imaplib 将 IMAP literal 拆成 (前缀, 值)，之后还有普通响应片段。
         parts = []
@@ -173,7 +217,8 @@ class ReadOnlyMailbox:
                 parts.append(re.sub(rb"\{[0-9]+\}$", b"", prefix) + b'"' + escaped + b'"')
             elif isinstance(part, bytes):
                 parts.append(part)
-        match = re.search(rb"\bBODYSTRUCTURE\s+(\(.*)", b" ".join(parts), re.IGNORECASE | re.DOTALL)
+        response = b" ".join(parts)
+        match = re.search(rb"\bBODYSTRUCTURE\s+(\(.*)", response, re.IGNORECASE | re.DOTALL)
         if match is None:
             raise MailError("IMAP 没有返回邮件结构。")
 
@@ -191,6 +236,11 @@ class ReadOnlyMailbox:
             elif value == b")" and stack:
                 node = stack.pop()
                 if not stack:
+                    if strict_uid:
+                        prefix = re.fullmatch(rb"[0-9]+ \(\s*(?:UID ([0-9]+) )?", response[:match.start()], re.I)
+                        suffix = re.fullmatch(rb"\s*(?:UID ([0-9]+)\s*)?\)", match[1][end:], re.I)
+                        if not prefix or not suffix or [v for v in (prefix[1], suffix[1]) if v] != [str(uid).encode()]:
+                            raise MailError("邮件结构与请求位置不符。")
                     return node
                 stack[-1].append(node)
             elif stack:
@@ -198,8 +248,16 @@ class ReadOnlyMailbox:
         raise MailError("IMAP 返回的邮件结构无效。")
 
 
+class TrialMailbox(ReadOnlyMailbox):
+    # 同样的正文提取算法，试运行的每个段须与 UID 和声明长度相符。
+    section = ReadOnlyMailbox.checked_section
+
+    def structure(self, uid: int) -> list:
+        return super().structure(uid, strict_uid=True)
+
+
 @contextmanager
-def connect(config: Mapping[str, str], factory: Callable = imaplib.IMAP4_SSL):
+def connect(config: Mapping[str, str], factory: Callable = imaplib.IMAP4_SSL, *, mailbox_type=ReadOnlyMailbox):
     connection = None
     try:
         try:
@@ -221,7 +279,7 @@ def connect(config: Mapping[str, str], factory: Callable = imaplib.IMAP4_SSL):
                 raise MailError("IMAP 认证被服务器拒绝。")
         except (imaplib.IMAP4.error, OSError, ValueError, OverflowError):
             raise MailError("无法建立 IMAP 会话。") from None
-        yield ReadOnlyMailbox(connection)
+        yield mailbox_type(connection)
     finally:
         if connection is not None:
             with suppress(imaplib.IMAP4.error, OSError):

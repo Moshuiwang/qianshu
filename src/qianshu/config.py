@@ -93,3 +93,28 @@ def load_config(*required: str, env_file: Path = Path(".env")) -> Config:
     if missing:
         raise ConfigError(f"缺少配置，请在 .env 中填写：{'、'.join(missing)}")
     return Config(config)
+
+
+def trial_config(path: Path) -> Config:
+    """从显式私有文件读取试运行开关，业务配置只在收信开启后读取。"""
+    try:
+        with path.open(encoding="utf-8-sig") as stream:
+            values = dotenv_values(stream=stream, interpolate=False)
+    except (OSError, UnicodeError):
+        raise ConfigError("无法读取试运行私有开关。") from None
+    result = {}
+    for name in ("RECEIVE", "CARD"):
+        key = f"MAIL_TRIAL_{name}_ENABLED"
+        value = values.get(key, "false")
+        if value not in {"true", "false"}:
+            raise ConfigError("试运行开关须为 true 或 false。")
+        result[key] = value
+    if result["MAIL_TRIAL_CARD_ENABLED"] == "true" and result["MAIL_TRIAL_RECEIVE_ENABLED"] != "true":
+        raise ConfigError("出卡须先开启收信。")
+    limit = values.get("MAIL_TRIAL_DAILY_PARSE_LIMIT", "15")
+    if not limit or not limit.isascii() or not limit.isdecimal() or len(limit) > 9:
+        raise ConfigError("试运行每日解析上限须为非负整数。")
+    if values.get("MAIL_TRIAL_TRIAGE_MODEL", "claude-haiku-5-5") != "claude-haiku-5-5":
+        raise ConfigError("试运行分拣模型与登记不符。")
+    result["MAIL_TRIAL_DAILY_PARSE_LIMIT"] = limit
+    return Config(result)

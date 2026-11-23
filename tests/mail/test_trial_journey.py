@@ -1,0 +1,577 @@
+import json
+import sqlite3
+from contextlib import nullcontext
+from datetime import UTC, datetime, timedelta
+from email import policy
+from email.message import EmailMessage
+from pathlib import Path
+from threading import Event
+
+import httpx
+import pytest
+
+from qianshu.ai import anthropic
+from qianshu.config import ConfigError, trial_config
+from qianshu.mail.imap import MailError, ReadOnlyMailbox
+from qianshu.mail.trial import Trial
+from qianshu.mail.trial_state import Hold, Store
+
+
+def synthetic(number, text, attachment=False):
+    msg = EmailMessage(policy=policy.SMTP)
+    msg["Message-ID"] = "<" + str(number) + chr(64) + "synthetic.invalid>"
+    msg["Subject"] = "subject " + str(number)
+    msg.set_content(text)
+    if attachment:
+        msg.add_attachment(b"ATTACHMENT_SENTINEL", maintype="application", subtype="octet-stream", filename="file")
+    return msg
+
+
+class Inbox:
+    def __init__(self):
+        self.messages = {1: synthetic(1, "historical")}
+        self.seen = {1}
+        self.generation = 1
+        self.next_uid = 2
+        self.reads = []
+
+    def snapshot(self, folder):
+        return self.generation, self.next_uid, len(self.messages)
+
+    def interval(self, first, last):
+        return [uid for uid in sorted(self.messages) if first <= uid <= last]
+
+    def read_seen(self, uid):
+        return uid in self.seen
+
+    def complete_message(self, uid):
+        self.reads.append(uid)
+        if uid not in self.messages:
+            raise MailError()
+        return self.messages[uid].as_bytes()
+
+    def section(self, uid, section):
+        msg = self.messages[uid]
+        if section == "TEXT":
+            return msg.as_bytes().split(b"\r\n\r\n", 1)[1]
+        part = msg.get_body().as_bytes().split(b"\r\n\r\n", 1)
+        return part[0] if section == "1.MIME" else part[1]
+
+    def structure(self, uid):
+        if self.messages[uid].is_multipart():
+            return [[b"TEXT", b"PLAIN"], [b"APPLICATION", b"OCTET-STREAM"], b"MIXED"]
+        return [b"TEXT", b"PLAIN"]
+
+    def add(self, msg):
+        self.messages[self.next_uid] = msg
+        self.next_uid += 1
+
+
+def test_switch_journey_queue_budget_attachments_and_rebuild(tmp_path, monkeypatch):
+    store = Store(tmp_path / "trial")
+    config = {"MAIL_HOST": "synthetic", "MAIL_USER": "local", "ANTHROPIC_API_KEY": "test-key"}
+    switches = {"MAIL_TRIAL_RECEIVE_ENABLED": "false", "MAIL_TRIAL_CARD_ENABLED": "false",
+                "MAIL_TRIAL_DAILY_PARSE_LIMIT": "1"}
+    box = Inbox()
+    opened, sent, requests = [], [], []
+    clock = [datetime(2026, 1, 1, tzinfo=UTC)]
+
+    def receive(req):
+        if req.method == "GET":
+            assert not req.content
+            return httpx.Response(200, json={"type": "model", "id": req.url.path.split("/")[-1],
+                                  "max_input_tokens": 1000000, "display_name": "synthetic",
+                                  "created_at": "2026-01-01T00:00:00Z"})
+        data = json.loads(req.content)
+        assert b"ATTACHMENT_SENTINEL" not in req.content
+        requests.append(data["model"])
+        if data["model"] == "claude-sonnet-5-5":
+            raise httpx.ReadTimeout("synthetic")
+        fields = json.loads(data["messages"][0]["content"])
+        text = {"first": "是", "discard": "否", "uncertain": "unrecognized"}.get(fields["body"], "是")
+        return httpx.Response(200, json={"type": "message", "id": "msg", "role": "assistant",
+            "model": data["model"], "content": [{"type": "text", "text": text}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 2}})
+
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    trial = Trial(store, config, lambda: switches, lambda content, uid, card, check: check() or sent.append((content, uid, card)), Event(),
+                  connector=lambda _: opened.append(1) or nullcontext(box), clock=lambda: clock[0],
+                  companies=Path("tests/parse/fixtures/companies.tsv"))
+    trial.poll()
+    assert not opened
+    switches["MAIL_TRIAL_RECEIVE_ENABLED"] = "true"
+    trial.poll()
+    assert not box.reads
+    for i, text in enumerate(("first", "discard", "uncertain"), 2):
+        box.add(synthetic(i, text, attachment=i == 2))
+    box.seen.add(3)
+    trial.poll()
+    assert not requests
+    assert not store.row("SELECT 1 FROM registration WHERE verdict IS NOT NULL")
+    store.import_spend("0")
+    trial.poll()
+    assert requests == ["claude-haiku-5-5"] * 3
+    assert [r[0] for r in store.db.execute("SELECT verdict FROM registration ORDER BY id")] == ["是", "否", "拿不准"]
+    assert [x[0] for x in sent] == ["收到，待核对 1 封。"] * 2
+    assert store.batch(1, 1) == (1, 1, 1, "附件未解析")
+    switches["MAIL_TRIAL_CARD_ENABLED"] = "true"
+    trial.poll()
+    assert requests.count("claude-sonnet-5-5") == 1
+    assert "含 1 个附件未解析，请对照原件核对" in json.dumps(sent, ensure_ascii=False)
+    assert store.row("SELECT count(*) FROM registration WHERE parse_day IS NOT NULL")[0] == 1
+    assert sum("顺延" in str(entry) for entry in sent) == 1
+    trial.store = Store(store.path)
+    trial.poll()
+    assert requests.count("claude-sonnet-5-5") == 1
+    clock[0] += timedelta(days=1)
+    trial.poll()
+    assert requests.count("claude-sonnet-5-5") == 2
+    assert store.row("SELECT count(*) FROM registration WHERE status='manual'")[0] == 2
+    assert box.seen == {1, 3} and 1 not in box.reads
+    box.add(box.messages[2])
+    trial.poll()
+    assert len(requests) == 5 and store.row("SELECT count(*) FROM registration")[0] == 3
+    box.generation += 1
+    trial.poll()
+    assert trial.box()["state"] == "frozen"
+    assert store.row("SELECT count(*) FROM reconciliation")[0] == len(box.messages)
+    assert len(requests) == 5
+
+
+def test_interval_and_checked_literals_only_read_matching_uid():
+    class Wire:
+        def uid(self, command, uid, query):
+            assert (command, uid, query) == ("FETCH", "3", "(BODY.PEEK[TEXT])")
+            return "OK", [(b"2 (BODY[TEXT] {4}", b"text"), self.tail]
+
+    wire = Wire()
+    mailbox = ReadOnlyMailbox(wire)
+    wire.tail = b" UID 3)"
+    assert mailbox.checked_section(3, "TEXT") == b"text"
+    wire.tail = b" UID 2)"
+    with pytest.raises(MailError):
+        mailbox.checked_section(3, "TEXT")
+
+
+def test_atomic_last_allowance_and_unknown_after_restart(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+    path = tmp_path / "db"
+    Store(path).import_spend("11")
+    ready = Barrier(2)
+    def reserve():
+        store = Store(path)
+        ready.wait()
+        try:
+            return store.reserve("sonnet", 128000, 2000000, 1)
+        except Hold:
+            return None
+    with ThreadPoolExecutor(2) as pool:
+        results = [pool.submit(reserve) for _ in range(2)]
+    assert sum(result.result() is not None for result in results) == 1
+    store = Store(path)
+    assert store.row("SELECT count(*) FROM charge WHERE inputs IS NULL")[0] == 1
+    for model in ("haiku", "sonnet"):
+        with pytest.raises(Hold):
+            store.reserve(model, 8, 100, 2)
+    assert {r[0] for r in store.db.execute("SELECT kind FROM notice")} == {"fee15", "stop20"}
+
+
+def test_legacy_pending_reconciliation_and_report_thresholds(tmp_path):
+    store = Store(tmp_path / "trial")
+    path = tmp_path / "old"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE delivery(scope,fingerprint,delivered)")
+        db.execute("INSERT INTO delivery VALUES('scope','fp',0)")
+    original = path.read_bytes()
+    store.import_legacy(path)
+    store.import_legacy(path)
+    assert path.read_bytes() == original and store.row("SELECT count(*) FROM legacy WHERE status='pending'")[0] == 1
+    store.import_spend("6")
+    store.reserve("sonnet", 128000, 2000000, 1)
+    store.reserve("sonnet", 128000, 2000000, 2)
+    assert {r[0] for r in store.db.execute("SELECT kind FROM notice")} == {"fee15", "parse8"}
+
+
+def test_switch_defaults_and_invalid_order(tmp_path):
+    path = tmp_path / "switches"
+    path.write_text("")
+    assert dict(trial_config(path)) == {"MAIL_TRIAL_RECEIVE_ENABLED": "false", "MAIL_TRIAL_CARD_ENABLED": "false",
+                                       "MAIL_TRIAL_DAILY_PARSE_LIMIT": "15"}
+    path.write_text("MAIL_TRIAL_CARD_ENABLED=true")
+    with pytest.raises(ConfigError):
+        trial_config(path)
+
+
+@pytest.mark.parametrize("amount", ["19.70", "19.90"])
+def test_paid_http_never_reaches_large_output_stub(tmp_path, monkeypatch, amount):
+    from qianshu.mail.triage import inspect_mail
+    store = Store(tmp_path / "trial")
+    store.import_spend(amount)
+    trial = Trial(store, dict(MAIL_HOST="synthetic", MAIL_USER="local", ANTHROPIC_API_KEY="test-key"),
+                  lambda: dict(MAIL_TRIAL_RECEIVE_ENABLED="true", MAIL_TRIAL_CARD_ENABLED="true",
+                               MAIL_TRIAL_DAILY_PARSE_LIMIT="15"), lambda *args: pytest.fail("card"), Event(),
+                  companies=Path("tests/parse/fixtures/companies.tsv"))
+    store.begin(trial.scope)
+    store.activate(trial.scope, 1, 1, 0)
+    store.observe(trial.scope, 1, 1, 2, [1])
+    reg = store.register(trial.scope, 1, 1, inspect_mail(synthetic(1, "text").as_bytes()))
+    trial.status(reg, "parse")
+    sent = []
+    def receive(req):
+        if req.method == "GET":
+            return httpx.Response(200, json=dict(id="claude-sonnet-5-5", max_input_tokens=1000000,
+                                  type="model", display_name="synthetic", created_at="2026-01-01T00:00:00Z"))
+        sent.append(req.content)
+        return httpx.Response(200, json={"usage": {"input_tokens": 10, "output_tokens": 50000}})
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    trial.parse(store.row("SELECT * FROM registration WHERE id=?", reg), 1, "text")
+    assert not sent and store.row("SELECT stopped FROM budget")[0] == 1
+    assert tuple(store.row("SELECT status,parse_day FROM registration")) == ("parse", None)
+
+
+@pytest.mark.parametrize("size", [1999, 2000, 2001])
+def test_unicode_limit_after_quote_removal_and_sender_privacy(monkeypatch, size):
+    from qianshu.mail.triage import inspect_mail, classify
+    msg = synthetic(1, "字" * size + "\nOn a date wrote:\n> HISTORY_SENTINEL")
+    msg["From"] = "display <" + "LOCAL_SENTINEL" + chr(64) + "synthetic.invalid>"
+    msg["Cc"] = "CC_SENTINEL" + chr(64) + "synthetic.invalid"
+    requests = []
+    def receive(req):
+        requests.append(req.content)
+        return httpx.Response(503)
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    classify({"ANTHROPIC_API_KEY": "synthetic"}, inspect_mail(msg.as_bytes()), lambda req: None)
+    raw, = requests
+    assert b"SENTINEL" not in raw
+    fields = json.loads(json.loads(raw)["messages"][0]["content"])
+    assert fields == dict(body="字" * min(size, 2000), display_name="display", domain="synthetic.invalid",
+                          subject="subject 1")
+
+
+def test_rebuild_requires_current_snapshot_and_preserves_historical_identity(tmp_path):
+    from qianshu.mail.triage import inspect_mail
+    store = Store(tmp_path / "trial")
+    store.begin("scope")
+    store.activate("scope", 1, 10, 0)
+    store.searching("scope", 1, 10, 11)
+    assert Store(store.path).begin("scope") == "frozen"
+    item = inspect_mail(synthetic(2, "synthetic").as_bytes())
+    store.rebuild("scope", 2, 3, 1, [(2, item)])
+    first = store.row("SELECT generation FROM mailbox")[0]
+    second_item = inspect_mail(synthetic(3, "changed").as_bytes())
+    store.rebuild("scope", 2, 3, 1, [(2, second_item)])
+    with pytest.raises(Hold):
+        store.reconcile("scope", first, 2, 3)
+    second = store.row("SELECT generation FROM mailbox")[0]
+    store.reconcile("scope", second, 2, 3)
+    store.observe("scope", second, 3, 4, [3])
+    reg = store.register("scope", second, 3, second_item)
+    assert store.row("SELECT status FROM registration WHERE id=?", reg)[0] == "manual"
+
+
+def test_distinct_id_conflict_and_full_attachment_bytes(tmp_path):
+    from qianshu.mail.triage import inspect_mail
+    store = Store(tmp_path / "trial")
+    store.begin("scope")
+    store.activate("scope", 1, 1, 0)
+    store.observe("scope", 1, 1, 5, [1, 2, 3, 4])
+    raw = synthetic(1, "body", attachment=True)
+    first = store.register("scope", 1, 1, inspect_mail(raw.as_bytes()))
+    raw.get_payload()[1].set_payload("QUJD")
+    second = store.register("scope", 1, 2, inspect_mail(raw.as_bytes()))
+    assert first != second and store.batch(first, 1)[3]
+    raw.replace_header("Message-ID", "<other" + chr(64) + "synthetic.invalid>")
+    third = store.register("scope", 1, 3, inspect_mail(raw.as_bytes()))
+    del raw["Message-ID"]
+    fourth = store.register("scope", 1, 4, inspect_mail(raw.as_bytes()))
+    assert len({first, second, third, fourth}) == 4
+    assert {r[0] for r in store.db.execute("SELECT status FROM registration")} == {"frozen"}
+
+
+@pytest.mark.parametrize("stage", ["sonnet", "card"])
+def test_freeze_committed_while_sender_waits_at_last_gate(tmp_path, monkeypatch, stage):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    from qianshu.mail.triage import inspect_mail
+    path = tmp_path / "trial"
+    db = Store(path)
+    db.import_spend("0")
+    config = dict(MAIL_HOST="synthetic", MAIL_USER="local", ANTHROPIC_API_KEY="test-key")
+    switches = lambda: dict(MAIL_TRIAL_RECEIVE_ENABLED="true", MAIL_TRIAL_CARD_ENABLED="true",
+                            MAIL_TRIAL_DAILY_PARSE_LIMIT="1")
+    scope = Trial(db, config, switches, None, Event()).scope
+    db.begin(scope)
+    db.activate(scope, 17, 1, 0)
+    db.observe(scope, 1, 1, 2, [1])
+    reg = db.register(scope, 1, 1, inspect_mail(synthetic(2, "body").as_bytes()))
+    with db.write() as sql:
+        sql.execute("UPDATE registration SET status='parse' WHERE id=?", (reg,))
+    waiting, resume = Event(), Event()
+    sent = []
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(lambda req: sent.append(req)))
+    def sender():
+        store = Store(path)
+        original = store.dispatch
+        @contextmanager
+        def dispatch(scope, gen, reg, kind, enabled):
+            if kind == stage:
+                waiting.set()
+                assert resume.wait(15)
+            with original(scope, gen, reg, kind, enabled):
+                yield
+        store.dispatch = dispatch
+        trial = Trial(store, config, switches, lambda *args: sent.append(args), Event(),
+                      companies=Path("tests/parse/fixtures/companies.tsv"))
+        trial.parse(store.row("SELECT * FROM registration WHERE id=?", reg), 1, "body" if stage == "sonnet" else "")
+    with ThreadPoolExecutor(1) as pool:
+        future = pool.submit(sender)
+        try:
+            assert waiting.wait(15)
+            db.freeze(scope, "generation")
+        finally:
+            resume.set()
+        future.result()
+    assert not sent
+    assert db.row("SELECT count(*) FROM charge")[0] == db.row("SELECT count(*) FROM card_intent")[0] == 0
+
+
+def test_existing_listener_lease_precedes_trial_worker(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from qianshu.feishu.handoff import HandoffService, MentionLog
+    from qianshu.feishu.settings import Settings
+    from qianshu.mail.trial import run_service
+    settings = Settings("app", "secret", "group", "bot", frozenset({"owner"}))
+    path = tmp_path / "mention"
+    business = tmp_path / "business"
+    business.write_text(f"MAIL_HOST=synthetic\nMAIL_USER=local\nMAIL_PASSWORD=secret\nFEISHU_CHAT_ID=group\n"
+                        f"MAIL_PRIVATE_DIR={tmp_path}\n")
+    monkeypatch.setattr(HandoffService, "__init__", lambda self, store: setattr(self, "store", store))
+    def run(self):
+        with self.store.listener():
+            pytest.fail("第二实例取得了租约")
+    monkeypatch.setattr(HandoffService, "run", run)
+    log = MentionLog(path, settings, create=True)
+    with log.listener(), pytest.raises(BlockingIOError):
+        run_service(SimpleNamespace(business_env_file=business), settings, path, lambda: {})
+    assert not (tmp_path / "trial-050.sqlite3").exists()
+
+
+def test_cli_disabled_trial_preserves_listener_and_skips_mail(tmp_path, monkeypatch):
+    from qianshu.__main__ import main
+    from qianshu.feishu.handoff import HandoffService
+    file = tmp_path / "handoff"
+    file.write_text(f"FEISHU_MENTION_LOG={tmp_path / 'mention'}\nFEISHU_HANDOFF_OWNER_OPEN_ID=ou_owner\n"
+                    "FEISHU_BOT_OPEN_ID=ou_bot\nFEISHU_APP_ID=app\nFEISHU_APP_SECRET=secret\nFEISHU_CHAT_ID=group\n")
+    switches = tmp_path / "switches"
+    switches.write_text("MAIL_TRIAL_RECEIVE_ENABLED=false\n")
+    called = []
+    monkeypatch.setattr(HandoffService, "__init__", lambda self, store: None)
+    monkeypatch.setattr(HandoffService, "run", lambda self: called.append(1))
+    argv = ["--env-file", str(file), "--business-env-file", str(file), "--handoff-only", "--trial-switches", str(switches)]
+    assert main(argv) == 0 and called == [1]
+    switches.write_text("MAIL_TRIAL_CARD_ENABLED=true\n")
+    assert main(argv) == 1 and called == [1]
+    assert not (tmp_path / "trial-050.sqlite3").exists()
+
+
+@pytest.mark.parametrize("text", ["", "synthetic"])
+def test_attachment_only_or_zero_policies_discloses_batch_and_counts_handoffs(tmp_path, monkeypatch, text):
+    from qianshu.mail.triage import inspect_mail
+    store = Store(tmp_path / "trial")
+    store.import_spend("0")
+    sent, requests = [], []
+    trial = Trial(store, dict(MAIL_HOST="synthetic", MAIL_USER="local", ANTHROPIC_API_KEY="test-key"),
+                  lambda: dict(MAIL_TRIAL_RECEIVE_ENABLED="true", MAIL_TRIAL_CARD_ENABLED="true",
+                               MAIL_TRIAL_DAILY_PARSE_LIMIT="1"),
+                  lambda content, uid, card, check: check() or sent.append(content), Event(),
+                  companies=Path("tests/parse/fixtures/companies.tsv"))
+    msg = EmailMessage()
+    msg["Message-ID"] = "<local" + chr(64) + "synthetic.invalid>"
+    if text:
+        msg.set_content(text)
+    msg.add_attachment(b"synthetic", maintype="image", subtype="png")
+    item = inspect_mail(msg.as_bytes())
+    store.begin(trial.scope)
+    store.activate(trial.scope, 1, 1, 0)
+    store.observe(trial.scope, 1, 1, 2, [1])
+    reg = store.register(trial.scope, 1, 1, item)
+    trial.status(reg, "parse")
+    trial.input_limits["claude-sonnet-5-5"] = 1000000
+
+    def receive(req):
+        requests.append(1)
+        events = [
+            {"type": "message_start", "message": {"id": "x", "role": "assistant", "type": "message",
+             "model": "synthetic", "content": [], "usage": {"input_tokens": 9, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "x",
+             "name": "submit_application_reply", "input": {}}},
+            {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta",
+             "partial_json": '{"policies":[]}'}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+             "usage": {"output_tokens": 5}},
+            {"type": "message_stop"}]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
+
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    trial.parse(store.row("SELECT * FROM registration WHERE id=?", reg), 1, text)
+    assert len(requests) == int(bool(text))
+    assert store.row("SELECT count(parse_day) FROM registration")[0] == len(requests)
+    assert "含 1 个附件未解析，请对照原件核对" in json.dumps(sent, ensure_ascii=False)
+    assert store.batch(reg, 1)[3] and store.batch(reg, 2)[3] and store.batch(12345, 1)[3]
+    assert store.row("SELECT count(*) FROM card_intent WHERE status='sent'")[0] == len(sent)
+
+
+def test_unknown_notification_is_not_replayed(tmp_path):
+    from qianshu.mail.triage import inspect_mail
+    from qianshu.mail.trial import _NOTICES
+    store = Store(tmp_path / "trial")
+    store.import_spend("0")
+    sent = []
+    def lose(content, uid, card, check):
+        sent.append((content, uid))
+        raise TimeoutError()
+    trial = Trial(store, dict(MAIL_HOST="synthetic", MAIL_USER="local"),
+                  lambda: dict(MAIL_TRIAL_RECEIVE_ENABLED="true"), lose, Event())
+    store.begin(trial.scope)
+    store.activate(trial.scope, 1, 1, 0)
+    store.observe(trial.scope, 1, 1, 2, [1])
+    reg = store.register(trial.scope, 1, 1, inspect_mail(synthetic(1, "text").as_bytes()))
+    trial.status(reg, "parse")
+    with store.write():
+        store.notice("event", trial.scope, reg, "received")
+    trial.flush()
+    trial.store = Store(store.path)
+    trial.flush()
+    assert sent == [(_NOTICES["received"], store.row("SELECT uuid FROM notice")[0])]
+    assert store.row("SELECT status FROM registration")[0] == "manual"
+
+
+def test_crash_after_examine_and_vanished_observed_uid(tmp_path, monkeypatch):
+    box = Inbox()
+    config = dict(MAIL_HOST="synthetic", MAIL_USER="local")
+    switches = lambda: {"MAIL_TRIAL_RECEIVE_ENABLED": "true", "MAIL_TRIAL_CARD_ENABLED": "false"}
+    store = Store(tmp_path / "interrupted")
+    trial = Trial(store, config, switches, lambda *args: None, Event(), connector=lambda _: nullcontext(box))
+    with monkeypatch.context() as change:
+        def interrupt(*args):
+            raise InterruptedError()
+        change.setattr(store, "activate", interrupt)
+        with pytest.raises(InterruptedError):
+            trial.poll()
+    assert trial.box()["state"] == "initializing"
+    box.add(synthetic(2, "during interruption"))
+    trial.store = Store(store.path)
+    trial.poll()
+    assert trial.box()["state"] == "frozen"
+    assert store.row("SELECT count(*) FROM reconciliation")[0] == 2
+
+    trial.store = Store(tmp_path / "vanished")
+    trial.poll()
+    box.add(synthetic(3, "observed once"))
+    with monkeypatch.context() as change:
+        def disappear(uid):
+            del box.messages[uid]
+            raise InterruptedError()
+        change.setattr(box, "complete_message", disappear)
+        with pytest.raises(InterruptedError):
+            trial.poll()
+    trial.store = Store(trial.store.path)
+    trial.poll()
+    assert trial.box()["state"] == "frozen" and trial.store.pending(trial.scope, 1) == [3]
+
+
+def test_bodystructure_uid_is_required_outside_the_mime_tree():
+    from qianshu.mail.imap import TrialMailbox
+    class Wire:
+        def uid(self, *args):
+            assert args == ("FETCH", "7", "(BODYSTRUCTURE)")
+            return "OK", [self.data]
+    wire = Wire()
+    box = TrialMailbox(wire)
+    wire.data = b'1 (BODYSTRUCTURE ("TEXT" "PLAIN") UID 7)'
+    assert box.structure(7) == [b"TEXT", b"PLAIN"]
+    wire.data = b'1 (UID 7 BODYSTRUCTURE ("TEXT" "PLAIN"))'
+    assert box.structure(7) == [b"TEXT", b"PLAIN"]
+    wire.data = b'1 (BODYSTRUCTURE ("TEXT" "UID 7") UID 8)'
+    with pytest.raises(MailError):
+        box.structure(7)
+
+
+def test_legacy_review_preserves_initial_boundary_without_reading_history(tmp_path):
+    store = Store(tmp_path / "trial")
+    old = tmp_path / "old"
+    with sqlite3.connect(old) as db:
+        db.execute("CREATE TABLE delivery(scope,fingerprint,delivered)")
+        db.execute("INSERT INTO delivery VALUES('first','opaque',1)")
+    box = Inbox()
+    trial = Trial(store, dict(MAIL_HOST="synthetic", MAIL_USER="local"),
+                  lambda: dict(MAIL_TRIAL_RECEIVE_ENABLED="true", MAIL_TRIAL_CARD_ENABLED="false"),
+                  lambda *args: None, Event(), connector=lambda _: nullcontext(box), legacy_path=old)
+    trial.poll()
+    box.add(synthetic(2, "after enabling"))
+    trial.poll()
+    assert not box.reads and trial.box()["reason"] == "legacy"
+    store.reconcile(trial.scope, 1, 1, 2)
+    trial.poll()
+    assert box.reads and set(box.reads) == {2}
+    assert store.row("SELECT status FROM legacy")[0] == "reviewed"
+
+
+def test_cli_import_and_receive_only_service_use_same_private_ledger(tmp_path, monkeypatch):
+    from qianshu import __main__ as entry
+    from qianshu.feishu.handoff import HandoffService
+    state = tmp_path / "trial-050.sqlite3"
+    assert entry.main(["--state", str(state), "--trial-import-spend", "1.25"]) == 0
+    assert entry.main(["--state", str(state), "--trial-import-spend", "0"]) == 1
+    settings = tmp_path / "settings"
+    settings.write_text(f"FEISHU_MENTION_LOG={tmp_path / 'mention'}\nFEISHU_HANDOFF_OWNER_OPEN_ID=ou_owner\n"
+                        "FEISHU_BOT_OPEN_ID=ou_bot\nFEISHU_APP_ID=app\nFEISHU_APP_SECRET=secret\nFEISHU_CHAT_ID=group\n")
+    business = tmp_path / "business"
+    business.write_text(f"MAIL_PRIVATE_DIR={tmp_path}\nMAIL_HOST=synthetic\nMAIL_USER=local\nMAIL_PASSWORD=secret\n"
+                        "FEISHU_CHAT_ID=group\nANTHROPIC_API_KEY=synthetic\n")
+    switches = tmp_path / "switches"
+    switches.write_text("MAIL_TRIAL_RECEIVE_ENABLED=true\n")
+    inbox, finished, notices, models = Inbox(), Event(), [], []
+
+    def init(service, store):
+        service.store = store
+        service.transport = object()
+
+    def listen(service):
+        with service.store.listener():
+            assert finished.wait(30)
+
+    def two_polls(trial):
+        try:
+            trial.connector = lambda _: nullcontext(inbox)
+            trial.poll()
+            inbox.add(synthetic(2, "synthetic"))
+            trial.poll()
+        finally:
+            finished.set()
+
+    def response(req):
+        if req.method == "GET":
+            return httpx.Response(200, json=dict(id="claude-haiku-5-5", max_input_tokens=1000000,
+                                  type="model", display_name="synthetic", created_at="2026-01-01T00:00:00Z"))
+        model = json.loads(req.content)["model"]
+        models.append(model)
+        return httpx.Response(200, json={"type": "message", "id": "msg", "role": "assistant", "model": model,
+            "content": [{"type": "text", "text": "是"}], "stop_reason": "end_turn",
+            "usage": {"input_tokens": 20, "output_tokens": 1}})
+
+    monkeypatch.setattr(HandoffService, "__init__", init)
+    monkeypatch.setattr(HandoffService, "run", listen)
+    monkeypatch.setattr(Trial, "run", two_polls)
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(response))
+    monkeypatch.setattr(entry, "_send_trial_message", lambda transport, content, uid, card, check:
+                        check() or notices.append((content, card)))
+    assert entry.main(["--env-file", str(settings), "--business-env-file", str(business),
+                       "--handoff-only", "--trial-switches", str(switches)]) == 0
+    assert models == ["claude-haiku-5-5"] and notices == [("收到，待核对 1 封。", False)]
+    with sqlite3.connect(state) as db:
+        assert db.execute("SELECT imported FROM budget").fetchone()[0] == 1250000000
+        assert db.execute("SELECT amount FROM charge").fetchone()[0] == 2500
