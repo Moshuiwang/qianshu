@@ -459,12 +459,16 @@ class State:
 
 def trial_batch(db: sqlite3.Connection, registration: int, version: int):
     """按卡片绑定的登记版本读取整批人工原因。连接指向 050 私有登记库。"""
+    from qianshu.mail.trial_state import MANUAL_BODY_MISSED
+
     row = db.execute("""SELECT r.attachments,r.status,m.state FROM registration r JOIN mailbox m USING(scope)
         WHERE r.id=? AND r.version=?""", (registration, version)).fetchone()
     if not row:
         return registration, version, None, "登记缺失或版本失效"
     count, status, state = row
-    if state != "active" or status in ("manual", "frozen"):
+    if status == MANUAL_BODY_MISSED:
+        reason = "正文未参与解析"
+    elif state != "active" or status in ("manual", "frozen"):
         reason = "登记冻结或待人工"
     elif count is None or count > 0:
         reason = "附件未解析"

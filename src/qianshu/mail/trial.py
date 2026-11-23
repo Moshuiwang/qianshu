@@ -16,7 +16,7 @@ from . import _fingerprint
 from .imap import MailError, trial_connect
 from .segmented import read_segmented
 from .triage import MailItem, classify, input_limit, trial_model
-from .trial_state import Hold, Store
+from .trial_state import MANUAL_BODY_MISSED, Hold, Store
 
 _LOG = logging.getLogger(__name__)
 _NOTICES = {
@@ -172,7 +172,7 @@ class Trial:
                 self.store.freeze(self.scope, "mapping")
                 break
             if card:
-                self.parse(row, gen, text)
+                self.parse(row, gen, text, html_body_missed=item.html_body_missed)
             else:
                 self.triage(row, gen, item)
         self.flush()
@@ -224,7 +224,7 @@ class Trial:
             if changed.rowcount and verdict != "否" and not self.enabled(True):
                 self.store.notice(f"received:{reg}", self.scope, reg, "received")
 
-    def parse(self, row, gen, text):
+    def parse(self, row, gen, text, *, html_body_missed=False):
         reg = row["id"]
         attempt = None
         refused = False
@@ -274,11 +274,16 @@ class Trial:
             if not db.execute("UPDATE registration SET status='sending' WHERE id=? AND status=?",
                               (reg, expected)).rowcount:
                 return
+        notices = []
+        if html_body_missed:
+            notices.append(CardLine("正文", "HTML 正文未参与解析，请人工核对原邮件"))
         if row["attachments"] != 0:
             hint = f"含 {row['attachments']} 个附件未解析，请对照原件核对"
             if row["attachments"] is None:
                 hint = "附件数量未知，请对照原件核对"
-            pages = (*detail_pages("收信", [CardLine("附件", hint)]), *pages)
+            notices.append(CardLine("附件", hint))
+        if notices:
+            pages = (*detail_pages("收信", notices), *pages)
         heading = detail_pages("试运行邮件", [])[0].elements
         try:
             for index, page in enumerate(pages, 1):
@@ -292,9 +297,9 @@ class Trial:
                     with self.store.write() as db:
                         db.execute("UPDATE card_intent SET status='sent' WHERE uuid=?", (request_id,))
         except Exception:
-            self.status(reg, "manual")
-            return
-        self.status(reg, "manual" if unknown or attempt is None else "done")
+            unknown = True
+        status = "manual" if unknown or attempt is None else "done"
+        self.status(reg, MANUAL_BODY_MISSED if html_body_missed else status)
 
     def flush(self):
         rows = list(self.store.db.execute("""SELECT * FROM notice WHERE status='pending'
@@ -380,10 +385,12 @@ def run_service(args, settings, path, switches):
     check_output_path(state)
     legacy = _private_dir(config) / "mail-poll.sqlite3"
     stop = Event()
+    closed = Event()
 
     def poll():
-        store = Store(state)
+        store = None
         try:
+            store = Store(state)
             with store.write() as db:
                 target = _fingerprint(settings.app_id, settings.chat_id, settings.tenant_key or "")
                 db.execute("INSERT OR IGNORE INTO trial_target VALUES(1,?)", (target,))
@@ -396,7 +403,9 @@ def run_service(args, settings, path, switches):
         except Exception:
             _LOG.error("试运行收信已停止，请核对私有登记。")
         finally:
-            store.db.close()
+            if store is not None:
+                store.db.close()
+            closed.set()
 
     class TrialLog(MentionLog):
         _listener_thread = None
@@ -424,5 +433,14 @@ def run_service(args, settings, path, switches):
         try:
             service.run()
         finally:
-            stop.set()
+            interrupted = False
+            while True:
+                try:
+                    stop.set()
+                    closed.wait()
+                    break
+                except KeyboardInterrupt:
+                    interrupted = True
             thread.join()
+            if interrupted:
+                raise KeyboardInterrupt

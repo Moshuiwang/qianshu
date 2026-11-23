@@ -16,6 +16,9 @@ from qianshu.feishu.handoff import _file
 from . import _fingerprint
 
 
+MANUAL_BODY_MISSED = "转人工（正文未参与解析）"
+
+
 class Hold(RuntimeError):
     """未获派发资格。"""
 
@@ -409,7 +412,7 @@ class Store:
                 raise Hold()
             # 本次水位以前未能证明的新信、旧待办和可能已发的工作均交人工。
             db.execute("""UPDATE registration SET status='manual',reason='reconciliation',version=version+1
-                WHERE scope=? AND status NOT IN ('done','no','frozen','manual')""", (scope,))
+                WHERE scope=? AND status NOT IN ('done','no','frozen','manual',?)""", (scope, MANUAL_BODY_MISSED))
             for row in list(db.execute("""SELECT * FROM reconciliation WHERE scope=? AND generation=?
                     AND matched IS NULL""", (scope, generation))):
                 reg = db.execute("""INSERT INTO registration(scope,msgkey,digest,candidate,attachments,status,

@@ -201,12 +201,17 @@ def read_segmented(mailbox, uid, seen):
             _frame(digest, (path, part))
         text = request_text(parts)
         preferred = "text/plain" if any(k == "text/plain" and has_body(s) for k, s in parts) else "text/html"
-        fields = triage_fields(outer, (part for path, part in chosen.items() if path in visible), preferred)
+        visible_parts = [part for path, part in chosen.items() if path in visible]
+        fields = triage_fields(outer, visible_parts, preferred)
+        # G405 保留 request_text 的选段。引文过滤后为空也须披露选段差异。
+        html_body_missed = (preferred == "text/html"
+                            and any(kind == "text/html" for kind, _ in visible_parts)
+                            and any(kind == "text/plain" and value.strip() for kind, value in parts))
         candidate = "2:" + digest.hexdigest()
         _frame(digest, [(k.lower(), v) for k, v in outer.raw_items() if k.lower() == "message-id"])
         key = message_id(outer)
         item = MailItem(_fingerprint(key) if key else None, "2:" + digest.hexdigest(),
-                        candidate, attachments, fields)
+                        candidate, attachments, fields, html_body_missed)
         complete = True
         return item, text
     except (AttributeError, IndexError, LookupError, MessageError, ValueError, TypeError, RecursionError, AssertionError):
