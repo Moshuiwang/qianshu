@@ -270,8 +270,7 @@ def snapshot_parts(raw: bytes) -> tuple[tuple[str, str], ...]:
                 body = _wire_body(wire)
             except ValueError:
                 # 纯头子段可直接接下一个边界，省略头与空正文之间的空行。
-                if (not child or part.defects or not part.keys() or part.get_payload() != ""
-                        or any(value.defects for value in part.values())):
+                if not child or part.defects or not part.keys() or part.get_payload() != "":
                     raise
                 body = b""
             mime = wire[:len(wire) - len(body)]

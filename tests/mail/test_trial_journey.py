@@ -1,5 +1,7 @@
 import json
 import sqlite3
+import sys
+import unicodedata
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from email import policy
@@ -721,6 +723,11 @@ def test_card_switch_file_changes_only_after_restart(tmp_path):
 
 
 @pytest.mark.parametrize("line", [
+    *(pytest.param(chr(code) + suffix, id=f"U+{code:04X}-{label}")
+      for code in range(sys.maxunicode + 1)
+      if unicodedata.category(chr(code)) in {"Cf", "Zs"}
+      for label, suffix in (("ascii", "> HISTORY_SENTINEL"), ("wide", "＞HISTORY_SENTINEL"))),
+    ">上次说的HISTORY_SENTINEL", "＞上次HISTORY_SENTINEL",
     "\u200e> HISTORY_SENTINEL", "\u200f＞ HISTORY_SENTINEL",
     "\u202a\u202b\u202c\u202d\u202e>\tHISTORY_SENTINEL",
     "\u2066\u2067\u2068\u2069＞>HISTORY_SENTINEL",
@@ -745,7 +752,8 @@ def test_triage_http_quote_marker_boundary(monkeypatch, line):
         assert fields["body"] == text
 
 
-def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch):
+@pytest.mark.parametrize("extra_header", [b"", b"Date: invalid\r\n"], ids=["plain", "invalid-date"])
+def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch, extra_header):
     from qianshu.mail.triage import inspect_mail
     store = Store(tmp_path / "trial")
     inbox = Inbox()
@@ -754,7 +762,8 @@ def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch):
     msg = synthetic(2, "FIRST")
     inbox.add(msg)
     raw = (b"Message-ID: " + msg["Message-ID"].encode() + b"\r\nContent-Type: multipart/mixed; boundary=q\r\n\r\n"
-           b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\n--q--\r\n")
+           b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\n"
+           + extra_header + b"--q--\r\n")
     monkeypatch.setattr(inbox, "complete_message", lambda uid: raw)
     store.observe(trial.scope, 1, 2, 3, [2])
     reg = store.register(trial.scope, 1, 2, inspect_mail(raw))

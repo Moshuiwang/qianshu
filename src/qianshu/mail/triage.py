@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-import re
+import unicodedata
 from dataclasses import dataclass, field
 from email import policy
 from email.errors import MessageError
@@ -19,9 +19,16 @@ from .message import (
 )
 
 
-_QUOTE_LINE = re.compile(
-    r"[\s\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]*[>＞](?=[ \t>＞]|$)"
-)
+def _is_quote_line(line: str) -> bool:
+    for index, char in enumerate(line):
+        if char == "\t" or unicodedata.category(char) in {"Cf", "Zs"}:
+            continue
+        if char not in {">", "＞"}:
+            return False
+        following = line[index + 1:index + 2]
+        return following != "=" and not following.isdigit()
+    return False
+
 
 
 @dataclass(repr=False)
@@ -56,14 +63,14 @@ def _triage_reply(kind, content):
         lines.pop()
     for index, line in enumerate(lines):
         stripped = line.strip()
-        if _QUOTE_LINE.match(line):
+        if _is_quote_line(line):
             return None
         if _DIVIDER.fullmatch(stripped) or _ATTRIBUTION.fullmatch(stripped):
             offset = index + 1
             while offset < len(lines) and (not lines[offset].strip() or _DIVIDER.fullmatch(lines[offset].strip())):
                 offset += 1
             quoted = lines[offset:]
-            if (quoted or structured_quote) and all(_QUOTE_LINE.match(item) for item in quoted):
+            if (quoted or structured_quote) and all(_is_quote_line(item) for item in quoted):
                 return "\n".join(lines[:index]).strip()
             return None
         if _HEADER_FIELD.match(stripped) or _UNKNOWN_DIVIDER.match(stripped):

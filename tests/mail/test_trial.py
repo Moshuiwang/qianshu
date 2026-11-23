@@ -190,7 +190,9 @@ def baseline_modules(tmp_path_factory):
     b"\r\nENCODED=20=E6=B5=8B=\r\n=E8=AF=95\r\n\r\n--q--\r\n",
     b"Content-Type: multipart/mixed; boundary=q\r\n\r\n"
     b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\n--q--\r\n",
-], ids=["mixed-headerless", "plain", "alternative", "quoted-printable", "mixed-header-only"])
+    b"Content-Type: multipart/mixed; boundary=q\r\n\r\n"
+    b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\nDate: invalid\r\n--q--\r\n",
+], ids=["mixed-headerless", "plain", "alternative", "quoted-printable", "mixed-header-only", "invalid-date"])
 def test_mime_to_sonnet_matches_baseline(monkeypatch, baseline_modules, raw):
     from qianshu.mail.message import request_text, snapshot_parts
     baseline, adapter = baseline_modules
@@ -199,7 +201,7 @@ def test_mime_to_sonnet_matches_baseline(monkeypatch, baseline_modules, raw):
         if wire.startswith(b"\r\n"):
             return wire[:2], wire[2:]
         fields, separator, body = wire.partition(b"\r\n\r\n")
-        if wire == b"Content-Type: text/plain":
+        if not separator and wire.startswith(b"Content-Type:"):
             return wire, b""
         assert separator
         return fields + separator, body
