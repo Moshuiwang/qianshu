@@ -29,6 +29,7 @@ class Settings:
     callback_max_age: float = 30
     handoff_sensitive_values: tuple[str, ...] = ()
     handoff_sensitive_urls: frozenset[str] = frozenset()
+    handoff_member_open_ids: frozenset[str] = frozenset()
 
     def __post_init__(self) -> None:
         if (
@@ -112,6 +113,10 @@ def load_handoff_settings(
     bot = (values.get("FEISHU_BOT_OPEN_ID") or "").strip()
     if not re.fullmatch(r"ou_[A-Za-z0-9]+", owner) or owner == bot:
         raise ConfigError("FEISHU_HANDOFF_OWNER_OPEN_ID 须填写一个产品负责人的飞书 open_id。")
+    raw_members = (values.get("FEISHU_HANDOFF_MEMBER_OPEN_IDS") or "").strip()
+    members = frozenset(item.strip() for item in raw_members.split(",")) if raw_members else frozenset()
+    if bot in members or any(not re.fullmatch(r"ou_[A-Za-z0-9]+", item) for item in members):
+        raise ConfigError("FEISHU_HANDOFF_MEMBER_OPEN_IDS 格式无效。")
     path = (values.get("FEISHU_MENTION_LOG", ".private/mentions.sqlite3") or "").strip()
     if not path:
         raise ConfigError("FEISHU_MENTION_LOG 须指向私有目录中的日志文件。")
@@ -138,6 +143,7 @@ def load_handoff_settings(
         bot_open_id=bot,
         allowed_senders=frozenset({owner}),
         tenant_key=(values.get("FEISHU_TENANT_KEY") or "").strip() or None,
+        handoff_member_open_ids=members,
         handoff_sensitive_values=sensitive_values,
         handoff_sensitive_urls=sensitive_urls,
     )

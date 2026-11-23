@@ -737,7 +737,7 @@ def main(argv: list[str] | None = None) -> int:
                 mingdao_config=args.mingdao_config,
             )
             setup_logging({"FEISHU_APP_SECRET": settings.app_secret})
-            with closing(MentionLog(path, settings, create=True)) as store:
+            with MentionLog.listening(path, settings) as store:
                 HandoffService(store).run()
         except ConfigError as error:
             print(error, file=sys.stderr)
