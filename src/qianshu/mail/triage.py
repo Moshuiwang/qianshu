@@ -14,7 +14,10 @@ from qianshu.config import ConfigError
 from qianshu.parse.model import DEFAULT_MODEL, configured_effort
 
 from . import _fingerprint
-from .message import authored_reply, message_id, sender
+from .message import _wire_body, _wire_children, authored_reply, message_id, sender
+
+
+_QUOTE_LINE = re.compile(r"[\s\u200b\u200c\u200d\u2060\ufeff]*[>＞]")
 
 
 @dataclass(repr=False)
@@ -40,27 +43,6 @@ def inspect_mail(raw: bytes) -> MailItem:
     except (AttributeError, IndexError, LookupError, MessageError, TypeError, ValueError, RecursionError):
         fields = dict(display_name="", domain="", subject="", body="")
         return MailItem(None, None, None, None, fields)
-
-
-def _wire_body(wire):
-    separator = re.search(rb"(?m)^\r?\n", wire)
-    if separator is None:
-        raise ValueError
-    return wire[separator.end():]
-
-
-def _wire_children(part, wire, count):
-    # 从原始字节定位子段，避免重新序列化时折行、编码或内嵌邮件头发生变化。
-    boundary = part.get_boundary()
-    if not boundary:
-        raise ValueError
-    body = _wire_body(wire)
-    markers = list(re.finditer(rb"(?m)^--" + re.escape(boundary.encode("ascii"))
-                               + rb"(--)?[ \t]*(?:\r?\n|\Z)", body))
-    if (len(markers) != count + 1 or not markers[-1][1]
-            or any(marker[1] for marker in markers[:-1])):
-        raise ValueError
-    return [body[first.end():last.start()] for first, last in zip(markers, markers[1:])]
 
 
 def _inspect_mail(raw: bytes) -> MailItem:
@@ -146,7 +128,11 @@ def _inspect_mail(raw: bytes) -> MailItem:
                     parser.feed(content)
                     parser.close()
                     eligible = not parser.uncertain
-                bodies.append((kind, authored_reply(kind, content) if eligible else None))
+                reply = authored_reply(kind, content) if eligible else None
+                # 在提取后的可见文本逐行检查，也覆盖 HTML 实体解码后的引文前缀。
+                if reply and any(_QUOTE_LINE.match(line) for line in reply.splitlines()):
+                    reply = None
+                bodies.append((kind, reply))
         if part.defects:
             raise ValueError
 

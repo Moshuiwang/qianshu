@@ -1,5 +1,7 @@
 import hashlib
+import importlib.util
 import json
+import subprocess
 from datetime import date
 from email.message import EmailMessage
 from pathlib import Path
@@ -70,7 +72,7 @@ def test_initialization_crash_freezes_and_observed_uids_survive(tmp_path):
     assert Store(store.path).pending("second", 1) == [101]
 
 
-def capture_sonnet(monkeypatch, trial):
+def capture_sonnet(monkeypatch, trial, text="合成材料", *, adapter=None):
     from qianshu.ai import anthropic
     from qianshu.parse.model import configured_model
     from qianshu.pipeline import Pipeline
@@ -92,15 +94,18 @@ def capture_sonnet(monkeypatch, trial):
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
 
-    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    monkeypatch.setattr(adapter or anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
     config = {"ANTHROPIC_API_KEY": "synthetic"}
     if trial:
         from qianshu.mail.triage import trial_model
         model = trial_model(config, lambda req: None, lambda result: None)
     else:
+        if adapter is not None:
+            from qianshu.ai import ADAPTERS
+            monkeypatch.setitem(ADAPTERS, "anthropic", adapter.streaming_model)
         model = configured_model(config)
     Pipeline(model=model, tag_dates={}, companies_file=Path("tests/parse/fixtures/companies.tsv"),
-             today=lambda: date(2026, 1, 1))(Application(None, "合成材料", ()))
+             today=lambda: date(2026, 1, 1))(Application(None, text, ()))
     return requests
 
 
@@ -154,3 +159,73 @@ def test_committed_freeze_blocks_handoff(tmp_path, stage):
         with one.dispatch("scope", 1, reg, stage, lambda: True):
             sent.append(1)
     assert not sent
+
+
+@pytest.fixture(scope="module")
+def baseline_modules(tmp_path_factory):
+    directory = tmp_path_factory.mktemp("baseline")
+
+    def load(package, name):
+        path = directory / f"{name}.py"
+        path.write_bytes(subprocess.check_output([
+            "git", "show", f"ccd7420:src/qianshu/{package}/{name}.py",
+        ]))
+        spec = importlib.util.spec_from_file_location(f"qianshu.{package}.baseline_{name}", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    return load("mail", "message"), load("ai", "anthropic")
+
+
+@pytest.mark.parametrize("raw", [
+    b"Content-Type: multipart/mixed; boundary=q\r\n\r\n"
+    b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\n\r\nSECOND\r\n--q--\r\n",
+    b"Content-Type: text/plain\r\n\r\nPLAIN\r\nTEXT",
+    b"Content-Type: multipart/alternative; boundary=q\r\n\r\n"
+    b"--q\r\nContent-Type: text/html\r\n\r\n<p>HTML</p>\r\n"
+    b"--q\r\nContent-Type: text/plain\r\n\r\nPLAIN\r\n--q--\r\n",
+    b"Content-Type: multipart/mixed; boundary=q\r\n\r\n"
+    b"--q\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n"
+    b"\r\nENCODED=20=E6=B5=8B=\r\n=E8=AF=95\r\n\r\n--q--\r\n",
+], ids=["mixed-headerless", "plain", "alternative", "quoted-printable"])
+def test_mime_to_sonnet_matches_baseline(monkeypatch, baseline_modules, raw):
+    from qianshu.mail.message import request_text, snapshot_parts
+    baseline, adapter = baseline_modules
+
+    def split_section(wire):
+        if wire.startswith(b"\r\n"):
+            return wire[:2], wire[2:]
+        fields, separator, body = wire.partition(b"\r\n\r\n")
+        assert separator
+        return fields + separator, body
+
+    header, body = split_section(raw)
+    root = baseline.headers(header)
+    sections = {"TEXT": body}
+    structure = [b"TEXT", b"PLAIN"]
+    if root.get_content_maintype() == "multipart":
+        # 此存根只模拟以上单层样本的 IMAP 分段读取，保留 MIME 字段和正文的原始字节。
+        structure = []
+        assert body.startswith(b"--q\r\n") and body.endswith(b"\r\n--q--\r\n")
+        parts = body.removeprefix(b"--q\r\n").removesuffix(b"\r\n--q--\r\n")
+        for index, wire in enumerate(parts.split(b"\r\n--q\r\n"), 1):
+            mime, content = split_section(wire)
+            sections[f"{index}.MIME"] = mime
+            sections[str(index)] = content
+            structure.append([b"TEXT", baseline.headers(mime).get_content_subtype().upper().encode()])
+        structure.append(root.get_content_subtype().upper().encode())
+
+    class Mailbox:
+        def structure(self, uid):
+            return structure
+
+        def section(self, uid, section):
+            return sections[section]
+
+    previous = baseline.request_text(baseline.body_parts(Mailbox(), 1, header))
+    with monkeypatch.context() as old:
+        expected = capture_sonnet(old, False, previous, adapter=adapter)
+    actual = capture_sonnet(monkeypatch, True, request_text(snapshot_parts(raw)))
+    assert len(expected) == len(actual) == 2
+    assert [body == reference for body, reference in zip(actual, expected)] == [True, True]

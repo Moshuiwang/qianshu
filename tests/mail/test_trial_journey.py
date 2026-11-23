@@ -616,7 +616,8 @@ def test_incomplete_imported_ledger_holds_pending(tmp_path, damage):
     assert store.row("SELECT status FROM registration")[0] == "parse"
 
 
-@pytest.mark.parametrize("prefix", ["\ufeff", "\u200b"])
+@pytest.mark.parametrize("prefix", ["\ufeff", "\u200b", " \ufeff", "CURRENT\n\u200b",
+                                     "CURRENT\n\u200c \t\u200d\u2060"])
 def test_prefixed_quote_absent_from_triage_http(monkeypatch, prefix):
     from qianshu.mail.triage import classify, inspect_mail
     requests = []

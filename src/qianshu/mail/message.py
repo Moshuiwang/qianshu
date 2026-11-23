@@ -226,27 +226,56 @@ def _decode_body(part: EmailMessage) -> tuple[str, str]:
     return part.get_content_type(), decoded
 
 
+def _wire_body(wire):
+    separator = re.search(rb"(?m)^\r?\n", wire)
+    if separator is None:
+        raise ValueError
+    return wire[separator.end():]
+
+
+def _wire_children(part, wire, count):
+    # 从原始字节定位子段，避免重新序列化时折行、编码或内嵌邮件头发生变化。
+    boundary = part.get_boundary()
+    if not boundary:
+        raise ValueError
+    body = _wire_body(wire)
+    markers = list(re.finditer(rb"(?m)^--" + re.escape(boundary.encode("ascii"))
+                               + rb"(--)?[ \t]*(?:\r?\n|\Z)", body))
+    if (len(markers) != count + 1 or not markers[-1][1]
+            or any(marker[1] for marker in markers[:-1])):
+        raise ValueError
+    return [body[first.end():last.start()] for first, last in zip(markers, markers[1:])]
+
+
 def snapshot_parts(raw: bytes) -> tuple[tuple[str, str], ...]:
     """按原正文选段口径读取本轮已取全的 MIME 快照。"""
-    def visit(part):
+    def visit(part, wire, *, child=False):
         if part.get_content_maintype() == "multipart":
             if part.get_content_disposition() == "attachment":
                 return
             children = list(part.iter_parts())
+            wires = _wire_children(part, wire, len(children))
+            segments = list(zip(children, wires, strict=True))
             if part.get_content_subtype() == "related":
                 start = part.get_param("start")
                 if start is not None:
-                    children = [child for child in children if child.get("Content-ID") == start]
-                    if len(children) != 1:
+                    segments = [(p, w) for p, w in segments if p.get("Content-ID") == start]
+                    if len(segments) != 1:
                         raise MailError("邮件的正文根段不确定。")
-                children = children[:1]
-            for child in children:
-                yield from visit(child)
+                segments = segments[:1]
+            for subpart, segment in segments:
+                yield from visit(subpart, segment, child=True)
         elif _body_leaf(part):
-            yield _decode_body(part)
+            body = _wire_body(wire)
+            mime = wire[:len(wire) - len(body)]
+            if child:
+                # 下一个 multipart 分隔符占用它前面的一个换行。
+                body = body.removesuffix(b"\r\n") if body.endswith(b"\r\n") else body.removesuffix(b"\n")
+            rebuilt = mime.rstrip(b"\r\n") + b"\r\n\r\n" + body
+            yield _decode_body(_PARSER.parsebytes(rebuilt))
 
     try:
-        return tuple(visit(_PARSER.parsebytes(raw)))
+        return tuple(visit(_PARSER.parsebytes(raw), raw))
     except (AttributeError, IndexError, LookupError, MessageError, TypeError, ValueError, RecursionError):
         raise MailError("无法解析邮件正文。") from None
 
