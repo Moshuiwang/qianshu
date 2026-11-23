@@ -213,49 +213,85 @@ def _token(value):
     return value
 
 
-def _header_blocks(body):
+_PHYSICAL_LINE = re.compile(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$")
+
+
+def _baseline_header_blocks(body):
     """在完整原文上定位连续头部，保留引文所用的字符坐标。"""
-    # 在基线头块内，仅扣除同层无已知头、且物理行紧邻已知引用头的普通字段。
-    # 每个字段仅记录本行正文坐标，折行和分隔换行始终留在遮盖范围内。
-    fields = []
-
-    def masked_ranges(end):
-        if not any(known for _, _, _, _, known in fields):
-            return
-        quoted_headers = {number for depth, number, _, _, known in fields if depth and known}
-        cursor = fields[0][2]
-        for depth, group in groupby(fields, key=lambda field: field[0]):
-            if depth:
-                continue
-            unquoted = list(group)
-            if any(known for _, _, _, _, known in unquoted):
-                continue
-            for _, number, start, stop, _ in unquoted:
-                if number - 1 not in quoted_headers and number + 1 not in quoted_headers:
-                    continue
-                if cursor < start:
-                    yield cursor, start
-                cursor = stop
-        if cursor < end:
-            yield cursor, end
-
+    start = None
+    known = False
     end = 0
     field_prefix = ""
-    lines = re.finditer(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$", body)
-    for number, line in enumerate(lines):
+    for line in _PHYSICAL_LINE.finditer(body):
         raw = line[0].rstrip("\r\n")
         prefix = _QUOTE_PREFIX.match(raw)
         quote_prefix = prefix[0] if prefix else ""
         content = raw[len(quote_prefix):]
-        known = bool(_HEADER.match(raw))
-        if known or _FIELD.match(content):
-            fields.append((quote_prefix.count(">"), number, line.start(), line.start() + len(raw), known))
+        known_field = _HEADER.match(raw)
+        if known_field or _FIELD.match(content):
+            if start is None:
+                start = line.start()
+            known |= bool(known_field)
             field_prefix = quote_prefix
         elif not (content.startswith((" ", "\t")) or raw.startswith((field_prefix + " ", field_prefix + "\t"))):
-            yield from masked_ranges(end)
-            fields.clear()
+            if known:
+                yield start, end
+            start = None
+            known = False
         end = line.start() + len(raw)
-    yield from masked_ranges(end)
+    if known:
+        yield start, end
+
+
+@dataclass
+class _HeaderField:
+    depth: int
+    first_line: int
+    last_line: int
+    start: int
+    stop: int
+    known: bool
+
+
+def _header_blocks(body):
+    """从基线遮盖区间中只扣除符合紧邻例外的普通字段首行。"""
+    for start, end in _baseline_header_blocks(body):
+        fields = []
+        field_prefix = ""
+        for number, line in enumerate(_PHYSICAL_LINE.finditer(body, start, end)):
+            raw = line[0].rstrip("\r\n")
+            prefix = _QUOTE_PREFIX.match(raw)
+            quote_prefix = prefix[0] if prefix else ""
+            content = raw[len(quote_prefix):]
+            if fields and fields[-1].last_line == number - 1 and (
+                content.startswith((" ", "\t")) or raw.startswith((field_prefix + " ", field_prefix + "\t"))
+            ):
+                fields[-1].last_line = number
+                continue
+            known = bool(_HEADER.match(raw))
+            if known or _FIELD.match(content):
+                fields.append(_HeaderField(quote_prefix.count(">"), number, number,
+                                           line.start(), line.start() + len(raw), known))
+                field_prefix = quote_prefix
+
+        single_line_headers = {
+            field.first_line for field in fields
+            if field.depth and field.known and field.first_line == field.last_line
+        }
+        cursor = start
+        for depth, group in groupby(fields, key=lambda field: field.depth):
+            if depth:
+                continue
+            unquoted = list(group)
+            if any(field.known for field in unquoted):
+                continue
+            for field in unquoted:
+                if field.first_line - 1 in single_line_headers or field.first_line + 1 in single_line_headers:
+                    if cursor < field.start:
+                        yield cursor, field.start
+                    cursor = field.stop
+        if cursor < end:
+            yield cursor, end
 
 
 def _material(batch, config, registered):

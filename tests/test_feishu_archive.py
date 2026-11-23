@@ -586,8 +586,17 @@ def test_quote_depth_changes_preview_registration(setup, use_old):
         assert published_paragraphs(stub) == new.blocks
 
 
+_FOLDED_SUBJECT = "> From: 甲\r\n> \tsUbJeCt: 合成折行\r\nX-Internal: 合成内部字段值"
+_TWO_FOLDS = (_QUOTED_FROM, ">  合成续行一", "\t合成续行二")
+_SCENARIO_AFTER_FOLDS = "\r\n".join((*_TWO_FOLDS, _SCENARIO))
+_SCENARIO_BEFORE_FOLDS = "\r\n".join((_SCENARIO, *_TWO_FOLDS))
+
+
 # 合成原文、ec8917f 实测遮盖区间、允许从区间内扣除的紧邻物理行。
 _BASELINE_CASES = (
+    (_FOLDED_SUBJECT, ((0, 48),), ()),
+    (_SCENARIO_AFTER_FOLDS, ((0, 54),), ()),
+    (_SCENARIO_BEFORE_FOLDS, ((0, 54),), ()),
     (_FOLDS[0], ((0, 44),), ()),
     (_FOLDS[1], ((0, 53),), ()),
     (_SAME_DEPTH, ((0, 50),), ()),
@@ -625,6 +634,25 @@ def test_nonadjacent_internal_field_stops_publication(setup, intervening):
     detail = "合成内部字段值"
     context = f"> fRoM: 合成甲\r\n{intervening}\r\nX-Internal: {detail}"
     batch = excerpt_batch(batch, "使用场景", context, detail)
+    register(batch)
+    transport = Mock(wraps=stub)
+    assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
+    transport.request.assert_not_called()
+
+
+def test_folded_subject_keeps_internal_field_masked(setup):
+    batch, _, _, stub, register, run = setup
+    batch = excerpt_batch(batch, "使用场景", _FOLDED_SUBJECT, "合成内部字段值")
+    register(batch)
+    transport = Mock(wraps=stub)
+    assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
+    transport.request.assert_not_called()
+
+
+@pytest.mark.parametrize("context", [_SCENARIO_AFTER_FOLDS, _SCENARIO_BEFORE_FOLDS])
+def test_scenario_adjacent_to_folded_header_stops_publication(setup, context):
+    batch, _, _, stub, register, run = setup
+    batch = excerpt_batch(batch, "使用场景", context, _SCENARIO)
     register(batch)
     transport = Mock(wraps=stub)
     assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
