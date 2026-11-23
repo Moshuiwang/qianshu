@@ -723,7 +723,7 @@ def test_poll_delivers_when_reply_has_no_body(config):
 
 
 @pytest.mark.parametrize(("plain", "expected"), [("合成纯文本", "合成纯文本"), (" ", "合成 HTML")])
-def test_related_alternative_prefers_plain_and_skips_inline_image(config, plain, expected):
+def test_related_alternative_prefers_plain_and_reads_inline_image(config, plain, expected):
     fake = FakeIMAP()
     inbox = config["MAIL_FOLDER"]
     fake.add(inbox, 1, mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], "合成占位"))
@@ -736,13 +736,15 @@ def test_related_alternative_prefers_plain_and_skips_inline_image(config, plain,
         "1.1": '<p>合成 HTML</p><img src="cid:fixture-image">'.encode(),
         "1.2.MIME": b"Content-Type: text/plain; charset=utf-8\r\n\r\n",
         "1.2": plain.encode(),
+        "2.MIME": b"Content-Type: image/png\r\nContent-Transfer-Encoding: base64\r\n",
+        "2": b"YmFkIQ==",
     })
     calls = []
 
-    assert poll_once(config, lambda *args: calls.append(args), factory=fake.factory).delivered
+    assert poll_once(config, lambda *args: calls.append(args), factory=fake.factory, include_attachments=True).delivered
     assert calls[0][0] == expected
-    assert not fake.fetched(inbox, 1, "2.MIME")
-    assert not fake.fetched(inbox, 1, "2")
+    assert calls[0][3][0].missing
+    assert fake.fetched(inbox, 1, "2")
 
 
 def test_related_text_resources_are_not_fetched(config):
@@ -962,7 +964,7 @@ def resident(config, tmp_path, monkeypatch):
         models=[], validations=[], cards={}, requests=[], unexpected_polls=[],
     )
 
-    def configure_model(_):
+    def configure_model(_, **options):
         def complete(*, system, user):
             rig.models.append(user)
             return rig.model_reply
@@ -1052,13 +1054,13 @@ def test_resident_mail_read_only_handoff(resident, monkeypatch, capsys, qualifie
     results = []
     done = Event()
 
-    def poll(config, process, *, stop, wait, approval_judge, on_result):
+    def poll(config, process, *, stop, wait, approval_judge, on_result, include_attachments):
         assert config["MAIL_PORT"] == "993"
         assert approval_judge is None
 
-        def handoff(text, approved, digest):
-            process(text, approved, digest)
-            process(text, approved, digest)
+        def handoff(*args):
+            process(*args)
+            process(*args)
 
         def finished(result):
             results.append(result)
@@ -1066,7 +1068,7 @@ def test_resident_mail_read_only_handoff(resident, monkeypatch, capsys, qualifie
             done.set()
 
         run_polling(config, handoff, stop, factory=fake.factory, wait=wait,
-                    approval_judge=approval_judge, on_result=finished)
+                    approval_judge=approval_judge, on_result=finished, include_attachments=include_attachments)
 
     monkeypatch.setattr(entry.mail, "run_polling", poll)
     resident.run = lambda: done.wait(5)
@@ -1168,3 +1170,50 @@ def test_poll_delivers_marked_mail_when_server_content_search_is_empty(config):
     assert [body for body, _approved, _digest in calls] == ["合成正文"]
     searches = [call for call in fake.calls if call[0] == "SEARCH" and call[1] == inbox]
     assert searches and all(call[2] == "SINCE" and len(call) == 4 for call in searches)
+
+
+def add_attachment_mail(fake, config, body, kind, raw):
+    """按 IMAP 线上段号提供同一封合成邮件的结构和原件。"""
+    import base64
+    encoded = base64.b64encode(raw)
+    request = mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], body)
+    fake.add("INBOX", 1, request)
+    major, minor = kind.upper().split("/")
+    leaf = f'("{major}" "{minor}" NIL NIL NIL "BASE64" {len(encoded)})'.encode()
+    header = f"Content-Type: {kind}\r\nContent-Transfer-Encoding: base64\r\n\r\n".encode()
+    msg = fake.folders["INBOX"][1]
+    if body:
+        msg.update({"1": body.encode(), "2.MIME": header, "2": encoded,
+                    "structure": b"(" + PLAIN + leaf + b' "MIXED")'})
+    else:
+        msg.update({"HEADER": header, "TEXT": encoded, "structure": leaf})
+
+
+@pytest.mark.parametrize("body,source", [("", "part-1"), ("合成正文", "part-2")])
+def test_resident_attachment_reaches_draft_with_original_id(resident, monkeypatch, body, source):
+    from hashlib import sha256
+    from tests.parse.test_attachment_sources import PNG, image_policy
+
+    fake = FakeIMAP()
+    add_attachment_mail(fake, resident.config, body, "image/png", PNG)
+    row = image_policy()
+    for ref in (row["image_main"], row["fields"]["start_date"]["image_evidence"]):
+        ref["source_id"] = source
+    resident.model_reply = json.dumps({"policies": [row]})
+    finished = Event()
+
+    def poll(config, process, *, on_result, include_attachments, **_):
+        on_result(poll_once(config, process, factory=fake.factory, include_attachments=include_attachments))
+        finished.set()
+
+    monkeypatch.setattr(entry.mail, "run_polling", poll)
+    resident.run = lambda: finished.wait(5)
+    assert entry.main(resident.argv()) == 0
+    assert finished.is_set()
+    content, = resident.models
+    assert json.loads(content[0]["text"])["application"] == body
+    assert content[-1]["type"] == "image"
+    [(draft, _)], = resident.validations
+    reason = draft.start_date.uncertainty.reason
+    assert "UID 1" in reason and f"{sha256(PNG).hexdigest()} / {source}" in reason
+    assert len(resident.cards) == 1

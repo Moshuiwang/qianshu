@@ -16,9 +16,7 @@ from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE, PROTOCOL_VERSION, REP
 
 from .business import PAIRING_VERSION, measure_fingerprint, pairing_fingerprint
 from .runner import RULES, IncompleteReply
-from qianshu.parse.materials import content_bytes
-
-from .storage import Output, PrivateFiles, RegressionError, digest, json_bytes, read_json
+from .storage import content_bytes, Output, PrivateFiles, RegressionError, digest, json_bytes, read_json
 
 MANIFEST = "recording.json"
 FAILURES = {None, "model_call", "model_incomplete", "model_invalid", "reply_truncated", *REPLY_FORMAT_ERRORS}

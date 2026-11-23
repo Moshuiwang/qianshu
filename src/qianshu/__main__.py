@@ -35,6 +35,7 @@ from .logs import setup_logging
 from .parse import EMPTY_DRAFTS_STATUS
 from .parse._output import check_output_path
 from .parse.companies import DEFAULT_COMPANIES_FILE
+from .parse.materials import image_settings
 from .parse.model import configured_model, load_model_config
 from .pipeline import Pipeline
 
@@ -524,7 +525,7 @@ def _mail_summary(pages: tuple[DetailPage, ...], approved: bool) -> tuple[Detail
 
 @contextmanager
 def _mail_worker(
-    config: Config, window: Window, stop: Event, process: Callable[[str, bool, str], None],
+    config: Config, window: Window, stop: Event, process: Callable,
     on_result: Callable[[mail.PollResult], None],
 ) -> Iterator[None]:
     end = window.end.timestamp()
@@ -539,7 +540,8 @@ def _mail_worker(
     def poll() -> None:
         while not wait(0):
             try:
-                mail.run_polling(config, process, stop=stop, wait=wait, approval_judge=None, on_result=on_result)
+                mail.run_polling(config, process, stop=stop, wait=wait, approval_judge=None, on_result=on_result,
+                                 include_attachments=True)
             except Exception as error:
                 _LOG.warning("mail_poll_failed count=1 category=%s", type(error).__name__)
                 if wait(60):
@@ -615,17 +617,14 @@ def _serve(
     args: argparse.Namespace, settings: Settings, window: Window, tag_dates: dict[str, date],
     sensitive_values: tuple[str, ...], config: Config, *, mail_config: Config | None = None,
 ) -> None:
-    # Anthropic SDK 支持从进程环境覆盖请求头和默认地址。服务只采用 .env 配置。
-    if "ANTHROPIC_CUSTOM_HEADERS" in os.environ or (
-        "ANTHROPIC_BASE_URL" in os.environ and "ANTHROPIC_BASE_URL" not in config
-    ):
-        raise ConfigError("请通过 .env 配置 AI 接口，并移除 SDK 的进程环境覆盖。")
-    model = configured_model(load_model_config(env_file=args.env_file, config=config))
+    settings_for_model = load_model_config(env_file=args.env_file, config=config)
+    model = configured_model(settings_for_model)
 
-    def complete(*, system: str, user: str) -> str:
+    def complete(*, system: str, user: str | list[dict]) -> str:
         if not window.contains(time.time()):
             raise RuntimeError("验收窗口已关闭。")
-        return model(system=system, user=user)
+        selected = configured_model(image_settings(settings_for_model), max_retries=0) if isinstance(user, list) else model
+        return selected(system=system, user=user)
 
     pipeline = Pipeline(
         model=complete, tag_dates=tag_dates, sensitive_values=sensitive_values,
@@ -664,7 +663,7 @@ def _serve(
     service = FeishuService(settings, window, args.state, processor)
     processor.attach(service.entrance, service.transport)
 
-    def process_mail(body: str, approved: bool, fingerprint: str) -> None:
+    def process_mail(body: str, approved: bool, fingerprint: str, blocks=()) -> None:
         digest = _MAIL_PREFIX + fingerprint
 
         def build_pages() -> tuple[DetailPage, ...]:
@@ -672,7 +671,7 @@ def _serve(
             if not processor._active(digest, now):
                 raise RuntimeError("邮件验收窗口已关闭。")
             message = Message(fingerprint, settings.chat_id, "", int(now * 1000), "text", "")
-            pages = _mail_summary(pipeline(Application(message, body, ())), approved)
+            pages = _mail_summary(pipeline(Application(message, body, ()), additional_blocks=blocks), approved)
             if not processor._active(digest, time.time()):
                 raise RuntimeError("邮件验收窗口已关闭。")
             return pages
@@ -779,7 +778,7 @@ def main(argv: list[str] | None = None) -> int:
         window = Window(args.window_start, args.window_end)
         tag_dates = _tag_dates(args.tag_dates)
         sensitive_values = tuple(
-            config[key] for key in ("FEISHU_APP_SECRET", "ANTHROPIC_API_KEY", "MINGDAO_PASSWORD",
+            config[key] for key in ("FEISHU_APP_SECRET", "ANTHROPIC_API_KEY", "AI_BACKUP_API_KEY", "MINGDAO_PASSWORD",
                                     "MINGDAO_ACCOUNT", "MAIL_PASSWORD", "MAIL_USER") if key in config
         )
         if args.inject is not None:

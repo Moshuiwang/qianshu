@@ -14,7 +14,7 @@ from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
 from .evidence import EvidenceReview, PolicyStructureIssue, Sources, can_use_absence, issue
 from .materials import ATTACHMENT_RULES, image_settings, user_content
-from .model import ModelError, ModelReplyError, ParseModel, configured_model, validate_reply_json
+from .model import ModelError, ModelReplyError, ParseModel, StreamingModel, configured_model, validate_reply_json
 from .model import load_model_config as load_config
 from .package_levels import PackageLevels, load_package_levels
 from .protocol import (
@@ -101,9 +101,10 @@ class ParseResult(list[ParsedPolicyDraft]):
     def __init__(
         self, drafts: Iterable[ParsedPolicyDraft] = (), *,
         structure_issues: Iterable[PolicyStructureIssue] = (), evidence_locations: Mapping[str, int] | None = None,
-        unused_passages: Iterable[UnusedPassage] = (),
+        material_warnings: Iterable[str] = (), unused_passages: Iterable[UnusedPassage] = (),
     ):
         super().__init__(drafts)
+        self.material_warnings = tuple(material_warnings)
         self.structure_issues = tuple(structure_issues)
         self.evidence_locations = dict(evidence_locations or {})
         self.unused_passages = tuple(unused_passages)
@@ -142,9 +143,9 @@ def parse_application(
         raise ParseError("旧回复投影须提供离线录制。")
     reference_date = today if recorded_reply or today is not None else datetime.now(UTC).date()
     attachments = tuple(additional_blocks)
+    warnings = tuple(f"{block.original_id} / {block.id} 未能读取，请核对原件" for block in attachments if block.missing)
     if not body.strip() and not any(block.text.strip() or block.image for block in attachments):
-        reason = "attachment_missing" if any(block.missing for block in attachments) else "empty_material"
-        return ParseResult(structure_issues=(PolicyStructureIssue(None, reason),))
+        return ParseResult(structure_issues=(PolicyStructureIssue(None, "empty_material"),), material_warnings=warnings)
 
     try:
         prompt = (rules_dir / "parse-prompt.md").read_text(encoding="utf-8")
@@ -167,9 +168,12 @@ def parse_application(
         sources = Sources((SourceBlock(_BODY_ID, body, _BODY_ID), *attachments))
     except ValueError:
         raise ParseError("申请输入块映射无效。") from None
+    has_images = any(block.image for block in attachments)
+    if has_images and isinstance(model, StreamingModel):
+        raise ModelError("预构造的客户端无法核对图片目的地，请通过配置组装请求。")
     if model is None:
         settings = config if config is not None else load_config()
-        model = (configured_model(image_settings(settings), max_retries=0) if any(b.image for b in attachments)
+        model = (configured_model(image_settings(settings), max_retries=0) if has_images
                  else configured_model(settings))
     try:
         reply = model(
@@ -200,7 +204,7 @@ def parse_application(
     drafts = [_draft(policy, review, options, results, hints, candidates)
               for policy, (results, hints, candidates) in zip(parsed.policies, resolved, strict=True)]
     return ParseResult(drafts, structure_issues=review.structure_issues, evidence_locations=review.evidence_locations,
-                       unused_passages=parsed.unused_passages or ())
+                       material_warnings=warnings, unused_passages=parsed.unused_passages or ())
 
 
 def _decode(reply: str) -> ApplicationReply:

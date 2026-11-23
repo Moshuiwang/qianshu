@@ -35,6 +35,7 @@ ROOT = Path(__file__).resolve().parents[1]
 PARSE_FIXTURES = ROOT / "tests" / "parse" / "fixtures"
 COMPANIES_FIXTURE = PARSE_FIXTURES / "companies.tsv"
 SECRET = "合成占位凭据-仅用于测试"
+BACKUP_SECRET = "合成备用凭据示例"
 
 _CHILD_SETUP = """
 import os
@@ -117,6 +118,7 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None, sep
     })
     config = {
         "FEISHU_APP_ID": placeholder["app"], "FEISHU_APP_SECRET": SECRET,
+        "AI_BACKUP_API_KEY": BACKUP_SECRET,
         "FEISHU_CHAT_ID": placeholder["chat"], "FEISHU_BOT_OPEN_ID": placeholder["bot"],
         "FEISHU_ALLOWED_SENDER_IDS": placeholder["sender"],
         "FEISHU_APPROVED_FINGERPRINT": fingerprint(body if approved_body is None else approved_body),
@@ -143,6 +145,7 @@ def _run(tmp_path, body, model_reply, *, tag_dates=None, approved_body=None, sep
     )
     assert run.returncode == 0, run.stderr
     assert SECRET not in run.stdout + run.stderr
+    assert BACKUP_SECRET not in run.stdout + run.stderr
     return [json.loads(line) for line in run.stdout.splitlines()]
 
 
@@ -280,7 +283,7 @@ def test_resident_uses_company_path_and_only_saves_raw_when_enabled(
 
 def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path, single_policy):
     body, model = single_policy
-    scope = f"占位休眠用户 {SECRET}"
+    scope = f"占位休眠用户 {SECRET} {BACKUP_SECRET}"
     body = body.replace("占位休眠用户", scope)
     model[0]["user_scope"] = {"value": scope, "evidence": [f"用户范围：{scope}"]}
     cards = _run(
@@ -294,7 +297,8 @@ def test_command_reports_all_field_evidence_and_waits_for_card_approval(tmp_path
         if name == "company":
             continue
         for excerpt in raw["evidence"]:
-            assert any(f"「{excerpt.replace(SECRET, '[已脱敏]')}」" in row for row in fields)
+            redacted = excerpt.replace(SECRET, "[已脱敏]").replace(BACKUP_SECRET, "[已脱敏]")
+            assert any(f"「{redacted}」" in row for row in fields)
     assert any("是否需要维护互斥组\n值　是\n原文出处　无原文摘录" in row for row in fields)
     assert "政策 1 · 公司\n值　占位公司甲\n原文出处　「 赞比亚占位申请。」" in content
     assert '政策 1 · 节目包\n值　[{"当前节目包": "占位甲", "赠送节目包": "占位甲_copy"}]\n原文出处　「占位甲包用户」' in content

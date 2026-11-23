@@ -16,7 +16,7 @@ from threading import TIMEOUT_MAX, Event, Lock, Thread
 from time import monotonic
 
 from .imap import SUMMARY, MailError, ReadOnlyMailbox, connect
-from .message import authored_reply, body_parts, headers, is_reply, message_id, request_text, sender
+from .message import application_attachments, authored_reply, body_parts, headers, is_reply, message_id, request_text, sender
 
 _LOG = logging.getLogger(__name__)
 _PACKAGE_SOURCE_DIR = Path(__file__).resolve().parents[2]
@@ -156,21 +156,23 @@ def _open_ledger(config: Mapping[str, str]) -> sqlite3.Connection:
 
 def poll_once(
     config: Mapping[str, str],
-    process: Callable[[str, bool, str], None],
+    process: Callable,
     *,
+    include_attachments: bool = False,
     factory: Callable = imaplib.IMAP4_SSL,
     approval_judge: ApprovalJudge | None = None,
     approval_judge_timeout: float = _DEFAULT_APPROVAL_TIMEOUT,
 ) -> PollResult:
-    """处理单封 X7 邮件。回调接收正文、当前审批结果和去重指纹。"""
-    return _poll_once(config, process, factory, _bounded_approval(approval_judge, approval_judge_timeout))
+    """处理单封 X7 邮件。回调接收正文、当前审批结果和去重指纹；启用附件时第四项为来源块元组。"""
+    return _poll_once(config, process, factory, _bounded_approval(approval_judge, approval_judge_timeout),
+                      include_attachments)
 
 
 def _poll_once(
     config: Mapping[str, str],
-    process: Callable[[str, bool, str], None],
+    process: Callable,
     factory: Callable,
-    check_approval: Callable[[list[str]], bool] | None,
+    check_approval: Callable[[list[str]], bool] | None, include_attachments: bool,
 ) -> PollResult:
     marker = config.get("MAIL_TEST_MARKER", "")
     approver = config.get("MAIL_APPROVER", "").strip().casefold()
@@ -228,12 +230,16 @@ def _poll_once(
                     if not delivered:
                         raw_headers = mailbox.section(uid, "HEADER")
                         body = request_text(body_parts(mailbox, uid, raw_headers))
-                        if not body:
+                        blocks = application_attachments(mailbox, uid, raw_headers, fingerprint) if include_attachments else ()
+                        if not body and not blocks:
                             raise MailError("测试邮件没有可处理的正文。")
                     approved = _approval(mailbox, sent, message_id(summary), approver, check_approval)
                     if not delivered:
                         try:
-                            process(body, approved, fingerprint)
+                            if include_attachments:
+                                process(body, approved, fingerprint, blocks)
+                            else:
+                                process(body, approved, fingerprint)
                         except Exception:
                             raise MailError("测试邮件处理回调失败。") from None
                         ledger.execute("UPDATE delivery SET delivered = 1 WHERE scope = ?", (scope,))
@@ -246,9 +252,10 @@ def _poll_once(
 
 def run_polling(
     config: Mapping[str, str],
-    process: Callable[[str, bool, str], None],
+    process: Callable,
     stop: Event,
     *,
+    include_attachments: bool = False,
     factory: Callable = imaplib.IMAP4_SSL,
     clock: Callable[[], float] = monotonic,
     wait: Callable[[float], bool] | None = None,
@@ -262,7 +269,7 @@ def run_polling(
     check_approval = _bounded_approval(approval_judge, approval_judge_timeout)
     while not stop.is_set():
         try:
-            result = _poll_once(config, process, factory, check_approval)
+            result = _poll_once(config, process, factory, check_approval, include_attachments)
         except MailError:
             _LOG.warning("mail_poll_failed count=1")
         else:

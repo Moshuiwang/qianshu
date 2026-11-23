@@ -14,7 +14,8 @@ ANTHROPIC_ORIGIN = "https://api.anthropic.com"
 
 def image_settings(config: Mapping[str, str]) -> dict[str, str]:
     base = (config.get("ANTHROPIC_BASE_URL") or ANTHROPIC_ORIGIN).rstrip("/")
-    if base != ANTHROPIC_ORIGIN:
+    if (config.get("AI_ACTIVE_PROFILE", "primary") != "primary"
+            or config.get("AI_PLATFORM", "anthropic") != "anthropic" or base != ANTHROPIC_ORIGIN):
         raise ConfigError("申请图片的解析接口未获准。")
     return {**config, "ANTHROPIC_BASE_URL": base}
 
@@ -39,12 +40,6 @@ def user_content(body: str, blocks: Sequence[SourceBlock]) -> str | list[dict]:
                                             "data": base64.b64encode(block.image).decode("ascii")}},
             ])
     return content
-
-
-def content_bytes(content: str | list[dict]) -> bytes:
-    if isinstance(content, str):
-        return content.encode()
-    return json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
 
 
 ATTACHMENT_RULES = """

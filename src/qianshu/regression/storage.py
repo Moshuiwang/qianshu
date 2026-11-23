@@ -17,6 +17,12 @@ def digest(data: bytes) -> str:
     return sha256(data).hexdigest()
 
 
+def content_bytes(content: str | list[dict]) -> bytes:
+    if isinstance(content, str):
+        return content.encode()
+    return json.dumps(content, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+
+
 def json_bytes(data: object) -> bytes:
     return (json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
 

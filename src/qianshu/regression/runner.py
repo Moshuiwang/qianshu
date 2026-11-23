@@ -1,13 +1,13 @@
 """调用解析入口，对齐原稿段落并生成公开计数和私有明细。"""
 
 from collections import Counter, defaultdict
-from dataclasses import fields, replace
+from dataclasses import fields
 from datetime import date
 from pathlib import Path
 from typing import get_origin
 
 from qianshu.draft import DraftField, OfferPolicyDraft
-from qianshu.parse import AttachmentExcerpt, ModelError, ParseError, _read_options, parse_application
+from qianshu.parse import ModelError, ParseError, _read_options, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
@@ -61,7 +61,7 @@ def _confirmed_targets(draft, targets: list[dict], body: str) -> list[str]:
         excerpt
         for field in fields(draft)
         if isinstance(value := getattr(draft, field.name), DraftField)
-        for excerpt in value.evidence if not isinstance(excerpt, AttachmentExcerpt)
+        for excerpt in value.evidence if not hasattr(excerpt, "source_id")
     )
     for excerpt in excerpts:
         start = excerpt.start
@@ -183,7 +183,7 @@ def _document_model(recording, token):
                     first_request.update({key: recording.document[key] for key in ("request", "request_sha256")})
                 attempts.append(attempt)
 
-            observed = replace(model, on_result=collect)
+            observed = StreamingModel(model.send, collect)
             for _ in range(recording.config["retries"] + 1):
                 try:
                     observed(system=system, user=user)

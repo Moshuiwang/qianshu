@@ -12,7 +12,6 @@ STRUCTURE_REASONS = {
     "unlocated_policy_main": "政策主段无法定位",
     "unlocated_policy_continuation": "政策续行无法定位",
     "overlapping_policy_mains": "政策主段相交",
-    "attachment_missing": "附件未能读取，请对照申请原件",
     "empty_material": "申请材料为空",
 }
 
@@ -163,8 +162,6 @@ class EvidenceReview:
         return tuple(located for span in spans if (located := self._locate(span)) is not None)
 
     def _check_structure(self, policies: list[Policy]) -> Iterable[PolicyStructureIssue]:
-        if any(block.missing for block in self.sources.blocks.values()):
-            yield PolicyStructureIssue(None, "attachment_missing")
         ids = Counter(policy.id for policy in policies)
         for policy in policies:
             main = self.main[id(policy)]

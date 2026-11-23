@@ -2506,3 +2506,20 @@ def test_explicit_empty_or_invalid_package_snapshot(repo, frozen, corrupt):
     model = (lambda **_: pytest.fail("损坏快照应先于模型中止")) if corrupt else no_policies
     assert main(args, model=model) == int(corrupt)
     assert (repo / "run/recording.json").exists() is (not corrupt)
+
+
+@pytest.mark.parametrize("body", ["无重复引文", "合成用户"])
+def test_eml_grade_uses_its_bound_source(body):
+    from qianshu.parse.protocol import SourceBlock
+    from qianshu.regression.business import grade
+    from tests.parse.test_attachment_sources import parsed
+    from tests.protocol_fixtures import policy, span, statement
+
+    text = "合成用户"
+    block = SourceBlock("part-2", text, "part-2", original_id="fixture")
+    anchor = span(0, len(text), block.id)
+    row = policy("p", anchor, {"user_scope": statement("确定", value=text, evidence=[{"text": text, "span": anchor}])})
+    draft, = parsed(body, (block,), [row])
+    args = ("user_scope", {"value": text}, {"inferable": True, "auto_allowed": True}, draft, body)
+    assert grade(*args, (block,)) == "correct"
+    assert grade(*args, (SourceBlock("part-3", text, "part-3"),)) == "false_determined"

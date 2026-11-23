@@ -108,21 +108,19 @@ def test_application_mime_source_order_and_local_eml(kind, html_only):
 
 
 def test_card_renders_reference_only_and_old_anchor_stops_batch(monkeypatch):
-    from functools import partial
     from types import SimpleNamespace
 
-    from qianshu import parse, validate
+    from qianshu import validate
     from qianshu.feishu.cards import result_card
     from qianshu.pipeline import Pipeline
 
     picture = attachment_block("1", "image/png", PNG, original_id="synthetic-mail")
     row = image_policy()
-    monkeypatch.setattr(parse, "parse_application", partial(parse_application, additional_blocks=(picture,)))
     pipeline = Pipeline(model=lambda **_: json.dumps({"policies": [row]}), tag_dates={},
                         companies_file=FIXTURES / "companies.tsv")
     app = SimpleNamespace(text="")
     def render():
-        return json.dumps([result_card(page) for page in pipeline(app)], ensure_ascii=False)
+        return json.dumps([result_card(page) for page in pipeline(app, additional_blocks=(picture,))], ensure_ascii=False)
     cards = render()
     assert "synthetic-mail / part-1" in cards
     assert "需对原图" in cards and base64.b64encode(PNG).decode() not in cards
@@ -168,5 +166,43 @@ def test_unreadable_image_only_stops_with_fixed_reason(caplog):
     assert len(blocks) == 1 and blocks[0].missing
     assert blocks[0].original_id == "UID 42（fixture）"
     result = parse_application("", additional_blocks=blocks, model=lambda **_: pytest.fail("仅损坏材料不应送模"))
-    assert [issue.code for issue in result.structure_issues] == ["attachment_missing"]
+    assert [issue.code for issue in result.structure_issues] == ["empty_material"]
+    assert "UID 42（fixture） / part-1" in result.material_warnings[0]
     assert "BAD-SYNTHETIC" not in caplog.text
+
+
+def test_bad_attachment_preserves_batch_validation_and_field(monkeypatch):
+    from types import SimpleNamespace
+    from qianshu import validate
+    from qianshu.parse.protocol import SourceBlock
+    from qianshu.pipeline import Pipeline
+
+    text = "合成用户"
+    row = policy("p", span(0, len(text)), {"user_scope": statement("确定", value=text, evidence=[
+        {"text": text, "span": span(0, len(text))}])})
+    pipeline = Pipeline(model=lambda **_: json.dumps({"policies": [row]}), tag_dates={},
+                        companies_file=FIXTURES / "companies.tsv")
+    batches = []
+    original = validate.validate_batch
+    def observe(policies, **kwargs):
+        batches.append(policies[0][0].user_scope)
+        return original(policies, **kwargs)
+    monkeypatch.setattr(validate, "validate_batch", observe)
+    app = SimpleNamespace(text=text)
+    pipeline(app)
+    bad = SourceBlock("part-2", "", "part-2", original_id="fixture", missing=True)
+    pages = pipeline(app, additional_blocks=(bad,))
+    assert len(batches) == 2 and batches[0] == batches[1] and batches[1].value == text
+    assert any("fixture / part-2 未能读取" in str(page.elements) for page in pages)
+
+
+def test_image_assembly_rejects_backup_before_model_call():
+    from qianshu.config import ConfigError
+    from qianshu.parse.model import ModelError, configured_model
+    block = attachment_block("1", "image/png", PNG, original_id="fixture")
+    with pytest.raises(ConfigError, match="未获准"):
+        parse_application("", additional_blocks=(block,), companies_text="",
+                          config={"AI_ACTIVE_PROFILE": "backup", "AI_BACKUP_PLATFORM": "anthropic"})
+    prebuilt = configured_model({"ANTHROPIC_API_KEY": "fixture", "ANTHROPIC_BASE_URL": "https://synthetic.invalid"})
+    with pytest.raises(ModelError, match="目的地"):
+        parse_application("", additional_blocks=(block,), companies_text="", model=prebuilt)

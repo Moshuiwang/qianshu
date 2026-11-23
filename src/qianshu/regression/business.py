@@ -301,7 +301,16 @@ def _score(gold: dict, draft: dict) -> list[str]:
     return hits
 
 
-def _evidence_passes(name: str, draft, mark: dict, body: str) -> bool:
+def _matches_excerpt(excerpt, body, blocks):
+    if hasattr(excerpt, "source_id"):
+        return any(block.source_id == excerpt.source_id and excerpt.source_start >= block.start
+                   and block.text.startswith(excerpt.text, excerpt.source_start - block.start) for block in blocks)
+    if excerpt.start is None:
+        return excerpt.text in body
+    return excerpt.start >= 0 and body.startswith(excerpt.text, excerpt.start)
+
+
+def _evidence_passes(name: str, draft, mark: dict, body: str, blocks) -> bool:
     # 4fb3cb5 也有 field_results，但没有薄版的只读核对结果，沿用旧投影。
     field = getattr(draft, name)
     result = getattr(draft, "field_results", {}).get(name)
@@ -332,13 +341,7 @@ def _evidence_passes(name: str, draft, mark: dict, body: str) -> bool:
     elif status not in (None, "确定"):
         return False
     if field.evidence:
-        return all(
-            excerpt.text and (
-                0 <= excerpt.start and body[excerpt.start:excerpt.start + len(excerpt.text)] == excerpt.text
-                if excerpt.start is not None else excerpt.text in body
-            )
-            for excerpt in field.evidence
-        )
+        return all(excerpt.text and _matches_excerpt(excerpt, body, blocks) for excerpt in field.evidence)
     if verified is True:
         return True
     if status is not None or not mark.get("default_allowed", True):
@@ -348,7 +351,7 @@ def _evidence_passes(name: str, draft, mark: dict, body: str) -> bool:
     return name in LEGACY_DEFAULTS and field.value == LEGACY_DEFAULTS[name]
 
 
-def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
+def grade(name: str, entry: dict, mark: dict, draft, body: str, blocks=()) -> str:
     if "value" not in entry or any(type(mark.get(key)) is not bool for key in ("inferable", "auto_allowed")):
         return "unknown"
     if draft is None:
@@ -357,7 +360,7 @@ def grade(name: str, entry: dict, mark: dict, draft, body: str) -> str:
     can_decide = mark["inferable"] and mark["auto_allowed"]
     if needs_confirmation(field):
         return "overasked" if can_decide else "justified_confirmation"
-    if can_decide and compare_field(name, entry["value"], field) == "match" and _evidence_passes(name, draft, mark, body):
+    if can_decide and compare_field(name, entry["value"], field) == "match" and _evidence_passes(name, draft, mark, body, blocks):
         return "correct"
     return "false_determined"
 
@@ -559,6 +562,7 @@ class BusinessScore:
         self.package_denominators = Counter()
 
     def add(self, document: dict, pairs: list[dict], drafts: list) -> dict:
+        blocks = document.get("additional_blocks", ())
         draft_keys = [_draft_keys(draft, self.countries) for draft in drafts]
         gold_keys = [_gold_keys(pair, self.samples[pair["id"]]) for pair in pairs]
         matches, ambiguous_policies, ambiguous_drafts, all_hits, scores = _pair_round(
@@ -567,7 +571,7 @@ class BusinessScore:
         remaining_rows = sorted(set(range(len(pairs))) - matches.keys() - ambiguous_policies)
         remaining_cols = sorted(set(range(len(drafts))) - set(matches.values()) - ambiguous_drafts)
         if remaining_rows and remaining_cols:
-            sources = Sources([SourceBlock("body", document["body"], "body")])
+            sources = Sources([SourceBlock("body", document["body"], "body"), *blocks])
             added, tied_rows, tied_cols, hits, points = _pair_round(
                 [gold_keys[i] for i in remaining_rows],
                 [_with_pending_keys(drafts[j], draft_keys[j], sources, self.options) for j in remaining_cols],
@@ -601,7 +605,7 @@ class BusinessScore:
                     name, pair, self.samples[sample_id], package_style or document.get("package_style"), self.company_table,
                     country_names=self.country_names,
                 )
-                status = grade(name, configuration.get(name, {}), mark, draft, document["body"])
+                status = grade(name, configuration.get(name, {}), mark, draft, document["body"], blocks)
                 self.field_counts[name][status] += 1
                 self.benefit_field_counts[self.samples[sample_id]["benefit_type"]][name][status] += 1
                 by_field[name] = status

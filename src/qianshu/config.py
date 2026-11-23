@@ -27,6 +27,11 @@ CONFIG_KEYS = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_BASE_URL",
     "ANTHROPIC_MODEL",
+    "AI_ACTIVE_PROFILE",
+    "AI_BACKUP_PLATFORM",
+    "AI_BACKUP_MODEL",
+    "AI_BACKUP_BASE_URL",
+    "AI_BACKUP_API_KEY",
 )
 
 # 端口、邮箱文件夹名和模型名仅用于选择连接端口、收件范围和模型，允许写入日志。

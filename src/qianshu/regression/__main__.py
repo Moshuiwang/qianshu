@@ -28,9 +28,7 @@ from .freeze import freeze, load_exclusions, load_freeze
 from .packages import freeze_packages
 from .recording import MANIFEST, Recording, SavedReplies, configuration, doc_names, historical_cost, probe_replies, reference_cost
 from .runner import RULES, RUN_FILES, evaluate, markdown_report
-from qianshu.parse.materials import content_bytes, image_settings
-
-from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json, staged_output
+from .storage import content_bytes, PrivateFiles, RegressionError, digest, json_bytes, read_json, staged_output
 from .summary import summarize
 
 _MODEL_SETTINGS = (
@@ -237,6 +235,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
                 raise RegressionError("实际调用模型须显式指定 --live。")
             settings = {key: os.environ[key] for key in _MODEL_SETTINGS if key in os.environ}
             if any(b.image for doc in snapshot["documents"].values() for b in doc.get("additional_blocks", ())):
+                from qianshu.parse.materials import image_settings
                 settings = image_settings(settings)
             model_id = settings.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
             effort = configured_effort(settings)

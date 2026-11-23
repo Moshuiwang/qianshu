@@ -503,7 +503,7 @@ class Pipeline:
             sections = [replace(line, text=self._sensitive.sub("[已脱敏]", line.text)) for line in sections]
         return detail_pages("飞书群申请", sections)
 
-    def __call__(self, application: Application) -> tuple[DetailPage, ...]:
+    def __call__(self, application: Application, *, additional_blocks=()) -> tuple[DetailPage, ...]:
         body = application.text
         redact = _CardRedaction(body, self._sensitive, self._sensitive_fragments)
         display_body = redact.display(body, 0)
@@ -515,7 +515,7 @@ class Pipeline:
             on_reply = None if self._on_reply is None else partial(self._on_reply, application)
             today = self.today()
             drafts = parse.parse_application(
-                body, model=self.model, on_reply=on_reply, company_rules=company_rules,
+                body, additional_blocks=additional_blocks, model=self.model, on_reply=on_reply, company_rules=company_rules,
                 benefit_catalog=self.benefit_catalog, today=today,
             )
             policies = []
@@ -564,6 +564,7 @@ class Pipeline:
 
         lines = [
             CardLine("处理状态", status, red=requires_full_review),
+            *(CardLine("附件待核", label) for label in getattr(drafts, "material_warnings", ())),
             *(_FreeTextLine("没用上的原文段落（对照下方申请原文）", "理由　", free_text=item.reason)
               for item in getattr(drafts, "unused_passages", ())),
             *self._structure_reminders(body, getattr(drafts, "structure_issues", ()), redact.spans, redact.display),

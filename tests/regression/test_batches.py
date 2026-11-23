@@ -605,13 +605,23 @@ def test_attachment_batch_instant_replay_and_public_artifacts(repo, frozen, monk
                                             inventory_supplied=True)
         summary = (repo / mode / "public-report.md").read_text()
         assert "含附件的申请 1 篇" in summary
-        for kind in ("issue", "pr"):
-            artifact = repo / f"{kind}-body.md"
-            artifact.write_text(f"## {'回写' if kind == 'issue' else '证据'}\n\n" + summary)
-            assert marker not in artifact.read_text() and encoded not in artifact.read_text()
+        publication = Path(__file__).parent / "fixtures/108-publication"
+        bodies = [publication / "issue-update.md", publication / "pr-body.md"]
+        artifacts = [repo / mode / name for name in ("public-report.md", "public-report.json")]
+        for path in [*bodies, *artifacts]:
+            data = path.read_bytes()
+            assert marker.encode() not in data and encoded.encode() not in data
     assert main(["replay", *shared, "--recording", ".private/instant", "--out", ".private/replay"]) == 0
+    manifest = get_json(repo / "materials.json")
+    manifest["documents"]["doc-batch"].reverse()
+    put_json(repo / "materials.json", manifest)
+    assert main(["replay", *shared, "--recording", ".private/instant", "--out", ".private/swapped"]) == 1
+    assert not (repo / "swapped").exists()
     images = [(path, p["messages"][0]["content"]) for path, p in sent if isinstance(p["messages"][0]["content"], list)]
     assert [path for path, content in images] == ["/v1/messages", "/v1/messages/batches"]
+    for _, payload in sent:
+        schema = payload["tools"][0]["input_schema"]
+        assert any("image_evidence" in node.get("properties", {}) for node in schema["$defs"].values()) == isinstance(payload["messages"][0]["content"], list)
     assert images[0][1] == images[1][1]
     assert images[0][1][-1]["source"]["data"] == encoded and marker in images[0][1][0]["text"]
     assert marker not in caplog.text and encoded not in caplog.text

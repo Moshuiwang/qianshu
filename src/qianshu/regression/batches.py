@@ -17,9 +17,7 @@ from qianshu.parse.protocol import ApplicationReply
 
 from .ledger import transaction
 from .recording import reference_cost
-from qianshu.parse.materials import ANTHROPIC_ORIGIN, content_bytes, image_settings
-
-from .storage import RegressionError, digest, json_bytes, read_json
+from .storage import content_bytes, RegressionError, digest, json_bytes, read_json
 
 
 def _members(raw):
@@ -68,8 +66,6 @@ class Captured(Exception):
 
 
 def capture_requests(snapshot, rules, legacy, settings):
-    if any(b.image for doc in snapshot["documents"].values() for b in doc.get("additional_blocks", ())):
-        settings = image_settings(settings)
     wires = {}
     def capture(request):
         wires[token] = request.content.decode("utf-8")
@@ -79,11 +75,14 @@ def capture_requests(snapshot, rules, legacy, settings):
         return httpx.Client(transport=transport, **kwargs)
     # 仅替换本地回归进程中这一轮 SDK 的传输，离开上下文即恢复。
     with patch.object(anthropic, "DefaultHttpxClient", http_client):
-        model = configured_model({**settings, "ANTHROPIC_API_KEY": "offline-capture"}, max_retries=0)
+        config = {**settings, "ANTHROPIC_API_KEY": "offline-capture"}
+        model = configured_model(config, max_retries=0)
         for token, doc in snapshot["documents"].items():
+            blocks = doc.get("additional_blocks", ())
             try:
                 parse_application(doc["body"], rules_dir=rules, companies_text=snapshot["companies_text"],
-                                  legacy_companies=legacy, model=model, additional_blocks=doc.get("additional_blocks", ()))
+                                  legacy_companies=legacy, config=config, additional_blocks=blocks,
+                                  model=None if any(block.image for block in blocks) else model)
             except (ModelError, Captured):
                 if token in wires:
                     continue
@@ -208,14 +207,11 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
     keys = {token: digest(json_bytes([run_id, token])) for token in wires}
     expected = {keys[token]: common_body(raw) for token, raw in wires.items()}
     requests = [{"custom_id": k, "params": json.loads(v)} for k, v in expected.items()]
-    includes_images = any(isinstance(item["params"]["messages"][0]["content"], list) for item in requests)
     identity = digest(json_bytes([config, expected]))
     journal = ledger.journal(run_id)
     def verify(request):
         if (request.url.scheme, request.url.host, request.url.port) != origin:
             raise RegressionError("批量接口返回了不同来源的地址。")
-        if includes_images and request.method == "POST" and str(request.url) != ANTHROPIC_ORIGIN + "/v1/messages/batches":
-            raise RegressionError("图片批量请求目的地未获准。")
         if request.method == "POST":
             if request.content != captured[0].encode():
                 raise RegressionError("待发送批量字节与预先登记的信封不同。")
