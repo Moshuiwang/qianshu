@@ -11,7 +11,7 @@ import stat
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -78,7 +78,7 @@ class MentionLog:
 
     def __init__(
         self, path: Path, settings: Settings, *, create: bool = False,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.time, _listener_lifetime: ExitStack | None = None,
     ) -> None:
         self.path, self.settings, self.clock = path, settings, clock
         if len(settings.allowed_senders) != 1:
@@ -90,15 +90,31 @@ class MentionLog:
         self._owner_tag = f'<at user_id="{self.owner}">产品负责人</at> '
         sensitive_values = (
             settings.app_id, settings.app_secret, settings.chat_id, settings.bot_open_id,
-            self.owner, settings.tenant_key, *settings.handoff_sensitive_values,
+            self.owner, settings.tenant_key, *settings.handoff_sensitive_values, *settings.handoff_member_open_ids,
         )
         exact_urls = settings.handoff_sensitive_urls.difference(sensitive_values)
         self._redact = _Redactor(
             (value for value in (*sensitive_values, *exact_urls) if value), exact_values=exact_urls,
         )
-        os.close(_file(path, create=create))
         self._lock = Lock()
-        db = self._db = sqlite3.connect(path, timeout=0.5, autocommit=True, check_same_thread=False)
+        with ExitStack() as opening:
+            if create:
+                lifetime = _listener_lifetime if _listener_lifetime is not None else opening
+                lifetime.enter_context(self.listener(create=True))
+            else:
+                os.close(_file(path))
+            self._open_database(create)
+
+    @classmethod
+    @contextmanager
+    def listening(cls, path: Path, settings: Settings):
+        """从初始化前到服务退出，连续持有同一把监听锁。"""
+        with ExitStack() as lifetime:
+            with closing(cls(path, settings, create=True, _listener_lifetime=lifetime)) as store:
+                yield store
+
+    def _open_database(self, create: bool) -> None:
+        db = self._db = sqlite3.connect(self.path, timeout=0.5, autocommit=True, check_same_thread=False)
         db.row_factory = sqlite3.Row
         try:
             if create:
@@ -120,14 +136,83 @@ class MentionLog:
                     );
                     CREATE INDEX IF NOT EXISTS outbox_ready ON outbox(status, due);
                 """)
-                now = clock()
+                now = self.clock()
                 db.execute("INSERT OR IGNORE INTO recovery VALUES (1, ?, ?, ?)", (self.scope, now, now))
             binding = db.execute("SELECT scope FROM recovery WHERE singleton = 1").fetchone()
             if binding is None or binding["scope"] != self.scope:
                 raise ValueError("转交日志与当前飞书配置不匹配。")
+            self._configure_members(create)
         except BaseException:
             db.close()
             raise
+
+    def _configure_members(self, create: bool) -> None:
+        db = self._db
+        members = self.settings.handoff_member_open_ids - {self.owner}
+        db.create_function("listed_member", 1, members.__contains__)
+        initialized = self._has_member_tables()
+        if create and (members or initialized):
+            with self._write():
+                db.execute("""CREATE TABLE IF NOT EXISTS memberships (
+                    id INTEGER PRIMARY KEY, sender_id TEXT NOT NULL, since REAL NOT NULL, active INTEGER NOT NULL
+                )""")
+                db.execute("""CREATE UNIQUE INDEX IF NOT EXISTS current_membership
+                              ON memberships(sender_id) WHERE active = 1""")
+                db.execute("""CREATE TABLE IF NOT EXISTS member_mentions (
+                    ref TEXT PRIMARY KEY, message_id TEXT NOT NULL, created_ms INTEGER NOT NULL,
+                    kind TEXT NOT NULL, content TEXT NOT NULL, membership INTEGER NOT NULL
+                )""")
+                retired = db.execute(
+                    "UPDATE memberships SET active = 0 WHERE active = 1 AND NOT listed_member(sender_id)"
+                )
+                if retired.rowcount:
+                    db.execute("""
+                        UPDATE outbox SET status = CASE WHEN first_attempt IS NULL THEN 'cancelled'
+                                                        ELSE 'unconfirmed' END
+                        WHERE status = 'member_pending' AND ref IN (
+                            SELECT m.ref FROM member_mentions m JOIN memberships p ON p.id = m.membership
+                            WHERE p.active = 0
+                        )
+                    """)
+                since = self.clock()
+                db.executemany("INSERT OR IGNORE INTO memberships(sender_id, since, active) VALUES (?, ?, 1)",
+                               [(member, since) for member in sorted(members)])
+                if db.execute("""SELECT 1 FROM member_mentions m LEFT JOIN memberships p ON p.id = m.membership
+                                 WHERE p.id IS NULL LIMIT 1""").fetchone():
+                    _LOG.warning("feishu_handoff_unknown_membership")
+            initialized = True
+        self._awaiting_member_tables = bool(members and not initialized)
+        self._create_authorized_view(bool(members and initialized))
+
+    def _has_member_tables(self) -> bool:
+        return self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'member_mentions'"
+        ).fetchone() is not None
+
+    def _create_authorized_view(self, include_members: bool) -> None:
+        authorized = "SELECT mentions.*, '产品负责人' AS sender FROM mentions"
+        if include_members:
+            # 只有监听器登记资格。旧资格失效后重新加入会获得新 id。
+            authorized += """
+                UNION ALL SELECT m.ref, m.message_id, m.created_ms, m.kind, m.content, '名单内同事'
+                FROM member_mentions m JOIN memberships p ON m.membership = p.id
+                WHERE p.active = 1 AND listed_member(p.sender_id)
+            """
+        self._db.execute("CREATE TEMP VIEW authorized_mentions AS " + authorized)
+
+    def _refresh_watcher_view(self) -> None:
+        if self._awaiting_member_tables and self._has_member_tables():
+            self._db.execute("DROP VIEW temp.authorized_mentions")
+            self._create_authorized_view(True)
+            self._awaiting_member_tables = False
+
+    def sender_label(self, message: Message) -> str | None:
+        if message.sender_type == "user":
+            if message.sender_id == self.owner:
+                return "产品负责人"
+            if message.sender_id in self.settings.handoff_member_open_ids:
+                return "名单内同事"
+        return None
 
     def close(self) -> None:
         self._db.close()
@@ -146,8 +231,8 @@ class MentionLog:
                     db.execute("ROLLBACK")
 
     @contextmanager
-    def listener(self):
-        fd = _file(self.path)
+    def listener(self, *, create: bool = False):
+        fd = _file(self.path, create=create)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield
@@ -169,22 +254,33 @@ class MentionLog:
                 return None
             if db.execute("SELECT 1 FROM outbox WHERE ref = ? LIMIT 1", (ref,)).fetchone():
                 return None
-            if message.sender_id != self.owner:
+            sender = self.sender_label(message)
+            if sender is None:
                 db.execute("""
                     INSERT INTO outbox (ref, kind, message_id, text, due)
                     VALUES (?, 'denied', ?, ?, ?)
                 """, (ref, message.message_id, DENIED, self.clock()))
                 return None
-            db.execute("INSERT INTO mentions VALUES (?, ?, ?, ?, ?)",
-                       (ref, message.message_id, message.created_ms, message.kind, message.content))
+            values = (ref, message.message_id, message.created_ms, message.kind, message.content)
+            status = "pending"
+            if sender == "名单内同事":
+                period = db.execute("SELECT id FROM memberships WHERE sender_id = ? AND active = 1 AND since <= ?",
+                                    (message.sender_id, created)).fetchone()
+                if period is None:
+                    return None
+                db.execute("INSERT INTO member_mentions VALUES (?, ?, ?, ?, ?, ?)", (*values, period["id"]))
+                # 旧监听器只预留 pending。成员任务由新版在资格仍有效时预留。
+                status = "member_pending"
+            else:
+                db.execute("INSERT INTO mentions VALUES (?, ?, ?, ?, ?)", values)
             now = self.clock()
             db.executemany("""
-                INSERT INTO outbox (ref, kind, message_id, text, due, first_attempt)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO outbox (ref, kind, message_id, text, due, first_attempt, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
             """, (
                 (ref, "reaction", message.message_id, "", now + _RETRY_INTERVAL if live else now,
-                 now if live else None),
-                (ref, "fallback", message.message_id, FALLBACK, created + _REPLY_TIMEOUT, None),
+                 now if live else None, status),
+                (ref, "fallback", message.message_id, FALLBACK, created + _REPLY_TIMEOUT, None, status),
             ))
         _LOG.info("feishu_handoff_recorded ref=%s", ref)
         return ref
@@ -207,9 +303,11 @@ class MentionLog:
 
     def pending(self) -> list[sqlite3.Row]:
         with self._lock:
+            self._refresh_watcher_view()
             return self._db.execute("""
-                SELECT mentions.*, fallback.status AS fallback_status
-                FROM mentions JOIN outbox AS fallback USING (ref)
+                SELECT mentions.*, CASE fallback.status WHEN 'member_pending' THEN 'pending'
+                                    ELSE fallback.status END AS fallback_status
+                FROM authorized_mentions AS mentions JOIN outbox AS fallback USING (ref)
                 JOIN outbox AS reaction USING (ref)
                 WHERE fallback.kind = 'fallback'
                   AND reaction.kind = 'reaction'
@@ -230,29 +328,34 @@ class MentionLog:
         self._validate_reply_text(text)
         if mention_owner:
             text = self._owner_tag + text
+        with self._lock:
+            self._refresh_watcher_view()
         with self._write() as db:
-            mention = db.execute("SELECT message_id FROM mentions WHERE ref = ?", (ref,)).fetchone()
+            mention = db.execute("SELECT message_id, sender FROM authorized_mentions WHERE ref = ?", (ref,)).fetchone()
             if mention is None:
                 raise ValueError("找不到已授权的转交记录。")
             db.execute("""
-                INSERT OR IGNORE INTO outbox (ref, kind, message_id, text, due)
-                VALUES (?, 'reply', ?, ?, ?)
-            """, (ref, mention["message_id"], text, self.clock()))
+                INSERT OR IGNORE INTO outbox (ref, kind, message_id, text, due, status)
+                VALUES (?, 'reply', ?, ?, ?, ?)
+            """, (ref, mention["message_id"], text, self.clock(),
+                  "member_pending" if mention["sender"] == "名单内同事" else "pending"))
             reply = db.execute("SELECT text, status FROM outbox WHERE ref = ? AND kind = 'reply'", (ref,)).fetchone()
             if reply["text"] != text:
                 raise ValueError("这条转交已有守望者回复。")
-            return reply["status"]
+            return "pending" if reply["status"] == "member_pending" else reply["status"]
 
     def reply_status(self, ref: str) -> str:
         with self._lock:
             row = self._db.execute(
                 "SELECT status FROM outbox WHERE ref = ? AND kind = 'reply'", (ref,),
             ).fetchone()
-        return row["status"] if row else "none"
+        if row is None:
+            return "none"
+        return "pending" if row["status"] == "member_pending" else row["status"]
 
     def validate_reserved_reply(self, row: sqlite3.Row) -> bool:
         with self._write() as db:
-            mention = db.execute("SELECT message_id FROM mentions WHERE ref = ?", (row["ref"],)).fetchone()
+            mention = db.execute("SELECT message_id FROM authorized_mentions WHERE ref = ?", (row["ref"],)).fetchone()
             try:
                 message_id = row["message_id"]
                 if (not isinstance(message_id, str) or not message_id.strip() or not mention
@@ -272,7 +375,9 @@ class MentionLog:
             now = self.clock()
             row = db.execute("""
                 SELECT * FROM outbox
-                WHERE status = 'pending' AND due <= ? AND (kind = 'reaction') = ?
+                WHERE (status = 'pending' OR (status = 'member_pending' AND EXISTS (
+                    SELECT 1 FROM authorized_mentions m WHERE m.ref = outbox.ref AND m.sender = '名单内同事'
+                ))) AND due <= ? AND (kind = 'reaction') = ?
                   AND kind IN ('reaction', 'fallback', 'denied', 'reply')
                 ORDER BY kind = 'fallback' DESC, due LIMIT 1
             """, (now, reaction)).fetchone()
@@ -304,7 +409,7 @@ class MentionLog:
             if kind == "reply":
                 db.execute("""
                     UPDATE outbox SET status = CASE WHEN first_attempt IS NULL THEN 'cancelled' ELSE 'unconfirmed' END
-                    WHERE ref = ? AND kind = 'fallback' AND status = 'pending'
+                    WHERE ref = ? AND kind = 'fallback' AND status IN ('pending', 'member_pending')
                 """, (ref,))
             elif kind == "denied":
                 db.execute("UPDATE outbox SET message_id = '' WHERE ref = ? AND kind = 'denied'", (ref,))
@@ -426,28 +531,27 @@ class HandoffService:
                 await client._disconnect()
 
     def run(self) -> None:
-        with self.handoff.store.listener():
-            client = _Connection(self, approvals=False)
-            threads = (
-                Thread(target=self._recover, name="feishu-handoff-history"),
-                Thread(target=self._deliver, args=(False,), name="feishu-handoff-replies"),
-                Thread(target=self._deliver, args=(True,), name="feishu-handoff-reactions"),
-            )
+        client = _Connection(self, approvals=False)
+        threads = (
+            Thread(target=self._recover, name="feishu-handoff-history"),
+            Thread(target=self._deliver, args=(False,), name="feishu-handoff-replies"),
+            Thread(target=self._deliver, args=(True,), name="feishu-handoff-reactions"),
+        )
+        for thread in threads:
+            thread.start()
+        serving = ws.loop.create_task(self._serve(client))
+        try:
+            ws.loop.run_until_complete(serving)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._stop.set()
+            self._scan.set()
+            serving.cancel()
+            ws.loop.run_until_complete(asyncio.gather(serving, return_exceptions=True))
+            self._receipts.shutdown(wait=True, cancel_futures=True)
             for thread in threads:
-                thread.start()
-            serving = ws.loop.create_task(self._serve(client))
-            try:
-                ws.loop.run_until_complete(serving)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                self._stop.set()
-                self._scan.set()
-                serving.cancel()
-                ws.loop.run_until_complete(asyncio.gather(serving, return_exceptions=True))
-                self._receipts.shutdown(wait=True, cancel_futures=True)
-                for thread in threads:
-                    thread.join()
+                thread.join()
 
 
 def _utc(ms: int) -> str:
@@ -543,7 +647,7 @@ def watcher_input(row: sqlite3.Row, transport: _Transport, store: MentionLog) ->
         }, size
 
     mention, _ = render(row["message_id"], row["kind"], row["content"], row["created_ms"],
-                        "产品负责人", _CONTENT_LIMIT, download=True)
+                        row["sender"], _CONTENT_LIMIT, download=True)
     end = row["created_ms"] / 1000
     context = []
     remaining = _CONTEXT_CONTENT_LIMIT
@@ -555,11 +659,10 @@ def watcher_input(row: sqlite3.Row, transport: _Transport, store: MentionLog) ->
             if message.message_id in seen:
                 continue
             seen.add(message.message_id)
-            if message.sender_type == "user" and message.sender_id == store.owner:
-                sender = "产品负责人"
-            elif message.sender_type == "app" and message.sender_id == store.settings.app_id:
+            sender = store.sender_label(message)
+            if message.sender_type == "app" and message.sender_id == store.settings.app_id:
                 sender = "千树Bot"
-            else:
+            if sender is None:
                 other_count += 1
                 continue
             if len(context) < _CONTEXT_LIMIT and remaining >= 2:
