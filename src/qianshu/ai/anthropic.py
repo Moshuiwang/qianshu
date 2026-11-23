@@ -3,6 +3,8 @@
 import json
 import logging
 import os
+import socket
+import sys
 from time import monotonic_ns
 from typing import get_args
 
@@ -81,7 +83,8 @@ def _guard_redirect(response: httpx.Response) -> None:
         target = httpx.URL(response.headers["location"])
         if not target.scheme:
             target = source.join(target)
-        if (source.scheme, source.raw_host, source.port) == (target.scheme, target.raw_host, target.port):
+        if (source.scheme == target.scheme == "https" and source.raw_host == target.raw_host
+                and source.port == target.port and not target.userinfo):
             return
     except (ValueError, httpx.InvalidURL):
         pass
@@ -90,12 +93,25 @@ def _guard_redirect(response: httpx.Response) -> None:
     response.headers["x-should-retry"] = "false"
 
 
+def _direct_transport(limits: httpx.Limits) -> httpx.HTTPTransport:
+    # 显式传输绕过 SDK 的代理发现，长时间流式读取仍使用原 TCP 保活参数。
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+    interval = getattr(socket, "TCP_KEEPINTVL", None)
+    if interval is None and sys.platform == "darwin":
+        interval = socket.TCP_KEEPALIVE
+    for option, value in ((interval, 60), (getattr(socket, "TCP_KEEPCNT", None), 5),
+                          (getattr(socket, "TCP_KEEPIDLE", None), 60)):
+        if option is not None:
+            options.append((socket.IPPROTO_TCP, option, value))
+    return httpx.HTTPTransport(limits=limits, trust_env=False, socket_options=options)
+
+
 def streaming_model(*, api_key, base_url, model, effort, on_result, max_retries, follow_redirects) -> StreamingModel:
     # 显式传入默认端点，防止 SDK 在解析 CLI 中另从进程环境取址。
     endpoint = base_url if base_url is not None else "https://api.anthropic.com"
 
     def attempt(system: str, messages: list, on_result, first_shape_error: str | None = None) -> str:
-        from anthropic import Anthropic, AnthropicError, DefaultHttpxClient
+        from anthropic import DEFAULT_CONNECTION_LIMITS, Anthropic, AnthropicError, DefaultHttpxClient, omit
         from anthropic.types import StopReason
 
         if "ANTHROPIC_CUSTOM_HEADERS" in os.environ:
@@ -148,14 +164,19 @@ def streaming_model(*, api_key, base_url, model, effort, on_result, max_retries,
         options = {}
         if max_retries is not None:
             options["max_retries"] = max_retries
-        http_client = DefaultHttpxClient(follow_redirects=follow_redirects)
-        http_client.event_hooks["response"].append(_guard_redirect)
-        options["http_client"] = http_client
         if first_shape_error:
             options["max_retries"] = 0
         reply = None
         try:
-            with Anthropic(api_key=api_key, base_url=endpoint, **options) as client:
+            # 锁版 SDK 在未指定 transport 时会自行读取环境代理。
+            with DefaultHttpxClient(
+                transport=_direct_transport(DEFAULT_CONNECTION_LIMITS),
+                trust_env=False, follow_redirects=follow_redirects,
+                event_hooks={"response": [_guard_redirect]},
+            ) as http_client, Anthropic(
+                api_key=api_key, base_url=endpoint, auth_token="", webhook_key="",
+                default_headers={"Authorization": omit}, http_client=http_client, **options,
+            ) as client:
                 # 使用原始事件，避免 SDK 的部分 JSON 解码先补全或拒绝工具参数。
                 with client.messages.create(
                     model=model,
@@ -190,7 +211,7 @@ def streaming_model(*, api_key, base_url, model, effort, on_result, max_retries,
                     if reply is None:
                         raise ValueError("缺少回复起始事件。")
         # 流式读取中途断开或超时时，SDK 不包装传输层异常。
-        except (AnthropicError, ValueError, httpx.HTTPError) as error:
+        except (AnthropicError, ValueError, httpx.HTTPError, httpx.InvalidURL) as error:
             raw = _interrupted_content(reply, tool_inputs)
             if raw is not None or isinstance(error, _BlockOrderError):
                 record(reply, raw, "reply_truncated", partial=True)

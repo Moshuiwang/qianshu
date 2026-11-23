@@ -328,5 +328,7 @@ def instant_transport(recording):
             raw = request.content.decode("utf-8")
             recording.document["request"] = raw
             recording.document["request_sha256"] = digest(common_body(raw).encode())
-        return factory(**options, event_hooks={"request": [capture]})
+        http_client = factory(**options)
+        http_client.event_hooks["request"].append(capture)
+        return http_client
     return patch.object(anthropic, "DefaultHttpxClient", client)
