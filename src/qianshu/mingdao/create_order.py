@@ -1529,14 +1529,8 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
         shown = grouped.display(text, offset)
         require(not any(secret in shown for secret in secrets), "展示字段与凭据冲突", CredentialConflict)
         evidence_lines.append(f"{labels.get(name, name)}依据：" + shown)
-        if name == "packages" and declared:
-            # 重叠的脱敏窗口只按被覆盖的原文字符数计一次。
-            hidden = end = 0
-            for left, right in sorted(grouped._overlaps(offset, len(text))):
-                hidden += max(0, right - max(left, end))
-                end = max(end, right)
-            if hidden * 2 <= len(text):
-                visible_package_text.extend(shown.split("[已脱敏]"))
+        if name == "packages" and declared and "[已脱敏]" not in shown:
+            visible_package_text.append(shown)
         offset += len(text)
     require(all(any(name in part for part in visible_package_text) for name in package_names),
             "节目包原文归属依据已脱敏", CredentialConflict)

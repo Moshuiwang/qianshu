@@ -2526,7 +2526,12 @@ def test_package_proof_survives_card_redaction(case, platform, business_cli, mon
         read_settings = order.dotenv_values
         monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": "密文合成当前包后缀"})
     text = "本政策适用于合成当前包，联系编号 " + fragment
-    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    parts = [(0, len(text))]
+    if not hidden:
+        start = len(text) + 1
+        text += "\n本次选用合成当前包"
+        parts.append((start, len(text)))
+    replace_order_quotes(export, "packages", text, parts)
     code, error = business_cli.run(export)
     if hidden:
         assert code == 1 and "节目包原文归属依据已脱敏" in error
@@ -2623,12 +2628,8 @@ def test_package_quote_retains_at_least_half(case, platform, business_cli, monke
     text = hidden + name if not allowed else name + hidden
     replace_order_quotes(export, "packages", text, [(0, len(text))])
     code, error = business_cli.run(export)
-    if allowed:
-        assert (code, error, platform.create_count) == (0, "", 1)
-        assert "节目包依据：" + name + "[已脱敏]" in business_cli.summaries[0].splitlines()
-    else:
-        assert code == 1 and "节目包原文归属依据已脱敏" in error
-        assert not business_cli.summaries and platform.create_count == 0
+    assert code == 1 and "节目包原文归属依据已脱敏" in error
+    assert not business_cli.summaries and platform.create_count == 0
 
 
 def test_trimmed_tenant_key_cannot_appear_in_contact(case, platform, business_cli, monkeypatch):
@@ -2664,3 +2665,30 @@ def test_template_conflict_reverse_direction(case, platform, business_cli):
     assert code == 1 and "互斥组" in error
     assert platform.create_count == 0
     assert not business_cli.summaries and not business_cli.notices
+
+
+@pytest.mark.parametrize("first,hidden,complete", [
+    ("适用于合成当前包", "适用于", None),
+    ("适用于合成当前包", "适用于", "本次选用合成当前包"),
+    ("适用于合成当前包，后附合成凭据测试填充值", "后附合成凭据测试填充值", None),
+])
+def test_package_requires_fully_visible_quote(case, platform, business_cli, monkeypatch, first, hidden, complete):
+    export = private_export(case.values)
+    export["drafts"][0]["scope"]["has_title"] = False
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": hidden})
+    text = first
+    parts = [(0, len(first))]
+    if complete:
+        text += "\n" + complete
+        parts.append((len(first) + 1, len(text)))
+    replace_order_quotes(export, "packages", text, parts)
+    code, error = business_cli.run(export)
+    if complete:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        card, = business_cli.summaries
+        assert "节目包依据：" + complete in card.splitlines()
+    else:
+        assert (code, platform.create_count) == (1, 0)
+        assert "节目包原文归属依据已脱敏" in error
+        assert not business_cli.summaries
