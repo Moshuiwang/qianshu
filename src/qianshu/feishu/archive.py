@@ -212,10 +212,7 @@ def _token(value):
     return value
 
 
-_PHYSICAL_LINE = re.compile(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$")
-
-
-def _baseline_header_blocks(body):
+def _header_blocks(body):
     """在完整原文上定位连续头部，保留引文所用的字符坐标。"""
     start = None
     known = False
@@ -240,43 +237,6 @@ def _baseline_header_blocks(body):
         end = line.start() + len(raw)
     if known:
         yield start, end
-
-
-def _header_blocks(body):
-    """只从基线区间首尾扣除紧邻单行引用头的普通字段。"""
-    for start, end in _baseline_header_blocks(body):
-        lines = list(_PHYSICAL_LINE.finditer(body, start, end))
-        single_headers = set()
-        field_prefix = None
-        for index, line in enumerate(lines):
-            raw = line[0].rstrip("\r\n")
-            prefix = _QUOTE_PREFIX.match(raw)
-            quote_prefix = prefix[0] if prefix else ""
-            content = raw[len(quote_prefix):]
-            if field_prefix is not None and (
-                content.startswith((" ", "\t")) or raw.startswith((field_prefix + " ", field_prefix + "\t"))
-            ):
-                single_headers.discard(index - 1)
-                continue
-            known = _HEADER.match(raw)
-            if known and prefix:
-                single_headers.add(index)
-            field_prefix = quote_prefix if known or _FIELD.match(content) else None
-
-        # 基线区间间至少隔一行未遮盖的原文，故只有首尾行的外侧满足条件。
-        cursor = start
-        for index, neighbor in ((0, 1), (len(lines) - 1, len(lines) - 2)):
-            if neighbor not in single_headers:
-                continue
-            line = lines[index]
-            raw = line[0].rstrip("\r\n")
-            if _QUOTE_PREFIX.match(raw) or _HEADER.match(raw) or not _FIELD.match(raw):
-                continue
-            if cursor < line.start():
-                yield cursor, line.start()
-            cursor = line.start() + len(raw)
-        if cursor < end:
-            yield cursor, end
 
 
 def _material(batch, config, registered):
