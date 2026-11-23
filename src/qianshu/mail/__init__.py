@@ -226,15 +226,19 @@ def _poll_once(
                     stored, delivered = binding
                     if stored != fingerprint:
                         raise MailError("测试标记已绑定另一封邮件。")
-                    body = ""
                     if not delivered:
                         raw_headers = mailbox.section(uid, "HEADER")
                         body = request_text(body_parts(mailbox, uid, raw_headers))
-                        blocks = application_attachments(mailbox, uid, raw_headers, fingerprint) if include_attachments else ()
-                        if not body and not blocks:
-                            raise MailError("测试邮件没有可处理的正文。")
                     approved = _approval(mailbox, sent, message_id(summary), approver, check_approval)
                     if not delivered:
+                        blocks = ()
+                        if include_attachments and approved:
+                            mailbox.select(inbox)
+                            if _fingerprint(scope, str(uid), mailbox.section(uid, SUMMARY)) != fingerprint:
+                                raise MailError("测试标记已绑定另一封邮件。")
+                            blocks = application_attachments(mailbox, uid, raw_headers, fingerprint)
+                        if not body and not blocks:
+                            raise MailError("测试邮件没有可处理的正文。")
                         try:
                             if include_attachments:
                                 process(body, approved, fingerprint, blocks)

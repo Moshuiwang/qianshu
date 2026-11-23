@@ -13,7 +13,7 @@ from qianshu.draft import Candidate, DraftField, OfferPolicyDraft, SourceExcerpt
 from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
 from .evidence import EvidenceReview, PolicyStructureIssue, Sources, can_use_absence, issue
-from .materials import ATTACHMENT_RULES, image_settings, user_content
+from .materials import ATTACHMENT_RULES, attachment_settings, user_content
 from .model import ModelError, ModelReplyError, ParseModel, StreamingModel, configured_model, validate_reply_json
 from .model import load_model_config as load_config
 from .package_levels import PackageLevels, load_package_levels
@@ -65,6 +65,7 @@ class ParsedPolicyDraft(OfferPolicyDraft):
 
     tier_field: DraftField | None = None
     package_tier_candidates: tuple[str, ...] = ()
+    image_locations: dict[str, str]
     hints: list[str]
 
     source_span: tuple[int, int] | None = None
@@ -168,12 +169,11 @@ def parse_application(
         sources = Sources((SourceBlock(_BODY_ID, body, _BODY_ID), *attachments))
     except ValueError:
         raise ParseError("申请输入块映射无效。") from None
-    has_images = any(block.image for block in attachments)
-    if has_images and isinstance(model, StreamingModel):
-        raise ModelError("预构造的客户端无法核对图片目的地，请通过配置组装请求。")
+    if attachments and isinstance(model, StreamingModel):
+        raise ModelError("预构造的客户端无法核对附件目的地，请通过配置组装请求。")
     if model is None:
         settings = config if config is not None else load_config()
-        model = (configured_model(image_settings(settings), max_retries=0) if has_images
+        model = (configured_model(attachment_settings(settings), max_retries=0) if attachments
                  else configured_model(settings))
     try:
         reply = model(
@@ -307,9 +307,14 @@ def _draft(
         "continuations": [review.corrected_span(span) or span for span in policy.continuations],
     })
     draft.scope = corrected.model_dump(mode="json", exclude={"fields"})
+    draft.image_locations = {}
     if main_label := review.sources.image_label(policy.image_main):
+        draft.image_locations["政策主段"] = main_label
         hints.append(f"政策主段需对原图：{main_label}")
     for field_name, result in results.items():
+        if result.statement.image_evidence is not None:
+            draft.image_locations[field_name] = (review.sources.image_label(result.statement.image_evidence)
+                                                 or "图片来源或区域无法定位，请核对原申请。")
         for quote in result.evidence:
             block = review.sources.blocks[quote.span.source_id]
             if block.original_id and block.text:

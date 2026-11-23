@@ -741,7 +741,9 @@ def test_related_alternative_prefers_plain_and_reads_inline_image(config, plain,
     })
     calls = []
 
-    assert poll_once(config, lambda *args: calls.append(args), factory=fake.factory, include_attachments=True).delivered
+    add_mail_approval(fake, config)
+    assert poll_once(config, lambda *args: calls.append(args), factory=fake.factory, include_attachments=True,
+                     approval_judge=judge_fixture_reply).approved
     assert calls[0][0] == expected
     assert calls[0][3][0].missing
     assert fake.fetched(inbox, 1, "2")
@@ -1172,6 +1174,17 @@ def test_poll_delivers_marked_mail_when_server_content_search_is_empty(config):
     assert searches and all(call[2] == "SINCE" and len(call) == 4 for call in searches)
 
 
+def add_mail_approval(fake, config):
+    original = fake.folders[config["MAIL_FOLDER"]][1]["message"]
+    reply = mail(config["MAIL_APPROVER"], config["MAIL_TEST_MARKER"], "OK", reply_to=str(original["Message-ID"]))
+    fake.add(config["MAIL_SENT_FOLDER"], 2, reply)
+
+
+def judge_fixture_reply(text):
+    assert text == "OK"
+    return ApprovalDecision.APPROVE
+
+
 def add_attachment_mail(fake, config, body, kind, raw):
     """按 IMAP 线上段号提供同一封合成邮件的结构和原件。"""
     import base64
@@ -1196,6 +1209,12 @@ def test_resident_attachment_reaches_draft_with_original_id(resident, monkeypatc
 
     fake = FakeIMAP()
     add_attachment_mail(fake, resident.config, body, "image/png", PNG)
+    if body:
+        item = fake.folders["INBOX"][1]
+        item["structure"] = item["structure"].replace(b' "MIXED"', b'("IMAGE" "PNG" NIL NIL NIL "BASE64" 4) "MIXED"')
+        item["3.MIME"] = item["2.MIME"]
+        item["3"] = b"YmFk"
+    add_mail_approval(fake, resident.config)
     row = image_policy()
     for ref in (row["image_main"], row["fields"]["start_date"]["image_evidence"]):
         ref["source_id"] = source
@@ -1203,7 +1222,10 @@ def test_resident_attachment_reaches_draft_with_original_id(resident, monkeypatc
     finished = Event()
 
     def poll(config, process, *, on_result, include_attachments, **_):
-        on_result(poll_once(config, process, factory=fake.factory, include_attachments=include_attachments))
+        result = poll_once(config, process, factory=fake.factory, include_attachments=include_attachments,
+                           approval_judge=judge_fixture_reply)
+        assert result.approved
+        on_result(result)
         finished.set()
 
     monkeypatch.setattr(entry.mail, "run_polling", poll)
@@ -1217,3 +1239,58 @@ def test_resident_attachment_reaches_draft_with_original_id(resident, monkeypatc
     reason = draft.start_date.uncertainty.reason
     assert "UID 1" in reason and f"{sha256(PNG).hexdigest()} / {source}" in reason
     assert len(resident.cards) == 1
+
+    card, = resident.cards.values()
+    text = json.dumps(card, ensure_ascii=False)
+    assert reason.split("需对原图：")[1] in text and "开始日期" in text
+    assert "2099-01-01" not in text
+    if body:
+        assert "part-3 未能读取，请核对原件" in text and "附件待核" in text
+
+
+def test_x7_without_mail_approval_delivers_only_body(resident, monkeypatch):
+    fake = FakeIMAP()
+    eml = EmailMessage()
+    eml.set_content("SYNTHETIC-X7-ATTACHMENT")
+    add_attachment_mail(fake, resident.config, "合成正文", "message/rfc822", eml.as_bytes())
+    finished = Event()
+
+    def poll(config, process, *, on_result, include_attachments, approval_judge, **_):
+        assert approval_judge is None
+        result = poll_once(config, process, factory=fake.factory, include_attachments=include_attachments)
+        assert result.delivered and not result.approved
+        on_result(result)
+        finished.set()
+
+    monkeypatch.setattr(entry.mail, "run_polling", poll)
+    resident.run = lambda: finished.wait(5)
+    assert entry.main(resident.argv()) == 0 and finished.is_set()
+    content, = resident.models
+    assert json.loads(content) == {"application": "合成正文"}
+    assert not fake.fetched("INBOX", 1, "2")
+
+
+def test_resident_approved_eml_cannot_use_backup_model(resident, monkeypatch):
+    resident.config.update(AI_ACTIVE_PROFILE="backup", AI_BACKUP_PLATFORM="anthropic",
+                           AI_BACKUP_MODEL="fixture", AI_BACKUP_API_KEY="fixture",
+                           AI_BACKUP_BASE_URL="https://alternate.invalid")
+    fake = FakeIMAP()
+    eml = EmailMessage()
+    eml.set_content("SYNTHETIC-EML-108")
+    add_attachment_mail(fake, resident.config, "合成正文", "message/rfc822", eml.as_bytes())
+    add_mail_approval(fake, resident.config)
+    finished = Event()
+
+    def poll(config, process, *, on_result, include_attachments, **_):
+        result = poll_once(config, process, factory=fake.factory, include_attachments=include_attachments,
+                           approval_judge=judge_fixture_reply)
+        assert result.approved and result.delivered
+        on_result(result)
+        finished.set()
+
+    monkeypatch.setattr(entry.mail, "run_polling", poll)
+    resident.run = lambda: finished.wait(5)
+    assert entry.main(resident.argv()) == 0 and finished.is_set()
+    card, = resident.cards.values()
+    assert "解析不完整" in json.dumps(card, ensure_ascii=False)
+    assert fake.fetched("INBOX", 1, "2") and not resident.models

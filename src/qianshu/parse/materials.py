@@ -12,11 +12,11 @@ from .protocol import SourceBlock
 ANTHROPIC_ORIGIN = "https://api.anthropic.com"
 
 
-def image_settings(config: Mapping[str, str]) -> dict[str, str]:
+def attachment_settings(config: Mapping[str, str]) -> dict[str, str]:
     base = (config.get("ANTHROPIC_BASE_URL") or ANTHROPIC_ORIGIN).rstrip("/")
     if (config.get("AI_ACTIVE_PROFILE", "primary") != "primary"
             or config.get("AI_PLATFORM", "anthropic") != "anthropic" or base != ANTHROPIC_ORIGIN):
-        raise ConfigError("申请图片的解析接口未获准。")
+        raise ConfigError("申请附件的解析接口未获准。")
     return {**config, "ANTHROPIC_BASE_URL": base}
 
 

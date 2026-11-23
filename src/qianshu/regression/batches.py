@@ -82,7 +82,7 @@ def capture_requests(snapshot, rules, legacy, settings):
             try:
                 parse_application(doc["body"], rules_dir=rules, companies_text=snapshot["companies_text"],
                                   legacy_companies=legacy, config=config, additional_blocks=blocks,
-                                  model=None if any(block.image for block in blocks) else model)
+                                  model=None if blocks else model)
             except (ModelError, Captured):
                 if token in wires:
                     continue

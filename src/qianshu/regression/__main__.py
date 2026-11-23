@@ -234,9 +234,9 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
             if not args.live:
                 raise RegressionError("实际调用模型须显式指定 --live。")
             settings = {key: os.environ[key] for key in _MODEL_SETTINGS if key in os.environ}
-            if any(b.image for doc in snapshot["documents"].values() for b in doc.get("additional_blocks", ())):
-                from qianshu.parse.materials import image_settings
-                settings = image_settings(settings)
+            if any(doc.get("additional_blocks") for doc in snapshot["documents"].values()):
+                from qianshu.parse.materials import attachment_settings
+                settings = attachment_settings(settings)
             model_id = settings.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
             effort = configured_effort(settings)
             origin = "live"

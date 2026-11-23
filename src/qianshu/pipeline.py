@@ -564,6 +564,9 @@ class Pipeline:
 
         lines = [
             CardLine("处理状态", status, red=requires_full_review),
+            *(CardLine("原图待核", f"政策 {index} · {_FIELD_LABELS.get(label, label)}　{location}")
+              for index, parsed in enumerate(drafts, 1)
+              for label, location in getattr(parsed, "image_locations", {}).items()),
             *(CardLine("附件待核", label) for label in getattr(drafts, "material_warnings", ())),
             *(_FreeTextLine("没用上的原文段落（对照下方申请原文）", "理由　", free_text=item.reason)
               for item in getattr(drafts, "unused_passages", ())),

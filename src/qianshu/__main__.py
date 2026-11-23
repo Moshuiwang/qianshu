@@ -35,7 +35,7 @@ from .logs import setup_logging
 from .parse import EMPTY_DRAFTS_STATUS
 from .parse._output import check_output_path
 from .parse.companies import DEFAULT_COMPANIES_FILE
-from .parse.materials import image_settings
+from .parse.materials import attachment_settings
 from .parse.model import configured_model, load_model_config
 from .pipeline import Pipeline
 
@@ -501,7 +501,7 @@ def _load_mail_config(config: Config, env_file: Path) -> Config:
 
 
 def _mail_summary(pages: tuple[DetailPage, ...], approved: bool) -> tuple[DetailPage, ...]:
-    # 汇报只允许固定状态和计数。群卡片的字段、摘录和模型输出都留在内存中。
+    # 仅投影程序生成的状态、计数与材料定位行。
     status = "解析不完整，需人工确认。"
     if pages and len(pages[0].elements) > 1:
         heading = pages[0].elements[1].get("text", {}).get("content", "")
@@ -517,9 +517,16 @@ def _mail_summary(pages: tuple[DetailPage, ...], approved: bool) -> tuple[Detail
                 if (text := element.get("text", {}).get("content", ""))
             )
             status = f"解析完成，共 {total} 条政策。通过校验 {validated} 条，需人工核对 {total - validated} 条。"
+    materials = []
+    for page in pages:
+        for element in page.elements:
+            label, _, location = element.get("text", {}).get("content", "").partition("\n")
+            if label in {"原图待核", "附件待核"}:
+                materials.append(CardLine(label, location))
     return detail_pages("邮件", [
         CardLine("邮件审批", "已获审批" if approved else "不确定，交人工"),
         CardLine("处理状态", status),
+        *materials,
     ])
 
 
@@ -623,7 +630,8 @@ def _serve(
     def complete(*, system: str, user: str | list[dict]) -> str:
         if not window.contains(time.time()):
             raise RuntimeError("验收窗口已关闭。")
-        selected = configured_model(image_settings(settings_for_model), max_retries=0) if isinstance(user, list) else model
+        has_materials = isinstance(user, list) or "attachments" in json.loads(user)
+        selected = configured_model(attachment_settings(settings_for_model), max_retries=0) if has_materials else model
         return selected(system=system, user=user)
 
     pipeline = Pipeline(

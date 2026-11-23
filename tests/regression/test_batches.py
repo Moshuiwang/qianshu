@@ -667,3 +667,29 @@ def test_attachment_selection_preserves_whole_documents(repo, frozen):
     assert sorted(chosen["samples"]) == samples and chosen["fingerprint"] == digest(json_bytes(selection))
     with pytest.raises(RegressionError):
         tiers.attachment_subset(snapshot, {**selection, "samples": []})
+
+
+@pytest.mark.parametrize("mode", ["instant", "batch"])
+def test_eml_only_live_run_rejects_alternate_destination(repo, frozen, monkeypatch, capsys, mode):
+    from email.message import EmailMessage
+    from test_regression import put_json
+
+    eml = EmailMessage()
+    eml.set_content("SYNTHETIC-EML-108")
+    raw = eml.as_bytes()
+    sha = digest(raw)
+    (repo / "objects").mkdir()
+    (repo / "objects" / sha).write_bytes(raw)
+    put_json(repo / "materials.json", {"freeze_sha256": frozen, "documents": {
+        "doc-batch": [{"section": "1", "media_type": "message/rfc822", "sha256": sha}], "doc-single": [],
+    }})
+    sent = []
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://alternate.invalid")
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(lambda req: sent.append(req) or httpx.Response(403)), **kw))
+    assert main(["run", "--frozen", ".private/frozen", "--expect-sha256", frozen,
+                 "--attachment-manifest", ".private/materials.json", "--live", "--run-id", "eml-" + mode,
+                 "--estimate-usd", "1", "--out", ".private/" + mode, "--mode", mode]) == 1
+    assert "回归模型配置不可用" in capsys.readouterr().err
+    assert sent == []

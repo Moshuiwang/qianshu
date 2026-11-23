@@ -130,13 +130,16 @@ def test_card_renders_reference_only_and_old_anchor_stops_batch(monkeypatch):
     assert "政策主段无法定位" in render()
 
 
-def test_image_redirect_and_wrong_origin_never_receive_image(monkeypatch):
+@pytest.mark.parametrize("kind", ["image/png", "message/rfc822"])
+def test_attachment_redirect_and_wrong_origin_never_receive_material(monkeypatch, kind):
     import anthropic
     import httpx
     from qianshu.config import ConfigError
     from qianshu.parse import ModelError
 
-    picture = attachment_block("1", "image/png", PNG, original_id="fixture")
+    eml = EmailMessage()
+    eml.set_content("SYNTHETIC-EML-108")
+    picture = attachment_block("1", kind, PNG if kind == "image/png" else eml.as_bytes(), original_id="fixture")
     sent = []
     def redirect(request):
         sent.append(str(request.url))
