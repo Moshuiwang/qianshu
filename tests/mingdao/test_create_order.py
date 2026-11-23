@@ -128,8 +128,8 @@ def case(tmp_path):
         statuses=statuses, status_labels=status_labels,
         cells={control[key]: value for key, value in template.items()}, private=private, window=window,
         relations=relations,
-        session_token="placeholder-sensitive-" + uuid4().hex,
-        official_token="placeholder-sensitive-" + uuid4().hex,
+        session_token="zq-sens-" + uuid4().hex,
+        official_token="vx-auth-" + uuid4().hex,
     )
 
 
@@ -2845,3 +2845,240 @@ def test_identifier_contiguous_credential_gate(case, platform, business_cli, mon
         assert (code, platform.create_count) == (1, 0)
         assert not business_cli.summaries and "凭据冲突" in error and identifier not in error
         assert all(identifier not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
+
+
+@pytest.fixture
+def outlet_case(case):
+    case.session_token = "x" + uuid4().hex
+    case.official_token = "y" + uuid4().hex
+    return case
+
+
+@pytest.mark.parametrize(("field", "missing"), [("key", True), ("label", True), ("label", False)])
+def test_outlet_notice_reports(outlet_case, platform, business_cli, field, missing):
+    case = outlet_case
+    fragment = case.session_token[1:9]
+    case.config["notice_recipients"][0][field] += fragment
+    if missing:
+        case.evidence["notices"].clear()
+    code, error = business_cli.run()
+    assert (code, platform.create_count) == (1, 0)
+    assert error.strip() == "凭据冲突，已停止，详见私有核对"
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    for pattern in ("create-preflight-*.json", "create-fields-*.json"):
+        assert all(fragment not in path.read_text() for path in case.private.glob(pattern))
+
+
+@pytest.mark.parametrize("location", ["receive_id", "unsafe_destination", "card", "announcement", "stderr", "log"])
+def test_outlet_positions(outlet_case, platform, business_cli, monkeypatch, caplog, location):
+    from qianshu.feishu.sdk import _Transport
+
+    case = outlet_case
+    chat = "group-" + (case.session_token[1:9] if location == "unsafe_destination" else uuid4().hex)
+    settings = SimpleNamespace(chat_id=chat)
+    monkeypatch.setattr(order, "load_settings", lambda _: settings)
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "FEISHU_CHAT_ID": chat})
+    bodies = []
+
+    def capture(request):
+        body = request.request_body
+        if body.msg_type == "interactive":
+            platform.actions.append("card")
+        bodies.append((body.receive_id, body.msg_type, json.loads(body.content)))
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="card"))
+
+    transport = order._Transport()
+    transport.settings = settings
+    transport.window = None
+    transport._require_window = lambda: None
+    transport.im = SimpleNamespace(message=SimpleNamespace(create=capture))
+    transport.send_card = partial(_Transport.send_card, transport)
+    transport.announce = partial(_Transport.announce, transport)
+    factory = order.FeishuService
+
+    def service(*args, **kwargs):
+        approvals = factory(*args, **kwargs)
+        def publish(binding, summary):
+            return approvals.transport.send_card({"summary": summary, "extra": chat if location == "card" else ""})
+        approvals.publish_approval = publish
+        if location == "announcement":
+            def reject(*_):
+                raise order.Stop(chat)
+            approvals.approval_status = reject
+        return approvals
+
+    monkeypatch.setattr(order, "FeishuService", service)
+    if location in ("stderr", "log"):
+        case.config["diagnostic"] = chat if location == "stderr" else case.session_token[1:9]
+        def diagnostic(*_):
+            if location == "log":
+                logging.getLogger("qianshu").warning("诊断 %s", case.config["diagnostic"])
+            raise order.Stop(case.config["diagnostic"])
+        monkeypatch.setattr(order, "check_catalog", diagnostic)
+    code, error = business_cli.run()
+    if location == "receive_id":
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert bodies and all(body[0] == chat and chat not in order.compact(body[2]) for body in bodies)
+        return
+    assert (code, platform.create_count) == (1, 0)
+    assert error.strip() == "凭据冲突，已停止，详见私有核对"
+    assert case.session_token[1:9] not in caplog.text
+    if location == "unsafe_destination":
+        assert bodies == []
+    else:
+        announcements = [content for _, kind, content in bodies if kind == "text"]
+        assert announcements == [{"text": "未建单（凭据冲突），转人工处理"}]
+        assert all(chat not in order.compact(content) for _, _, content in bodies)
+
+
+@pytest.fixture
+def runtime_case(outlet_case):
+    # 避免随机十六进制四字片段偶合草稿日期，使出口用例始终抵达指定注入点。
+    outlet_case.session_token = "ZQKLMNOPRSTUVW"
+    outlet_case.official_token = "YKJHGFDSAPOIU"
+    outlet_case.ids["official_app"] = "XNMBCVZLKJHQ"
+    return outlet_case
+
+
+@pytest.mark.parametrize("placement", ["unused", "nested", "duplicate_env", "trimmed_env"])
+def test_configuration_conflict_precedes_external_calls(runtime_case, platform, business_cli, monkeypatch, placement):
+    from unittest.mock import Mock
+
+    case = runtime_case
+    read_settings = order.dotenv_values
+    extra = {}
+    fragment = case.session_token[2:10]
+    if placement == "unused":
+        case.config["unused"] = "前" + fragment + "后"
+    elif placement == "nested":
+        case.config["unused"] = [{"value": fragment}]
+    elif placement == "duplicate_env":
+        extra["EXTRA"] = case.official_token
+    else:
+        extra["MAIL_FOLDER"] = " " + fragment + " "
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), **extra})
+    blocked = [Mock(side_effect=AssertionError("预检冲突后进入下游")) for _ in range(4)]
+    for name, stub in zip(("Official", "FeishuService", "_Transport", "extract_token"), blocked):
+        monkeypatch.setattr(order, name, stub)
+    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert all(stub.call_count == 0 for stub in blocked)
+    assert platform.actions == [] and platform.create_count == 0
+    assert not list(case.private.glob("create-preflight-*"))
+    assert not (case.private / "trial-orders.jsonl").exists()
+
+
+def test_first_conflict_on_created_readback(runtime_case, platform, business_cli):
+    fragment = runtime_case.session_token[2:10]
+    platform.before_read = lambda row: row.update(extra="前" + fragment + "后")
+    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert platform.create_count == 1 and "delete" not in platform.actions
+    assert events(runtime_case)[-1] == "readback_unconfirmed"
+    assert not list(runtime_case.private.glob("create-readback-*"))
+    assert fragment not in (runtime_case.private / "trial-orders.jsonl").read_text()
+    assert business_cli.notices == ["建单请求已发出（凭据冲突），已停止，转人工核对"]
+
+
+@pytest.mark.parametrize("sink", ["preflight", "fields", "lock", "ledger", "official", "create", "stderr", "logging"])
+def test_runtime_outlet_blocks_before_create(runtime_case, platform, business_cli, monkeypatch, caplog, sink):
+    case = runtime_case
+    fragment = case.session_token[2:10]
+    if sink in {"preflight", "fields", "lock"}:
+        prefix = {"preflight": "create-preflight-", "fields": "create-fields-", "lock": "trace-12-create.lock"}[sink]
+        original = order.exclusive
+
+        def write(path, value):
+            if path.name.startswith(prefix):
+                value = {**value, "extra": fragment}
+            original(path, value)
+
+        monkeypatch.setattr(order, "exclusive", write)
+        if sink == "preflight":
+            case.evidence["notices"].clear()
+    elif sink == "ledger":
+        original = order.Ledger.append
+
+        def append(ledger, event, *args, **kwargs):
+            return original(ledger, event, *args, extra=fragment, **kwargs)
+
+        monkeypatch.setattr(order.Ledger, "append", append)
+    elif sink == "official":
+        original = order.Official._request
+
+        def request(api, action, *args, **kwargs):
+            kwargs["params"] = {"extra": fragment}
+            return original(api, action, *args, **kwargs)
+
+        monkeypatch.setattr(order.Official, "_request", request)
+    elif sink == "create":
+        original = order.CreateRequest.func.prepare
+
+        def prepare(create, payload):
+            return original(create, order.compact({**order.decode(payload), "extra": fragment}).encode())
+
+        monkeypatch.setattr(order.CreateRequest.func, "prepare", prepare)
+    else:
+        def stop(*args):
+            if sink == "logging":
+                logging.getLogger("qianshu").warning("诊断 %s", fragment)
+            raise order.Stop(fragment)
+
+        monkeypatch.setattr(order, "check_catalog", stop)
+
+    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert platform.create_count == 0
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert fragment not in caplog.text
+    if sink == "official":
+        assert platform.actions == []
+    for pattern in ("create-preflight-*", "create-fields-*", "trace-12-create.lock", "trial-orders.jsonl"):
+        assert all(fragment not in path.read_text() for path in case.private.glob(pattern))
+
+
+def test_approval_state_rejects_returned_message_id(live_approval):
+    service, *_ = live_approval
+    guard = order.Outlet()
+    guard.configure({"EXTRA": "abcdefghijk"})
+    service.before_send = guard.sdk
+    service.transport.send_card = lambda card: "returned-abcdefgh"
+    with pytest.raises(order.OutletConflict):
+        FeishuService.publish_approval(service, "binding", "摘要")
+    with service._state.connection() as db:
+        assert db.execute("SELECT count(*) FROM feishu_approvals").fetchone() == (0,)
+
+
+def test_callback_response_rejects_inherited_frame_header(live_approval):
+    service, _, origin, _ = live_approval
+    guard = order.Outlet()
+    guard.configure({"EXTRA": "abcdefghijk"})
+    service.before_send = guard.sdk
+    sent = []
+
+    async def send(raw):
+        sent.append(raw)
+
+    origin.send = send
+    service._client._conn = origin
+    frame = ws.Frame(method=ws.FrameType.DATA.value, SeqID=0, LogID=0, service=1)
+    for key, value in ((ws.HEADER_TYPE, ws.MessageType.CARD.value), (ws.HEADER_SUM, "1"),
+                       (ws.HEADER_TRACE_ID, "trace-abcdefgh")):
+        header = frame.headers.add()
+        header.key, header.value = key, value
+    frame.payload = b"{}"
+    try:
+        ws.loop.run_until_complete(service._client._handle_message(frame.SerializeToString()))
+        assert sent == [] and guard.conflict
+    finally:
+        service._client._conn = None
+
+
+def test_success_stdout_is_checked_before_printing(monkeypatch, capsys):
+    def run(*args):
+        guard = order._outlet.get()
+        guard.configure({"EXTRA": "建单回读一致，D15"})
+        return True
+
+    monkeypatch.setattr(order, "run", run)
+    assert order.main(["--config", "config", "--registration", "trial", "draft"]) == 1
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "凭据冲突，已停止，详见私有核对\n")

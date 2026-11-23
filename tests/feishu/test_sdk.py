@@ -1441,3 +1441,20 @@ def test_run_create_window_expiry_during_proof_warns_on_original_socket(
         assert reader.approval_status(*key) == "closed"
         assert reader.claim_create(*key) is None
         assert not reader.dispatch_create(*key, pytest.fail)
+
+
+def test_callback_frame_with_default_and_observing_hook(connected, monkeypatch):
+    service, socket, _ = connected
+    sent = []
+    monkeypatch.setattr(time, "monotonic", lambda: 200.0)
+
+    async def capture(data):
+        sent.append(data)
+
+    monkeypatch.setattr(socket, "send", capture)
+    dispatch(service, {"schema": "2.0"}, frame_type=ws.MessageType.CARD)
+    checked = []
+    service.before_send = lambda outlet, data: checked.append((outlet, data))
+    dispatch(service, {"schema": "2.0"}, frame_type=ws.MessageType.CARD)
+    assert len(sent) == 2 and sent[0] == sent[1]
+    assert checked[-1] == ("callback_response", sent[1])

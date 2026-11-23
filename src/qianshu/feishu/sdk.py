@@ -90,6 +90,12 @@ def _message(
     )
 
 
+def _before_send(target, outlet, value):
+    check = getattr(target, "before_send", None)
+    if check is not None:
+        check(outlet, value)
+
+
 class _Transport:
     def __init__(self, settings: Settings, window: Window | None, clock: Callable[[], float]):
         self.settings, self.window, self.clock = settings, window, clock
@@ -196,6 +202,7 @@ class _Transport:
         request = (
             CreateSelfTenantTokenRequestBuilder(CreateSelfTenantTokenRequest()).request_body(body).build()
         )
+        _before_send(self, "token", {"app_id": body.app_id, "app_secret": body.app_secret})
         raw = await SDKTransport.aexecute(config, request)
         if raw.status_code != HTTPStatus.OK:
             raise RuntimeError("飞书租户令牌请求失败。")
@@ -219,6 +226,7 @@ class _Transport:
             )
             if page:
                 request.page_token(page)
+            _before_send(self, "members", {"chat_id": self.settings.chat_id, "page_token": page})
             response = await self.im.chat_members.aget(request.build(), option)
             data = _checked(response).data
             if data.trigger_security_conf_limit or type(data.has_more) is not bool:
@@ -239,6 +247,7 @@ class _Transport:
         ).content(json.dumps(card, ensure_ascii=False)).build()
         request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body)
         self._require_window()
+        _before_send(self, "message", vars(body))
         response = _checked(self.im.message.create(request.build()))
         if not response.data or not response.data.message_id:
             raise RuntimeError("飞书未返回卡片消息标识。")
@@ -250,6 +259,7 @@ class _Transport:
             "text",
         ).content(json.dumps({"text": text}, ensure_ascii=False)).build()
         request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+        _before_send(self, "message", vars(body))
         _checked(self.im.message.create(request))
 
     async def notify_callback_timeout(self, notice=_CALLBACK_TIMEOUT_NOTICE) -> None:
@@ -261,6 +271,7 @@ class _Transport:
             ).content(json.dumps({"text": notice}, ensure_ascii=False)).build()
             request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
             self._require_window()
+            _before_send(self, "message", vars(body))
             _checked(await self.im.message.acreate(request, option))
 
     def _history_items(
@@ -395,6 +406,7 @@ class _Connection(ws.Client):
                 if self._conn is not None:
                     return
                 conn_url = await self._discover_endpoint()
+                _before_send(self.service, "websocket", conn_url)
                 query = parse_qs(urlparse(conn_url).query)
                 conn_id, service_id = query[ws.DEVICE_ID][0], query[ws.SERVICE_ID][0]
                 self.service.transport._require_window()
@@ -414,6 +426,8 @@ class _Connection(ws.Client):
         # 固定版本的 SDK 在这里直接调用无超时的 requests.post。
         headers = {"locale": "zh", ws.USER_AGENT: self._user_agent}
         body = {"AppID": self._app_id, "AppSecret": self._app_secret}
+        _before_send(self.service, "endpoint", body)
+        _before_send(self.service, "endpoint_metadata", [headers, self._domain + ws.GEN_ENDPOINT_URI])
         remaining = self.service._remaining()
         limit = _HTTP_TIMEOUT if remaining is None else min(_HTTP_TIMEOUT, remaining)
         try:
@@ -468,7 +482,9 @@ class _Connection(ws.Client):
             try:
                 if self._conn is not None:
                     frame = ws._new_ping_frame(int(self._service_id))
-                    await self._write_message(frame.SerializeToString())
+                    encoded = frame.SerializeToString()
+                    _before_send(self.service, "ping", encoded)
+                    await self._write_message(encoded)
             except Exception:
                 _LOG.error("feishu_connection_ping_failed")
             await asyncio.sleep(self._ping_interval)
@@ -516,6 +532,7 @@ class _Connection(ws.Client):
             if payload is None:
                 return
 
+        _before_send(self.service, "callback_headers", [(h.key, h.value) for h in headers])
         response = ws.Response(code=HTTPStatus.OK)
         timing = self._dispatch.set((origin, started, deadline))
         try:
@@ -525,7 +542,9 @@ class _Connection(ws.Client):
                     raise ValueError("卡片帧缺少卡片回调类型。")
             result = self._event_handler._do_without_validation(payload)
             if result is not None:
-                response.data = base64.b64encode(ws.JSON.marshal(await result).encode())
+                encoded = ws.JSON.marshal(await result).encode()
+                _before_send(self.service, "callback_content", encoded)
+                response.data = base64.b64encode(encoded)
         except Exception:
             _LOG.error("feishu_event_dispatch_failed")
             if frame_type == ws.MessageType.CARD.value:
@@ -545,7 +564,9 @@ class _Connection(ws.Client):
         async with asyncio.timeout(remaining):
             async with self._lock:
                 if origin is not None and origin is self._conn and origin.close_code is None:
-                    await origin.send(frame.SerializeToString())
+                    encoded = frame.SerializeToString()
+                    _before_send(self.service, "callback_response", encoded)
+                    await origin.send(encoded)
 
     def _combine(self, msg_id, count, sequence, data):
         # SDK 分片缓存跨重连保留，给每次连接独立的缓存键。
@@ -617,6 +638,7 @@ class FeishuService:
         process: Callable[[Application], Report] | None, *, clock: Callable[[], float] = time.time,
         membership_check: Callable[[str], Awaitable[bool]] | None = None,
         callback_response_margin: float = _CALLBACK_RESPONSE_MARGIN,
+        before_send: Callable[[str, object], None] | None = None,
     ):
         if not 0 < callback_response_margin < _CALLBACK_BUDGET:
             raise ValueError("飞书卡片回调的应答预留时间无效。")
@@ -627,10 +649,12 @@ class FeishuService:
         self._approval_disconnected = Event()
         self._approval_disconnected.set()
         self._connected_at: float | None = None
+        self.before_send = before_send
         self._membership_check = membership_check
         self._callback_response_margin = callback_response_margin
         self._callback_notices = set()
         self._callback_notice_failures = 0
+        _before_send(self, "approval_scope", (settings.app_id, settings.chat_id))
         self._state = State(state_path, settings)
         self._state.close_approvals()
         self._callback_claim_lock = asyncio.Lock()
@@ -639,6 +663,7 @@ class FeishuService:
         logging.getLogger("Lark").disabled = True
         logging.getLogger("httpx").disabled = True
         self.transport = _Transport(settings, window, clock)
+        self.transport.before_send = before_send
         self.entrance = (
             Entrance(settings, window, self._state, self.transport, process, clock=clock)
             if process is not None else None
@@ -682,6 +707,7 @@ class FeishuService:
                 or not self.window.contains(self.clock())
             ):
                 raise RuntimeError("发送审批卡片期间审批已关闭。")
+            _before_send(self, "approval_state", (approval_id, message_id, record_id, self.window.end.timestamp()))
             self._state.bind(approval_id, message_id, record_id, self.window.end.timestamp())
         return approval_id
 
@@ -748,6 +774,8 @@ class FeishuService:
             for item in (context.open_message_id, approval_id, record_id, event_id, operator_id)
         ):
             return _approval_warning("审批回调缺少有效标识或决定")
+        _before_send(self, "approval_state", (approval_id, record_id, decision, context.open_message_id,
+                                              event_id, operator_id))
         raw_time = data.header.create_time
         if isinstance(raw_time, str) and re.fullmatch(r"[0-9]+", raw_time):
             try:

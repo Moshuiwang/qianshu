@@ -13,6 +13,7 @@ import sys
 import time
 from collections import Counter
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -79,6 +80,82 @@ class Stop(RuntimeError):
 
 class CredentialConflict(Stop):
     """发卡前命中凭据门禁，须公告转人工。"""
+
+
+_LOCAL_CONFLICT = "凭据冲突，已停止，详见私有核对"
+_MANUAL_NOTICE = "未建单（凭据冲突），转人工处理"
+_outlet = ContextVar("create_order_outlet", default=None)
+
+
+class OutletConflict(CredentialConflict):
+    def __init__(self):
+        super().__init__(_LOCAL_CONFLICT)
+
+
+class Outlet:
+    def __init__(self):
+        self.fragments = {}
+        self.credentials = {}
+        self.conflict = False
+        self.configuration_checked = False
+        self.started = False
+
+    def require_clear(self):
+        if self.conflict:
+            raise OutletConflict()
+
+    def configure(self, credentials):
+        self.credentials = credentials
+        for owner, value in credentials.items():
+            for fragment in credential_fragments((value, value.strip()), 8):
+                self.fragments.setdefault(fragment, set()).add(owner)
+
+    def check(self, value, owner=None):
+        if isinstance(value, dict):
+            for key, item in value.items():
+                self.check(key)
+                self.check(item)
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                self.check(item)
+        else:
+            text = value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else str(value)
+            own_value = self.credentials.get(owner)
+            exempt = {owner} if own_value and text in (own_value, own_value.strip()) else set()
+            for index in range(len(text) - 7):
+                owners = self.fragments.get(text[index:index + 8])
+                if owners and owners - exempt:
+                    self.conflict = True
+                    raise OutletConflict()
+
+    def sdk(self, outlet, value):
+        self.require_clear()
+        self.check_sdk_fields(outlet, value)
+
+    def check_sdk_fields(self, outlet, value):
+        if outlet == "approval_scope":
+            self.check(digest("\0".join(value).encode()))
+            return
+        positions = {
+            "message": {"receive_id": "FEISHU_CHAT_ID"},
+            "members": {"chat_id": "FEISHU_CHAT_ID"},
+            "endpoint": {"AppID": "FEISHU_APP_ID", "AppSecret": "FEISHU_APP_SECRET"},
+            "token": {"app_id": "FEISHU_APP_ID", "app_secret": "FEISHU_APP_SECRET"},
+        }
+        if outlet in positions:
+            if outlet == "message":
+                self.check(decode(value["content"]))
+            for key, item in value.items():
+                self.check(key)
+                self.check(item, positions[outlet].get(key))
+        else:
+            self.check(value)
+
+
+def check_outlet(value):
+    guard = _outlet.get()
+    if guard is not None:
+        guard.check(value)
 
 
 def require(condition, reason, error_type=Stop):
@@ -153,6 +230,7 @@ def sync_directory(directory):
 
 
 def exclusive(path, value):
+    check_outlet((path.name, value, compact(value) + "\n"))
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(compact(value) + "\n")
@@ -171,6 +249,7 @@ class Ledger:
     def append(self, event, record_id=None, **results):
         row = dict(registration=self.registration, event=event, name=self.name,
                    record_id=record_id, is_test=True, utc=datetime.now(UTC).isoformat(), **results)
+        check_outlet((row, compact(row) + "\n"))
         self.stream.write(compact(row) + "\n")
         self.stream.flush()
         os.fsync(self.stream.fileno())
@@ -388,6 +467,20 @@ class Official:
                 and read["missing_key"] != ["success"] and read["missing_value"] is not None,
                 "记录不存在信号配置无效")
 
+    def check_wire_request(self, request):
+        guard = _outlet.get()
+        if guard:
+            guard.require_clear()
+            guard.check((request.method, str(request.url), request.content))
+            for key, value in request.headers.items():
+                guard.check(key)
+                if key.lower() == "authorization" and value.startswith("Bearer "):
+                    guard.check(value.removeprefix("Bearer "), self.config["token_key"])
+                elif key.lower() == "hap-appid":
+                    guard.check(value, self.config["app_id_key"])
+                else:
+                    guard.check(value)
+
     def _request(self, action, record_id="", *, body=None, params=None, timeout=None, relation_control=None):
         if action in ("read", "logs", "delete", "relations"):
             require(uuid_record(record_id), "记录编号格式无效")
@@ -399,6 +492,10 @@ class Official:
             url += "/relations/" + relation_control
         method = {"delete": "DELETE", "search": "POST"}.get(action, "GET")
         options = {} if timeout is None else {"timeout": timeout}
+        check_outlet((method, url, body, params))
+        guard = _outlet.get()
+        if guard:
+            guard.require_clear()
         failed = False
         try:
             with self.client.stream(method, url, json=body, params=params, follow_redirects=False,
@@ -409,10 +506,14 @@ class Official:
                     require(len(buffer) <= _LIMIT, "官方接口响应超出限制")
                 status = response.status_code
             payload = decode(buffer)
+        except OutletConflict:
+            raise
         except Exception:
             failed = True
         if failed:
             raise Stop("官方接口请求或响应未确认")
+        if guard and guard.started:
+            guard.check(payload)
         if action == "read" and status == spec["missing_status"]:
             try:
                 marker = at(payload, spec["missing_key"])
@@ -1331,6 +1432,12 @@ class CreateRequest:
     @contextmanager
     def prepare(self, body):
         require(not self.started and len(body) <= _LIMIT, "建单请求已尝试或正文过长")
+        check_outlet((self.endpoint, body, decode(body), "Authorization", "md_pss_id ",
+                      "Accept-Encoding", "identity", "Content-Type", "application/json; charset=utf-8",
+                      "Content-Length", len(body)))
+        guard = _outlet.get()
+        if guard:
+            guard.check(self._token, guard.session_owner)
         connection = self.connect(self.endpoint["host"], timeout=_CONNECT_TIMEOUT,
                                   context=ssl.create_default_context())
         connection.response_class = CreateResponse
@@ -1347,6 +1454,9 @@ class CreateRequest:
             def send(check_approval):
                 require(not self.started and connection.sock is not None, "建单传输不可用")
                 check_approval()
+                if guard:
+                    guard.require_clear()
+                    guard.started = True
                 self.started = True
                 connection.endheaders(body)
 
@@ -1354,6 +1464,7 @@ class CreateRequest:
                 connection.sock.settimeout(_READ_TIMEOUT)
                 response = connection.getresponse()
                 raw = read_create_response(response)
+                check_outlet(raw)
                 record_id = at(decode(raw), self.spec["response_id"])
                 require(uuid_record(record_id), "建单记录编号未确认")
                 return record_id
@@ -1624,6 +1735,9 @@ def card_summary(values, *, default_mutual_exclusion=False):
 
 
 def stop_if_interrupted(stop):
+    guard = _outlet.get()
+    if guard:
+        guard.require_clear()
     if stop.is_set():
         raise Stop("审批监听已停止或执行中断")
 
@@ -1678,6 +1792,8 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
         stop_if_interrupted(stop)
     except (Exception, KeyboardInterrupt) as error:
         ledger.append("delete_unconfirmed", record_id)
+        if isinstance(error, OutletConflict):
+            raise
         reason = str(error) if type(error) is Stop else "删除状态未确认"
         announce(f"删除未获确认（{reason}），需人工核对")
         if isinstance(error, KeyboardInterrupt):
@@ -1691,7 +1807,9 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
               contact, login_check, stop, *, packages, company,
               clock=time.time, pause=time.sleep, monotonic=time.monotonic, check_start_date=None):
     def announce(text):
-        feishu.transport.announce(f"{ledger.name} · {text}\n{contact}")
+        message = f"{ledger.name} · {text}\n{contact}"
+        check_outlet(message)
+        feishu.transport.announce(message)
 
     registration_hash = digest(ledger.registration.encode())
     binding = "create:" + registration_hash
@@ -1717,6 +1835,7 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
             stop_if_interrupted(stop)
             require(window.contains(clock()), "审批到期")
             pause(0.05)
+        check_outlet((binding, summary))
         approval_id = feishu.publish_approval(binding, summary)
         ledger.append("card_published")
         while (status := feishu.approval_status(approval_id, binding)) == "pending":
@@ -1734,6 +1853,14 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
             record_id = read_id()
         ledger.append("created", record_id)
     except (Exception, KeyboardInterrupt) as error:
+        if isinstance(error, OutletConflict):
+            if create.started:
+                ledger.append("create_unknown")
+            else:
+                if approval_id is not None:
+                    feishu.close_create_approval(approval_id, binding)
+                ledger.append("aborted_before_write", allowed_writes=0)
+            raise
         interrupted = isinstance(error, KeyboardInterrupt)
         if create.started:
             ledger.append("create_unknown")
@@ -1741,6 +1868,9 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
                 matches = api.find(ledger.name)
                 ledger.append("create_reconciled_read", matches[0] if len(matches) == 1 else None,
                               candidates=len(matches))
+            except OutletConflict:
+                ledger.append("create_reconciled_read_unconfirmed")
+                raise
             except (Exception, KeyboardInterrupt):
                 ledger.append("create_reconciled_read_unconfirmed")
             announce("建单结果未知，已冻结清理，需人工核对官方回读和私有台账")
@@ -1767,6 +1897,8 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
             return False
     except (Exception, KeyboardInterrupt) as error:
         ledger.append("readback_unconfirmed", record_id)
+        if isinstance(error, OutletConflict):
+            raise
         announce("官方回读未获确认，已停止，需人工核对")
         if isinstance(error, KeyboardInterrupt):
             raise
@@ -1782,18 +1914,59 @@ class Arguments(argparse.ArgumentParser):
 
 
 def run(args, directory, *, clock=time.time):
+    guard = _outlet.get()
+    if guard is None:
+        with outlet_scope() as guard:
+            return _run(args, directory, clock, guard)
+    return _run(args, directory, clock, guard)
+
+
+def _run(args, directory, clock, guard):
     require(not directory.is_symlink() and directory.is_dir() and directory.stat().st_mode & 0o777 == 0o700,
             "运行目录下 .private 须为 0700 的私有目录")
+    config_data = private_bytes(args.config)
+    login_path = directory / "mingdao-state.json"
+    login_data = private_bytes(login_path)
+    config = decode(config_data)
+    login = decode(login_data)
+    with args.env_file.open(encoding="utf-8-sig") as stream:
+        secrets = dotenv_values(stream=stream, interpolate=False)
+    official = config["official"]
+
+    def official_setting(key):
+        name = official[key]
+        require(isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name),
+                "官方接口环境配置键无效")
+        value = secrets.get(name)
+        require(secret_safe(value), "官方接口鉴权配置无效")
+        return value
+
+    display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
+    official_keys = {official["token_key"], official["app_id_key"]}
+    credentials = {key: value for key, value in secrets.items()
+                   if receipt(value) and (key not in display_settings or key in official_keys)}
+    for index, cookie in enumerate(login["cookies"]):
+        if receipt(cookie.get("value")):
+            credentials[("cookie", index)] = cookie["value"]
+    guard.configure(credentials)
+    for key, value in secrets.items():
+        guard.check(key)
+        guard.check(value, key)
+    guard.check(config)
+    token = extract_token(login, config["create"]["session_cookie"])
+    guard.session_owner = next(key for key in credentials if isinstance(key, tuple) and credentials[key] == token)
+    official_token = official_setting("token_key")
+    official_app_id = official_setting("app_id_key")
+    sensitive = {form for value in credentials.values() for form in (value, value.strip())}
+    configurator = config["configurator"]
+    guard.configuration_checked = True
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", args.registration):
         # 历史登记编号可能不符合新字符集，结果未知时仍须先对账。
         with ledger_open(directory, args.registration, None) as ledger:
             ledger.check_available()
             raise CredentialConflict("展示字段与凭据冲突")
-    config_data = private_bytes(args.config)
+
     draft_data = private_bytes(args.draft)
-    login_path = directory / "mingdao-state.json"
-    login_data = private_bytes(login_path)
-    config = decode(config_data)
     evidence = decode(private_bytes(directory / "create-authorizations.json"))[args.registration]
     recipients = notice_recipients(config)
     notices = notice_summary(recipients, evidence.get("notices"))
@@ -1813,6 +1986,8 @@ def run(args, directory, *, clock=time.time):
         verify_company_inputs(draft, sources, owners, snapshot, config["template"]["country"]["value"])
         check_catalog(values, snapshot, draft["field_results"])
         projected, assembly_config = x5_projection(values, config, inactive)
+    except OutletConflict:
+        raise
     except Stop as error:
         write_preflight_failure(error)
         raise
@@ -1820,28 +1995,6 @@ def run(args, directory, *, clock=time.time):
         error = Stop("草稿字段或来源证据无效")
         write_preflight_failure(error)
         raise error from None
-
-    token = extract_token(decode(login_data), config["create"]["session_cookie"])
-    with args.env_file.open(encoding="utf-8-sig") as stream:
-        secrets = dotenv_values(stream=stream, interpolate=False)
-    official = config["official"]
-
-    def official_setting(key):
-        name = official[key]
-        require(isinstance(name, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name),
-                "官方接口环境配置键无效")
-        value = secrets.get(name)
-        require(secret_safe(value), "官方接口鉴权配置无效")
-        return value
-
-    official_token = official_setting("token_key")
-    official_app_id = official_setting("app_id_key")
-    configurator = config["configurator"]
-    sensitive = {token, official_token, official_app_id}
-    display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
-    for key, value in secrets.items():
-        if key not in display_settings and receipt(value):
-            sensitive.update((value, value.strip()))
 
     def login_check():
         require(not pending, "降包用户取消优惠须确认具体取值")
@@ -1889,6 +2042,7 @@ def run(args, directory, *, clock=time.time):
         timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
         with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             api = Official(official, official_token, official_app_id, client)
+            client.event_hooks["request"].append(api.check_wire_request)
             template_id = config["template"]["row_id"]
             require(uuid_record(template_id), "模板记录编号须为 UUID")
             cells = api.detail(api.read(template_id), template_id)
@@ -1910,12 +2064,15 @@ def run(args, directory, *, clock=time.time):
                     payload, config, cells, relations, values, inactive, sensitive,
                     draft["field_results"]["packages"]["statement"],
                 )
+                check_outlet((payload, decode(payload)))
                 require(decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
                 summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline, package_names)
             except (KeyError, ValueError, TypeError, IndexError, AttributeError):
                 error = Stop("请求字段或查表快照无法核实")
                 write_preflight_failure(error)
                 raise error from None
+            except OutletConflict:
+                raise
             except Stop as error:
                 write_preflight_failure(error)
                 raise
@@ -1925,7 +2082,8 @@ def run(args, directory, *, clock=time.time):
                 exclusive(directory / f"create-fields-{registration_hash}.json",
                           {"字段": fields_summary, "通知回执": notices})
                 service = FeishuService(settings, window, directory / "create-approvals.sqlite",
-                                        process=None, clock=clock)
+                                        process=None, clock=clock, before_send=guard.sdk)
+                service.transport.before_send = guard.sdk
             except (Exception, KeyboardInterrupt):
                 ledger.append("aborted_before_write", allowed_writes=0)
                 raise
@@ -1945,23 +2103,75 @@ def main(argv=None):
     args = parser.parse_args(argv)
     for name in ("Lark", "httpx", "httpcore", "websockets", "dotenv.main", "urllib3"):
         logging.getLogger(name).setLevel(logging.CRITICAL + 1)
+    with outlet_scope() as guard:
+        try:
+            return execute(args, guard)
+        except OutletConflict:
+            if guard.configuration_checked:
+                notice = ("建单请求已发出（凭据冲突），已停止，转人工核对" if guard.started else _MANUAL_NOTICE)
+                try:
+                    announce_conflict(args, guard, notice)
+                except Exception:
+                    pass
+            print(_LOCAL_CONFLICT, file=sys.stderr)
+            return 1
+
+
+@contextmanager
+def outlet_scope():
+    guard = Outlet()
+    scope = _outlet.set(guard)
+    previous_factory = logging.getLogRecordFactory()
+
+    def checked_record(*args, **kwargs):
+        record = previous_factory(*args, **kwargs)
+        if guard.fragments:
+            guard.check((record.name, logging.Formatter().format(record)))
+        return record
+
+    logging.setLogRecordFactory(checked_record)
     try:
-        if run(args, Path(".private")):
-            print("建单回读一致，D15 删除已核验。")
+        yield guard
+    finally:
+        logging.setLogRecordFactory(previous_factory)
+        _outlet.reset(scope)
+
+
+def announce_conflict(args, guard, notice):
+    guard.check(notice)
+    transport = _Transport(load_settings(args.env_file), None, time.time)
+    transport.before_send = guard.check_sdk_fields
+    transport.announce(notice)
+
+
+def execute(args, guard):
+    def output(message, stream):
+        guard.check(message)
+        print(message, file=stream)
+
+    try:
+        success = run(args, Path(".private"))
+        guard.require_clear()
+        if success:
+            output("建单回读一致，D15 删除已核验。", sys.stdout)
             return 0
-        print("验收未通过，请核对群公告与私有报告。", file=sys.stderr)
+        output("验收未通过，请核对群公告与私有报告。", stream=sys.stderr)
+    except OutletConflict:
+        raise
     except CredentialConflict as error:
         try:
-            _Transport(load_settings(args.env_file), None, time.time).announce("未建单（凭据冲突），转人工处理")
+            announce_conflict(args, guard, _MANUAL_NOTICE)
+        except OutletConflict:
+            raise
         except Exception:
-            print("转人工公告发送未获确认，请人工核对。", file=sys.stderr)
-        print(f"已停止：{error}", file=sys.stderr)
+            output("转人工公告发送未获确认，请人工核对。", stream=sys.stderr)
+        output(f"已停止：{error}", stream=sys.stderr)
     except Stop as error:
-        print(f"已停止：{error}", file=sys.stderr)
+        output(f"已停止：{error}", stream=sys.stderr)
     except KeyboardInterrupt:
-        print("执行中断，请核对私有台账。", file=sys.stderr)
+        output("执行中断，请核对私有台账。", stream=sys.stderr)
     except Exception:
-        print("步骤未获确认，请核对私有台账。", file=sys.stderr)
+        output("步骤未获确认，请核对私有台账。", stream=sys.stderr)
     return 1
 
 
