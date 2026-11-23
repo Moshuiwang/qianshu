@@ -1541,8 +1541,8 @@ def verify_selected_packages(config, controls, actual, relations, values, snapsh
     return required_names
 
 
-def credential_fragments(secrets):
-    return {value[i:i + 4] for value in secrets for i in range(len(value) - 3)}
+def credential_fragments(values, width=4):
+    return {value[i:i + width] for value in values for i in range(len(value) - width + 1)}
 
 
 def registered_windows(text, fragments):
@@ -1869,8 +1869,10 @@ def run(args, directory, *, clock=time.time):
         contact_id = configurator.get("id")
         require(isinstance(contact_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", contact_id),
                 reason, CredentialConflict)
+        identifiers = (args.registration, contact_id)
         require(not any(secret in identifier or identifier in secret
-                        for identifier in (args.registration, contact_id) for secret in sensitive),
+                        for identifier in identifiers for secret in sensitive)
+                and credential_fragments(identifiers, 8).isdisjoint(credential_fragments(sensitive, 8)),
                 reason, CredentialConflict)
         label = configurator["label"]
         contact = mention(contact_id, label)

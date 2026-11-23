@@ -2807,3 +2807,41 @@ def test_conflicting_source_blocks_stop_before_card(case, platform, business_cli
     code, error = business_cli.run(export)
     assert code == 1 and "建单草稿缺少整批来源证据" in error
     assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize(("target", "overlap", "decision"), [
+    ("id", 21, "reject"),
+    ("id", 21, "approve"),
+    ("id", 7, "approve"),
+    ("registration", 8, "approve"),
+])
+def test_identifier_contiguous_credential_gate(case, platform, business_cli, monkeypatch, target, overlap, decision):
+    from qianshu.feishu.sdk import _Transport
+
+    secret = case.session_token = "X0123456789abcdef01234Z"
+    identifier = "ou_" + "7" * 6 + secret[1:1 + overlap] + "8" * 5
+    holder = case.config["configurator"] if target == "id" else case.ids
+    holder[target] = identifier
+    bodies = []
+
+    def capture(request):
+        bodies.append(request.request_body)
+        return SimpleNamespace(success=lambda: True)
+
+    transport = order._Transport()
+    transport.settings = SimpleNamespace(chat_id="synthetic-chat")
+    transport.im = SimpleNamespace(message=SimpleNamespace(create=capture))
+    transport.announce = partial(_Transport.announce, transport)
+    monkeypatch.setattr(Approvals, "approval_status", lambda *args: decision)
+
+    code, error = business_cli.run()
+    if overlap == 7:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert len(business_cli.summaries) == 1
+    else:
+        body, = bodies
+        assert all(secret[i:i + 8] not in body.content for i in range(len(secret) - 7))
+        assert json.loads(body.content) == {"text": "未建单（凭据冲突），转人工处理"}
+        assert (code, platform.create_count) == (1, 0)
+        assert not business_cli.summaries and "凭据冲突" in error and identifier not in error
+        assert all(identifier not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
