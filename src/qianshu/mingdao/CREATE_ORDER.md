@@ -10,6 +10,8 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 
 在本 Trace 独占的运行目录执行。固定使用该目录下权限为 `0700` 的 `.private/`，运行之间保留整个目录及其资格锁。配置、草稿、登录态和授权登记使用 `0600`。会话取自登录检查脚本生成的 `.private/mingdao-state.json`。飞书沿用 #8 的私有配置，默认读当前目录的 `.env`，也可用 `--env-file` 指定私有文件。官方接口个人令牌和应用 ID 也从该文件取值，配置只登记键名。官方请求使用 `Authorization: Bearer <占位个人令牌>` 和 `HAP-Appid: <占位应用标识>`。台账、摘要、报告和错误信息均不记录这些值或网页会话令牌。
 
+凭据冲突时，独立入口以退出码 1 停止，标准错误输出短码 `E-CRED-STOP`。短码本身命中凭据门禁时保持静默。启动器可用 `QIANSHU_LOG_FILE` 为常驻服务与独立入口指定同一私有 JSON 日志文件，未指定时沿用标准错误。配置冲突日志只含短码和配置键标签。
+
 ## 授权登记
 
 `.private/create-authorizations.json` 按登记号索引，每项登记以下记录。

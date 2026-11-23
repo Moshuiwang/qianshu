@@ -2041,7 +2041,7 @@ def test_order_evidence_masks_intersection_with_loaded_secret(case, platform, bu
     result["evidence"] = result["statement"]["evidence"] = [quote]
     draft["user_scope"]["evidence"] = [{"text": fragment, "start": start}]
     code, error = business_cli.run(export)
-    assert code == 1 and "凭据" in error
+    assert (code, error) == (1, "E-CRED-STOP\n")
     assert not business_cli.summaries
     assert platform.create_count == 0
     assert fragment not in error + "".join(business_cli.notices)
@@ -2173,7 +2173,7 @@ def test_sensitive_write_value_stops_before_approval(case, platform, business_cl
         value = case.session_token if source == "session" else case.session_token[4:13]
         case.values["user_scope"] = "合成范围" + value
     code, error = business_cli.run()
-    assert code == 1 and "凭据" in error
+    assert code == 1 and ("E-CRED-STOP\n" == error if source == "fragment" else "凭据" in error)
     assert not business_cli.summaries and platform.create_count == 0
 
 
@@ -2188,10 +2188,10 @@ def test_credential_stop_announces_manual_handoff(case, platform, business_cli, 
     if source == "display":
         block_external()
     code, error = business_cli.run()
-    assert code == 1 and "凭据" in error
+    assert code == 1 and ("凭据" in error if source == "template" else error == "E-CRED-STOP\n")
     assert not business_cli.summaries and platform.create_count == 0
     if source == "display":
-        assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+        assert (code, error) == (1, "E-CRED-STOP\n")
         assert business_cli.notices == []
     else:
         assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
@@ -2213,7 +2213,7 @@ def test_unknown_create_reentry_with_credential_conflict(case, platform, busines
     code = order.main(["--config", str(case.private / "config.json"), "--registration", case.ids["registration"],
                        "--env-file", str(settings), str(case.private / "draft.json")])
 
-    assert (code, capsys.readouterr().err) == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert (code, capsys.readouterr().err) == (1, "E-CRED-STOP\n")
     assert events(case) == before
     assert platform.actions == actions
     assert platform.create_count == 1
@@ -2224,7 +2224,7 @@ def test_fresh_registration_with_credential_conflict(case, platform, business_cl
     case.config["fields"][case.control["user_scope"]]["label"] += case.session_token
     block_external()
     code, error = business_cli.run()
-    assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert (code, error) == (1, "E-CRED-STOP\n")
     assert not business_cli.summaries and platform.create_count == 0
     assert business_cli.notices == []
 
@@ -2559,7 +2559,7 @@ def test_contact_credential_collision_announces_fixed_handoff(case, platform, bu
     case.config["configurator"][key] = secret
     block_external()
     code, error = business_cli.run()
-    assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert (code, error) == (1, "E-CRED-STOP\n")
     assert not business_cli.summaries and platform.create_count == 0
     assert business_cli.notices == []
     assert secret not in error + "".join(business_cli.notices)
@@ -2649,7 +2649,7 @@ def test_trimmed_tenant_key_cannot_appear_in_contact(case, platform, business_cl
     case.config["configurator"]["label"] = secret
     block_external()
     code, error = business_cli.run()
-    assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n") and secret not in error
+    assert (code, error) == (1, "E-CRED-STOP\n") and secret not in error
     assert business_cli.notices == []
     assert not business_cli.summaries and platform.create_count == 0
 
@@ -2798,7 +2798,7 @@ def test_opaque_identifier_credential_gate(case, platform, business_cli, monkeyp
         assert (code, error, platform.create_count) == (0, "", 1)
         assert len(business_cli.summaries) == 1
     elif target == "id" and change in ("contains", "contained", "equal"):
-        assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+        assert (code, error) == (1, "E-CRED-STOP\n")
         assert business_cli.notices == [] and identifier not in error
         assert not business_cli.summaries and platform.create_count == 0
     else:
@@ -2857,7 +2857,7 @@ def test_identifier_contiguous_credential_gate(case, platform, business_cli, mon
         assert (code, error, platform.create_count) == (0, "", 1)
         assert len(business_cli.summaries) == 1
     elif overlap == 21:
-        assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+        assert (code, error) == (1, "E-CRED-STOP\n")
         assert bodies == []
         assert not business_cli.summaries and platform.create_count == 0 and identifier not in error
         assert all(identifier not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
@@ -2887,7 +2887,7 @@ def test_outlet_notice_reports(outlet_case, platform, business_cli, field, missi
     block_external()
     code, error = business_cli.run()
     assert (code, platform.create_count) == (1, 0)
-    assert error.strip() == "凭据冲突，已停止，详见私有核对"
+    assert error.strip() == "E-CRED-STOP"
     assert business_cli.notices == []
     for pattern in ("create-preflight-*.json", "create-fields-*.json"):
         assert all(fragment not in path.read_text() for path in case.private.glob(pattern))
@@ -2948,7 +2948,7 @@ def test_outlet_positions(outlet_case, platform, business_cli, monkeypatch, capl
         assert bodies and all(body[0] == chat and chat not in order.compact(body[2]) for body in bodies)
         return
     assert (code, platform.create_count) == (1, 0)
-    assert error.strip() == "凭据冲突，已停止，详见私有核对"
+    assert error.strip() == "E-CRED-STOP"
     assert case.session_token[1:9] not in caplog.text
     if location == "unsafe_destination":
         assert bodies == []
@@ -2990,7 +2990,7 @@ def test_configuration_conflict_precedes_external_calls(runtime_case, platform, 
     blocked = [Mock(side_effect=AssertionError("预检冲突后进入下游")) for _ in range(4)]
     for name, stub in zip(("Official", "FeishuService", "_Transport", "extract_token"), blocked):
         monkeypatch.setattr(order, name, stub)
-    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
     assert all(stub.call_count == 0 for stub in blocked)
     assert platform.actions == [] and platform.create_count == 0
     assert not list(case.private.glob("create-preflight-*"))
@@ -3000,7 +3000,7 @@ def test_configuration_conflict_precedes_external_calls(runtime_case, platform, 
 def test_first_conflict_on_created_readback(runtime_case, platform, business_cli):
     fragment = runtime_case.session_token[2:10]
     platform.before_read = lambda row: row.update(extra="前" + fragment + "后")
-    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
     assert platform.create_count == 1 and "delete" not in platform.actions
     assert events(runtime_case)[-1] == "readback_unconfirmed"
     assert not list(runtime_case.private.glob("create-readback-*"))
@@ -3054,7 +3054,7 @@ def test_runtime_outlet_blocks_before_create(runtime_case, platform, business_cl
 
         monkeypatch.setattr(order, "check_catalog", stop)
 
-    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
     assert platform.create_count == 0
     assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
     assert fragment not in caplog.text
@@ -3110,7 +3110,7 @@ def test_success_stdout_is_checked_before_printing(monkeypatch, capsys):
     monkeypatch.setattr(order, "run", run)
     assert order.main(["--config", "config", "--registration", "trial", "draft"]) == 1
     captured = capsys.readouterr()
-    assert (captured.out, captured.err) == ("", "凭据冲突，已停止，详见私有核对\n")
+    assert (captured.out, captured.err) == ("", "E-CRED-STOP\n")
 
 
 @pytest.fixture
@@ -3144,8 +3144,258 @@ def test_configuration_conflict_project_log(runtime_case, business_cli, monkeypa
     else:
         runtime_case.config[key]["label"] += fragment
     block_external()
-    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
     assert [record.getMessage() for record in caplog.records if record.name == "qianshu"] == [
-        f"凭据冲突，已停止，详见私有核对 键={expected}"
+        f"E-CRED-STOP 键={expected}"
     ]
     assert fragment not in caplog.text
+
+
+_cli_load_settings = order.load_settings
+
+
+def test_checked_settings_read_once(runtime_case, business_cli, monkeypatch):
+    from io import StringIO
+    from pathlib import Path
+
+    reads = []
+    original = Path.open
+    def opened(path, mode="r", *args, **kwargs):
+        stream = original(path, mode, *args, **kwargs)
+        if path.name != "synthetic-settings" or mode != "r":
+            return stream
+        with stream:
+            content = stream.read()
+        reads.append(path)
+        chat = "group" if len(reads) == 1 else runtime_case.session_token[2:10]
+        return StringIO(content + f"FEISHU_CHAT_ID={chat}\nFEISHU_APP_ID=synth-a\nFEISHU_APP_SECRET=synth-b\n"
+                        "FEISHU_BOT_OPEN_ID=bot\nFEISHU_ALLOWED_SENDER_IDS=member\n")
+
+    monkeypatch.setattr(Path, "open", opened)
+    monkeypatch.setattr(order, "load_settings", _cli_load_settings)
+    assert business_cli.run()[0] == 0
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("target", ["official", "create"])
+def test_final_authorization_prefix(runtime_case, business_cli, platform, monkeypatch, target):
+    token = "ZXKLMPQJHNG"
+    if target == "official":
+        runtime_case.official_token = token
+        overlap = "Bearer ZXK"
+    else:
+        runtime_case.session_token = token
+        overlap = "id ZXKLM"
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "EXTRA": overlap})
+    assert business_cli.run()[0] == 1
+    assert platform.create_count == 0
+    if target == "official":
+        assert not platform.actions
+
+
+@pytest.mark.parametrize("value", ["凭据冲突，已停止", "QunconfirmedZ", "E-CRED-STOP"])
+def test_stop_code_and_ledger_markers(runtime_case, business_cli, platform, monkeypatch, value):
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "EXTRA": value})
+    if value != "QunconfirmedZ":
+        runtime_case.config["diagnostic"] = value
+    code, error = business_cli.run()
+    assert code == 1 and value not in error
+    assert platform.actions == []
+
+
+def test_standalone_conflict_json_log(runtime_case, business_cli, monkeypatch):
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])
+    path = runtime_case.private / "project.log"
+    monkeypatch.setenv("QIANSHU_LOG_FILE", str(path))
+    fragment = runtime_case.session_token[2:10]
+    runtime_case.config["configurator"]["label"] += fragment
+    code, error = business_cli.run()
+    assert code == 1 and fragment not in error
+    assert error == "E-CRED-STOP\n"
+    contents = path.read_text()
+    assert fragment not in contents
+    assert json.loads(contents)["message"] == "E-CRED-STOP 键=configurator"
+
+
+def test_unknown_response_conflict_reconciles_once(runtime_case, business_cli, platform, monkeypatch):
+    monkeypatch.setattr(order, "read_create_response",
+                        lambda _: order.compact({"extra": runtime_case.session_token[2:10]}).encode())
+    assert business_cli.run()[0] == 1
+    assert platform.create_count == 1 and "delete" not in platform.actions
+    assert platform.actions[platform.actions.index("create") + 1:] == ["search"]
+    assert events(runtime_case)[-2:] == ["create_unknown", "create_reconciled_read"]
+
+
+def test_tenant_exchange_checks_final_header(runtime_case, monkeypatch):
+    import requests
+    from qianshu.feishu.sdk import _Transport, TokenManager
+
+    settings = Settings("app", "secret", "chat", "bot", frozenset({"member"}))
+    guard = order.Outlet()
+    guard.configure({"EXTRA": runtime_case.session_token})
+    transport = _Transport(settings, None, lambda: 0, guard.sdk)
+    transport.before_send = guard.sdk
+    monkeypatch.setattr(TokenManager.cache, "get", lambda _: None)
+    sent = []
+    def response(request):
+        sent.append(request.url)
+        return {"code": 0, "expire": 7200, "tenant_access_token": "t" + runtime_case.session_token[2:10],
+                "data": {"message_id": "card"}}
+
+    def adapter(self, request, **kwargs):
+        result = requests.Response()
+        result.status_code = 200
+        result._content = json.dumps(response(request)).encode()
+        return result
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", adapter)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request",
+                        lambda self, req: httpx.Response(200, json=response(req)))
+    with pytest.raises(order.OutletConflict):
+        transport.announce("合成公告")
+    assert len(sent) == 1
+
+
+def test_complete_order_checks_every_http_send(runtime_case, platform, business_cli, monkeypatch):
+    from qianshu.feishu import sdk
+
+    import requests
+    from websockets.client import ClientProtocol
+    from websockets.uri import parse_uri
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("请求绕过了合成传输")
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", unexpected)
+    endpoint = httpx.URL(runtime_case.config["official"]["origin"]).copy_with(
+        scheme="wss", path="/approval", params={ws.DEVICE_ID: "device", ws.SERVICE_ID: "1"})
+    history = []
+    operations = []
+    def snapshot(request):
+        return (request.method, str(request.url), tuple(request.headers.raw), request.content)
+
+    check = order.Outlet.check_http
+    def checked(guard, request, **positions):
+        check(guard, request, **positions)
+        history.append(("check", snapshot(request)))
+    monkeypatch.setattr(order.Outlet, "check_http", checked)
+
+    def exchange(request):
+        history.append(("send", snapshot(request)))
+        path = request.url.path
+        if path.startswith("/v3/"):
+            operations.append("official")
+            return platform.official(request)
+        if path == ws.GEN_ENDPOINT_URI:
+            operations.append("endpoint")
+            data = {"data": {"URL": str(endpoint)}}
+        elif path.endswith("/internal"):
+            operations.append("token")
+            data = {"expire": 300, "tenant_access_token": "tenant-XYQJHB"}
+        elif path.endswith("/members"):
+            operations.append("members")
+            data = {"data": {"has_more": False, "items": [{"member_id_type": "open_id", "member_id": "member"}]}}
+        else:
+            assert path.endswith("/messages")
+            operations.append(json.loads(request.content)["msg_type"])
+            data = {"data": {"message_id": "card"}}
+        return httpx.Response(200, json={"code": 0, **data})
+
+    wire = httpx.MockTransport(exchange)
+    monkeypatch.setattr(httpx, "Client", partial(httpx.Client.func, transport=wire))
+    monkeypatch.setattr(httpx, "AsyncClient", partial(httpx.AsyncClient, transport=wire))
+    connect = platform.connection
+    def connection(host, **kwargs):
+        conn = connect(host, **kwargs)
+        putheader, endheaders = conn.putheader, conn.endheaders
+        headers = []
+        def header(key, value):
+            headers.append((key.encode(), value.encode()))
+            putheader(key, value)
+        def send(body):
+            history.append(("send", ("POST", "https://" + host + order._CREATE_PATH, tuple(headers), body)))
+            operations.append("create")
+            endheaders(body)
+        conn.putheader, conn.endheaders = header, send
+        return conn
+
+    monkeypatch.setattr(order, "CreateRequest", partial(order.CreateRequest.func, connect=connection))
+    settings = Settings("app-NJVLZ", "key-HYTJK", "chat-DWQPL", "bot", frozenset({"member"}))
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {
+        **parse(**kw), "FEISHU_APP_ID": settings.app_id, "FEISHU_APP_SECRET": settings.app_secret,
+        "FEISHU_CHAT_ID": settings.chat_id})
+    monkeypatch.setattr(order, "load_settings", lambda values: settings)
+    def service(settings, window, *args, clock, http_check, before_send, **kwargs):
+        approvals = Approvals(platform)
+        transport = sdk._Transport(settings, window, clock, http_check)
+        transport.before_send = before_send
+        approvals.transport = transport
+        client = sdk._Connection(SimpleNamespace(settings=settings, http_check=http_check, before_send=before_send,
+                                                  transport=transport, _remaining=lambda: 10, _connected=lambda _: None))
+
+        async def connect(url, *, create_connection, **kwargs):
+            protocol = ClientProtocol(parse_uri(url))
+            def send(upgrade):
+                history.append(("send", ("GET", url,
+                                         tuple((k.encode(), v.encode()) for k, v in upgrade.headers.raw_items()), b"")))
+                operations.append("upgrade")
+            protocol.send_request = send
+            socket = create_connection(protocol)
+            protocol.send_request(protocol.connect())
+            return socket
+
+        async def receive():
+            pass
+
+        monkeypatch.setattr(ws.websockets, "connect", connect)
+        monkeypatch.setattr(client, "_receive_message_loop", receive)
+        def publish(binding, summary):
+            ws.loop.run_until_complete(client._connect())
+            card = transport.send_card({"text": summary})
+            assert ws.loop.run_until_complete(transport.is_member("member"))
+            ws.loop.run_until_complete(transport.notify_callback_timeout())
+            platform.actions.append("card")
+            return card
+        approvals.publish_approval = publish
+        approvals.run_create = lambda work: work(Event())
+        return approvals
+    monkeypatch.setattr(order, "FeishuService", service)
+    assert business_cli.run() == (0, "")
+    assert operations.count("create") == 1
+    assert {"endpoint", "upgrade", "token", "interactive", "text", "members"} <= set(operations)
+    assert "official" in operations[:operations.index("create")]
+    assert "official" in operations[operations.index("create") + 1:]
+    checked_requests = [req for step, req in history if step == "check"]
+    sent_requests = [req for step, req in history if step == "send"]
+    assert checked_requests == sent_requests
+    assert [step for step, _ in history] == ["check", "send"] * len(sent_requests)
+
+
+def test_reconciliation_cookie_is_checked_at_transport(runtime_case, business_cli, platform, monkeypatch):
+    monkeypatch.setattr(order, "read_create_response", lambda _: b"{}")
+    find = order.Official.find
+    def lookup(api, name):
+        if platform.create_count:
+            api.client.cookies.set("extra", runtime_case.session_token[2:10])
+        return find(api, name)
+
+    monkeypatch.setattr(order.Official, "find", lookup)
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert platform.actions[-1] == "create"
+    assert platform.create_count == 1 and "delete" not in platform.actions
+    assert events(runtime_case)[-2:] == ["create_unknown", "readback_unconfirmed"]
+    assert business_cli.notices == ["建单请求已发出（凭据冲突），已停止，转人工核对"]
+
+
+def test_final_header_name_preserves_wire_case(runtime_case, business_cli, platform, monkeypatch):
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "EXTRA": "QZXCaseABC"})
+    send = httpx.Client.func.send
+    def attach(client, request, **kwargs):
+        request.headers["Extra-ZXCaseABC"] = "value"
+        return send(client, request, **kwargs)
+    monkeypatch.setattr(httpx.Client.func, "send", attach)
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert platform.actions == [] and platform.create_count == 0

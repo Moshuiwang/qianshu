@@ -43,8 +43,9 @@ from qianshu.parse.protocol import Duration, SourceBlock, Span
 from qianshu.pipeline import _CardRedaction
 from qianshu.validate import effective_start_date
 from qianshu.feishu.cards import mention
-from qianshu.feishu.sdk import ApprovalClosed, FeishuService, _Transport
-from qianshu.feishu.settings import Window, load_settings
+from qianshu.feishu.sdk import ApprovalClosed, CheckedHTTPTransport, FeishuService, _Transport
+from qianshu.feishu.settings import Settings, Window
+from qianshu.logs import setup_logging
 
 _PREFIX = "【测试】"
 _NEW = "新建"
@@ -82,7 +83,7 @@ class CredentialConflict(Stop):
     """发卡前命中凭据门禁，须公告转人工。"""
 
 
-_LOCAL_CONFLICT = "凭据冲突，已停止，详见私有核对"
+_LOCAL_CONFLICT = "E-CRED-STOP"
 _MANUAL_NOTICE = "未建单（凭据冲突），转人工处理"
 _outlet = ContextVar("create_order_outlet", default=None)
 
@@ -105,7 +106,7 @@ class Outlet:
             raise OutletConflict()
 
     def configure(self, credentials):
-        self.credentials = credentials
+        self.credentials.update(credentials)
         for owner, value in credentials.items():
             for fragment in credential_fragments((value, value.strip()), 8):
                 self.fragments.setdefault(fragment, set()).add(owner)
@@ -121,18 +122,79 @@ class Outlet:
         else:
             text = value.decode("utf-8", "surrogateescape") if isinstance(value, bytes) else str(value)
             own_value = self.credentials.get(owner)
-            exempt = {owner} if own_value and text in (own_value, own_value.strip()) else set()
-            for index in range(len(text) - 7):
-                owners = self.fragments.get(text[index:index + 8])
-                if owners and owners - exempt:
-                    self.conflict = True
-                    raise OutletConflict()
+            spans = [(0, len(text), owner)] if own_value and text in (own_value, own_value.strip()) else []
+            self.check_text(text, spans)
+
+    def check_text(self, text, spans=()):
+        for index in range(len(text) - 7):
+            owners = self.fragments.get(text[index:index + 8])
+            if owners and owners.difference(
+                owner for start, end, owner in spans if start <= index and index + 8 <= end
+            ):
+                self.conflict = True
+                raise OutletConflict()
+
+    def credential_span(self, value, owner, start):
+        credential = self.credentials.get(owner)
+        if credential and value in (credential, credential.strip()):
+            return [(start, start + len(value), owner)]
+        return []
+
+    def check_http(self, request, *, headers=None, fields=None, chat_path=False):
+        """检查同一个待发送请求。豁免区间绑定到指定字段和值。"""
+        self.check(request.method)
+        url = str(request.url)
+        spans = []
+        if chat_path:
+            prefix = str(request.url.copy_with(path="/open-apis/im/v1/chats/", query=None))
+            chat = self.credentials.get("FEISHU_CHAT_ID", "")
+            if url.startswith(prefix + chat + "/members?"):
+                spans = self.credential_span(chat, "FEISHU_CHAT_ID", len(prefix))
+        self.check_text(url, spans)
+        for raw_key, raw_value in request.headers.raw:
+            self.check(raw_key)
+            key = raw_key.decode("ascii")
+            value = raw_value.decode("utf-8", "surrogateescape")
+            owner, prefix = (headers or {}).get(key.lower(), (None, ""))
+            spans = self.credential_span(value[len(prefix):], owner, len(prefix)) if value.startswith(prefix) else []
+            self.check_text(value, spans)
+        body = request.content.decode("utf-8", "surrogateescape")
+        if not fields or not body:
+            self.check_text(body)
+            return
+        # HTTPX 的 JSON 编码是紧凑的顶层对象。按成员边界定位，重复字段不予豁免。
+        parsed = decode(body)
+        cursor = 1
+        spans = []
+        for key, item in parsed.items():
+            key_wire = compact(key) + ":"
+            require(body.startswith(key_wire, cursor), "请求字段边界未确认")
+            cursor += len(key_wire)
+            wire, end = json.JSONDecoder().raw_decode(body, cursor)
+            self.check(key)
+            self.check(wire, fields.get(key))
+            if isinstance(item, str) and body[cursor:end] == '"' + item + '"':
+                spans.extend(self.credential_span(item, fields.get(key), cursor + 1))
+            cursor = end + 1
+        self.check_text(body, spans)
 
     def sdk(self, outlet, value):
         self.require_clear()
         self.check_sdk_fields(outlet, value)
 
     def check_sdk_fields(self, outlet, value):
+        if outlet == "tenant_credential":
+            self.configure({("tenant", value): value})
+            self.check(value, ("tenant", value))
+            return
+        if outlet == "http":
+            request, purpose, token = value
+            fields = {"message": {"receive_id": "FEISHU_CHAT_ID"},
+                      "token": {"app_id": "FEISHU_APP_ID", "app_secret": "FEISHU_APP_SECRET"},
+                      "endpoint": {"AppID": "FEISHU_APP_ID", "AppSecret": "FEISHU_APP_SECRET"}}
+            self.check_http(request, headers={"authorization": (("tenant", token), "Bearer ")},
+                            fields=fields.get(purpose), chat_path=purpose == "members")
+            return
         if outlet == "approval_scope":
             self.check(digest("\0".join(value).encode()))
             return
@@ -421,6 +483,7 @@ class Official:
     def __init__(self, config, token, app_id, client):
         require(secret_safe(token) and secret_safe(app_id), "官方接口鉴权配置无效")
         self.config, self.client = config, client
+        self.reconciling = False
         self._headers = {"Authorization": "Bearer " + token, "HAP-Appid": app_id}
         self.origin = https_origin(config["origin"])
         for action in ("read", "search", "logs", "delete"):
@@ -470,16 +533,12 @@ class Official:
     def check_wire_request(self, request):
         guard = _outlet.get()
         if guard:
-            guard.require_clear()
-            guard.check((request.method, str(request.url), request.content))
-            for key, value in request.headers.items():
-                guard.check(key)
-                if key.lower() == "authorization" and value.startswith("Bearer "):
-                    guard.check(value.removeprefix("Bearer "), self.config["token_key"])
-                elif key.lower() == "hap-appid":
-                    guard.check(value, self.config["app_id_key"])
-                else:
-                    guard.check(value)
+            if not self.reconciling:
+                guard.require_clear()
+            guard.check_http(request, headers={
+                "authorization": (self.config["token_key"], "Bearer "),
+                "hap-appid": (self.config["app_id_key"], ""),
+            })
 
     def _request(self, action, record_id="", *, body=None, params=None, timeout=None, relation_control=None):
         if action in ("read", "logs", "delete", "relations"):
@@ -494,7 +553,7 @@ class Official:
         options = {} if timeout is None else {"timeout": timeout}
         check_outlet((method, url, body, params))
         guard = _outlet.get()
-        if guard:
+        if guard and not (action == "search" and self.reconciling):
             guard.require_clear()
         failed = False
         try:
@@ -1445,14 +1504,21 @@ class CreateRequest:
         try:
             connection.connect()
             connection.auto_open = 0
-            connection.putrequest(self.endpoint["method"], self.endpoint["path"], skip_accept_encoding=True)
-            connection.putheader("Authorization", "md_pss_id " + self._token)
-            connection.putheader("Accept-Encoding", "identity")
-            connection.putheader("Content-Type", "application/json; charset=utf-8")
-            connection.putheader("Content-Length", str(len(body)))
+            request = httpx.Request("POST", "https://" + self.endpoint["host"] + self.endpoint["path"],
+                                    content=body, headers={
+                                        "Authorization": "md_pss_id " + self._token,
+                                        "Accept-Encoding": "identity", "Content-Type": "application/json; charset=utf-8",
+                                        "Content-Length": str(len(body)),
+                                    })
+            connection.putrequest(request.method, self.endpoint["path"], skip_host=True, skip_accept_encoding=True)
+            for key, value in request.headers.raw:
+                connection.putheader(key.decode("ascii"), value.decode("ascii"))
 
             def send(check_approval):
                 require(not self.started and connection.sock is not None, "建单传输不可用")
+                if guard:
+                    guard.require_clear()
+                    guard.check_http(request, headers={"authorization": (guard.session_owner, "md_pss_id ")})
                 check_approval()
                 if guard:
                     guard.require_clear()
@@ -1853,28 +1919,31 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
             record_id = read_id()
         ledger.append("created", record_id)
     except (Exception, KeyboardInterrupt) as error:
-        if isinstance(error, OutletConflict):
-            if create.started:
-                ledger.append("create_unknown")
-            else:
-                if approval_id is not None:
-                    feishu.close_create_approval(approval_id, binding)
-                ledger.append("aborted_before_write", allowed_writes=0)
-            raise
         interrupted = isinstance(error, KeyboardInterrupt)
         if create.started:
             ledger.append("create_unknown")
+            api.reconciling = True
             try:
                 matches = api.find(ledger.name)
                 ledger.append("create_reconciled_read", matches[0] if len(matches) == 1 else None,
                               candidates=len(matches))
             except OutletConflict:
-                ledger.append("create_reconciled_read_unconfirmed")
+                ledger.append("readback_unconfirmed")
                 raise
             except (Exception, KeyboardInterrupt):
-                ledger.append("create_reconciled_read_unconfirmed")
+                ledger.append("readback_unconfirmed" if isinstance(error, OutletConflict)
+                              else "create_reconciled_read_unconfirmed")
+            finally:
+                api.reconciling = False
+            if isinstance(error, OutletConflict):
+                raise
             announce("建单结果未知，已冻结清理，需人工核对官方回读和私有台账")
             raise Stop("建单结果未知，需人工对账") from None
+        if isinstance(error, OutletConflict):
+            if approval_id is not None:
+                feishu.close_create_approval(approval_id, binding)
+            ledger.append("aborted_before_write", allowed_writes=0)
+            raise
         reason = str(error) if type(error) in (Stop, ApprovalClosed) else "审批或建单准备未完成"
         if interrupted:
             reason = "执行中断"
@@ -1947,6 +2016,15 @@ def check_configuration(guard, secrets, config):
                 raise
 
 
+def load_settings(values):
+    return Settings(values["FEISHU_APP_ID"], values["FEISHU_APP_SECRET"], values["FEISHU_CHAT_ID"],
+                    values["FEISHU_BOT_OPEN_ID"].strip(),
+                    frozenset(item.strip() for item in values["FEISHU_ALLOWED_SENDER_IDS"].split(",") if item.strip()),
+                    (values.get("FEISHU_APPROVED_FINGERPRINT") or "").strip().lower(),
+                    tenant_key=values.get("FEISHU_TENANT_KEY", "").strip() or None,
+                    callback_max_age=float(values.get("FEISHU_CALLBACK_MAX_AGE_SECONDS", "30")))
+
+
 def _run(args, directory, clock, guard):
     require(not directory.is_symlink() and directory.is_dir() and directory.stat().st_mode & 0o777 == 0o700,
             "运行目录下 .private 须为 0700 的私有目录")
@@ -1976,6 +2054,11 @@ def _run(args, directory, clock, guard):
             credentials[("cookie", index)] = cookie["value"]
     guard.configure(credentials)
     check_configuration(guard, secrets, config)
+    guard.check((_LOCAL_CONFLICT, "create_reserved", "create_attempt", "created", "create_unknown", "aborted_before_write",
+                 "approval_closed", "card_published", "create_reconciled_read", "create_reconciled_read_unconfirmed",
+                 "readback_unconfirmed", "readback_compared", "delete_attempt", "delete_unconfirmed", "delete_verified",
+                 "registration", "record_id", "allowed_writes", "candidates"))
+    guard.settings = load_settings(secrets)
     token = extract_token(login, config["create"]["session_cookie"])
     guard.session_owner = next(key for key in credentials if isinstance(key, tuple) and credentials[key] == token)
     official_token = official_setting("token_key")
@@ -2038,7 +2121,6 @@ def _run(args, directory, clock, guard):
             "官方读写与建单目标表不一致")
     require(config["fields"].get(official["search"]["name_control"], {}).get("draft") == "policy_name",
             "同名查询字段与建单政策名称不一致")
-    settings = load_settings(args.env_file)
     with ledger_open(directory, args.registration, values["policy_name"]) as ledger:
         ledger.check_available()
         reason = "展示字段与凭据冲突"
@@ -2065,7 +2147,7 @@ def _run(args, directory, clock, guard):
         timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
         with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
             api = Official(official, official_token, official_app_id, client)
-            client.event_hooks["request"].append(api.check_wire_request)
+            CheckedHTTPTransport(client, api.check_wire_request)
             template_id = config["template"]["row_id"]
             require(uuid_record(template_id), "模板记录编号须为 UUID")
             cells = api.detail(api.read(template_id), template_id)
@@ -2104,8 +2186,8 @@ def _run(args, directory, clock, guard):
             try:
                 exclusive(directory / f"create-fields-{registration_hash}.json",
                           {"字段": fields_summary, "通知回执": notices})
-                service = FeishuService(settings, window, directory / "create-approvals.sqlite",
-                                        process=None, clock=clock, before_send=guard.sdk)
+                service = FeishuService(guard.settings, window, directory / "create-approvals.sqlite",
+                                        process=None, clock=clock, before_send=guard.sdk, http_check=guard.sdk)
                 service.transport.before_send = guard.sdk
             except (Exception, KeyboardInterrupt):
                 ledger.append("aborted_before_write", allowed_writes=0)
@@ -2118,6 +2200,11 @@ def _run(args, directory, clock, guard):
 
 
 def main(argv=None):
+    if not logging.getLogger().handlers:
+        try:
+            setup_logging({})
+        except OSError:
+            return 1
     parser = Arguments(description="Trace #12 X5 群审批后建单及 D15 清理")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--registration", required=True)
@@ -2133,9 +2220,13 @@ def main(argv=None):
             if guard.configuration_checked:
                 notice = ("建单请求已发出（凭据冲突），已停止，转人工核对" if guard.started else _MANUAL_NOTICE)
                 try:
-                    announce_conflict(args, guard, notice)
+                    announce_conflict(guard, notice)
                 except Exception:
                     pass
+            try:
+                guard.check(_LOCAL_CONFLICT)
+            except OutletConflict:
+                return 1
             print(_LOCAL_CONFLICT, file=sys.stderr)
             return 1
 
@@ -2160,9 +2251,9 @@ def outlet_scope():
         _outlet.reset(scope)
 
 
-def announce_conflict(args, guard, notice):
+def announce_conflict(guard, notice):
     guard.check(notice)
-    transport = _Transport(load_settings(args.env_file), None, time.time)
+    transport = _Transport(guard.settings, None, time.time, guard.check_sdk_fields)
     transport.before_send = guard.check_sdk_fields
     transport.announce(notice)
 
@@ -2183,7 +2274,7 @@ def execute(args, guard):
         raise
     except CredentialConflict as error:
         try:
-            announce_conflict(args, guard, _MANUAL_NOTICE)
+            announce_conflict(guard, _MANUAL_NOTICE)
         except OutletConflict:
             raise
         except Exception:
