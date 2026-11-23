@@ -30,6 +30,7 @@ from pydantic import TypeAdapter
 
 from qianshu.config import CONFIG_KEYS, LOGGABLE_CONFIG_KEYS
 from qianshu.draft import DraftField, OfferPolicyDraft, PolicyDraft
+from qianshu.mingdao.offer_fields import WEB_TYPES, web_value
 from qianshu.parse import _normalized_value, _read_options
 from qianshu.parse.benefits import (
     BenefitCatalog, OFFER_FIELD_LABELS, _CHOICES, benefit_applicability, benefit_field_format,
@@ -77,6 +78,54 @@ _ARRAY = _SELECT | {26, 29, 34}
 
 class Stop(RuntimeError):
     """只承载固定原因与私有配置批准的字段名。"""
+
+
+def manual_review_card(text):
+    return {"header": {"title": {"tag": "plain_text", "content": "建单需人工核对"}},
+            "elements": [{"tag": "div", "text": {"tag": "plain_text", "content": text}}]}
+
+
+class UnverifiedCombination(Stop):
+    def card(self):
+        return manual_review_card(str(self))
+
+
+def require_verified_combination(snapshot, policy, benefit):
+    """#154 在展示与交接前均读取当前快照，守望者登记真实回读一致的组合。"""
+    pairs = snapshot.get("verified_combinations") if isinstance(snapshot, dict) else None
+    require(isinstance(pairs, list) and all(isinstance(pair, list) and len(pair) == 2
+            and all(receipt(item) for item in pair) for pair in pairs)
+            and [policy, benefit] in pairs, "该类型尚未经真实回读验证", UnverifiedCombination)
+
+
+@dataclass(frozen=True)
+class TrialRegistration:
+    """由 #154 从当次私有授权构造。此接口仅消耗一次资格，删除另验 X7。"""
+    registration: str
+    owner_receipt: str
+    test_name: str
+    policy: str
+    benefit: str
+    expires: str
+
+    def close(self, directory):
+        """门禁失败或窗口到期时，调用方须持久关闭同一登记。"""
+        require(receipt(self.registration), "缺少一次性登记编号")
+        require(directory.is_dir() and not directory.is_symlink() and directory.stat().st_mode & 0o777 == 0o700,
+                "一次性测试登记目录权限无效")
+        path = directory / ("trial-closed-" + digest(self.registration.encode()) + ".json")
+        try:
+            exclusive(path, {"registration": self.registration})
+        except FileExistsError:
+            return False
+        return True
+
+    def consume(self, directory, name, policy, benefit, now):
+        require(self.close(directory), "一次性测试登记已关闭")
+        require(receipt(self.owner_receipt) and receipt(name) and name == self.test_name and name.startswith(_PREFIX)
+                and (policy, benefit) == (self.policy, self.benefit)
+                and receipt(policy) and receipt(benefit) and now < utc(self.expires).timestamp(),
+                "当次测试授权不符或已过期")
 
 
 class CredentialConflict(Stop):
@@ -356,6 +405,10 @@ class Ledger:
     def registered(self, record_id):
         rows = [row for row in self.records() if row["registration"] == self.registration]
         created = [row for row in rows if row["event"] == "created"]
+        compared = [row for row in rows if row["event"] == "readback_compared" and row["record_id"] == record_id]
+        require(len(compared) == 1 and type(compared[0].get("total")) is int and compared[0]["total"] > 0
+                and compared[0].get("counts") == {"一致": compared[0]["total"]}
+                and not any(row["event"] == "readback_unconfirmed" for row in rows), "全项回读尚未确认")
         require(sum(row["event"] == "create_attempt" for row in rows) == 1
                 and uuid_record(record_id) and self.name.startswith(_PREFIX) and len(created) == 1
                 and created[0]["is_test"] is True and created[0]["name"] == self.name
@@ -557,7 +610,7 @@ class Official:
             require(receipt(relation_control) and re.fullmatch(r"[A-Za-z0-9_-]+", relation_control),
                     "官方关联字段配置无效")
             url += "/relations/" + relation_control
-        method = {"delete": "DELETE", "search": "POST"}.get(action, "GET")
+        method = {"delete": "DELETE", "search": "POST", "tag_search": "POST"}.get(action, "GET")
         options = {} if timeout is None else {"timeout": timeout}
         check_outlet((method, url, body, params))
         guard = _outlet.get()
@@ -593,7 +646,19 @@ class Official:
                 "官方接口结果未确认")
         if action == "logs":
             require(no_log_continuation(payload), "状态历史不能证明完整")
-        return payload.get("data")
+        require(type(payload.get("error_code", 0)) is int and payload.get("error_code", 0) == 0,
+                "官方接口结果未确认")
+        data = payload.get("data")
+        if action in ("search", "relations", "tag_search"):
+            require(isinstance(data, dict), "官方分页结果未确认")
+            require(not (payload.keys() - {"success", "data", "error_code", "error_msg", "total", "pageIndex",
+                                           "pageSize", "hasMore", "snapshotVersion", "uniqueConstraint"}), "官方分页外层信号未确认")
+            data = data.copy()
+            for key in ("total", "pageIndex", "pageSize", "hasMore", "snapshotVersion", "uniqueConstraint"):
+                if key in payload:
+                    require(key not in data or compact(data[key]) == compact(payload[key]), "官方分页信号冲突")
+                    data[key] = payload[key]
+        return data
 
     def read(self, record_id, *, budget=None):
         timeout = None if budget is None else httpx.Timeout(
@@ -602,14 +667,51 @@ class Official:
         return self._request("read", record_id, timeout=timeout)
 
     def relations(self, record_id, control):
-        result = self._request("relations", record_id, relation_control=control,
-                               params={"pageIndex": 1, "pageSize": _RELATION_PAGE_SIZE})
-        require(isinstance(result, dict) and isinstance(rows := result.get("rows"), list)
-                and type(total := result.get("total")) is int and total == len(rows) < _RELATION_PAGE_SIZE,
-                "官方关联行结果不完整，需人工")
-        require(all(isinstance(row, dict) and uuid_record(row.get("rowId")) for row in rows),
-                "官方关联行记录编号未确认")
-        return rows
+        def fetch(page):
+            return self._request("relations", record_id, relation_control=control,
+                                 params={"pageIndex": page, "pageSize": _RELATION_PAGE_SIZE})
+        return list(self.page_rows(fetch, _RELATION_PAGE_SIZE, relation=True))
+
+    def page_rows(self, fetch, requested, *, relation=False, snapshot=None):
+        reason = "官方关联行结果不完整，需人工" if relation else "官方查询结果不完整"
+        total = capacity = None
+        count = 0
+        seen = set()
+        for page in range(1, self.page_limit + 1):
+            result = fetch(page)
+            require(isinstance(result, dict) and result.keys() <= {"rows", "total", "pageIndex", "pageSize",
+                                                                    "hasMore", "snapshotVersion", "uniqueConstraint"}, reason)
+            rows = result.get("rows")
+            size = result.get("pageSize", requested)
+            index = result.get("pageIndex", page)
+            require(type(index) is int and index == page and type(size) is int and 0 < size <= requested
+                    and capacity in (None, size) and isinstance(rows, list) and len(rows) <= size, reason)
+            capacity = size
+            count += len(rows)
+            reported = result.get("total")
+            if relation or "total" in result or total is not None:
+                require(type(reported) is int and reported >= count and total in (None, reported), reason)
+                total = reported
+            if snapshot is not None:
+                require(result.get("snapshotVersion") == snapshot and total is not None, reason)
+            if "tag_search" in self.config and not relation:
+                require(total is not None or type(result.get("hasMore")) is bool, reason)
+            for row in rows:
+                require(isinstance(row, dict) and uuid_record(row.get("rowId")),
+                        "官方关联行记录编号未确认" if relation else "官方查询记录编号未确认")
+                identity = row["rowId"].lower()
+                if relation or "tag_search" in self.config or total is not None or "hasMore" in result or "pageIndex" in result:
+                    require(identity not in seen, reason)
+                seen.add(identity)
+                yield row
+            more = result.get("hasMore", count < total if total is not None else len(rows) == size)
+            require(type(more) is bool and (total is None or more == (count < total))
+                    and (not more or rows), reason)
+            if relation and "pageIndex" not in result and "hasMore" not in result:
+                require(not more and len(rows) < size, reason)
+            if not more:
+                return
+        raise Stop("官方查询超过分页上限，需人工")
 
     def detail(self, raw, record_id):
         require(uuid_record(record_id) and isinstance(raw, dict) and uuid_record(raw.get("rowId"))
@@ -639,26 +741,47 @@ class Official:
         spec = self.config["search"]
         control = spec["name_control"]
         condition = {"type": "condition", "field": control, "operator": "eq", "value": name}
-        matches = {}
+        records = {}
         for view in spec["view_ids"]:
-            for page in range(1, self.page_limit + 1):
-                result = self._request("search", body={
+            def fetch(page):
+                return self._request("search", body={
                     "viewId": view, "pageSize": self.page_size, "pageIndex": page,
                     "filter": {"type": "group", "logic": "AND", "children": [condition]},
                 })
-                rows = result["rows"]
-                require(isinstance(rows, list) and len(rows) <= self.page_size, "官方查询结果不完整")
-                for row in rows:
-                    require(isinstance(row, dict) and receipt(row.get(control)), "官方查询返回无效名称")
-                    record_id = row.get("rowId")
-                    require(uuid_record(record_id), "官方查询记录编号未确认")
-                    if row[control] == name:
-                        matches.setdefault(record_id.lower(), record_id)
-                if len(rows) < self.page_size:
-                    break
-            else:
-                raise Stop("官方查询超过分页上限，需人工")
-        return list(matches.values())
+            for row in self.page_rows(fetch, self.page_size):
+                require(receipt(row.get(control)), "官方查询返回无效名称")
+                key = row["rowId"].lower()
+                previous = records.setdefault(key, (row["rowId"], row[control]))
+                require(previous[1] == row[control], "官方查询同一记录名称冲突")
+        return [record for record, value in records.values() if value == name]
+
+    def verified_tag_version(self, scope, tags, selected, clock):
+        """独立授权指定全表视图及写入窗口内的唯一性证明。任何未知均先于查询停止。"""
+        spec = self.config.get("tag_search")
+        error = "标签表范围或全名唯一性证明未确认"
+        require(isinstance(scope, dict) and isinstance(spec, dict)
+                and spec.keys() == {"path", "view", "name_control"}
+                and all(scope.get(k) == v for k, v in spec.items())
+                and re.fullmatch(r"/v3/app/worksheets/[A-Za-z0-9_-]+/rows/list", spec["path"])
+                and all(receipt(spec[k]) for k in ("view", "name_control"))
+                and scope.get("origin") == self.origin and scope.get("coverage") == "full_table"
+                and scope.get("app_sha256") == digest(self._headers["HAP-Appid"].encode())
+                and receipt(scope.get("snapshot")) and utc(scope["unique_until"]).timestamp() > clock(), error)
+        def fetch(page):
+            result = self._request("tag_search", body={"viewId": spec["view"], "pageIndex": page,
+                                                        "pageSize": self.page_size})
+            constraint = {"field": spec["name_control"], "coverage": "full_table", "enforced": True,
+                          "version": scope["snapshot"], "validUntil": scope["unique_until"]}
+            require(compact(result.get("uniqueConstraint")) == compact(constraint), error)
+            return result
+        by_name = {}
+        for row in self.page_rows(fetch, self.page_size, snapshot=scope["snapshot"]):
+            name = row.get(spec["name_control"])
+            require(receipt(name), error)
+            by_name.setdefault(name, []).append(row["rowId"].lower())
+        require(len(tags) == len(selected) and all(by_name.get(tag) == [item["sid"].lower()]
+                for tag, item in zip(tags, selected)) and utc(scope["unique_until"]).timestamp() > clock(), error)
+        return digest(compact([scope, by_name]).encode())
 
     def history(self, current):
         result = self._request("logs", current.record_id, params={"pageIndex": 1, "pageSize": _LOG_PAGE_SIZE})
@@ -792,6 +915,12 @@ def check_derivation(name, value, result, draft, declared, reason):
                 require(source["gift_package"] in (None, current, current + "_copy"), reason)
             else:
                 require(receipt(source["gift_package"]) and source["gift_package"] + "_copy" == gift, reason)
+    elif name == "recharge_amount":
+        if draft["amount_mode"]["value"] != "节目包资费" or original is not None:
+            require(compact(value) == compact(original) and declared, reason)
+            number = Decimal(str(value))
+            require(any(Decimal(match.group()) == number for quote in declared
+                        for match in re.finditer(r"(?<![0-9.,−+-])[0-9]+(?:\.[0-9]+)?(?![0-9.]|,[0-9])", quote["text"])), reason)
     elif name == "after_offer_package":
         require(original == value, reason)
     elif name == "company":
@@ -1158,7 +1287,7 @@ def select_tag_ids(rows, name_keys, tags):
 def template_relation_rows(cells, control, read_relations, label):
     count = cells[control]
     error = f"模板{label}字段计数与关联行总数不一致，需人工"
-    require(type(count) is int and 0 <= count < _RELATION_PAGE_SIZE, error)
+    require(type(count) is int and 0 <= count, error)
     rows = read_relations(control)
     require(count == len(rows), error)
     return rows
@@ -1295,6 +1424,12 @@ def fixed_cells(config, schema, draft_controls):
 
 
 def assemble(values, template_cells, config, read_relations, *, is_test, array_controls=()):
+    controls, summary, _ = assemble_controls(values, template_cells, config, read_relations,
+                                             is_test=is_test, array_controls=array_controls)
+    return controls, summary
+
+
+def assemble_controls(values, template_cells, config, read_relations, *, is_test, array_controls=(), web_fields=None):
     schema = config["fields"]
     draft_controls = cell_schema(schema, config["readback_skip"])
     require(is_test is True, "正式单不得照抄任务审批链接，需人工")
@@ -1322,10 +1457,11 @@ def assemble(values, template_cells, config, read_relations, *, is_test, array_c
     company = values.get("company")
     require(receipt(company), "公司显示名不确定，需人工核对")
     company_spec = schema[company_control]
-    company_is_relation = company_spec["type"] == 29
-    if company_is_relation:
+    company_row = None
+    if company_spec["type"] == 29:
         rows = template_relation_rows(template_cells, company_control, read_relations, "公司")
         company_id = select_company_id(rows, company_spec, company)
+        company_row, = [row for row in rows if row["rowId"] == company_id]
         company_value = encode_cell([company_id], company_spec)
     else:
         require(template_cells[company_control] == company, "公司显示名不确定，需人工核对")
@@ -1345,17 +1481,23 @@ def assemble(values, template_cells, config, read_relations, *, is_test, array_c
     tag_rows = template_relation_rows(template_cells, tag_control, read_relations, "用户标签")
     tag_ids = select_tag_ids(tag_rows, config["official"]["tag_relation"]["name_keys"], values["user_tags"])
 
+    if web_fields is None:
+        require("web_rules" not in config.get("order_snapshot", {})
+                and not any(spec["label"] in WEB_TYPES for spec in schema.values()), "网页字段缺少公式依据")
+    web = web_fields(company_row, packages) if web_fields is not None else {}
     controls, summary = [], []
     for control, spec in schema.items():
         key = spec.get("draft")
-        if control in fixed:
+        if control in web:
+            source, encoded = "网页公式", web[control][0]
+        elif control in fixed:
             source, encoded = "固定值", fixed[control]
         elif control == tag_control:
             source, encoded = "草稿", encode_cell(tag_ids, spec)
         elif control == package_control:
             source, encoded = "模板", compact(packages)
         elif control == company_control:
-            source, encoded = ("草稿" if company_is_relation else "模板"), company_value
+            source, encoded = ("草稿" if company_row is not None else "模板"), company_value
         elif key in _VARIABLE:
             source, encoded = "草稿", encode_cell(values[key], spec)
         elif control in array_controls:
@@ -1373,7 +1515,136 @@ def assemble(values, template_cells, config, read_relations, *, is_test, array_c
         controls.append({"controlId": control, "type": spec["type"], "value": encoded})
         summary.append({"字段名": spec["label"], "类型": spec["type"], "来源": source,
                         "值指纹": digest(encoded.encode())[:12]})
-    return controls, summary
+    return controls, summary, web
+
+
+def price_plan_name(encoded, package_spec):
+    field = package_spec["children"][package_spec["price_plan_control"]]
+    if field["type"] in _ARRAY:
+        # 实际关联或选项编码与经配置核实的业务全名逐项对应。
+        display = field.get("business_names", {}).get(encoded)
+    else:
+        display = encoded
+    require(receipt(display) and not uuid_record(display), "当前节目包价格计划缺少业务名称")
+    return display
+
+
+def project_web_fields(config, evidence, values, company_row, packages, clock):
+    snapshot = config["order_snapshot"]
+    rules = snapshot.get("web_rules")
+    fields = config["fields"]
+    require(isinstance(rules, dict), "缺少网页公式定义")
+    missing = WEB_TYPES.keys() - rules.keys()
+    require(not missing, "缺少网页字段公式：" + "、".join(sorted(missing)))
+    require(rules.keys() == WEB_TYPES.keys() and evidence.get("web_rules_sha256") == digest(compact(rules).encode()),
+            "网页字段公式登记未确认")
+    by_draft = {spec["draft"]: key for key, spec in fields.items() if "draft" in spec}
+    company = by_draft["company"]
+    company_spec = fields[company]
+    require(company_row is not None and company_spec["type"] == 29, "网页字段 companyId 缺少已核实的公司关联")
+    package = by_draft["packages"]
+    spec = fields[package]
+    price = spec.get("price_plan_control")
+    require(price in spec["children"] and price not in {spec[role]["control"] for role in ("current", "gift")},
+            "当前节目包价格计划列未确认")
+    plans = [(package_row["current_package"], price_plan_name(row[price], spec)) for package_row, row in
+             zip(values["packages"], subtable_rows(packages), strict=True)]
+    displays = {}
+    for name, kind in WEB_TYPES.items():
+        rule = rules[name]
+        reason = f"网页字段 {name} 的定义、绑定或来源未确认"
+        require(isinstance(rule, dict) and receipt(rule.get("control")), reason)
+        control = rule["control"]
+        spec = fields.get(control, {})
+        require(rule.get("formula") == name and spec.get("label") == name and spec.get("type") == kind
+                and "draft" not in spec and control not in config["fixed"]
+                and control not in config["readback_skip"] and control != config["template"]["country"]["control"]
+                and sum(field["label"] == name for field in fields.values()) == 1, reason)
+        try:
+            if name == "升包执行任务状态值" and values["benefit_type"] == "升级权益" and values["after_offer"] == "指定节目包":
+                require(uuid_record(snapshot.get("upgrade_task_id")) and receipt(rule.get("column"))
+                        and rule["column"] not in _OFFICIAL_METADATA, reason)
+            if name == "companyId":
+                require(receipt(rule.get("column"))
+                        and rule["column"] not in _OFFICIAL_METADATA | {company_spec["display_name_key"]}, reason)
+            value = web_value(name, rule, values, company_row, plans, snapshot)
+            display = value
+            if name == "标签与适用条件关系":
+                display = rule["default"]["value"]
+            if name == "同期有效优惠政策":
+                require(set(spec["children"]) == {rule.get("child")} and spec["children"][rule["child"]]["type"] == 29,
+                        reason)
+                facts = snapshot["concurrent_policies"]
+                candidates = facts["rows"]
+                cutoff = utc(facts["as_of"])
+                require(cutoff.timestamp() <= clock() < utc(facts["valid_until"]).timestamp()
+                        and type(facts["total"]) is int and facts["total"] == len(candidates)
+                        and all(uuid_record(row["id"]) and utc(row["created_at"]) <= cutoff
+                                and receipt(row["company"]) for row in candidates)
+                        and len({row["id"].lower() for row in candidates}) == len(candidates), reason)
+                titles = {row["id"]: row["name"] for row in candidates}
+                display = [titles[row[rule["child"]][0]] for row in value]
+                require(all(receipt(title) for title in display), reason)
+            encoded = encode_cell(value, spec)
+        except CredentialConflict:
+            raise
+        except (ValueError, TypeError, KeyError, IndexError, Stop):
+            raise Stop(reason) from None
+        displays[control] = (encoded, display)
+    return displays
+
+
+def request_display(payload, config, values, inactive, summary, web):
+    """使用将要交接的请求生成展示。数组值仅显示已核对的业务名。"""
+    snapshot = config["order_snapshot"]
+    proofs = snapshot.get("template_sources", {})
+    by_label = {item["字段名"]: item["来源"] for item in summary}
+    lines = []
+    for cell in decode(payload)["receiveControls"]:
+        key, encoded = cell["controlId"], cell["value"]
+        spec = config["fields"][key]
+        name = spec.get("draft")
+        label = spec["label"]
+        reason = f"字段 {label} 缺少可展示的业务值或适用依据"
+        source = by_label[label]
+        if key in web:
+            approved, display = web[key]
+            require(approved == encoded, reason)
+            source = "网页公式与本条已核来源"
+        elif name == "packages":
+            rows = subtable_rows(encoded)
+            display = []
+            price = spec["price_plan_control"]
+            for row, pair in zip(rows, values["packages"], strict=True):
+                parts = [pair["current_package"], pair["gift_package"], "价格计划 " + price_plan_name(row[price], spec)]
+                for child in row.keys() - {spec["current"]["control"], spec["gift"]["control"], price}:
+                    definition = spec["children"][child]
+                    require(receipt(definition.get("label")) and definition["type"] not in _ARRAY, reason)
+                    parts.append(definition["label"] + " " + row[child])
+                display.append(" / ".join(parts))
+            source = "已核草稿、目录与模板关联，按行顺序"
+        elif name in values:
+            display = values[name]
+            source = "已核草稿与请求"
+        elif name in inactive:
+            require(encoded == encode_cell(None, spec), reason)
+            display, source = "空", values["benefit_type"] + "不适用"
+        elif key == config["official"]["status_control"]:
+            display = _NEW
+        elif key == config["applicant_control"]:
+            display = snapshot.get("member_names", {}).get(decode(encoded)[0]["accountId"])
+            require(receipt(display), reason)
+        elif name == "approval_url" or key == config["template"]["country"]["control"]:
+            display = encoded
+        else:
+            proof = proofs.get(key, {})
+            require(proof.get("label") == label and proof.get("type") == spec["type"]
+                    and proof.get("source") in ("模板复制", "工作流回填") and spec["type"] not in _ARRAY, reason)
+            display, source = encoded, proof["source"]
+        if isinstance(display, list):
+            display = "、".join(str(item) for item in display)
+        lines.append(f"{label}：{display if display not in ('', None) else '空'}（{source}）")
+    return lines
 
 
 def compare_company(control, actual, field, read_relations, display_name):
@@ -1386,6 +1657,8 @@ def compare_company(control, actual, field, read_relations, display_name):
         if len(rows) != 1:
             return "不确定"
         company_id = select_company_id(rows, field, display_name)
+    except OutletConflict:
+        raise
     except Stop:
         return "不确定"
     return "一致" if company_id.lower() == decode(control["value"])[0]["sid"].lower() else "不确定"
@@ -1394,37 +1667,43 @@ def compare_company(control, actual, field, read_relations, display_name):
 def compare_relation(control, count, field, read_relations, packages):
     try:
         rows = read_relations(control["controlId"])
+    except OutletConflict:
+        raise
     except Stop:
         return "无法核对"
     if type(count) is not int or count != len(rows):
         return "不一致"
-    if field["draft"] == "user_tags":
+    if field.get("draft") == "user_tags":
         matches = {row["rowId"].lower() for row in rows} == {
             item["sid"].lower() for item in decode(control["value"])
         }
     else:
         # 写入的节目包行按草稿顺序从模板挑选，关联对象在写入值中只保留 sid。
         try:
-            matches = len(rows) == len(packages) and all(
-                relation_package_names(row, field) == draft_package_names(package)
-                for row, package in zip(rows, packages)
-            )
-        except (Stop, KeyError):
+            expected = subtable_rows(control["value"])
+            if any(not field["children"].keys() <= row.keys() for row in rows):
+                return "缺失"
+            matches = len(rows) == len(expected) and all(
+                equivalent(written[key], encode_cell(row[key], child), child)
+                for row, written in zip(rows, expected) for key, child in field["children"].items())
+            if field.get("draft") == "packages":
+                matches = matches and len(rows) == len(packages) and all(
+                    relation_package_names(row, field) == draft_package_names(package)
+                    for row, package in zip(rows, packages))
+        except (Stop, KeyError, ValueError, TypeError):
             matches = False
     return "一致" if matches else "不一致"
 
 
 def compare(expected, raw_cells, config, *, read_relations, packages, company=None):
-    results, differences = [], []
+    results, differences, inactive = [], [], []
     for control in expected:
         key = control["controlId"]
         field = config["fields"][key]
         actual = raw_cells.get(key, _NO_CELL)
-        if key in config["readback_skip"]:
-            result = "跳过"
-        elif field.get("draft") == "company":
+        if field.get("draft") == "company":
             result = compare_company(control, actual, field, read_relations, company)
-        elif field.get("draft") in ("user_tags", "packages"):
+        elif field.get("draft") in ("user_tags", "packages") or (field["type"] == 34 and type(actual) is int):
             result = compare_relation(control, actual, field, read_relations, packages)
         elif actual is _NO_CELL:
             result = "缺失"
@@ -1435,9 +1714,23 @@ def compare(expected, raw_cells, config, *, read_relations, packages, company=No
                 matches = False
             result = "一致" if matches else "不一致"
         results.append({"字段名": field["label"], "结果": result})
+        if (config.get("order_snapshot", {}).get("web_rules") and result == "一致"
+                and field["label"] in ("singlePurchaseTime", "升包执行任务状态值") and control["value"] == ""):
+            inactive.append(field["label"])
         if result == "不一致":
             differences.append({"字段名": field["label"], "类型": field["type"]})
-    return {"字段比对": results, "可能由工作流回填": differences}, Counter(row["结果"] for row in results)
+    counts = Counter(row["结果"] for row in results)
+    snapshot = config.get("order_snapshot", {})
+    classes = snapshot.get("template_sources", {})
+    workflow = [row["字段名"] for cell, row in zip(expected, results)
+                if classes.get(cell["controlId"], {}).get("source") == "工作流回填" and row["结果"] == "一致"]
+    # 保留 X5 私有报告的历史字段。清理资格只取逐控件实比结果。
+    legacy = [{**row, "结果": "跳过"} if cell["controlId"] in config["readback_skip"] else row
+              for cell, row in zip(expected, results)]
+    report = {"字段比对": legacy, "可能由工作流回填": differences, "逐项核对": results, "应核总数": len(expected),
+              "差异字段": differences, "已核工作流字段": workflow, "已证不适用": inactive, "分类计数": dict(counts),
+              "逐字段计数": [{"字段名": row["字段名"], "应核": 1, row["结果"]: 1} for row in results]}
+    return report, counts
 
 
 class CreateResponse(http.client.HTTPResponse):
@@ -1721,9 +2014,26 @@ def verify_selected_packages(config, controls, actual, relations, values, snapsh
             entries = unpack_array(children[child])
             require(len(entries) == 1 and relation_item(entries[0], "sid",
                     spec["children"][child].get("relation_id_key", "rowid"))["sid"] == offer.id, reason)
-    require(all(name == name.strip() and any(name in quote["text"] for quote in statement["evidence"])
-                for name in required_names), proof)
-    return required_names
+    require(all(name == name.strip() for name in required_names), proof)
+    catalog = TypeAdapter(BenefitCatalog).validate_json(compact(snapshot.get("benefit_catalog", {})), strict=True)
+    catalog_names = {offer.name for offer in levels.offers} | set(catalog.package_names)
+    catalog_names.update(rate.base_package for rate in catalog.tariffs)
+    return required_names, catalog_names
+
+
+def package_mentions(text, start, end, catalog):
+    """原文中的完整目录名须全部落在同一引文内。较长或交叠的解释排除短名。"""
+    spans = []
+    for name in catalog:
+        require(receipt(name), "节目包目录名称无效")
+        index = text.find(name, max(0, start - len(name)))
+        while 0 <= index < end:
+            spans.append((index, index + len(name), name))
+            index = text.find(name, index + 1)
+    return {name for left, right, name in spans if start <= left and right <= end
+            and not (left and text[left-1].isascii() and text[left-1].isalnum() and name[0].isascii())
+            and not (right < len(text) and text[right].isascii() and text[right].isalnum() and name[-1].isascii())
+            and not any((a, b) != (left, right) and a < right and left < b for a, b, _ in spans)}
 
 
 def credential_fragments(values, width=4):
@@ -1734,7 +2044,7 @@ def registered_windows(text, fragments):
     return ((i, i + 4) for i in range(len(text) - 3) if text[i:i + 4] in fragments)
 
 
-def order_summary(values, config, adjustments, excerpts, sources, secrets, deadline, package_names):
+def order_summary(values, config, adjustments, excerpts, sources, secrets, deadline, package_names, request_lines=()):
     pattern = re.compile("|".join(map(re.escape, sorted(secrets, key=len, reverse=True))))
     fragments = credential_fragments(secrets)
     # 同一来源可拆为多个连续或重叠块。拼回连续区间再判引文与凭据的交集。
@@ -1770,15 +2080,21 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
     grouped = _CardRedaction(joined, pattern, fragments, source_spans=spans)
     offset = 0
     evidence_lines = []
-    visible_package_text = []
-    for name, _, text, declared in excerpts:
+    required_names, catalog = package_names
+    original_names, visible_names = set(), set()
+    for name, span, text, declared in excerpts:
         shown = grouped.display(text, offset)
         require(not any(secret in shown for secret in secrets), "展示字段与凭据冲突", CredentialConflict)
         evidence_lines.append(f"{labels.get(name, name)}依据：" + shown)
-        if name == "packages" and declared and "[已脱敏]" not in shown:
-            visible_package_text.append(shown)
+        if name == "packages" and declared:
+            redact, block_offset = redactions[span.source_id]
+            names = package_mentions(redact.body, block_offset + span.start, block_offset + span.end, catalog)
+            original_names.update(names)
+            if "[已脱敏]" not in shown:
+                visible_names.update(names)
         offset += len(text)
-    require(all(any(name in part for part in visible_package_text) for name in package_names),
+    require(required_names <= original_names, "节目包缺少原文归属依据")
+    require(required_names <= visible_names,
             "节目包原文归属依据已脱敏", CredentialConflict)
     for name in ("policy_name", "user_scope"):
         checked_display_value(values[name])
@@ -1791,7 +2107,7 @@ def order_summary(values, config, adjustments, excerpts, sources, secrets, deadl
     lines = [card_summary(values), *(f"{labels.get(k, k)}：{checked_display_value(str(v))}" for k, v in values.items()
              if k not in (*_VARIABLE, "user_tags", "packages")), f"用户范围：{values['user_scope']}",
              f"标签最晚截止日：{deadline}", *("自动调整：" + a for a in adjustments)]
-    summary = "\n".join([*lines, *evidence_lines])
+    summary = "\n".join([*lines, *(checked_display_value(line) for line in request_lines), *evidence_lines])
     require(not any(secret in summary for secret in secrets), "展示字段与凭据冲突", CredentialConflict)
     return summary
 
@@ -1879,25 +2195,37 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
 
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
               contact, login_check, stop, *, packages, company,
-              clock=time.time, pause=time.sleep, monotonic=time.monotonic, check_start_date=None):
-    def announce(text):
-        message = f"{ledger.name} · {text}\n{contact}"
+              clock=time.time, pause=time.sleep, monotonic=time.monotonic, check_start_date=None,
+              source_version=None, current_version=None):
+    def announce(text, *, readback=False):
+        prefix = "" if readback else f"{ledger.name} · "
+        message = f"{prefix}{text}\n{contact}"
         check_outlet(message)
         feishu.transport.announce(message)
 
     registration_hash = digest(ledger.registration.encode())
-    binding = "create:" + registration_hash
+
+    def approval_binding(version):
+        return "create:" + digest(compact([registration_hash, digest(payload), summary, version]).encode())
+
+    binding = approval_binding(source_version)
+
+    def check_sources():
+        if current_version is not None:
+            require(binding == approval_binding(current_version()), "建单来源或放行登记已变化，需重新审批")
+
     approval_id = None
 
     def prepare():
         stop_if_interrupted(stop)
         require(not api.find(ledger.name), "已存在同名记录，需人工")
+        check_sources()
 
     def record_attempt():
         stop_if_interrupted(stop)
         ledger.append("create_attempt")
 
-    def check_before_transport(check_approval):
+    def final_approval(check_approval):
         login_check()
         stop_if_interrupted(stop)
         if check_start_date is not None:
@@ -1919,10 +2247,11 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         if status != "approve":
             raise Stop("群卡片已驳回" if status == "reject" else "审批到期或断线")
         with create.prepare(payload) as (transmit, read_id):
-            def send(check_approval):
-                transmit(lambda: check_before_transport(check_approval))
+            def check_before_transport(check_approval):
+                check_sources()
+                transmit(lambda: final_approval(check_approval))
 
-            require(feishu.send_first_create(approval_id, binding, prepare, record_attempt, send),
+            require(feishu.send_first_create(approval_id, binding, prepare, record_attempt, check_before_transport),
                     "建单审批已关闭")
             record_id = read_id()
         ledger.append("created", record_id)
@@ -1958,31 +2287,48 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         abandon(ledger, feishu, approval_id, binding, announce, reason)
         return False
 
+    path = ledger.directory / f"create-readback-{registration_hash}.json"
+    expected = decode(payload)["receiveControls"]
     try:
         stop_if_interrupted(stop)
-        raw = api.read(record_id)
-        observed = api.detail(raw, record_id)
-        report, counts = compare(controls, observed, config,
-                                 read_relations=lambda control: api.relations(record_id, control),
+        try:
+            raw = api.read(record_id)
+            observed = api.detail(raw, record_id)
+        except OutletConflict:
+            raise
+        except (KeyError, TypeError, ValueError, Stop):
+            report = {"字段比对": [{"字段名": config["fields"][cell["controlId"]]["label"], "结果": "无法核对"}
+                                  for cell in expected], "应核总数": len(expected),
+                      "分类计数": {"无法核对": len(expected)}}
+            exclusive(path, report)
+            raise
+        report, counts = compare(expected, observed, config, read_relations=lambda key: api.relations(record_id, key),
                                  packages=packages, company=company)
-        exclusive(ledger.directory / f"create-readback-{registration_hash}.json", report)
-        ledger.append("readback_compared", record_id, counts=dict(counts))
-        announce(f"官方回读 一致 {counts['一致']} / 不一致 {counts['不一致']} / "
-                 f"缺失 {counts['缺失']} / 跳过 {counts['跳过']} / 无法核对 {counts['无法核对']}")
-        if counts["不确定"]:
-            announce("公司回读不确定，已保留记录，需人工核对")
-            return False
+        exclusive(path, report)
+        ledger.append("readback_compared", record_id, counts=dict(counts), total=len(expected))
+        legacy = Counter(row["结果"] for row in report["字段比对"])
+        announce(f"官方回读 应核 {len(expected)} / 已确认 {counts['一致']} / 不确定 {counts['不确定']} / "
+                 f"不一致 {counts['不一致']} / 缺失 {counts['缺失']} / 无法核对 {counts['无法核对']}；"
+                 f"原报告 一致 {legacy['一致']} / 不一致 {legacy['不一致']} / 缺失 {legacy['缺失']} / "
+                 f"跳过 {legacy['跳过']} / 无法核对 {legacy['无法核对']}", readback=True)
     except (Exception, KeyboardInterrupt) as error:
         ledger.append("readback_unconfirmed", record_id)
         if isinstance(error, OutletConflict):
             raise
-        announce("官方回读未获确认，已停止，需人工核对")
+        announce("官方回读未获确认，已停止，需人工核对", readback=True)
         if isinstance(error, KeyboardInterrupt):
             raise
         raise Stop("官方回读未获确认") from None
+    if counts["一致"] != len(expected):
+        announce("公司回读不确定，已保留记录，需人工核对" if counts["不确定"] else "回读未确认，已保留记录，需人工核对",
+                 readback=True)
+        if api.record(observed).status != _NEW:
+            ledger.append("delete_unconfirmed", record_id)
+            raise Stop("删除前状态须为新建")
+        return False
     delete_test(api, ledger, record_id, notice_recipients(config), evidence, announce, stop, raw,
                 pause=pause, monotonic=monotonic)
-    return not (counts["不一致"] or counts["缺失"] or counts["无法核对"])
+    return True
 
 
 class Arguments(argparse.ArgumentParser):
@@ -2117,11 +2463,18 @@ def _run(args, directory, clock, guard):
                 and extract_token(decode(current), config["create"]["session_cookie"]) == token,
                 "建单登录状态已变化")
 
+    def check_proof_window():
+        if tag_profile:
+            require(clock() < utc(evidence["tag_scope"]["unique_until"]).timestamp(), "标签唯一性证明已到期")
+        if web_profile:
+            require(clock() < utc(snapshot["concurrent_policies"]["valid_until"]).timestamp(), "同期政策来源已过期")
+
     def check_start_date():
         today = datetime.fromtimestamp(clock(), UTC).date()
         approved_start = effective_start_date(date.fromisoformat(draft["start_date"]["value"]), today)
         require(values["start_date"] == approved_start.isoformat(),
                 "经卡片确认的开始日期已过，需重新审批")
+        check_proof_window()
 
     create = CreateRequest(config["create"], evidence, token)
     worksheet = config["create"]["identifiers"]["worksheetId"]
@@ -2164,14 +2517,33 @@ def _run(args, directory, clock, guard):
                 relations[control] = api.relations(template_id, control)
                 return relations[control]
 
+            web_profile = ("web_rules" in snapshot or "web_rules_sha256" in evidence
+                           or any(spec["label"] in WEB_TYPES for spec in config["fields"].values()))
+            tag_profile = web_profile or "tag_search" in official or "tag_scope" in evidence
+            def web_fields(company_row, packages):
+                return project_web_fields(config, evidence, values, company_row, packages, clock)
+
             try:
-                controls, fields_summary = assemble(
+                controls, fields_summary, web = assemble_controls(
                     projected, cells, assembly_config, template_rows,
-                    is_test=evidence["is_test"],
+                    is_test=evidence["is_test"], web_fields=web_fields if web_profile else None,
                     array_controls={c for c, s in config["fields"].items()
                                     if s.get("draft") in values and "draft" not in assembly_config["fields"][c]
                                     and s["type"] in (10, 26, 29, 34)},
                 )
+
+                def tag_version():
+                    if not tag_profile:
+                        return None
+                    key = next(key for key, field in config["fields"].items() if field.get("draft") == "user_tags")
+                    selected = next(decode(cell["value"]) for cell in controls if cell["controlId"] == key)
+                    keys = official["tag_relation"]["name_keys"]
+                    for name, item in zip(values["user_tags"], selected, strict=True):
+                        require(any(row["rowId"] == item["sid"] and any(row.get(k) == name for k in keys)
+                                    for row in relations[key]) and any(row["name"] == name and row["id"] == item["sid"]
+                                    for row in snapshot["tags"]), "模板或快照标签全名未确认")
+                    return api.verified_tag_version(evidence.get("tag_scope"), values["user_tags"], selected, clock)
+                initial_tag_version = tag_version()
                 payload = create.payload(controls)
                 deadline, package_names = verify_order_request(
                     payload, config, cells, relations, values, inactive, sensitive,
@@ -2179,7 +2551,9 @@ def _run(args, directory, clock, guard):
                 )
                 check_outlet((payload, decode(payload)))
                 require(decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
-                summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline, package_names)
+                lines = request_display(payload, config, values, inactive, fields_summary, web) if web_profile else []
+                summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline,
+                                        package_names, lines)
             except (KeyError, ValueError, TypeError, IndexError, AttributeError):
                 error = Stop("请求字段或查表快照无法核实")
                 write_preflight_failure(error)
@@ -2188,6 +2562,14 @@ def _run(args, directory, clock, guard):
                 raise
             except Stop as error:
                 write_preflight_failure(error)
+                if tag_profile and type(error) is Stop:
+                    note = f"政策名称：{values['policy_name']}\n优惠类型：{values['benefit_type']}\n未建单：{error}，转人工核对"
+                    require(not any(fragment in note for fragment in fragments), reason, CredentialConflict)
+                    card = manual_review_card(note)
+                    guard.check(card)
+                    transport = _Transport(guard.settings, window, clock, guard.sdk)
+                    transport.before_send = guard.sdk
+                    guard.check(transport.send_card(card))
                 raise
             require(window.contains(clock()), "验收窗口已关闭")
             ledger.reserve()
@@ -2200,10 +2582,29 @@ def _run(args, directory, clock, guard):
             except (Exception, KeyboardInterrupt):
                 ledger.append("aborted_before_write", allowed_writes=0)
                 raise
+            # X5 仅供原验收。序 2a 的邮件审批、预览、存档和同意由 #154 共用门禁接入。
+            def version(data, template, children, tag):
+                return digest(compact([digest(data), template, children, tag]).encode())
+
+            # 原格式 X5 保持既有验收读序；带 050 来源登记时须实时核对模板及关联。
+            refresh_template = tag_profile or "verified_combinations" in snapshot
+            source_version = version(config_data, cells, relations, initial_tag_version)
+
+            def current_version():
+                authorization = decode(private_bytes(directory / "create-authorizations.json"))
+                require(authorization.get(args.registration) == evidence, "当次授权登记已变化")
+                check_proof_window()
+                template, children = cells, relations
+                if refresh_template:
+                    template = api.detail(api.read(template_id), template_id)
+                    children = {key: api.relations(template_id, key) for key in relations}
+                tag = tag_version()
+                return version(private_bytes(args.config), template, children, tag)
+
             return service.run_create(lambda stop: run_order(
                 ledger, api, create, service, window, payload, summary, controls, config, evidence,
                 contact, login_check, stop, packages=values["packages"], company=values["company"], clock=clock,
-                check_start_date=check_start_date,
+                check_start_date=check_start_date, source_version=source_version, current_version=current_version,
             ))
 
 
