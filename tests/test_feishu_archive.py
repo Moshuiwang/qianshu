@@ -529,21 +529,8 @@ _NESTED = ("> From: 甲", ">> Extra: 引用明细", "> Sent: 乙",
            "> > Subject: 丙", "\t>> Tail: 丁", ">> \t折行")
 
 
-@pytest.fixture(scope="module")
-def baseline_archive(tmp_path_factory):
-    import importlib.util
-    import subprocess
-    from pathlib import Path
-
-    source = subprocess.check_output(
-        ["git", "show", "ec8917f:src/qianshu/feishu/archive.py"], cwd=Path(a.__file__).parent,
-    )
-    path = tmp_path_factory.mktemp("archive_baseline") / "archive.py"
-    path.write_bytes(source)
-    spec = importlib.util.spec_from_file_location("qianshu.feishu.archive_baseline", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+# ec8917f 对下列合成批次生成的预览指纹。
+_OLD_PREVIEW_FINGERPRINT = "011cda37eca52f6187ecefed553fa78c412dda245750b1083f60f45e96e3d09b"
 
 
 def published_paragraphs(stub):
@@ -583,15 +570,14 @@ def test_quoted_header_block_remains_fully_masked(setup, headers):
 
 
 @pytest.mark.parametrize("use_old", [True, False], ids=["old", "new"])
-def test_quote_depth_changes_preview_registration(setup, baseline_archive, use_old):
+def test_quote_depth_changes_preview_registration(setup, use_old):
     batch, _, cfg, stub, register, run = setup
     context = "可见明细\n" + _QUOTED_FROM + "\n" + _SCENARIO
     batch = excerpt_batch(batch, "使用场景", context, context)
-    old = baseline_archive.preview_archive_batch(batch, config=cfg)
     new = a.preview_archive_batch(batch, config=cfg)
-    assert _SCENARIO not in old.body and _SCENARIO in new.body
-    assert old.fingerprint != new.fingerprint
-    register(batch, preview_fingerprint=(old if use_old else new).fingerprint)
+    assert _SCENARIO in new.body
+    assert _OLD_PREVIEW_FINGERPRINT != new.fingerprint
+    register(batch, preview_fingerprint=_OLD_PREVIEW_FINGERPRINT if use_old else new.fingerprint)
     if use_old:
         assert run(batch) == a.ArchiveFailed("prepare", "preview")
         assert stub.writes == []
@@ -600,25 +586,46 @@ def test_quote_depth_changes_preview_registration(setup, baseline_archive, use_o
         assert published_paragraphs(stub) == new.blocks
 
 
-def test_quote_depth_mask_covers_baseline(baseline_archive):
-    cases = [
-        *[(context, ()) for context in (*_FOLDS, _SAME_DEPTH, ">From: 甲\n> 续行",
-                                        "> Extra: 甲\n>  续行\n> From: 乙\n>\n" + _SCENARIO,
-                                        "Subject: 甲\n" + _SCENARIO,
-                                        _SCENARIO + "\n \t\nSubject: 甲",
-                                        "> Extra: 甲\n\n" + _SCENARIO)],
-        *[(ending.join(_NESTED), ()) for ending in ("\n", "\r\n")],
-        ("> From: 甲\n" + _SCENARIO + "\n 续行", (_SCENARIO,)),
-        (_SCENARIO + "\r\n>> \t折行\r\n>> Subject: 甲", (_SCENARIO,)),
-        (_SCENARIO + "\n" + _QUOTED_FROM, (_SCENARIO,)),
-        (_QUOTED_FROM + "\n" + _SCENARIO, (_SCENARIO,)),
-    ]
+# 合成原文、ec8917f 实测遮盖区间、允许从区间内扣除的紧邻物理行。
+_BASELINE_CASES = (
+    (_FOLDS[0], ((0, 44),), ()),
+    (_FOLDS[1], ((0, 53),), ()),
+    (_SAME_DEPTH, ((0, 50),), ()),
+    (">From: 甲\n> 续行", ((0, 13),), ()),
+    ("> Extra: 甲\n>  续行\n> From: 乙\n>\n" + _SCENARIO, ((0, 26),), ()),
+    ("Subject: 甲\n" + _SCENARIO, ((0, 28),), ()),
+    (_SCENARIO + "\n \t\nSubject: 甲", ((0, 31),), ()),
+    ("> Extra: 甲\n\n" + _SCENARIO, (), ()),
+    ("\n".join(_NESTED), ((0, 68),), ()),
+    ("\r\n".join(_NESTED), ((0, 73),), ()),
+    ("> From: 甲\n" + _SCENARIO + "\n 续行", ((0, 31),), (_SCENARIO,)),
+    (_SCENARIO + "\r\n>> \t折行\r\n>> Subject: 甲", ((0, 40),), ()),
+    (_SCENARIO + "\n" + _QUOTED_FROM, ((0, 35),), (_SCENARIO,)),
+    (_QUOTED_FROM + "\n" + _SCENARIO, ((0, 35),), (_SCENARIO,)),
+    ("> fRoM: 合成甲\r\nScenario: 合成明细\r\nX-Internal: 合成内部字段值", ((0, 48),), ("Scenario: 合成明细",)),
+    ("> fRoM: 合成甲\r\n>>\t合成折行\r\nX-Internal: 合成内部字段值", ((0, 41),), ()),
+    ("Subject: 甲\n" + _SCENARIO + "\n" + _QUOTED_FROM, ((0, 46),), ()),
+)
 
+
+def test_quote_depth_mask_covers_baseline():
     def covered(spans):
         return {i for start, end in spans for i in range(start, end)}
 
-    for body, ordinary_fields in cases:
+    for body, baseline_spans, ordinary_fields in _BASELINE_CASES:
         allowed = covered((body.index(field), body.index(field) + len(field)) for field in ordinary_fields)
-        old = covered(baseline_archive._header_blocks(body))
+        old = covered(baseline_spans)
         new = covered(a._header_blocks(body))
-        assert old <= new | allowed, body
+        assert new == old - allowed, body
+
+
+@pytest.mark.parametrize("intervening", ["Scenario: 合成明细", ">>\t合成折行"])
+def test_nonadjacent_internal_field_stops_publication(setup, intervening):
+    batch, _, _, stub, register, run = setup
+    detail = "合成内部字段值"
+    context = f"> fRoM: 合成甲\r\n{intervening}\r\nX-Internal: {detail}"
+    batch = excerpt_batch(batch, "使用场景", context, detail)
+    register(batch)
+    transport = Mock(wraps=stub)
+    assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
+    transport.request.assert_not_called()

@@ -215,21 +215,24 @@ def _token(value):
 
 def _header_blocks(body):
     """在完整原文上定位连续头部，保留引文所用的字符坐标。"""
-    # 保留连续头部原有的遮盖范围，只从中扣除无引用、同层没有已知头的普通字段。
+    # 在基线头块内，仅扣除同层无已知头、且物理行紧邻已知引用头的普通字段。
     # 每个字段仅记录本行正文坐标，折行和分隔换行始终留在遮盖范围内。
     fields = []
 
     def masked_ranges(end):
-        if not any(known for _, _, _, known in fields):
+        if not any(known for _, _, _, _, known in fields):
             return
-        cursor = fields[0][1]
+        quoted_headers = {number for depth, number, _, _, known in fields if depth and known}
+        cursor = fields[0][2]
         for depth, group in groupby(fields, key=lambda field: field[0]):
             if depth:
                 continue
             unquoted = list(group)
-            if any(known for _, _, _, known in unquoted):
+            if any(known for _, _, _, _, known in unquoted):
                 continue
-            for _, start, stop, _ in unquoted:
+            for _, number, start, stop, _ in unquoted:
+                if number - 1 not in quoted_headers and number + 1 not in quoted_headers:
+                    continue
                 if cursor < start:
                     yield cursor, start
                 cursor = stop
@@ -238,14 +241,15 @@ def _header_blocks(body):
 
     end = 0
     field_prefix = ""
-    for line in re.finditer(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$", body):
+    lines = re.finditer(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$", body)
+    for number, line in enumerate(lines):
         raw = line[0].rstrip("\r\n")
         prefix = _QUOTE_PREFIX.match(raw)
         quote_prefix = prefix[0] if prefix else ""
         content = raw[len(quote_prefix):]
         known = bool(_HEADER.match(raw))
         if known or _FIELD.match(content):
-            fields.append((quote_prefix.count(">"), line.start(), line.start() + len(raw), known))
+            fields.append((quote_prefix.count(">"), number, line.start(), line.start() + len(raw), known))
             field_prefix = quote_prefix
         elif not (content.startswith((" ", "\t")) or raw.startswith((field_prefix + " ", field_prefix + "\t"))):
             yield from masked_ranges(end)
