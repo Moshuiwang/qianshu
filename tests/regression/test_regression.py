@@ -1052,7 +1052,7 @@ def test_release_retry_limit_matches_actual_sdk_http_requests(repo, frozen, monk
         requests[json.loads(request.content)["messages"][0]["content"]] += 1
         return httpx.Response(status, headers={"Location": "/redirected"})
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kwargs: httpx.Client(
         transport=httpx.MockTransport(reply), **kwargs,
     ))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
@@ -1118,7 +1118,7 @@ def test_release_records_invalid_tool_json_and_replays_parse_failure(repo, froze
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               content=b"".join(_stream_reply_events(text)))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kwargs: httpx.Client(
         transport=httpx.MockTransport(reply), **kwargs,
     ))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
@@ -1169,7 +1169,7 @@ def test_release_retries_interrupted_partial_text(repo, frozen, monkeypatch, int
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=ReplyStream("[" if text is None else text, text is None))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kwargs: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kwargs: httpx.Client(
         transport=httpx.MockTransport(reply), **kwargs,
     ))
     monkeypatch.setenv("AI_PLATFORM", "anthropic")
@@ -2425,7 +2425,7 @@ def test_shape_retry_records_both_requests_and_replays_final_result(repo, frozen
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               content=b"".join(_stream_reply_events(json.dumps(payload))))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(reply), **kw))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     assert main([*run_args(frozen), "--live", "--mode", "instant", "--run-id", "shape",

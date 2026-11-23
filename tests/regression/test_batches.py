@@ -23,7 +23,7 @@ def test_batch_sdk_record_replay_and_resume(repo, frozen, monkeypatch):
     subset = ["--frozen", ".private/large", "--expect-sha256", expanded_exam(repo, 4)]
     posts = []
     payload = serialized_empty()
-    def transport(request):
+    def respond(request):
         if request.url.path.endswith("/messages"):
             return httpx.Response(200, content=b"".join(_stream_reply_events(payload)),
                                   headers={"Content-Type": "text/event-stream"})
@@ -43,8 +43,8 @@ def test_batch_sdk_record_replay_and_resume(repo, frozen, monkeypatch):
             return httpx.Response(200, content="\n".join(reversed(lines)).encode())
         return httpx.Response(200, json={"id": "batch-test", "processing_status": "ended",
                                         "results_url": "https://fixture.invalid/results"})
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
-        transport=httpx.MockTransport(transport), **kw))
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(respond), **kw))
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     args = ["run", *subset, "--out", ".private/run", "--live", "--run-id", "r1", "--estimate-usd", "2", "--release"]
@@ -144,7 +144,7 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
         def __iter__(self):
             yield self.first
             raise httpx.ReadError("synthetic")
-    def transport(request):
+    def respond(request):
         if request.method == "POST":
             posts.append(json.loads(request.content)["requests"])
             if fault == "lost_create":
@@ -178,8 +178,8 @@ def test_batch_recovery_never_reposts(repo, frozen, monkeypatch, fault):
     def advance(_seconds):
         now[0] += 26 * 3600
     monkeypatch.setattr(batches, "time", type("Clock", (), {"time": lambda: now[0], "sleep": advance}))
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
-        transport=httpx.MockTransport(transport), **kw))
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(respond), **kw))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
     args = [*run_args(frozen), "--live", "--trial", "2", "--run-id", "r", "--estimate-usd", "1"]
@@ -431,7 +431,7 @@ def test_two_processes_resume_one_publication(repo, frozen, monkeypatch):
             return httpx.Response(200, content=data)
         return httpx.Response(200, json={"id": "b", "processing_status": "ended",
                                          "results_url": "https://fixture.invalid/results"})
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(http), **kw))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
@@ -484,7 +484,7 @@ def test_batch_cost_before_publication_failure(repo, frozen, monkeypatch):
         ledger.reserve("prior", "instant", "1", "prior")
         ledger.settle("prior", Decimal(102), False)
     posts = []
-    def transport(request):
+    def respond(request):
         if request.method == "POST":
             posts.extend(json.loads(request.content)["requests"])
             return httpx.Response(200, json={"id": "b"})
@@ -493,8 +493,8 @@ def test_batch_cost_before_publication_failure(repo, frozen, monkeypatch):
             return httpx.Response(200, content=json_bytes({"custom_id": posts[0]["custom_id"], "result": result}))
         return httpx.Response(200, json={"id": "b", "processing_status": "ended",
                                          "results_url": "https://fixture.invalid/results"})
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
-        transport=httpx.MockTransport(transport), **kw))
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(respond), **kw))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
     write = Output.write
@@ -516,10 +516,10 @@ def test_instant_disconnect_after_start_keeps_reservation(repo, frozen, monkeypa
         def __iter__(self):
             yield next(iter(_stream_reply_events("")))
             raise httpx.ReadError("synthetic")
-    def transport(request):
+    def respond(request):
         return httpx.Response(200, stream=BrokenStream(), headers={"content-type": "text/event-stream"})
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
-        transport=httpx.MockTransport(transport), **kw))
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(respond), **kw))
     monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
     assert main([*run_args(frozen), "--live", "--mode", "instant", "--trial", "1", "--retries", "1",
                  "--run-id", "broken", "--estimate-usd", "1"]) == 0
@@ -552,3 +552,16 @@ def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
             ledger.reserve("fourth", "batch", "1", "fourth")
 
 
+
+
+def test_capture_requests_accepts_v040_client_signature(monkeypatch):
+    def historical_model(settings, *, max_retries):
+        def send(*, system, user):
+            with anthropic.DefaultHttpxClient(follow_redirects=False) as client:
+                client.post("https://model.invalid/messages", content=user.encode())
+        return send
+
+    monkeypatch.setattr(batches, "configured_model", historical_model)
+    snapshot = {"documents": {"fixture": {"body": "合成正文"}}, "companies_text": ""}
+    rules = Path(__file__).resolve().parents[2] / "rules"
+    assert batches.capture_requests(snapshot, rules, False, {}) == {"fixture": '{"application": "合成正文"}'}
