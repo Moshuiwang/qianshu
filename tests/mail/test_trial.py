@@ -9,22 +9,24 @@ from pathlib import Path
 import httpx
 import pytest
 
+from trial_segments import Inbox, Segments, fixture_item, read_fixture
+
 
 def sample(charset="iso-8859-1"):
     return (f"Content-Type: text/plain; charset={charset}\r\n\r\n".encode() + b"\xa1")
 
 
 def test_identity_charset_and_related_root():
-    from qianshu.mail.triage import inspect_mail
-    inspect = lambda raw: inspect_mail(raw).digest
+    inspect = lambda raw: fixture_item(raw).digest
     assert inspect(sample()) != inspect(sample("iso-8859-2"))
+    assert inspect(sample()[:-1] + b"A") != inspect(sample("iso-8859-2")[:-1] + b"A")
     raw = b'Content-Type: multipart/related; boundary=q; start="<a>"\n\n'
     raw += b'--q\nContent-ID: <a>\n\nfirst\n--q\nContent-ID: <b>\n\nsecond\n--q--\n'
     assert inspect(raw) != inspect(raw.replace(b'start="<a>"', b'start="<b>"'))
 
 
 def test_triage_http_contains_only_authored_fields(monkeypatch):
-    from qianshu.mail.triage import inspect_mail, classify
+    from qianshu.mail.triage import classify
     from qianshu.ai import anthropic
     msg = EmailMessage()
     msg.set_content('<p>current</p><div style="border-left:2px solid">HISTORY_SENTINEL</div>', subtype="html")
@@ -41,7 +43,7 @@ def test_triage_http_contains_only_authored_fields(monkeypatch):
         return httpx.Response(503)
 
     monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
-    item = inspect_mail(msg.as_bytes())
+    item = fixture_item(msg.as_bytes())
     assert item.attachments == 1
     result = classify({"ANTHROPIC_API_KEY": "synthetic"}, item, lambda req: None)
     assert result[0] == "拿不准"
@@ -192,47 +194,15 @@ def baseline_modules(tmp_path_factory):
     b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\n--q--\r\n",
     b"Content-Type: multipart/mixed; boundary=q\r\n\r\n"
     b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\nDate: invalid\r\n--q--\r\n",
-], ids=["mixed-headerless", "plain", "alternative", "quoted-printable", "mixed-header-only", "invalid-date"])
+    b"Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\nQ1VSUkVOVA==",
+], ids=["mixed-headerless", "plain", "alternative", "quoted-printable", "mixed-header-only", "invalid-date", "base64"])
 def test_mime_to_sonnet_matches_baseline(monkeypatch, baseline_modules, raw):
-    from qianshu.mail.message import request_text, snapshot_parts
     baseline, adapter = baseline_modules
-
-    def split_section(wire):
-        if wire.startswith(b"\r\n"):
-            return wire[:2], wire[2:]
-        fields, separator, body = wire.partition(b"\r\n\r\n")
-        if not separator and wire.startswith(b"Content-Type:"):
-            return wire, b""
-        assert separator
-        return fields + separator, body
-
-    header, body = split_section(raw)
-    root = baseline.headers(header)
-    sections = {"TEXT": body}
-    structure = [b"TEXT", b"PLAIN"]
-    if root.get_content_maintype() == "multipart":
-        # 此存根只模拟以上单层样本的 IMAP 分段读取，保留 MIME 字段和正文的原始字节。
-        structure = []
-        assert body.startswith(b"--q\r\n") and body.endswith(b"\r\n--q--\r\n")
-        parts = body.removeprefix(b"--q\r\n").removesuffix(b"\r\n--q--\r\n")
-        for index, wire in enumerate(parts.split(b"\r\n--q\r\n"), 1):
-            mime, content = split_section(wire)
-            sections[f"{index}.MIME"] = mime
-            sections[str(index)] = content
-            structure.append([b"TEXT", baseline.headers(mime).get_content_subtype().upper().encode()])
-        structure.append(root.get_content_subtype().upper().encode())
-
-    class Mailbox:
-        def structure(self, uid):
-            return structure
-
-        def section(self, uid, section):
-            return sections[section]
-
-    previous = baseline.request_text(baseline.body_parts(Mailbox(), 1, header))
+    segments = Segments(raw)
+    previous = baseline.request_text(baseline.body_parts(segments, 2, segments.sections["HEADER"]))
     with monkeypatch.context() as old:
         expected = capture_sonnet(old, False, previous, adapter=adapter)
-    actual = capture_sonnet(monkeypatch, True, request_text(snapshot_parts(raw)))
+    actual = capture_sonnet(monkeypatch, True, read_fixture(raw)[1])
     assert len(expected) == len(actual) == 2
     assert [body == reference for body, reference in zip(actual, expected)] == [True, True]
 
@@ -252,16 +222,9 @@ def test_related_root_trailing_space_poll(tmp_path, monkeypatch, baseline_module
            + b"--a\r\n" + plain + sections["2.1"] + b"\r\n--a\r\n" + html + sections["2.2"]
            + b"\r\n--a--\r\n--q--\r\n")
 
-    class Segments:
-        def structure(self, uid):
-            return [[b"TEXT", b"PLAIN"], [[b"TEXT", b"PLAIN"], [b"TEXT", b"HTML"], b"ALTERNATIVE"],
-                    b"RELATED", [b"START", b"<root>"]]
-
-        def section(self, uid, section):
-            return sections[section]
-
+    segments = Segments(raw)
     baseline, adapter = baseline_modules
-    text = baseline.request_text(baseline.body_parts(Segments(), 2, header))
+    text = baseline.request_text(baseline.body_parts(segments, 2, header))
     assert text == "CURRENT"
     with monkeypatch.context() as old:
         expected = capture_sonnet(old, False, text, adapter=adapter)
@@ -272,7 +235,7 @@ def test_related_root_trailing_space_poll(tmp_path, monkeypatch, baseline_module
     trial = revision_trial(store, inbox, sent)
     trial.poll()
     inbox.add(synthetic(2, "placeholder"))
-    monkeypatch.setattr(inbox, "complete_message", lambda uid: raw)
+    inbox.messages[2] = Segments(raw)
     store.import_spend("0")
     trial.input_limits.update({"claude-haiku-5-5": 100000, "claude-sonnet-5-5": 100000})
     requests = []
@@ -306,20 +269,130 @@ def test_related_root_trailing_space_poll(tmp_path, monkeypatch, baseline_module
     assert trial.box()["state"] == "active"
     assert tuple(store.row("SELECT status,verdict,attachments FROM registration")) == ("manual", "是", 1)
     assert requests[1:] == expected
+    assert inbox.commands.count(("FETCH", "2", "(BODY.PEEK[TEXT])")) == 2
     assert sent and inbox.seen == {1}
 
 
-@pytest.mark.parametrize("ids", [(b"<root>", b"<root> \t"), (b"<first>", b"<second>")],
-                         ids=["ambiguous", "absent"])
-def test_related_requires_unique_normalized_root(ids):
-    from qianshu.mail.imap import MailError
-    from qianshu.mail.message import snapshot_parts
-    from qianshu.mail.triage import inspect_mail
+def test_raw_payload_fingerprint_decodes_leaf_once(monkeypatch):
+    import base64
+    from email.message import EmailMessage
+    from email.parser import BytesParser
 
-    raw = b'Content-Type: multipart/related; boundary=q; start="<root>"\r\n\r\n'
-    for content_id in ids:
-        raw += b"--q\r\nContent-ID: " + content_id + b"\r\n\r\nbody\r\n"
-    raw += b"--q--\r\n"
-    assert inspect_mail(raw).digest is None
-    with pytest.raises(MailError):
-        snapshot_parts(raw)
+    parsed, decoded = [], []
+    parse, decode = BytesParser.parsebytes, EmailMessage.get_content
+    def record(self, raw, headersonly=False):
+        if not headersonly:
+            parsed.append(raw)
+        return parse(self, raw, headersonly=headersonly)
+    monkeypatch.setattr(BytesParser, "parsebytes", record)
+    monkeypatch.setattr(EmailMessage, "get_content", lambda self, **kw: decoded.append(1) or decode(self, **kw))
+    header = b"Content-Type: text/plain; charset=utf-8-sig\r\nContent-Transfer-Encoding: base64\r\n\r\n"
+    results = [read_fixture(header + base64.b64encode(prefix + b"CURRENT")) for prefix in (b"", b"\xef\xbb\xbf")]
+    assert [text for _, text in results] == ["CURRENT"] * 2
+    assert results[0][0].digest != results[1][0].digest
+    assert len(parsed) == len(decoded) == 2
+
+
+@pytest.mark.parametrize("tail", [b"--q\r\nTAIL", b"\rTAIL", b""])
+def test_segmented_body_ignores_epilogue_boundary(monkeypatch, baseline_modules, tail):
+    raw = b"Content-Type: multipart/mixed; boundary=q\r\n\r\n--q\r\n\r\nCURRENT\r\n"
+    if tail:
+        raw += b"--q--\r\n" + tail
+    compare_segments(monkeypatch, baseline_modules, Segments(raw), "CURRENT")
+
+
+def compare_segments(monkeypatch, baseline_modules, segments, expected_text):
+    from qianshu.mail.segmented import read_segmented
+    base, adapter = baseline_modules
+    text = base.request_text(base.body_parts(segments, 2, segments.sections["HEADER"]))
+    assert text == expected_text
+    with monkeypatch.context() as old:
+        expected = capture_sonnet(old, False, text, adapter=adapter)
+    box = Inbox()
+    box.add(segments)
+    item, verified = read_segmented(box, 2, False)
+    actual = capture_sonnet(monkeypatch, True, verified)
+    assert len(expected) == len(actual) == (2 if text else 0)
+    assert actual == expected
+    return item
+
+
+@pytest.mark.parametrize("structure_id,start,text", [(b"<root>", True, "SECOND"), (b"NIL", True, "SECOND"),
+                                                     (b"NIL", False, "FIRST")])
+def test_related_binding_uses_server_structure(monkeypatch, baseline_modules, structure_id, start, text):
+    raw = (b'Content-Type: multipart/related; boundary=q; start="<root>"\r\n\r\n--q\r\n\r\nFIRST\r\n'
+           b'--q\r\nContent-ID: <root> \t\r\n\r\nSECOND\r\n--q--\r\n')
+    parts = Segments(raw)
+    parts.tree[1][3] = structure_id
+    if not start:
+        parts.tree[-2] = b"NIL"
+    assert compare_segments(monkeypatch, baseline_modules, parts, text).attachments == 1
+
+
+def test_signed_body_and_signature_batch(monkeypatch, baseline_modules):
+    raw = (b"Content-Type: multipart/signed; boundary=q\r\n\r\n--q\r\n\r\nCURRENT\r\n"
+           b"--q\r\nContent-Type: application/signature\r\n\r\nSIGNATURE\r\n--q--\r\n")
+    assert compare_segments(monkeypatch, baseline_modules, Segments(raw), "CURRENT").attachments == 1
+
+
+@pytest.mark.parametrize("opaque", [
+    b"Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: base64\r\n\r\nYQ",
+    b"Content-Type: application/octet-stream\r\nContent-Type: text/plain\r\n\r\nX",
+    b"Content-Type: message/rfc822\r\n\r\nContent-Type: multipart/mixed; boundary=z\r\n\r\n--z"])
+def test_opaque_attachment_defects_preserve_body(monkeypatch, baseline_modules, opaque):
+    raw = (b"Content-Type: multipart/mixed; boundary=q\r\n\r\n--q\r\n\r\nCURRENT\r\n--q\r\n"
+           + opaque + b"\r\n--q--\r\n")
+    item = compare_segments(monkeypatch, baseline_modules, Segments(raw), "CURRENT")
+    assert item.attachments == 1 and fixture_item(raw.replace(opaque, opaque + b"X")).digest != item.digest
+
+
+def test_outer_identity_and_cross_id_candidate():
+    raw = b"Message-ID: <a" + chr(64).encode() + b"local>\r\nSubject: A\r\n\r\nCURRENT"
+    item = fixture_item(raw)
+    for field in [b"From", b"Date", b"Cc", b"To", b"Subject"]:
+        assert fixture_item(field + b": B\r\n" + raw).digest != item.digest
+    changed = fixture_item(raw.replace(b"<a", b"<b"))
+    assert changed.key != item.key and changed.candidate == item.candidate
+
+
+@pytest.mark.parametrize("role", ["attachment", "omitted", "inline-filename", "name"])
+def test_container_sonnet_matches_old_sections(monkeypatch, baseline_modules, role):
+    from trial_segments import synthetic
+    inner = synthetic(2, "ATTACHED_SENTINEL")
+    inner.make_mixed()
+    if role == "name":
+        inner.set_param("name", "file")
+    else:
+        inner["Content-Disposition"] = 'inline; filename="file"' if role == "inline-filename" else "attachment"
+    msg = synthetic(2, "")
+    msg.clear_content()
+    msg.make_mixed()
+    msg.attach(inner)
+    parts = Segments(msg.as_bytes())
+    if role == "omitted":
+        parts.tree[0].pop()
+    item = compare_segments(monkeypatch, baseline_modules, parts, "" if role == "attachment" else "ATTACHED_SENTINEL")
+    assert item.attachments == 1 and item.fields["body"] == ""
+
+
+def test_final_seen_check_survives_outer_exception_handler(monkeypatch):
+    from qianshu.mail.imap import MailError
+    from qianshu.mail.segmented import read_segmented
+    from trial_segments import synthetic
+    box = Inbox()
+    box.add(Segments(synthetic(2, "CURRENT").as_bytes()))
+    checks = []
+    check = box.check_seen
+
+    def observe(uid, seen):
+        checks.append(uid)
+        if len(checks) == 4:  # HEADER、结构、TEXT 后，最后一次复核
+            box.seen.add(uid)
+        check(uid, seen)
+
+    monkeypatch.setattr(box, "check_seen", observe)
+    try:
+        raise RuntimeError("synthetic")
+    except RuntimeError:
+        with pytest.raises(MailError):
+            read_segmented(box, 2, False)

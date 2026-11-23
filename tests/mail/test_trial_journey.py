@@ -4,7 +4,6 @@ import sys
 import unicodedata
 from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
-from email import policy
 from email.message import EmailMessage
 from pathlib import Path
 from threading import Event
@@ -12,61 +11,13 @@ from threading import Event
 import httpx
 import pytest
 
+from trial_segments import Inbox, Segments, fixture_item, synthetic
+
 from qianshu.ai import anthropic
 from qianshu.config import ConfigError, trial_config
 from qianshu.mail.imap import MailError, ReadOnlyMailbox
 from qianshu.mail.trial import Trial
 from qianshu.mail.trial_state import Hold, Store
-
-
-def synthetic(number, text, attachment=False):
-    msg = EmailMessage(policy=policy.SMTP)
-    msg["Message-ID"] = "<" + str(number) + chr(64) + "synthetic.invalid>"
-    msg["Subject"] = "subject " + str(number)
-    msg.set_content(text)
-    if attachment:
-        msg.add_attachment(b"ATTACHMENT_SENTINEL", maintype="application", subtype="octet-stream", filename="file")
-    return msg
-
-
-class Inbox:
-    def __init__(self):
-        self.messages = {1: synthetic(1, "historical")}
-        self.seen = {1}
-        self.generation = 1
-        self.next_uid = 2
-        self.reads = []
-
-    def snapshot(self, folder):
-        return self.generation, self.next_uid, len(self.messages)
-
-    def interval(self, first, last):
-        return [uid for uid in sorted(self.messages) if first <= uid <= last]
-
-    def read_seen(self, uid):
-        return uid in self.seen
-
-    def complete_message(self, uid):
-        self.reads.append(uid)
-        if uid not in self.messages:
-            raise MailError()
-        return self.messages[uid].as_bytes()
-
-    def section(self, uid, section):
-        msg = self.messages[uid]
-        if section == "TEXT":
-            return msg.as_bytes().split(b"\r\n\r\n", 1)[1]
-        part = msg.get_body().as_bytes().split(b"\r\n\r\n", 1)
-        return part[0] if section == "1.MIME" else part[1]
-
-    def structure(self, uid):
-        if self.messages[uid].is_multipart():
-            return [[b"TEXT", b"PLAIN"], [b"APPLICATION", b"OCTET-STREAM"], b"MIXED"]
-        return [b"TEXT", b"PLAIN"]
-
-    def add(self, msg):
-        self.messages[self.next_uid] = msg
-        self.next_uid += 1
 
 
 def test_switch_journey_queue_budget_attachments_and_rebuild(tmp_path, monkeypatch):
@@ -213,7 +164,6 @@ def test_switch_defaults_and_invalid_order(tmp_path):
 
 @pytest.mark.parametrize("amount", ["19.70", "19.90"])
 def test_paid_http_never_reaches_large_output_stub(tmp_path, monkeypatch, amount):
-    from qianshu.mail.triage import inspect_mail
     store = Store(tmp_path / "trial")
     store.import_spend(amount)
     trial = Trial(store, dict(MAIL_HOST="synthetic", MAIL_USER="local", ANTHROPIC_API_KEY="test-key"),
@@ -223,7 +173,7 @@ def test_paid_http_never_reaches_large_output_stub(tmp_path, monkeypatch, amount
     store.begin(trial.scope)
     store.activate(trial.scope, 1, 1, 0)
     store.observe(trial.scope, 1, 1, 2, [1])
-    reg = store.register(trial.scope, 1, 1, inspect_mail(synthetic(1, "text").as_bytes()))
+    reg = store.register(trial.scope, 1, 1, fixture_item(synthetic(1, "text").as_bytes()))
     trial.status(reg, "parse")
     sent = []
     def receive(req):
@@ -240,7 +190,7 @@ def test_paid_http_never_reaches_large_output_stub(tmp_path, monkeypatch, amount
 
 @pytest.mark.parametrize("size", [1999, 2000, 2001])
 def test_unicode_limit_after_quote_removal_and_sender_privacy(monkeypatch, size):
-    from qianshu.mail.triage import inspect_mail, classify
+    from qianshu.mail.triage import classify
     msg = synthetic(1, "字" * size + "\nOn a date wrote:\n> HISTORY_SENTINEL")
     msg["From"] = "display <" + "LOCAL_SENTINEL" + chr(64) + "synthetic.invalid>"
     msg["Cc"] = "CC_SENTINEL" + chr(64) + "synthetic.invalid"
@@ -249,7 +199,7 @@ def test_unicode_limit_after_quote_removal_and_sender_privacy(monkeypatch, size)
         requests.append(req.content)
         return httpx.Response(503)
     monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
-    classify({"ANTHROPIC_API_KEY": "synthetic"}, inspect_mail(msg.as_bytes()), lambda req: None)
+    classify({"ANTHROPIC_API_KEY": "synthetic"}, fixture_item(msg.as_bytes()), lambda req: None)
     raw, = requests
     assert b"SENTINEL" not in raw
     fields = json.loads(json.loads(raw)["messages"][0]["content"])
@@ -258,16 +208,15 @@ def test_unicode_limit_after_quote_removal_and_sender_privacy(monkeypatch, size)
 
 
 def test_rebuild_requires_current_snapshot_and_preserves_historical_identity(tmp_path):
-    from qianshu.mail.triage import inspect_mail
     store = Store(tmp_path / "trial")
     store.begin("scope")
     store.activate("scope", 1, 10, 0)
     store.searching("scope", 1, 10, 11)
     assert Store(store.path).begin("scope") == "frozen"
-    item = inspect_mail(synthetic(2, "synthetic").as_bytes())
+    item = fixture_item(synthetic(2, "synthetic").as_bytes())
     store.rebuild("scope", 2, 3, 1, [(2, item)])
     first = store.row("SELECT generation FROM mailbox")[0]
-    second_item = inspect_mail(synthetic(3, "changed").as_bytes())
+    second_item = fixture_item(synthetic(3, "changed").as_bytes())
     store.rebuild("scope", 2, 3, 1, [(2, second_item)])
     with pytest.raises(Hold):
         store.reconcile("scope", first, 2, 3)
@@ -279,20 +228,19 @@ def test_rebuild_requires_current_snapshot_and_preserves_historical_identity(tmp
 
 
 def test_distinct_id_conflict_and_full_attachment_bytes(tmp_path):
-    from qianshu.mail.triage import inspect_mail
     store = Store(tmp_path / "trial")
     store.begin("scope")
     store.activate("scope", 1, 1, 0)
     store.observe("scope", 1, 1, 5, [1, 2, 3, 4])
     raw = synthetic(1, "body", attachment=True)
-    first = store.register("scope", 1, 1, inspect_mail(raw.as_bytes()))
+    first = store.register("scope", 1, 1, fixture_item(raw.as_bytes()))
     raw.get_payload()[1].set_payload("QUJD")
-    second = store.register("scope", 1, 2, inspect_mail(raw.as_bytes()))
+    second = store.register("scope", 1, 2, fixture_item(raw.as_bytes()))
     assert first != second and store.batch(first, 1)[3]
     raw.replace_header("Message-ID", "<other" + chr(64) + "synthetic.invalid>")
-    third = store.register("scope", 1, 3, inspect_mail(raw.as_bytes()))
+    third = store.register("scope", 1, 3, fixture_item(raw.as_bytes()))
     del raw["Message-ID"]
-    fourth = store.register("scope", 1, 4, inspect_mail(raw.as_bytes()))
+    fourth = store.register("scope", 1, 4, fixture_item(raw.as_bytes()))
     assert len({first, second, third, fourth}) == 4
     assert {r[0] for r in store.db.execute("SELECT status FROM registration")} == {"frozen"}
 
@@ -301,7 +249,6 @@ def test_distinct_id_conflict_and_full_attachment_bytes(tmp_path):
 def test_freeze_committed_while_sender_waits_at_last_gate(tmp_path, monkeypatch, stage):
     from concurrent.futures import ThreadPoolExecutor
     from contextlib import contextmanager
-    from qianshu.mail.triage import inspect_mail
     path = tmp_path / "trial"
     db = Store(path)
     db.import_spend("0")
@@ -312,7 +259,7 @@ def test_freeze_committed_while_sender_waits_at_last_gate(tmp_path, monkeypatch,
     db.begin(scope)
     db.activate(scope, 17, 1, 0)
     db.observe(scope, 1, 1, 2, [1])
-    reg = db.register(scope, 1, 1, inspect_mail(synthetic(2, "body").as_bytes()))
+    reg = db.register(scope, 1, 1, fixture_item(synthetic(2, "body").as_bytes()))
     with db.write() as sql:
         sql.execute("UPDATE registration SET status='parse' WHERE id=?", (reg,))
     waiting, resume = Event(), Event()
@@ -385,7 +332,6 @@ def test_cli_disabled_trial_preserves_listener_and_skips_mail(tmp_path, monkeypa
 
 @pytest.mark.parametrize("text", ["", "synthetic"])
 def test_attachment_only_or_zero_policies_discloses_batch_and_counts_handoffs(tmp_path, monkeypatch, text):
-    from qianshu.mail.triage import inspect_mail
     store = Store(tmp_path / "trial")
     store.import_spend("0")
     sent, requests = [], []
@@ -399,7 +345,7 @@ def test_attachment_only_or_zero_policies_discloses_batch_and_counts_handoffs(tm
     if text:
         msg.set_content(text)
     msg.add_attachment(b"synthetic", maintype="image", subtype="png")
-    item = inspect_mail(msg.as_bytes())
+    item = fixture_item(msg.as_bytes())
     store.begin(trial.scope)
     store.activate(trial.scope, 1, 1, 0)
     store.observe(trial.scope, 1, 1, 2, [1])
@@ -433,7 +379,6 @@ def test_attachment_only_or_zero_policies_discloses_batch_and_counts_handoffs(tm
 
 
 def test_unknown_notification_is_not_replayed(tmp_path):
-    from qianshu.mail.triage import inspect_mail
     from qianshu.mail.trial import _NOTICES
     store = Store(tmp_path / "trial")
     store.import_spend("0")
@@ -446,7 +391,7 @@ def test_unknown_notification_is_not_replayed(tmp_path):
     store.begin(trial.scope)
     store.activate(trial.scope, 1, 1, 0)
     store.observe(trial.scope, 1, 1, 2, [1])
-    reg = store.register(trial.scope, 1, 1, inspect_mail(synthetic(1, "text").as_bytes()))
+    reg = store.register(trial.scope, 1, 1, fixture_item(synthetic(1, "text").as_bytes()))
     trial.status(reg, "parse")
     with store.write():
         store.notice("event", trial.scope, reg, "received")
@@ -480,10 +425,10 @@ def test_crash_after_examine_and_vanished_observed_uid(tmp_path, monkeypatch):
     trial.poll()
     box.add(synthetic(3, "observed once"))
     with monkeypatch.context() as change:
-        def disappear(uid):
+        def disappear(uid, section):
             del box.messages[uid]
             raise InterruptedError()
-        change.setattr(box, "complete_message", disappear)
+        change.setattr(box, "checked_section", disappear)
         with pytest.raises(InterruptedError):
             trial.poll()
     trial.store = Store(trial.store.path)
@@ -595,13 +540,12 @@ def revision_trial(store, inbox, sent, switches=None):
 
 @pytest.mark.parametrize("damage", ["DROP TABLE charge", "DELETE FROM charge"])
 def test_incomplete_imported_ledger_holds_pending(tmp_path, damage):
-    from qianshu.mail.triage import inspect_mail
     store = Store(tmp_path / "ledger")
     inbox, sent = Inbox(), []
     trial = revision_trial(store, inbox, sent)
     trial.poll()
     store.observe(trial.scope, 1, 2, 3, [2])
-    reg = store.register(trial.scope, 1, 2, inspect_mail(synthetic(2, "pending").as_bytes()))
+    reg = store.register(trial.scope, 1, 2, fixture_item(synthetic(2, "pending").as_bytes()))
     trial.status(reg, "parse")
     store.import_spend("19.00")
     store.reserve("sonnet", 50000, 1, reg)
@@ -621,29 +565,28 @@ def test_incomplete_imported_ledger_holds_pending(tmp_path, damage):
 @pytest.mark.parametrize("prefix", ["\ufeff", "\u200b", " \ufeff", "CURRENT\n\u200b",
                                      "CURRENT\n\u200c \t\u200d\u2060"])
 def test_prefixed_quote_absent_from_triage_http(monkeypatch, prefix):
-    from qianshu.mail.triage import classify, inspect_mail
+    from qianshu.mail.triage import classify
     requests = []
     def receive(req):
         requests.append(req.content)
         return httpx.Response(503)
     monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
-    item = inspect_mail(synthetic(1, prefix + "> HISTORY_SENTINEL").as_bytes())
+    item = fixture_item(synthetic(1, prefix + "> HISTORY_SENTINEL").as_bytes())
     classify({"ANTHROPIC_API_KEY": "synthetic"}, item, lambda req: None)
     request, = requests
     assert request.count(b"HISTORY_SENTINEL") == 0
 
 
 def test_nested_received_changes_attachment_identity(tmp_path):
-    from qianshu.mail.triage import inspect_mail
     msg = synthetic(1, "current")
     nested = synthetic(2, "attached")
     nested["Received"] = "inner-a"
     msg.add_attachment(nested)
     raw = msg.as_bytes()
-    first = inspect_mail(raw)
+    first = fixture_item(raw)
     assert first.digest and first.attachments == 1
-    assert inspect_mail(b"Received: outer\r\n" + raw).digest == first.digest
-    second = inspect_mail(raw.replace(b"inner-a", b"inner-b"))
+    assert fixture_item(b"Received: outer\r\n" + raw).digest == first.digest
+    second = fixture_item(raw.replace(b"inner-a", b"inner-b"))
     store = Store(tmp_path / "trial")
     store.begin("scope")
     store.activate("scope", 1, 1, 0)
@@ -667,32 +610,7 @@ def test_vanished_offline_uid_persists_unknown_and_notifies_once(tmp_path):
     assert tuple(trial.store.row("SELECT first,last,status FROM unknown_range")) == (100, 100, "unknown")
 
 
-def test_sonnet_http_uses_verified_snapshot(tmp_path, monkeypatch):
-    from qianshu.mail.triage import inspect_mail
-    store = Store(tmp_path / "trial")
-    inbox = Inbox()
-    trial = revision_trial(store, inbox, [])
-    trial.poll()
-    msg = synthetic(2, "BODY_SNAPSHOT_A")
-    inbox.add(msg)
-    store.observe(trial.scope, 1, 2, 3, [2])
-    reg = store.register(trial.scope, 1, 2, inspect_mail(msg.as_bytes()))
-    trial.status(reg, "parse")
-    store.import_spend("0")
-    trial.input_limits["claude-sonnet-5-5"] = 100000
-    monkeypatch.setattr(inbox, "section", lambda *args: b"BODY_SNAPSHOT_B")
-    requests = []
-    def receive(req):
-        requests.append(req.content)
-        raise httpx.ReadTimeout("synthetic")
-    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
-    trial.poll()
-    raw, = requests
-    assert b"BODY_SNAPSHOT_A" in raw and b"BODY_SNAPSHOT_B" not in raw
-
-
 def test_card_switch_file_changes_only_after_restart(tmp_path):
-    from qianshu.mail.triage import inspect_mail
     path = tmp_path / "switches"
     def configure(value):
         path.write_text("MAIL_TRIAL_RECEIVE_ENABLED=true\nMAIL_TRIAL_CARD_ENABLED=" + value)
@@ -711,7 +629,7 @@ def test_card_switch_file_changes_only_after_restart(tmp_path):
         msg = synthetic(uid, "")
         inbox.add(msg)
         store.observe(trial.scope, 1, uid, uid + 1, [uid])
-        reg = store.register(trial.scope, 1, uid, inspect_mail(msg.as_bytes()))
+        reg = store.register(trial.scope, 1, uid, fixture_item(msg.as_bytes()))
         trial.status(reg, "parse")
         trial.poll()
         if uid == 2:
@@ -734,7 +652,7 @@ def test_card_switch_file_changes_only_after_restart(tmp_path):
     "\u200b>10", ">10", ">=", "＞10",
 ])
 def test_triage_http_quote_marker_boundary(monkeypatch, line):
-    from qianshu.mail.triage import classify, inspect_mail
+    from qianshu.mail.triage import classify
     text = "CURRENT\n" + line
     requests = []
 
@@ -743,7 +661,7 @@ def test_triage_http_quote_marker_boundary(monkeypatch, line):
         return httpx.Response(503)
 
     monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
-    classify({"ANTHROPIC_API_KEY": "synthetic"}, inspect_mail(synthetic(1, text).as_bytes()), lambda req: None)
+    classify({"ANTHROPIC_API_KEY": "synthetic"}, fixture_item(synthetic(1, text).as_bytes()), lambda req: None)
     request, = requests
     if "HISTORY_SENTINEL" in line:
         assert request.count(b"HISTORY_SENTINEL") == 0
@@ -754,7 +672,6 @@ def test_triage_http_quote_marker_boundary(monkeypatch, line):
 
 @pytest.mark.parametrize("extra_header", [b"", b"Date: invalid\r\n"], ids=["plain", "invalid-date"])
 def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch, extra_header):
-    from qianshu.mail.triage import inspect_mail
     store = Store(tmp_path / "trial")
     inbox = Inbox()
     trial = revision_trial(store, inbox, [])
@@ -764,9 +681,9 @@ def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch, extra_hea
     raw = (b"Message-ID: " + msg["Message-ID"].encode() + b"\r\nContent-Type: multipart/mixed; boundary=q\r\n\r\n"
            b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\n"
            + extra_header + b"--q--\r\n")
-    monkeypatch.setattr(inbox, "complete_message", lambda uid: raw)
+    inbox.messages[2] = Segments(raw)
     store.observe(trial.scope, 1, 2, 3, [2])
-    reg = store.register(trial.scope, 1, 2, inspect_mail(raw))
+    reg = store.register(trial.scope, 1, 2, fixture_item(raw))
     trial.status(reg, "parse")
     store.import_spend("0")
     trial.input_limits["claude-sonnet-5-5"] = 100000
@@ -786,7 +703,7 @@ def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch, extra_hea
 @pytest.mark.parametrize("category", ["Cc", "Cf", "Mn", "Me", "Zs"])
 @pytest.mark.parametrize("marker", [">", "＞"])
 def test_all_invisible_quote_prefixes(monkeypatch, category, marker):
-    from qianshu.mail.triage import classify, inspect_mail
+    from qianshu.mail.triage import classify
 
     requests = []
 
@@ -799,8 +716,412 @@ def test_all_invisible_quote_prefixes(monkeypatch, category, marker):
         prefix = chr(code)
         if unicodedata.category(prefix) != category or prefix.splitlines() != [prefix]:
             continue
-        raw = synthetic(1, f"CURRENT\n{prefix}{marker} HISTORY_SENTINEL").as_bytes()
-        classify({"ANTHROPIC_API_KEY": "synthetic"}, inspect_mail(raw), lambda req: None)
+        text = f"CURRENT\n{prefix}{marker} HISTORY_SENTINEL"
+        msg = synthetic(1, text)
+        if prefix == "\x00":
+            # X7 在分拣前拒绝 NUL。另把同一文本单独交给投影，保留 HTTP 字符全集断言。
+            from qianshu.mail.triage import MailItem, triage_fields
+            with pytest.raises(MailError):
+                fixture_item(msg.as_bytes())
+            fields = triage_fields(msg, [("text/plain", text)], "text/plain")
+            item = MailItem(None, None, None, None, fields)
+        else:
+            item = fixture_item(msg.as_bytes())
+        classify({"ANTHROPIC_API_KEY": "synthetic"}, item, lambda req: None)
         request, = requests
         assert request.count(b"HISTORY_SENTINEL") == 0, f"U+{code:04X}"
         requests.clear()
+
+
+def mixed(*leaves):
+    msg = synthetic(2, "")
+    msg.clear_content()
+    msg.make_mixed()
+    for kind, text in leaves:
+        leaf = EmailMessage()
+        leaf.set_content(text, subtype=kind)
+        msg.attach(leaf)
+    return Segments(msg.as_bytes())
+
+
+@pytest.fixture
+def journey(tmp_path, monkeypatch):
+    store, inbox, cards, requests = Store(tmp_path / "trial"), Inbox(), [], []
+    trial = revision_trial(store, inbox, cards)
+    trial.poll()
+    store.import_spend("0")
+    trial.input_limits.update({"claude-haiku-5-5": 100000, "claude-sonnet-5-5": 100000})
+
+    def start(message, verdict):
+        def receive(req):
+            data = json.loads(req.content)
+            requests.append(req.content)
+            if data["model"] == "claude-sonnet-5-5" or verdict == "timeout":
+                raise httpx.ReadTimeout("synthetic")
+            fields = json.loads(data["messages"][0]["content"])
+            answer = verdict(fields) if callable(verdict) else verdict
+            return httpx.Response(200, json={"type": "message", "id": "msg", "role": "assistant",
+                "model": data["model"], "content": [{"type": "text", "text": answer}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 2}})
+
+        monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+        inbox.add(message)
+        trial.poll()
+        return trial, inbox, requests, cards
+    return start
+
+
+@pytest.mark.parametrize("leaves", [
+    [("plain", ""), ("plain", "CURRENT")], [("plain", "CURRENT"), ("plain", ""), ("plain", "")],
+    [("plain", ""), ("html", "<p>CURRENT</p>")]])
+def test_empty_sibling_never_clears_triage_body(journey, leaves):
+    trial, _, requests, _ = journey(mixed(*leaves), lambda f: "是" if f["body"] == "CURRENT" else "否")
+    trial.poll()
+    assert trial.store.row("SELECT verdict FROM registration")[0] == "是"
+    assert len(requests) == 2 and b"CURRENT" in requests[1]
+
+
+@pytest.mark.parametrize("leaves,body,sonnet", [
+    ([("plain", "> HISTORY")], "", 1), ([("html", '<div style="color:red">unknown</div>')], "", 1),
+    ([("plain", "")], "", 0), ([("plain", "> HISTORY"), ("plain", "CURRENT")], "CURRENT", 0)])
+def test_empty_or_uncertain_triage_cannot_record_no(journey, leaves, body, sonnet):
+    trial, _, requests, cards = journey(mixed(*leaves), "否")
+    assert json.loads(json.loads(requests[0])["messages"][0]["content"])["body"] == body
+    trial.poll()
+    verdict, day = trial.store.row("SELECT verdict,parse_day FROM registration")
+    assert verdict == ("否" if body else "拿不准")
+    assert len(requests) == 1 + sonnet and bool(day) == bool(sonnet)
+    if not body:
+        assert any(card for card, _ in cards)
+
+
+def test_open_quote_boundary_spans_plain_siblings(journey):
+    trial, _, requests, _ = journey(mixed(("plain", "CURRENT\n-----Original Message-----"),
+                                          ("plain", "HISTORY_SENTINEL")), "否")
+    assert b"HISTORY_SENTINEL" not in requests[0]
+    assert trial.store.row("SELECT verdict FROM registration")[0] == "拿不准"
+    trial.poll()
+    assert len(requests) == 2
+
+
+@pytest.mark.parametrize("extension", [True, False])
+def test_multipart_container_roles_follow_fetched_sections(journey, extension):
+    msg = synthetic(2, "ATTACHED_SENTINEL")
+    msg.make_mixed()
+    msg["Content-Disposition"] = "attachment"
+    outer = synthetic(2, "")
+    outer.clear_content()
+    outer.make_mixed()
+    outer.attach(msg)
+    parts = Segments(outer.as_bytes())
+    if not extension:
+        parts.tree[0].pop()
+    trial, _, requests, cards = journey(parts, "否")
+    assert b"ATTACHED_SENTINEL" not in requests[0]
+    trial.poll()
+    assert tuple(trial.store.row("SELECT verdict,attachments FROM registration")) == ("拿不准", 1)
+    assert len(requests) == (1 if extension else 2)
+    assert bool(trial.store.row("SELECT parse_day FROM registration")[0]) == (not extension)
+    assert trial.store.batch(1, 1)[3] and "含 1 个附件" in str(cards)
+
+
+@pytest.mark.parametrize("changed", ["TEXT", "1", "2", "HEADER", "structure", "generation", "seen"])
+def test_parse_reread_mismatch_freezes_before_http(journey, changed):
+    parts = mixed(("plain", "BODY_A"), ("html", "<p>other</p>"))
+    parts.tree[-3] = b"RELATED"
+    parts.tree[0][3], parts.tree[1][3] = b"<first>", b"<other>"
+    parts.tree[-2] = [b"START", b"<first>"]
+    trial, inbox, requests, cards = journey(parts, "是")
+    if changed == "generation":
+        inbox.generation += 1
+    elif changed == "seen":
+        inbox.seen.add(2)
+    elif changed == "structure":
+        parts.tree[-2] = [b"START", b"<other>"]
+    elif changed == "HEADER":
+        parts.sections[changed] = b"Date: changed\r\n" + parts.sections[changed]
+    else:
+        parts.sections[changed] = parts.sections[changed].replace(b"A", b"B").replace(b"other", b"alter")
+    trial.poll()
+    assert trial.box()["state"] == "frozen" and len(requests) == 1
+    assert not any(card for card, _ in cards)
+
+
+@pytest.mark.parametrize("second", [False, True])
+def test_incomplete_outer_header_freezes_each_phase(journey, second):
+    parts = mixed(("plain", "CURRENT"))
+    if not second:
+        parts.sections["HEADER"] = parts.sections["HEADER"].rstrip() + b"\r\n"
+    trial, _, requests, cards = journey(parts, "是")
+    if second:
+        parts.sections["HEADER"] = parts.sections["HEADER"].rstrip() + b"\r\n"
+        trial.poll()
+    assert trial.box()["state"] == "frozen" and len(requests) == int(second)
+    assert not any(card for card, _ in cards)
+
+
+@pytest.mark.parametrize("seen", [False, True])
+def test_segment_reads_once_per_phase(journey, monkeypatch, seen):
+    from collections import Counter
+    parts = mixed(("plain", "CURRENT"), ("html", "<p>alternate</p>"))
+    add = Inbox.add
+    def deliver(box, message):
+        if seen:
+            box.seen.add(box.next_uid)
+        add(box, message)
+    monkeypatch.setattr(Inbox, "add", deliver)
+    trial, inbox, requests, _ = journey(parts, "是")
+    expected = Counter(["(BODYSTRUCTURE)", *(f"(BODY.PEEK[{s}])" for s in parts.sections)])
+    assert Counter(c[2] for c in inbox.commands if c[0] == "FETCH") == expected
+    assert inbox.seen == ({1, 2} if seen else {1})
+    assert {c[0] for c in inbox.commands} == {"SEARCH", "FETCH", "EXAMINE"}
+    inbox.commands.clear()
+    trial.poll()
+    assert Counter(c[2] for c in inbox.commands if c[0] == "FETCH") == expected
+    assert {c[0] for c in inbox.commands} == {"SEARCH", "FETCH", "EXAMINE"}
+    assert inbox.seen == ({1, 2} if seen else {1}) and len(requests) == 2
+
+
+@pytest.mark.parametrize("answer,expected,sonnet", [("否", "否", 0), ("是", "是", 1), ("拿不准", "拿不准", 1),
+                                                   ("invalid", "拿不准", 1), ("timeout", "拿不准", 1)])
+def test_e7_triage_routes_at_transport(journey, answer, expected, sonnet):
+    trial, _, requests, _ = journey(synthetic(2, "CURRENT"), answer)
+    trial.poll()
+    assert trial.store.row("SELECT verdict FROM registration")[0] == expected
+    assert len(requests) == 1 + sonnet
+
+
+def test_changed_epilogue_conflicts_after_no(journey):
+    parts = mixed(("plain", "CURRENT"))
+    parts.sections["TEXT"] += b"TAIL-AAAA"
+    trial, inbox, requests, _ = journey(parts, "否")
+    parts.sections["TEXT"] = parts.sections["TEXT"].replace(b"TAIL-AAAA", b"TAIL-BBBB")
+    inbox.add(parts)
+    trial.poll()
+    assert len(requests) == 1 and b"TAIL-" not in requests[0]
+    assert {r[0] for r in trial.store.db.execute("SELECT reason FROM registration")} == {"conflict"}
+
+
+@pytest.mark.parametrize("second", [False, True])
+@pytest.mark.parametrize("initial", [False, True])
+def test_seen_changes_during_segment_read(journey, monkeypatch, second, initial):
+    _interrupt_read(journey, monkeypatch, second, initial, vanish=False)
+
+
+@pytest.mark.parametrize("second", [False, True])
+def test_unread_uid_vanishes_before_final_seen_check(journey, monkeypatch, second):
+    _interrupt_read(journey, monkeypatch, second, False, vanish=True)
+
+
+def _interrupt_read(journey, monkeypatch, second, initial, vanish):
+    original = Inbox.uid
+    phase = 0
+
+    def interrupt(box, command, *args):
+        nonlocal phase
+        if command == "SEARCH" and args[:2] == ("UID", "2") and not phase and initial:
+            box.seen.add(2)
+        result = original(box, command, *args)
+        if command == "FETCH":
+            if args[1] == "(BODY.PEEK[HEADER])":
+                phase += 1
+            if phase == 1 + second and args[1] == "(BODY.PEEK[TEXT])":
+                if vanish:
+                    del box.messages[2]
+                else:
+                    box.seen.symmetric_difference_update({2})
+        return result
+    monkeypatch.setattr(Inbox, "uid", interrupt)
+    trial, _, requests, cards = journey(synthetic(2, "CURRENT"), "是")
+    if second:
+        trial.poll()
+    assert trial.box()["state"] == "frozen" and len(requests) == int(second)
+    assert not any(card for card, _ in cards)
+
+
+@pytest.mark.parametrize("variant", ["original", "missing", "replacement"])
+def test_v1_no_rebuild_requires_v2_candidate_coverage(tmp_path, variant):
+    from dataclasses import replace
+    inbox, cards = Inbox(), []
+    store = Store(tmp_path / "trial")
+    trial = revision_trial(store, inbox, cards)
+    trial.poll()
+    msg = synthetic(2, "ORIGINAL")
+    inbox.add(msg)
+    import hashlib
+    from qianshu.mail import _fingerprint
+    original = fixture_item(msg.as_bytes())
+    # f730bfe 的 v1 固定分帧，独立于当前分段读取与候选索引。
+    digest = hashlib.sha256(b"mime-v1")
+    for value in (b'["text/plain", [["charset", "utf-8"]], []]', b"ORIGINAL\r\n"):
+        digest.update(len(value).to_bytes(8, "big") + value)
+    prior = "1:" + digest.hexdigest()
+    store.observe(trial.scope, 1, 2, 3, [2])
+    reg = store.register(trial.scope, 1, 2, replace(original, digest=prior,
+                         candidate=_fingerprint("", msg["Subject"], prior)))
+    trial.status(reg, "no")
+    if variant == "missing":
+        del inbox.messages[2]
+    elif variant == "replacement":
+        inbox.messages[2] = synthetic(2, "REPLACED")
+    trial.poll()
+    assert trial.box()["state"] == "frozen"
+    inbox.generation += 1
+    trial.poll()
+    generation = trial.box()["generation"]
+    if variant != "original":
+        with pytest.raises(Hold):
+            store.reconcile(trial.scope, generation, 2, 3)
+        assert not store.row("SELECT 1 FROM original_index")
+    else:
+        assert store.row("SELECT candidate FROM original_index WHERE registration=?", reg)[0] == original.candidate
+        store.reconcile(trial.scope, generation, 2, 3)
+        assert store.row("SELECT status FROM registration WHERE id=?", reg)[0] == "no"
+    msg.replace_header("Message-ID", synthetic(3, "")["Message-ID"])
+    inbox.add(msg)
+    trial.poll()
+    if variant == "original":
+        assert store.row("SELECT reason FROM registration ORDER BY id DESC")[0] == "duplicate"
+    else:
+        assert trial.box()["state"] == "frozen"
+        assert store.row("SELECT reason FROM reconciliation WHERE generation=? AND uid=3",
+                         trial.box()["generation"])[0] == "duplicate"
+    assert not store.row("SELECT 1 FROM charge") and not any(card for card, _ in cards)
+
+
+@pytest.mark.parametrize("damage", ["uid", "section", "length", "octets", "structure-literal"])
+def test_invalid_section_evidence_freezes(journey, monkeypatch, damage):
+    original = Inbox.uid
+
+    def response(box, command, *args):
+        status, data = original(box, command, *args)
+        if command == "FETCH" and args[1] == "(BODY.PEEK[TEXT])":
+            (prefix, raw), tail = data
+            if damage == "uid":
+                data = [(prefix.replace(b"UID 2", b"UID 3"), raw), tail]
+            elif damage == "section":
+                data = [(prefix.replace(b"[TEXT]", b"[1]"), raw), tail]
+            elif damage == "length":
+                data = [(prefix, raw[:-1]), tail]
+        if command == "FETCH" and args[1] == "(BODYSTRUCTURE)" and damage == "structure-literal":
+            data = [(b"1 (UID 2 BODYSTRUCTURE ({5}", b"TEXT"), b'"PLAIN"))']
+        return status, data
+    monkeypatch.setattr(Inbox, "uid", response)
+    parts = Segments(synthetic(2, "CURRENT").as_bytes())
+    if damage == "octets":
+        parts.tree[6] = b"9999"
+    trial, _, requests, cards = journey(parts, "是")
+    assert trial.box()["state"] == "frozen" and not requests and not any(card for card, _ in cards)
+
+
+@pytest.mark.parametrize("ids,structure", [
+    ((b"<root>", b"<root> \t"), False), ((b"<first>", b"<second>"), False),
+    ((b"<root>", b"<root> "), True), ((b"<root> ", b"<other>"), True)])
+def test_related_requires_unique_normalized_root(journey, ids, structure):
+    raw = b"Message-ID: " + synthetic(2, "")["Message-ID"].encode()
+    raw += b'\r\nContent-Type: multipart/related; boundary=q; start="<root>"\r\n\r\n'
+    for content_id in ids:
+        raw += b"--q\r\nContent-ID: " + content_id + b"\r\n\r\nbody\r\n"
+    parts = Segments(raw + b"--q--\r\n")
+    if structure:
+        parts.tree[0][3], parts.tree[1][3] = ids
+    trial, _, requests, cards = journey(parts, "是")
+    assert trial.box()["state"] == "frozen" and not requests and not any(card for card, _ in cards)
+    assert not trial.store.row("SELECT 1 FROM registration WHERE status IN ('triage','parse')")
+
+
+def test_binary_only_no_cannot_spend_parse_quota(journey):
+    msg = synthetic(2, "")
+    msg.set_content(b"OPAQUE", maintype="application", subtype="octet-stream")
+    trial, _, requests, cards = journey(msg, "否")
+    assert json.loads(json.loads(requests[0])["messages"][0]["content"])["body"] == ""
+    trial.poll()
+    assert tuple(trial.store.row("SELECT verdict,attachments,parse_day,status FROM registration")) == (
+        "拿不准", 1, None, "manual")
+    assert len(requests) == 1 and "含 1 个附件" in str(cards)
+
+
+def test_unknown_attachment_count_disclosed_and_blocks_batch(tmp_path):
+    from dataclasses import replace
+    store, cards = Store(tmp_path / "trial"), []
+    trial = revision_trial(store, Inbox(), cards)
+    trial.poll()
+    store.import_spend("0")
+    item = replace(fixture_item(synthetic(2, "").as_bytes()), attachments=None)
+    store.observe(trial.scope, 1, 2, 3, [2])
+    reg = store.register(trial.scope, 1, 2, item)
+    trial.status(reg, "parse")
+    trial.parse(store.row("SELECT * FROM registration WHERE id=?", reg), 1, "")
+    assert "附件数量未知，请对照原件核对" in str(cards)
+    assert store.batch(reg, 1)[2] is None and store.batch(reg, 1)[3]
+
+
+def test_upgrade_rechecks_frozen_v1_reconciliation(tmp_path):
+    inbox = Inbox()
+    trial = revision_trial(Store(tmp_path / "trial"), inbox, [])
+    trial.poll()
+    inbox.add(synthetic(2, "ORIGINAL"))
+    with trial.store.write() as db:
+        db.execute("ALTER TABLE reconciliation DROP COLUMN reason")
+        db.execute("UPDATE mailbox SET state='frozen',reason='reconciling',cursor=3,peak=3")
+        db.execute("""INSERT INTO reconciliation(scope,generation,uid,msgkey,digest,candidate)
+            VALUES(?,1,2,'old-key','1:old','old-candidate')""", (trial.scope,))
+    trial.store.db.close()
+    trial.store = Store(tmp_path / "trial")
+    trial.poll()
+    assert trial.box()["state"] == "frozen"
+    assert trial.store.row("SELECT digest FROM reconciliation WHERE generation=? AND uid=2",
+                           trial.box()["generation"])[0].startswith("2:")
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+def test_archived_original_covers_multipart_after_uidvalidity_change(tmp_path, replacement):
+    from dataclasses import replace
+
+    store, archive, live = Store(tmp_path / "trial"), Inbox(), Inbox()
+    trial = revision_trial(store, live, [])
+    trial.poll()
+    msg = synthetic(2, "ORIGINAL", attachment=True)
+    msg.set_boundary("synthetic-boundary")
+    archive.add(Segments(msg.as_bytes()))
+    old = fixture_item(msg.as_bytes())
+    store.observe(trial.scope, 1, 2, 3, [2])
+    # 同一固定边界夹具在 f730bfe 的两个实际摘要。
+    prior = replace(old, digest="1:a83f0eb2ca4782658330cf37920118a7018a35152bb88dda1a6432dbe1ffd2f8",
+                    candidate="2efdffcf8459e07874ca884605a4e72b0bbed700bec5ff0b26cb5b689d7b900b")
+    reg = store.register(trial.scope, 1, 2, prior)
+    with store.write() as db:
+        db.execute("UPDATE registration SET status='no',verdict='否' WHERE id=?", (reg,))
+    live.generation += 1
+    live.add(Segments(msg.as_bytes().replace(b"ORIGINAL", b"REPLACED")) if replacement else Segments(msg.as_bytes()))
+    trial.poll()
+    gen = trial.box()["generation"]
+    with pytest.raises(Hold):
+        store.reconcile(trial.scope, gen, 2, 3)
+    with pytest.raises(Hold):
+        store.index_archived_original(trial.scope, gen, reg, live, trial.folder, 2)
+    if replacement:
+        with pytest.raises(Hold):
+            store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
+        with pytest.raises(Hold):
+            store.reconcile(trial.scope, gen, 2, 3)
+    else:
+        store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
+        assert trial.box()["state"] == "frozen"
+        store.reconcile(trial.scope, gen, 2, 3)
+        assert tuple(store.row("SELECT status,verdict FROM registration WHERE id=?", reg)) == ("no", "否")
+        assert store.row("SELECT candidate FROM original_index WHERE registration=?", reg)[0] == old.candidate
+    assert not store.row("SELECT 1 FROM charge")
+
+
+@pytest.mark.parametrize("disposition,expected", [(b"ambiguous", None), ([b"INLINE", [b"FILENAME*0*", b"file"]], 1)])
+def test_uncertain_or_extended_disposition_masks_selected_leaf(journey, disposition, expected):
+    parts = mixed(("plain", "ATTACHED_SENTINEL"))
+    parts.tree[0][-1] = disposition
+    trial, _, requests, cards = journey(parts, "否")
+    assert json.loads(json.loads(requests[0])["messages"][0]["content"])["body"] == ""
+    trial.poll()
+    assert tuple(trial.store.row("SELECT verdict,attachments FROM registration")) == ("拿不准", expected)
+    assert len(requests) == 2 and b"ATTACHED_SENTINEL" in requests[1]
+    assert ("附件数量未知" if expected is None else "含 1 个附件") in str(cards)
+    assert trial.store.batch(1, 1)[3]

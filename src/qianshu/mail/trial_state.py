@@ -32,6 +32,7 @@ CREATE TABLE IF NOT EXISTS snapshot(
  scope TEXT, generation INTEGER, validity INTEGER, initial INTEGER, history INTEGER, enabled TEXT,
  PRIMARY KEY(scope,generation));
 CREATE TABLE IF NOT EXISTS scan_range(scope TEXT PRIMARY KEY, generation INTEGER, first INTEGER, last INTEGER);
+CREATE TABLE IF NOT EXISTS observed_range(scope TEXT PRIMARY KEY, generation INTEGER, next_uid INTEGER);
 CREATE TABLE IF NOT EXISTS location(
  scope TEXT, generation INTEGER, uid INTEGER, registration INTEGER, status TEXT DEFAULT 'pending',
  PRIMARY KEY(scope,generation,uid));
@@ -41,6 +42,9 @@ CREATE TABLE IF NOT EXISTS registration(
  sender_length INTEGER, subject_length INTEGER, due TEXT, parse_day TEXT);
 CREATE INDEX IF NOT EXISTS trial_identity ON registration(scope,msgkey);
 CREATE INDEX IF NOT EXISTS trial_candidate ON registration(scope,candidate);
+CREATE TABLE IF NOT EXISTS original_index(
+ registration INTEGER PRIMARY KEY, digest TEXT NOT NULL, candidate TEXT NOT NULL, validity INTEGER NOT NULL, uid INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS original_candidate ON original_index(candidate);
 CREATE TABLE IF NOT EXISTS trial_target(id INTEGER PRIMARY KEY CHECK(id=1), fingerprint TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS trial_folder(scope TEXT PRIMARY KEY, folder TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS card_intent(
@@ -78,6 +82,14 @@ class Store:
             for statement in (_SCHEMA + (_LEDGER_SCHEMA if fresh else "")).split(";"):
                 if statement.strip():
                     db.execute(statement)
+            if "initial_seen" not in {r[1] for r in db.execute("PRAGMA table_info(location)")}:
+                db.execute("ALTER TABLE location ADD COLUMN initial_seen INTEGER")
+            if "reason" not in {r[1] for r in db.execute("PRAGMA table_info(reconciliation)")}:
+                db.execute("ALTER TABLE reconciliation ADD COLUMN reason TEXT")
+                # 旧库已停在对账页时，UIDNEXT 不变也要用 v2 重读一次。
+                db.execute("""UPDATE mailbox SET reason='originals' WHERE state='frozen' AND
+                    (reason='reconciling' OR (reason='legacy' AND EXISTS
+                    (SELECT 1 FROM registration WHERE scope=mailbox.scope AND digest LIKE '1:%')))""")
             if fresh:
                 self._seal_ledger()
             else:
@@ -126,6 +138,9 @@ class Store:
             if row[0] == "initializing":
                 self._freeze(scope, "initialization")
                 return "frozen"
+            if row[0] == "active" and self.uncovered(scope):
+                self._freeze(scope, "originals")
+                return "frozen"
             if row[0] == "active" and self.row("SELECT 1 FROM scan_range WHERE scope=?", scope):
                 self._freeze(scope, "interrupted_search")
                 return "frozen"
@@ -161,9 +176,19 @@ class Store:
                 first = uid + 1
             db.executemany("INSERT OR IGNORE INTO location(scope,generation,uid) VALUES(?,?,?)",
                            ((scope, generation, uid) for uid in uids))
-            if db.execute("""UPDATE mailbox SET cursor=? WHERE scope=? AND generation=?
-                AND cursor=? AND state='active'""", (next_uid, scope, generation, start)).rowcount != 1:
+            if not self.row("""SELECT 1 FROM mailbox WHERE scope=? AND generation=?
+                    AND cursor=? AND state='active'""", scope, generation, start):
                 raise Hold()
+            db.execute("INSERT INTO observed_range VALUES(?,?,?)", (scope, generation, next_uid))
+            self._advance(scope, generation)
+
+    def _advance(self, scope, generation):
+        if not self.row("SELECT 1 FROM location WHERE scope=? AND generation=? AND status='pending' LIMIT 1",
+                        scope, generation):
+            observed = self.row("SELECT next_uid FROM observed_range WHERE scope=? AND generation=?", scope, generation)
+            if observed:
+                self.db.execute("UPDATE mailbox SET cursor=? WHERE scope=?", (observed[0], scope))
+                self.db.execute("DELETE FROM observed_range WHERE scope=?", (scope,))
 
     def pending(self, scope, generation):
         return [r[0] for r in self.db.execute("""SELECT uid FROM location WHERE scope=? AND generation=?
@@ -182,7 +207,13 @@ class Store:
         with self.write():
             self._freeze(scope, reason)
 
-    def register(self, scope, generation, uid, item):
+    def uncovered(self, scope):
+        return self.row("""SELECT 1 FROM registration r WHERE r.scope=? AND (r.digest LIKE '1:%' OR r.digest IS NULL)
+            AND NOT EXISTS (SELECT 1 FROM original_index o JOIN reconciliation c
+            ON c.matched=o.registration AND c.digest=o.digest AND c.candidate=o.candidate
+            WHERE o.registration=r.id AND c.scope=r.scope AND c.msgkey=r.msgkey) LIMIT 1""", scope)
+
+    def register(self, scope, generation, uid, item, *, seen=None):
         with self.write() as db:
             if not self.row("SELECT 1 FROM mailbox WHERE scope=? AND generation=? AND state='active'", scope, generation):
                 raise Hold()
@@ -190,13 +221,15 @@ class Store:
             if not loc or loc["status"] != "pending":
                 raise Hold()
             key, digest, candidate = item.key, item.digest, item.candidate
-            same = list(db.execute("SELECT * FROM registration WHERE scope=? AND msgkey=?", (scope, key)))
-            related = list(db.execute("SELECT * FROM registration WHERE scope=? AND candidate=? AND msgkey IS NOT ?",
-                                      (scope, candidate, key)))
+            same = list(db.execute("""SELECT r.*,coalesce(o.digest,r.digest) effective_digest FROM registration r
+                LEFT JOIN original_index o ON o.registration=r.id WHERE r.scope=? AND r.msgkey=?""", (scope, key)))
+            related = list(db.execute("""SELECT r.* FROM registration r LEFT JOIN original_index o ON o.registration=r.id
+                WHERE r.scope=? AND (r.candidate=? OR o.candidate=?) AND r.msgkey IS NOT ?""",
+                                      (scope, candidate, candidate, key)))
             reason = None
             if not key or related:
                 reason = "duplicate"
-            if not digest or any(r["digest"] != digest or r["status"] == "frozen" for r in same):
+            if not digest or any(r["effective_digest"] != digest or r["status"] == "frozen" for r in same):
                 reason = "conflict"
             if same and not reason:
                 reg = same[0]["id"]
@@ -210,8 +243,9 @@ class Store:
                                   reason, now(), len(item.fields["display_name"]), len(item.fields["subject"]))).lastrowid
                 if reason:
                     self.notice(f"{reason}:{reg}", scope, reg, reason, 1 + len(same) + len(related))
-            db.execute("""UPDATE location SET registration=?,status='registered'
-                WHERE scope=? AND generation=? AND uid=?""", (reg, scope, generation, uid))
+            db.execute("""UPDATE location SET registration=?,initial_seen=?,status='registered'
+                WHERE scope=? AND generation=? AND uid=?""", (reg, seen, scope, generation, uid))
+            self._advance(scope, generation)
             return reg
 
     def batch(self, reg, version):
@@ -352,8 +386,17 @@ class Store:
             generation = box["generation"]
             observations = []
             for uid, item in entries:
-                matches = list(db.execute("""SELECT id,status FROM registration WHERE scope=? AND msgkey=?
-                    AND digest=?""", (scope, item.key, item.digest)))
+                if item.original:
+                    # 同一 UIDVALIDITY 下原登记的位置、旧内容证明与本轮完整回读三者同时成立。
+                    verified = list(db.execute("""SELECT DISTINCT r.id FROM registration r JOIN location l
+                        ON l.registration=r.id JOIN snapshot s ON s.scope=l.scope AND s.generation=l.generation
+                        WHERE r.scope=? AND r.msgkey=? AND r.digest=? AND r.candidate=?
+                        AND l.uid=? AND s.validity=?""", (scope, item.key, *item.original, uid, validity)))
+                    if len(verified) == 1:
+                        db.execute("INSERT OR IGNORE INTO original_index VALUES(?,?,?,?,?)",
+                                   (verified[0][0], item.digest, item.candidate, validity, uid))
+                matches = list(db.execute("""SELECT r.id,r.status FROM registration r LEFT JOIN original_index o
+                    ON o.registration=r.id WHERE r.scope=? AND r.msgkey=? AND coalesce(o.digest,r.digest)=?""", (scope, item.key, item.digest)))
                 match = matches[0][0] if len(matches) == 1 and matches[0][1] != "frozen" else None
                 observations.append((uid, item.key, item.digest, item.candidate, item.attachments, match))
             old = [tuple(r) for r in db.execute("""SELECT uid,msgkey,digest,candidate,attachments,matched
@@ -362,14 +405,57 @@ class Store:
                     or old != observations):
                 generation += 1
                 db.execute("INSERT INTO snapshot VALUES(?,?,?,?,?,?)", (scope, generation, validity, cursor, history, now()))
-                db.executemany("INSERT INTO reconciliation VALUES(?,?,?,?,?,?,?,?)",
+                db.executemany("""INSERT INTO reconciliation(scope,generation,uid,msgkey,digest,candidate,attachments,matched)
+                    VALUES(?,?,?,?,?,?,?,?)""",
                                ((scope, generation, *data) for data in observations))
+            if self.uncovered(scope):
+                count = db.execute("""UPDATE reconciliation SET reason='duplicate' WHERE scope=? AND generation=?
+                    AND matched IS NULL AND reason IS NULL""", (scope, generation)).rowcount
+                if count:
+                    self.notice(f"uncovered:{scope}:{generation}", scope, None, "duplicate", count)
             db.execute("""UPDATE mailbox SET generation=?,validity=?,cursor=?,peak=?,reason='reconciling'
                 WHERE scope=?""", (generation, validity, cursor, cursor, scope))
+
+    def index_archived_original(self, scope, generation, reg, archive, folder, uid):
+        """人工对账使用本账户独立留存的原代只读邮箱。只补索引，解冻仍走 reconcile。"""
+        from .segmented import read_segmented
+
+        validity, cursor, _ = archive.snapshot(folder)
+        original = self.row("""SELECT r.msgkey,r.digest,r.candidate FROM registration r
+            JOIN location l ON l.registration=r.id AND l.scope=r.scope
+            JOIN snapshot s ON s.scope=l.scope AND s.generation=l.generation
+            JOIN mailbox m ON m.scope=r.scope JOIN trial_folder f ON f.scope=m.scope
+            WHERE r.id=? AND r.scope=? AND r.digest LIKE '1:%' AND f.folder=?
+            AND l.uid=? AND s.validity=? AND m.validity!=s.validity
+            AND m.state='frozen' AND m.reason='reconciling' AND m.generation=?""",
+                            reg, scope, _fingerprint(folder), uid, validity, generation)
+        if not original:
+            raise Hold()
+        item, _ = read_segmented(archive, uid, archive.read_seen(uid), original=True)
+        if (archive.snapshot(folder)[:2] != (validity, cursor) or item.key != original["msgkey"]
+                or (item.original and item.original != (original["digest"], original["candidate"]))):
+            raise Hold()
+        with self.write() as db:
+            if not self.row("""SELECT 1 FROM mailbox WHERE scope=? AND state='frozen'
+                    AND reason='reconciling' AND generation=?""", scope, generation):
+                raise Hold()
+            matched = db.execute("""UPDATE reconciliation SET matched=?,reason=NULL WHERE scope=?
+                AND generation=? AND msgkey=? AND digest=? AND candidate=? AND attachments IS ?
+                AND (matched IS NULL OR matched=?)""",
+                                 (reg, scope, generation, item.key, item.digest, item.candidate, item.attachments, reg))
+            if not matched.rowcount:
+                raise Hold()
+            db.execute("INSERT OR IGNORE INTO original_index VALUES(?,?,?,?,?)", (reg, item.digest, item.candidate, validity, uid))
+            if not self.row("SELECT 1 FROM original_index WHERE registration=? AND digest=? AND candidate=?",
+                            reg, item.digest, item.candidate):
+                raise Hold()
 
     def reconcile(self, scope, generation, validity, cursor):
         with self.write() as db:
             box = self.row("SELECT reason FROM mailbox WHERE scope=?", scope)
+            if self.uncovered(scope) or self.row("""SELECT 1 FROM reconciliation WHERE scope=? AND generation=?
+                    AND (digest IS NULL OR candidate IS NULL) LIMIT 1""", scope, generation):
+                raise Hold()
             if db.execute("""UPDATE mailbox SET state='active',reason=NULL WHERE scope=? AND generation=?
                 AND validity=? AND cursor=? AND state='frozen' AND reason IN ('reconciling','legacy')""",
                           (scope, generation, validity, cursor)).rowcount != 1:
@@ -386,6 +472,7 @@ class Store:
                 db.execute("UPDATE reconciliation SET matched=? WHERE scope=? AND generation=? AND uid=?",
                            (reg, scope, generation, row["uid"]))
             db.execute("DELETE FROM scan_range WHERE scope=?", (scope,))
+            db.execute("DELETE FROM observed_range WHERE scope=?", (scope,))
             db.execute("""INSERT OR IGNORE INTO location(scope,generation,uid,registration,status)
                 SELECT scope,generation,uid,matched,'reviewed' FROM reconciliation WHERE scope=? AND generation=?""",
                        (scope, generation))

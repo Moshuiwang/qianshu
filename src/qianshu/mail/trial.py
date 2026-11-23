@@ -6,7 +6,6 @@ from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
-from functools import partial
 
 from qianshu.config import ConfigError
 from qianshu.feishu.cards import CardLine, detail_pages, result_card
@@ -14,9 +13,9 @@ from qianshu.feishu.entrance import Application
 from qianshu.pipeline import Pipeline
 
 from . import _fingerprint
-from .imap import MailError, TrialMailbox, connect
-from .message import snapshot_parts, request_text
-from .triage import MailItem, classify, inspect_mail, input_limit, trial_model
+from .imap import MailError, trial_connect
+from .segmented import read_segmented
+from .triage import MailItem, classify, input_limit, trial_model
 from .trial_state import Hold, Store
 
 _LOG = logging.getLogger(__name__)
@@ -35,7 +34,7 @@ _NOTICES = {
 
 
 class Trial:
-    def __init__(self, store, config, switches, send, stop, *, connector=partial(connect, mailbox_type=TrialMailbox),
+    def __init__(self, store, config, switches, send, stop, *, connector=trial_connect,
                  clock=lambda: datetime.now(UTC),
                  companies=None, sensitive=(), legacy_path=None):
         self.store, self.config, self.switches, self.send = store, config, dict(switches()), send
@@ -58,22 +57,11 @@ class Trial:
     def box(self):
         return self.store.row("SELECT * FROM mailbox WHERE scope=?", self.scope)
 
-    def read(self, mailbox, uid, *, parse=False):
-        before = mailbox.read_seen(uid)
-        if self.seen.setdefault(uid, before) != before:
-            self.store.freeze(self.scope, "seen")
-            raise Hold()
-        try:
-            raw = mailbox.complete_message(uid)
-            item = inspect_mail(raw)
-            text = None
-            if parse:
-                text = request_text(snapshot_parts(raw))
-            return item, text
-        finally:
-            if mailbox.read_seen(uid) != before:
-                self.store.freeze(self.scope, "seen")
-                raise Hold()
+    def read(self, mailbox, uid, expected=None, *, original=False):
+        seen = mailbox.read_seen(uid)
+        if self.seen.setdefault(uid, seen) != seen or (expected is not None and seen != expected):
+            raise MailError("已读位置或状态变化。")
+        return read_segmented(mailbox, uid, seen, original=original)
 
     def poll(self):
         if not self.enabled():
@@ -90,7 +78,9 @@ class Trial:
                 self.scan(mailbox, state)
             finally:
                 for uid, seen in self.seen.items():
-                    if mailbox.read_seen(uid) != seen:
+                    try:
+                        mailbox.check_seen(uid, seen)
+                    except MailError:
                         self.store.freeze(self.scope, "seen")
                         break
 
@@ -115,12 +105,15 @@ class Trial:
         if box["state"] == "frozen" or validity != box["validity"] or next_uid < box["peak"]:
             if box["state"] != "frozen":
                 self.store.freeze(self.scope, "generation")
+            originals = bool(self.store.uncovered(self.scope))
             entries = []
-            for uid in mailbox.interval(1, next_uid - 1):
+            boundary = self.store.row("""SELECT initial FROM snapshot WHERE scope=? AND generation=1
+                AND validity=?""", self.scope, validity) if originals else None
+            for uid in mailbox.interval(boundary[0] if boundary else 1, next_uid - 1):
                 if not self.enabled():
                     return
                 try:
-                    item, _ = self.read(mailbox, uid)
+                    item, _ = self.read(mailbox, uid, original=originals)
                 except MailError:
                     item = MailItem(None, None, None, None, {})
                 entries.append((uid, replace(item, fields={})))
@@ -130,10 +123,11 @@ class Trial:
             return
         gen = box["generation"]
         self.store.peak(self.scope, next_uid)
-        if box["cursor"] < next_uid:
+        if box["cursor"] < next_uid and not self.store.row("SELECT 1 FROM observed_range WHERE scope=?", self.scope):
             self.store.searching(self.scope, gen, box["cursor"], next_uid - 1)
             uids = mailbox.interval(box["cursor"], next_uid - 1)
             self.store.observe(self.scope, gen, box["cursor"], next_uid, uids)
+        fresh = {}
         for uid in self.store.pending(self.scope, gen):
             if not self.enabled():
                 return
@@ -146,11 +140,12 @@ class Trial:
                 return
             if not self.verify_generation(mailbox):
                 return
-            self.store.register(self.scope, gen, uid, item)
+            self.store.register(self.scope, gen, uid, item, seen=self.seen[uid])
+            fresh[uid] = item
         if not self.store.budget_open():
             self.flush()
             return
-        rows = list(self.store.db.execute("""SELECT r.*,min(l.uid) uid FROM registration r
+        rows = list(self.store.db.execute("""SELECT r.*,min(l.uid) uid,l.initial_seen FROM registration r
             JOIN location l ON l.registration=r.id WHERE r.scope=? AND l.generation=?
             AND r.status IN ('triage','parse') GROUP BY r.id ORDER BY r.id""", (self.scope, gen)))
         for row in rows:
@@ -158,13 +153,19 @@ class Trial:
             if not self.enabled(card) or (card and row["due"] and row["due"] > self.clock().astimezone(UTC).date().isoformat()):
                 continue
             try:
-                item, text = self.read(mailbox, row["uid"], parse=card)
+                uid = row["uid"]
+                if not card and uid in fresh:
+                    mailbox.check_seen(uid, row["initial_seen"])
+                    item, text = fresh.pop(uid), None
+                else:
+                    item, text = self.read(mailbox, uid, row["initial_seen"])
             except MailError:
                 self.store.freeze(self.scope, "mapping")
                 break
             if not self.verify_generation(mailbox):
                 break
-            if (item.key, item.digest, item.candidate) != (row["msgkey"], row["digest"], row["candidate"]):
+            if (item.key, item.digest, item.candidate, item.attachments) != (
+                    row["msgkey"], row["digest"], row["candidate"], row["attachments"]):
                 self.store.freeze(self.scope, "mapping")
                 break
             if card:
@@ -211,6 +212,8 @@ class Trial:
         verdict, reason, inputs, outputs = classify(self.config, item, reserve)
         if attempt is None:
             return
+        if not item.fields["body"]:
+            verdict, reason = "拿不准", "分拣正文为空"
         self.store.settle(attempt, inputs, outputs)
         with self.store.write() as db:
             changed = db.execute("UPDATE registration SET verdict=?,failure=?,status=? WHERE id=? AND status='classifying'",
@@ -268,8 +271,10 @@ class Trial:
             if not db.execute("UPDATE registration SET status='sending' WHERE id=? AND status=?",
                               (reg, expected)).rowcount:
                 return
-        if row["attachments"]:
+        if row["attachments"] != 0:
             hint = f"含 {row['attachments']} 个附件未解析，请对照原件核对"
+            if row["attachments"] is None:
+                hint = "附件数量未知，请对照原件核对"
             pages = (*detail_pages("收信", [CardLine("附件", hint)]), *pages)
         heading = detail_pages("试运行邮件", [])[0].elements
         try:
