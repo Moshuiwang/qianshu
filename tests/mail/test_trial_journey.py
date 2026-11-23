@@ -939,7 +939,7 @@ def _interrupt_read(journey, monkeypatch, second, initial, vanish):
     assert not any(card for card, _ in cards)
 
 
-@pytest.mark.parametrize("variant", ["original", "missing", "replacement"])
+@pytest.mark.parametrize("variant", ["original", "missing", "replacement", "previous-index"])
 def test_v1_no_rebuild_requires_v2_candidate_coverage(tmp_path, variant):
     from dataclasses import replace
     inbox, cards = Inbox(), []
@@ -964,28 +964,25 @@ def test_v1_no_rebuild_requires_v2_candidate_coverage(tmp_path, variant):
         del inbox.messages[2]
     elif variant == "replacement":
         inbox.messages[2] = synthetic(2, "REPLACED")
+    elif variant == "previous-index":
+        # 已升级过的库可能留有归档补出的索引和匹配记录。
+        with store.write() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS original_index(
+                registration INTEGER PRIMARY KEY, digest TEXT, candidate TEXT, validity INTEGER, uid INTEGER)""")
+            db.execute("INSERT INTO original_index VALUES(?,?,?,?,?)", (reg, original.digest, original.candidate, 1, 2))
+            db.execute("""INSERT INTO reconciliation(scope,generation,uid,msgkey,digest,candidate,matched)
+                VALUES(?,1,2,?,?,?,?)""", (trial.scope, original.key, original.digest, original.candidate, reg))
     trial.poll()
     assert trial.box()["state"] == "frozen"
     inbox.generation += 1
     trial.poll()
     generation = trial.box()["generation"]
-    if variant != "original":
-        with pytest.raises(Hold):
-            store.reconcile(trial.scope, generation, 2, 3)
-        assert not store.row("SELECT 1 FROM original_index")
-    else:
-        assert store.row("SELECT candidate FROM original_index WHERE registration=?", reg)[0] == original.candidate
+    with pytest.raises(Hold):
         store.reconcile(trial.scope, generation, 2, 3)
-        assert store.row("SELECT status FROM registration WHERE id=?", reg)[0] == "no"
     msg.replace_header("Message-ID", synthetic(3, "")["Message-ID"])
     inbox.add(msg)
     trial.poll()
-    if variant == "original":
-        assert store.row("SELECT reason FROM registration ORDER BY id DESC")[0] == "duplicate"
-    else:
-        assert trial.box()["state"] == "frozen"
-        assert store.row("SELECT reason FROM reconciliation WHERE generation=? AND uid=3",
-                         trial.box()["generation"])[0] == "duplicate"
+    assert trial.box()["state"] == "frozen" and not inbox.reads
     assert not store.row("SELECT 1 FROM charge") and not any(card for card, _ in cards)
 
 
@@ -1075,7 +1072,7 @@ def test_upgrade_rechecks_frozen_v1_reconciliation(tmp_path):
 
 
 @pytest.mark.parametrize("replacement", [False, True])
-def test_archived_original_covers_multipart_after_uidvalidity_change(tmp_path, replacement):
+def test_v1_multipart_stays_frozen_after_uidvalidity_change(tmp_path, replacement):
     from dataclasses import replace
 
     store, archive, live = Store(tmp_path / "trial"), Inbox(), Inbox()
@@ -1098,19 +1095,7 @@ def test_archived_original_covers_multipart_after_uidvalidity_change(tmp_path, r
     gen = trial.box()["generation"]
     with pytest.raises(Hold):
         store.reconcile(trial.scope, gen, 2, 3)
-    with pytest.raises(Hold):
-        store.index_archived_original(trial.scope, gen, reg, live, trial.folder, 2)
-    if replacement:
-        with pytest.raises(Hold):
-            store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
-        with pytest.raises(Hold):
-            store.reconcile(trial.scope, gen, 2, 3)
-    else:
-        store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
-        assert trial.box()["state"] == "frozen"
-        store.reconcile(trial.scope, gen, 2, 3)
-        assert tuple(store.row("SELECT status,verdict FROM registration WHERE id=?", reg)) == ("no", "否")
-        assert store.row("SELECT candidate FROM original_index WHERE registration=?", reg)[0] == old.candidate
+    assert trial.box()["state"] == "frozen" and not live.reads and not archive.reads
     assert not store.row("SELECT 1 FROM charge")
 
 
@@ -1172,7 +1157,7 @@ def test_final_examine_failure_requires_reconciliation(journey, monkeypatch, cha
     assert len(requests) == 1 and not any(card for card, _ in cards)
 
 
-@pytest.mark.parametrize("variant", ["original", "replacement", "unprovable", "invalid-encoding"])
+@pytest.mark.parametrize("variant", ["original", "replacement", "unprovable", "invalid-encoding", "base64", "outer-header"])
 def test_archive_binding_blocks_changed_id_redelivery(tmp_path, monkeypatch, variant):
     from dataclasses import replace
 
@@ -1196,19 +1181,21 @@ def test_archive_binding_blocks_changed_id_redelivery(tmp_path, monkeypatch, var
         archived = raw.replace(b"--synthetic-boundary", b"PREAMBLE\r\n--synthetic-boundary", 1)
     elif variant == "invalid-encoding":
         archived = raw.replace(b"Encoding: 7bit", b"Encoding: unknown")
+    elif variant == "base64":
+        archived = raw.replace(b"Encoding: 7bit", b"Encoding: base64").replace(b"ORIGINAL", b"T1JJR0lOQUwNCg==")
+    elif variant == "outer-header":
+        archived = b"X-Synthetic-Test: extra\r\n" + raw
     for box in (archive, live):
         box.add(Segments(archived))
-    trial.poll()
-    gen = trial.box()["generation"]
-    if variant != "original":
-        with pytest.raises(Hold):
-            store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
-        assert not store.row("SELECT 1 FROM original_index")
-        with pytest.raises(Hold):
-            store.reconcile(trial.scope, gen, 2, 3)
-    else:
-        store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
-        store.reconcile(trial.scope, gen, 2, 3)
+    decodes = []
+    payload = EmailMessage.get_payload
+
+    def counted(message, *args, **kwargs):
+        if kwargs.get("decode"):
+            decodes.append(message.get_content_type())
+        return payload(message, *args, **kwargs)
+
+    monkeypatch.setattr(EmailMessage, "get_payload", counted)
     requests = []
 
     def receive(req):
@@ -1218,11 +1205,116 @@ def test_archive_binding_blocks_changed_id_redelivery(tmp_path, monkeypatch, var
     monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
     trial.input_limits["claude-haiku-5-5"] = 100000
     store.import_spend("0")
+    trial.poll()
+    box = trial.box()
+    with pytest.raises(Hold):
+        store.reconcile(trial.scope, box["generation"], box["validity"], box["cursor"])
     msg.replace_header("Message-ID", synthetic(3, "")["Message-ID"])
     live.add(msg)
     trial.poll()
     assert requests == []
-    if variant != "original":
-        assert trial.box()["state"] == "frozen"
-    else:
-        assert store.row("SELECT reason FROM registration ORDER BY id DESC")[0] == "duplicate"
+    assert trial.box()["state"] == "frozen"
+    assert decodes == [] and archive.reads == live.reads == []
+
+
+@pytest.mark.parametrize("blank", ["\x01", "\t", "\u200b", "\u0301", "\u20dd", "\u00a0", "\ufeff\u200b"],
+                         ids=["Cc", "tab", "Cf", "Mn", "Me", "Zs", "BOM"])
+@pytest.mark.parametrize("layout", ["quote", "plain", "html-quote", "html-readable"])
+def test_invisible_sibling_at_http(journey, blank, layout):
+    sibling = {
+        "quote": ("plain", "CURRENT\nOn a date wrote:\nHISTORY"),
+        "plain": ("html", '<div style="color:red">CURRENT</div>'),
+        "html-quote": ("html", "<p>CURRENT</p><p>From: previous</p>"),
+        "html-readable": ("html", "<p>CURRENT</p>"),
+    }[layout]
+    trial, _, requests, _ = journey(mixed(("plain", blank), sibling), "否")
+    body = json.loads(json.loads(requests[0])["messages"][0]["content"])["body"]
+    assert body == ("CURRENT" if layout == "html-readable" else "")
+    trial.poll()
+    assert trial.store.row("SELECT verdict FROM registration")[0] == ("否" if body else "拿不准")
+    assert [json.loads(req)["model"] for req in requests[1:]] == ([] if body else ["claude-sonnet-5-5"])
+
+
+@pytest.mark.parametrize("damage", ["exists", "exists-extra", "search", "search-range", "uidnext", "tuple",
+                                    "section-length", "structure-length", "sequence"])
+def test_malformed_imap_reply_stays_frozen(journey, monkeypatch, damage):
+    trial, inbox, requests, cards = journey(synthetic(2, "CURRENT"), "是")
+    wire = inbox._connection
+    select, uid, response = wire.select, wire.uid, wire.response
+    inbox.commands.clear()
+    final = False
+
+    def examine(*args, **kwargs):
+        nonlocal final
+        final = any(cmd[0] == "FETCH" for cmd in inbox.commands)
+        result = select(*args, **kwargs)
+        if final and damage == "exists":
+            return "OK", [b"9" * 5000]
+        if final and damage == "exists-extra":
+            return "OK", [b"2", b"1"]
+        return result
+
+    def read(command, *args):
+        status, data = uid(command, *args)
+        if final and command == "SEARCH" and damage in {"search", "search-range"}:
+            return status, [b"9" * 5000 if damage == "search" else b"4294967296"]
+        if command == "FETCH" and args[1] == "(BODY.PEEK[TEXT])":
+            (prefix, raw), tail = data
+            if damage == "tuple":
+                return status, [(prefix,), tail]
+            if damage == "section-length":
+                return status, [(prefix.split(b"{")[0] + b"{" + b"9" * 5000 + b"}", raw), tail]
+            if damage == "sequence":
+                return status, [(b"4294967296" + prefix[1:], raw), tail]
+        if command == "FETCH" and args[1] == "(BODYSTRUCTURE)" and damage == "structure-length":
+            return status, [(b"1 (UID 2 BODYSTRUCTURE ({" + b"9" * 5000 + b"}", b"TEXT"), b"))"]
+        return status, data
+
+    with monkeypatch.context() as patch:
+        patch.setattr(wire, "select", examine)
+        patch.setattr(wire, "uid", read)
+        if damage == "uidnext":
+            patch.setattr(wire, "response", lambda key: (key, []) if key == "UIDNEXT" and final else response(key))
+        trial.poll()
+    assert trial.box()["state"] == "frozen" and len(requests) == 1
+    trial.poll()
+    assert trial.box()["state"] == "frozen" and len(requests) == 1 and not any(card for card, _ in cards)
+
+
+@pytest.mark.parametrize("operation,row", [
+    ("list", ()), ("list", (rb'(\Sent) "/" {2}', b"S")),
+    ("list", (rb'(\Sent) "/" {1}', b"\xff")),
+    ("section", (b"1 (BODY[TEXT] {1}",)),
+    ("section", (b"1 (BODY[TEXT] {2}", b"x")),
+    ("structure", (b"1 (BODYSTRUCTURE ({2}", b"x")),
+])
+def test_readonly_response_parser_reports_mail_error(operation, row):
+    class Wire:
+        def list(self):
+            return "OK", [row]
+
+        def uid(self, *args):
+            return "OK", [row, b"))"]
+
+    mailbox = ReadOnlyMailbox(Wire())
+    with pytest.raises(MailError):
+        if operation == "list":
+            mailbox.sent_folder({})
+        elif operation == "section":
+            mailbox.section(1, "TEXT")
+        else:
+            mailbox.structure(1)
+
+
+@pytest.mark.parametrize("kind,content,body", [
+    ("html", "<p>CURRENT</p><!--\ufeff\u200b-->", "CURRENT"),
+    ("html", "<p>CURRENT</p><blockquote>HISTORY</blockquote>\ufeff\u200b", "CURRENT"),
+    ("plain", "\u200b" * 2000 + "CURRENT", ""),
+    ("plain", "\u200b\nOn a date wrote:\n> HISTORY", ""),
+], ids=["comment", "tail", "clipped", "before-quote"])
+def test_normalized_retained_range_at_http(journey, kind, content, body):
+    trial, _, requests, _ = journey(mixed((kind, content)), "否")
+    assert json.loads(json.loads(requests[0])["messages"][0]["content"])["body"] == body
+    trial.poll()
+    assert trial.store.row("SELECT verdict FROM registration")[0] == ("否" if body else "拿不准")
+    assert len(requests) == (1 if body else 2)

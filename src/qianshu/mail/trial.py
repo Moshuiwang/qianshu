@@ -57,11 +57,11 @@ class Trial:
     def box(self):
         return self.store.row("SELECT * FROM mailbox WHERE scope=?", self.scope)
 
-    def read(self, mailbox, uid, expected=None, *, original=False):
+    def read(self, mailbox, uid, expected=None):
         seen = mailbox.read_seen(uid)
         if self.seen.setdefault(uid, seen) != seen or (expected is not None and seen != expected):
             raise MailError("已读位置或状态变化。")
-        return read_segmented(mailbox, uid, seen, original=original)
+        return read_segmented(mailbox, uid, seen)
 
     def poll(self):
         if not self.enabled():
@@ -76,6 +76,9 @@ class Trial:
             self.seen = {}
             try:
                 self.scan(mailbox, state)
+            except MailError:
+                self.store.freeze(self.scope, "mapping")
+                self.flush()
             finally:
                 for uid, seen in self.seen.items():
                     try:
@@ -105,15 +108,15 @@ class Trial:
         if box["state"] == "frozen" or validity != box["validity"] or next_uid < box["peak"]:
             if box["state"] != "frozen":
                 self.store.freeze(self.scope, "generation")
-            originals = bool(self.store.uncovered(self.scope))
+            if self.store.uncovered(self.scope):
+                self.flush()
+                return
             entries = []
-            boundary = self.store.row("""SELECT initial FROM snapshot WHERE scope=? AND generation=1
-                AND validity=?""", self.scope, validity) if originals else None
-            for uid in mailbox.interval(boundary[0] if boundary else 1, next_uid - 1):
+            for uid in mailbox.interval(1, next_uid - 1):
                 if not self.enabled():
                     return
                 try:
-                    item, _ = self.read(mailbox, uid, original=originals)
+                    item, _ = self.read(mailbox, uid)
                 except MailError:
                     item = MailItem(None, None, None, None, {})
                 entries.append((uid, replace(item, fields={})))

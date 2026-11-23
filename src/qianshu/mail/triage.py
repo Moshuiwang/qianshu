@@ -18,6 +18,10 @@ def _structure_line(line: str) -> str:
     return ""
 
 
+def has_body(text: str) -> bool:
+    return any(_structure_line(line) for line in text.splitlines())
+
+
 def _is_quote_line(line: str) -> bool:
     following = line[1:2]
     return line.startswith((">", "＞")) and following != "=" and not following.isdigit()
@@ -30,10 +34,13 @@ class MailItem:
     candidate: str | None
     attachments: int | None
     fields: dict = field(repr=False)
-    original: tuple[str, str] | None = None
 
 
 class _StyledHTML(_HTMLText):
+    def handle_comment(self, text):
+        if has_body(text):
+            super().handle_comment(text)
+
     def handle_starttag(self, tag, attrs):
         if tag in {"link", "style"} or any(key == "style" for key, _ in attrs):
             self.uncertain = True
@@ -51,9 +58,10 @@ def _triage_reply(kind, content):
         parser = _StyledHTML(authored_only=True)
         parser.feed(content)
         parser.close()
-        if parser.uncertain or parser.excluded or "".join(parser.tail).strip():
+        tail_has_body = has_body("".join(parser.tail))
+        if parser.uncertain or parser.excluded or tail_has_body:
             open_boundary = any(_opens_boundary(_structure_line(line)) for line in parser.get_text().splitlines())
-            return "", bool(open_boundary or parser.excluded or "".join(parser.tail).strip())
+            return "", bool(open_boundary or parser.excluded or tail_has_body)
         content = parser.get_text()
         structured_quote = parser.structured_quote
 
@@ -61,6 +69,12 @@ def _triage_reply(kind, content):
     structure = [_structure_line(line) for line in lines]
     while structure and not structure[-1]:
         structure.pop()
+
+    def retained(end):
+        if not any(structure[:end]):
+            return ""
+        return "\n".join(lines[:end]).strip()
+
     for index, stripped in enumerate(structure):
         if _is_quote_line(stripped):
             return "", any(_opens_boundary(line) for line in structure[index + 1:])
@@ -70,11 +84,11 @@ def _triage_reply(kind, content):
                 offset += 1
             quoted = structure[offset:]
             if (quoted or structured_quote) and all(_is_quote_line(item) for item in quoted):
-                return "\n".join(lines[:index]).strip(), True
+                return retained(index), True
             return "", True
         if _HEADER_FIELD.match(stripped) or _UNKNOWN_DIVIDER.match(stripped):
             return "", True
-    return "\n".join(lines).strip(), False
+    return retained(len(structure)), False
 
 
 def triage_fields(msg, selected, preferred):
@@ -95,7 +109,8 @@ def triage_fields(msg, selected, preferred):
             confirmed.append(text)
         if boundary:
             break
-    return dict(display_name=display, domain=domain, subject=subject, body="\n".join(confirmed)[:2000])
+    body = "\n".join(confirmed)[:2000]
+    return dict(display_name=display, domain=domain, subject=subject, body=body if has_body(body) else "")
 
 
 def _options(config):

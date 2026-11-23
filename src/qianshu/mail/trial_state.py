@@ -42,9 +42,6 @@ CREATE TABLE IF NOT EXISTS registration(
  sender_length INTEGER, subject_length INTEGER, due TEXT, parse_day TEXT);
 CREATE INDEX IF NOT EXISTS trial_identity ON registration(scope,msgkey);
 CREATE INDEX IF NOT EXISTS trial_candidate ON registration(scope,candidate);
-CREATE TABLE IF NOT EXISTS original_index(
- registration INTEGER PRIMARY KEY, digest TEXT NOT NULL, candidate TEXT NOT NULL, validity INTEGER NOT NULL, uid INTEGER NOT NULL);
-CREATE INDEX IF NOT EXISTS original_candidate ON original_index(candidate);
 CREATE TABLE IF NOT EXISTS trial_target(id INTEGER PRIMARY KEY CHECK(id=1), fingerprint TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS trial_folder(scope TEXT PRIMARY KEY, folder TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS card_intent(
@@ -208,10 +205,10 @@ class Store:
             self._freeze(scope, reason)
 
     def uncovered(self, scope):
-        return self.row("""SELECT 1 FROM registration r WHERE r.scope=? AND (r.digest LIKE '1:%' OR r.digest IS NULL)
-            AND NOT EXISTS (SELECT 1 FROM original_index o JOIN reconciliation c
-            ON c.matched=o.registration AND c.digest=o.digest AND c.candidate=o.candidate
-            WHERE o.registration=r.id AND c.scope=r.scope AND c.msgkey=r.msgkey) LIMIT 1""", scope)
+        # 旧归档补出的索引无法证明登记当时的身份，只认登记本身的 v2 证据。
+        return self.row("""SELECT 1 FROM registration WHERE scope=? AND
+            (digest IS NULL OR digest NOT LIKE '2:%' OR candidate IS NULL OR candidate NOT LIKE '2:%')
+            LIMIT 1""", scope)
 
     def register(self, scope, generation, uid, item, *, seen=None):
         with self.write() as db:
@@ -221,15 +218,13 @@ class Store:
             if not loc or loc["status"] != "pending":
                 raise Hold()
             key, digest, candidate = item.key, item.digest, item.candidate
-            same = list(db.execute("""SELECT r.*,coalesce(o.digest,r.digest) effective_digest FROM registration r
-                LEFT JOIN original_index o ON o.registration=r.id WHERE r.scope=? AND r.msgkey=?""", (scope, key)))
-            related = list(db.execute("""SELECT r.* FROM registration r LEFT JOIN original_index o ON o.registration=r.id
-                WHERE r.scope=? AND (r.candidate=? OR o.candidate=?) AND r.msgkey IS NOT ?""",
-                                      (scope, candidate, candidate, key)))
+            same = list(db.execute("SELECT * FROM registration WHERE scope=? AND msgkey=?", (scope, key)))
+            related = list(db.execute("""SELECT * FROM registration WHERE scope=? AND candidate=?
+                AND msgkey IS NOT ?""", (scope, candidate, key)))
             reason = None
             if not key or related:
                 reason = "duplicate"
-            if not digest or any(r["effective_digest"] != digest or r["status"] == "frozen" for r in same):
+            if not digest or any(r["digest"] != digest or r["status"] == "frozen" for r in same):
                 reason = "conflict"
             if same and not reason:
                 reg = same[0]["id"]
@@ -386,17 +381,8 @@ class Store:
             generation = box["generation"]
             observations = []
             for uid, item in entries:
-                if item.original:
-                    # 同一 UIDVALIDITY 下原登记的位置、旧内容证明与本轮完整回读三者同时成立。
-                    verified = list(db.execute("""SELECT DISTINCT r.id FROM registration r JOIN location l
-                        ON l.registration=r.id JOIN snapshot s ON s.scope=l.scope AND s.generation=l.generation
-                        WHERE r.scope=? AND r.msgkey=? AND r.digest=? AND r.candidate=?
-                        AND l.uid=? AND s.validity=?""", (scope, item.key, *item.original, uid, validity)))
-                    if len(verified) == 1:
-                        db.execute("INSERT OR IGNORE INTO original_index VALUES(?,?,?,?,?)",
-                                   (verified[0][0], item.digest, item.candidate, validity, uid))
-                matches = list(db.execute("""SELECT r.id,r.status FROM registration r LEFT JOIN original_index o
-                    ON o.registration=r.id WHERE r.scope=? AND r.msgkey=? AND coalesce(o.digest,r.digest)=?""", (scope, item.key, item.digest)))
+                matches = list(db.execute("""SELECT id,status FROM registration WHERE scope=?
+                    AND msgkey=? AND digest=?""", (scope, item.key, item.digest)))
                 match = matches[0][0] if len(matches) == 1 and matches[0][1] != "frozen" else None
                 observations.append((uid, item.key, item.digest, item.candidate, item.attachments, match))
             old = [tuple(r) for r in db.execute("""SELECT uid,msgkey,digest,candidate,attachments,matched
@@ -408,47 +394,8 @@ class Store:
                 db.executemany("""INSERT INTO reconciliation(scope,generation,uid,msgkey,digest,candidate,attachments,matched)
                     VALUES(?,?,?,?,?,?,?,?)""",
                                ((scope, generation, *data) for data in observations))
-            if self.uncovered(scope):
-                count = db.execute("""UPDATE reconciliation SET reason='duplicate' WHERE scope=? AND generation=?
-                    AND matched IS NULL AND reason IS NULL""", (scope, generation)).rowcount
-                if count:
-                    self.notice(f"uncovered:{scope}:{generation}", scope, None, "duplicate", count)
             db.execute("""UPDATE mailbox SET generation=?,validity=?,cursor=?,peak=?,reason='reconciling'
                 WHERE scope=?""", (generation, validity, cursor, cursor, scope))
-
-    def index_archived_original(self, scope, generation, reg, archive, folder, uid):
-        """人工对账使用本账户独立留存的原代只读邮箱。只补索引，解冻仍走 reconcile。"""
-        from .segmented import read_segmented
-
-        validity, cursor, _ = archive.snapshot(folder)
-        original = self.row("""SELECT r.msgkey,r.digest,r.candidate FROM registration r
-            JOIN location l ON l.registration=r.id AND l.scope=r.scope
-            JOIN snapshot s ON s.scope=l.scope AND s.generation=l.generation
-            JOIN mailbox m ON m.scope=r.scope JOIN trial_folder f ON f.scope=m.scope
-            WHERE r.id=? AND r.scope=? AND r.digest LIKE '1:%' AND f.folder=?
-            AND l.uid=? AND s.validity=? AND m.validity!=s.validity
-            AND m.state='frozen' AND m.reason='reconciling' AND m.generation=?""",
-                            reg, scope, _fingerprint(folder), uid, validity, generation)
-        if not original:
-            raise Hold()
-        item, _ = read_segmented(archive, uid, archive.read_seen(uid), original=True)
-        if (archive.snapshot(folder)[:2] != (validity, cursor) or item.key != original["msgkey"]
-                or item.original != (original["digest"], original["candidate"])):
-            raise Hold()
-        with self.write() as db:
-            if not self.row("""SELECT 1 FROM mailbox WHERE scope=? AND state='frozen'
-                    AND reason='reconciling' AND generation=?""", scope, generation):
-                raise Hold()
-            matched = db.execute("""UPDATE reconciliation SET matched=?,reason=NULL WHERE scope=?
-                AND generation=? AND msgkey=? AND digest=? AND candidate=? AND attachments IS ?
-                AND (matched IS NULL OR matched=?)""",
-                                 (reg, scope, generation, item.key, item.digest, item.candidate, item.attachments, reg))
-            if not matched.rowcount:
-                raise Hold()
-            db.execute("INSERT OR IGNORE INTO original_index VALUES(?,?,?,?,?)", (reg, item.digest, item.candidate, validity, uid))
-            if not self.row("SELECT 1 FROM original_index WHERE registration=? AND digest=? AND candidate=?",
-                            reg, item.digest, item.candidate):
-                raise Hold()
 
     def reconcile(self, scope, generation, validity, cursor):
         with self.write() as db:

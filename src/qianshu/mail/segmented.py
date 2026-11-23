@@ -1,14 +1,13 @@
 """试运行的一轮只读分段响应。正文选择和解码由旧收信入口完成。"""
 
 import hashlib
-import json
 import re
 from email.errors import MessageError
 
 from . import _fingerprint
-from .imap import MailError
-from .message import body_parts, headers, message_id, request_text, sender
-from .triage import MailItem, triage_fields
+from .imap import MailError, _number
+from .message import body_parts, headers, message_id, request_text
+from .triage import MailItem, has_body, triage_fields
 
 
 def _frame(digest, value):
@@ -22,13 +21,12 @@ def _frame(digest, value):
 
 
 class _Read:
-    def __init__(self, mailbox, uid, seen, original):
+    def __init__(self, mailbox, uid, seen):
         self.mailbox, self.uid, self.seen = mailbox, uid, seen
         self.tree = None
         self.mime = {}
         self.payloads = {}
         self.selected = []
-        self.proof_leaves = {} if original else None
 
     def fetch(self, section):
         raw = self.mailbox.checked_section(self.uid, section)
@@ -43,8 +41,6 @@ class _Read:
 
     def payload(self, path):
         raw = self.fetch(path)
-        if self.proof_leaves is not None and (path != "TEXT" or not isinstance(self.tree[0], list)):
-            self.proof_leaves[path] = raw
         self.payloads[path] = (str(len(raw)), hashlib.sha256(raw).digest())
         return raw
 
@@ -109,81 +105,8 @@ def _related_root(children, params, read, prefix):
     return matches[0][0]
 
 
-def _original_proof(outer, read, visible):
-    """按旧摘要分帧，只为能由实读各段逐字节核实的归档生成证明。"""
-    proof = hashlib.sha256(b"mime-v1")
-    wire = hashlib.sha256()
-
-    def frame(*chunks):
-        proof.update(sum(map(len, chunks)).to_bytes(8, "big"))
-        for chunk in chunks:
-            proof.update(chunk)
-
-    def visit(node, path, mime, header):
-        for name in ("Content-Type", "Content-Disposition", "Content-Transfer-Encoding", "Content-ID"):
-            values = mime.get_all(name, [])
-            if len(values) > 1 or any(value.defects for value in values):
-                return False
-        kind = mime.get_content_type()
-        encoding = mime.get("Content-Transfer-Encoding", "7bit").lower()
-        if encoding not in {"7bit", "8bit", "binary"} and (
-                isinstance(node[0], list) or encoding not in {"base64", "quoted-printable"}):
-            return False
-        params = [(k, v) for k, v in (mime.get_params() or [])[1:] if k.lower() != "boundary"]
-        fields = [(k.lower(), str(v)) for k, v in mime.items() if k.lower().startswith("content-")
-                  and k.lower() not in {"content-type", "content-transfer-encoding"}]
-        frame(json.dumps([kind, params, fields]).encode())
-        if path:
-            wire.update(header)
-        if isinstance(node[0], list):
-            children = []
-            for child in node:
-                if not isinstance(child, list):
-                    break
-                children.append(child)
-            if (kind not in {"multipart/mixed", "multipart/alternative", "multipart/related"}
-                    or not mime.get_boundary() or mime.get_filename() is not None
-                    or mime.get_content_disposition() not in (None, "inline")):
-                return False
-            delimiter = b"--" + mime.get_boundary().encode("ascii")
-            # 旧格式分别登记序言、尾声与子段数。这里的空值须由整段 TEXT 摘要证实。
-            frame(b"")
-            frame(b"")
-            frame(str(len(children)).encode())
-            for i, child in enumerate(children, 1):
-                child_path = f"{path}.{i}" if path else str(i)
-                child_header = read.mime.get(child_path + ".MIME")
-                if child_header is None:
-                    return False
-                wire.update(delimiter + b"\r\n")
-                if not visit(child, child_path, headers(child_header), child_header):
-                    return False
-                wire.update(b"\r\n")
-            wire.update(delimiter + b"--\r\n")
-        else:
-            section = path or "TEXT"
-            payload = read.proof_leaves.get(section)
-            if payload is None or kind.startswith(("message/", "multipart/")):
-                return False
-            wire.update(payload)
-            if section not in visible:
-                if path:
-                    frame(header, payload, b"\r\n")
-                else:
-                    frame(payload)
-            mime.set_payload(payload)
-            frame(mime.get_payload(decode=True))
-            if mime.defects:
-                return False
-        return True
-
-    if visit(read.tree, "", outer, b"") and wire.digest() == read.payloads["TEXT"][1]:
-        return "1:" + proof.hexdigest()
-    return None
-
-
-def read_segmented(mailbox, uid, seen, *, original=False):
-    read = _Read(mailbox, uid, seen, original)
+def read_segmented(mailbox, uid, seen):
+    read = _Read(mailbox, uid, seen)
     complete = False
     try:
         raw = read.fetch("HEADER")
@@ -222,8 +145,9 @@ def read_segmented(mailbox, uid, seen, *, original=False):
                 params = _params(node[n + 1]) if len(node) > n + 1 else {}
                 disp_index = n + 2
             else:
-                if len(node) < 7 or not node[6].isdigit():
+                if len(node) < 7:
                     raise MailError("无法核实邮件段长度。")
+                octets = _number(node[6], zero=True)
                 params = _params(node[2])
                 disp_index = 8
                 if node[0].upper() == b"TEXT":
@@ -257,7 +181,7 @@ def read_segmented(mailbox, uid, seen, *, original=False):
                         return count
             if section not in read.payloads:
                 read.payload(section)
-            if not multi and int(node[6]) != int(read.payloads[section][0]):
+            if not multi and str(octets) != read.payloads[section][0]:
                 raise MailError("邮件段长度与结构不符。")
             if section in chosen and not opaque:
                 visible.add(section)
@@ -276,17 +200,13 @@ def read_segmented(mailbox, uid, seen, *, original=False):
         for path, part in chosen.items():
             _frame(digest, (path, part))
         text = request_text(parts)
-        preferred = "text/plain" if any(k == "text/plain" and s.strip() for k, s in parts) else "text/html"
+        preferred = "text/plain" if any(k == "text/plain" and has_body(s) for k, s in parts) else "text/html"
         fields = triage_fields(outer, (part for path, part in chosen.items() if path in visible), preferred)
         candidate = "2:" + digest.hexdigest()
         _frame(digest, [(k.lower(), v) for k, v in outer.raw_items() if k.lower() == "message-id"])
         key = message_id(outer)
         item = MailItem(_fingerprint(key) if key else None, "2:" + digest.hexdigest(),
                         candidate, attachments, fields)
-        if original:
-            prior = _original_proof(outer, read, visible)
-            if prior:
-                item.original = (prior, _fingerprint(sender(outer), fields["subject"], prior))
         complete = True
         return item, text
     except (AttributeError, IndexError, LookupError, MessageError, ValueError, TypeError, RecursionError, AssertionError):
