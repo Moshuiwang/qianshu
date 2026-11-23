@@ -15,7 +15,6 @@ from contextlib import closing, contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import date
-from itertools import groupby
 from pathlib import Path
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
@@ -222,7 +221,7 @@ def _baseline_header_blocks(body):
     known = False
     end = 0
     field_prefix = ""
-    for line in _PHYSICAL_LINE.finditer(body):
+    for line in re.finditer(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$", body):
         raw = line[0].rstrip("\r\n")
         prefix = _QUOTE_PREFIX.match(raw)
         quote_prefix = prefix[0] if prefix else ""
@@ -243,58 +242,39 @@ def _baseline_header_blocks(body):
         yield start, end
 
 
-@dataclass
-class _HeaderField:
-    depth: int
-    first_line: int
-    last_line: int
-    start: int
-    stop: int
-    known: bool
-
-
 def _header_blocks(body):
-    """从基线遮盖区间中只扣除符合紧邻例外的普通字段首行。"""
+    """只从基线区间首尾扣除紧邻单行引用头的普通字段。"""
     for start, end in _baseline_header_blocks(body):
-        fields = []
-        field_prefix = ""
-        for number, line in enumerate(_PHYSICAL_LINE.finditer(body, start, end)):
+        lines = list(_PHYSICAL_LINE.finditer(body, start, end))
+        single_headers = set()
+        field_prefix = None
+        for index, line in enumerate(lines):
             raw = line[0].rstrip("\r\n")
             prefix = _QUOTE_PREFIX.match(raw)
             quote_prefix = prefix[0] if prefix else ""
             content = raw[len(quote_prefix):]
-            if fields and fields[-1].last_line == number - 1 and (
+            if field_prefix is not None and (
                 content.startswith((" ", "\t")) or raw.startswith((field_prefix + " ", field_prefix + "\t"))
             ):
-                fields[-1].last_line = number
+                single_headers.discard(index - 1)
                 continue
-            known = bool(_HEADER.match(raw))
-            if known or _FIELD.match(content):
-                fields.append(_HeaderField(quote_prefix.count(">"), number, number,
-                                           line.start(), line.start() + len(raw), known))
-                field_prefix = quote_prefix
+            known = _HEADER.match(raw)
+            if known and prefix:
+                single_headers.add(index)
+            field_prefix = quote_prefix if known or _FIELD.match(content) else None
 
-        single_line_headers = {
-            field.first_line for field in fields
-            if field.depth and field.known and field.first_line == field.last_line
-        }
-        known_starts = {field.first_line for field in fields if field.known}
-        known_ends = {field.last_line for field in fields if field.known}
+        # 基线区间间至少隔一行未遮盖的原文，故只有首尾行的外侧满足条件。
         cursor = start
-        for depth, group in groupby(fields, key=lambda field: field.depth):
-            if depth:
+        for index, neighbor in ((0, 1), (len(lines) - 1, len(lines) - 2)):
+            if neighbor not in single_headers:
                 continue
-            unquoted = list(group)
-            if any(field.known for field in unquoted):
+            line = lines[index]
+            raw = line[0].rstrip("\r\n")
+            if _QUOTE_PREFIX.match(raw) or _HEADER.match(raw) or not _FIELD.match(raw):
                 continue
-            for field in unquoted:
-                above = field.first_line - 1
-                below = field.first_line + 1
-                if ((above in single_line_headers and below not in known_starts)
-                        or (below in single_line_headers and above not in known_ends)):
-                    if cursor < field.start:
-                        yield cursor, field.start
-                    cursor = field.stop
+            if cursor < line.start():
+                yield cursor, line.start()
+            cursor = line.start() + len(raw)
         if cursor < end:
             yield cursor, end
 

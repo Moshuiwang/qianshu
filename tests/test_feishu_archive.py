@@ -609,11 +609,11 @@ _BASELINE_CASES = (
     ("> Extra: 甲\n\n" + _SCENARIO, (), ()),
     ("\n".join(_NESTED), ((0, 68),), ()),
     ("\r\n".join(_NESTED), ((0, 73),), ()),
-    ("> From: 甲\n" + _SCENARIO + "\n 续行", ((0, 31),), (_SCENARIO,)),
+    ("> From: 甲\n" + _SCENARIO + "\n 续行", ((0, 31),), ()),
     (_SCENARIO + "\r\n>> \t折行\r\n>> Subject: 甲", ((0, 40),), ()),
     (_SCENARIO + "\n" + _QUOTED_FROM, ((0, 35),), (_SCENARIO,)),
     (_QUOTED_FROM + "\n" + _SCENARIO, ((0, 35),), (_SCENARIO,)),
-    ("> fRoM: 合成甲\r\nScenario: 合成明细\r\nX-Internal: 合成内部字段值", ((0, 48),), ("Scenario: 合成明细",)),
+    ("> fRoM: 合成甲\r\nScenario: 合成明细\r\nX-Internal: 合成内部字段值", ((0, 48),), ()),
     ("> fRoM: 合成甲\r\n>>\t合成折行\r\nX-Internal: 合成内部字段值", ((0, 41),), ()),
     ("Subject: 甲\n" + _SCENARIO + "\n" + _QUOTED_FROM, ((0, 46),), ()),
 )
@@ -720,3 +720,28 @@ def test_required_field_neighbor_matrix(setup, above, below):
 
     actual_mask = {i for left, right in a._header_blocks(body) for i in range(left, right)}
     assert actual_mask == expected_mask
+
+
+def test_baseline_header_blocks_match_frozen_spans():
+    for body, spans, _ in _BASELINE_CASES:
+        assert tuple(a._baseline_header_blocks(body)) == spans
+    for above, row in zip(_ABOVE, _NEIGHBOR_BASELINE, strict=True):
+        for below, spans in zip(_BELOW, row, strict=True):
+            assert tuple(a._baseline_header_blocks(_neighbor_body(above, below))) == spans
+
+
+@pytest.mark.parametrize("lines", [
+    ("> From: 甲", _MATRIX_FIELD, "> X-Internal: 合成同层字段", "> Subject: 乙"),
+    ("> Subject: 乙", "> X-Internal: 合成同层字段", _MATRIX_FIELD, "> From: 甲"),
+    ("> From: 甲", _MATRIX_FIELD, ">> X-Internal: 合成字段", ">>  合成续行", ">> Subject: 乙"),
+    (">> Subject: 乙", ">> X-Internal: 合成字段", ">>  合成续行", _MATRIX_FIELD, "> From: 甲"),
+])
+def test_masked_neighbor_keeps_required_field_private(setup, lines):
+    body = "\r\n".join(lines)
+    batch, _, _, stub, register, run = setup
+    batch = excerpt_batch(batch, "使用场景", body, "合成内部字段值")
+    register(batch)
+    transport = Mock(wraps=stub)
+    assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
+    transport.request.assert_not_called()
+    assert list(a._header_blocks(body)) == [(0, len(body))]
