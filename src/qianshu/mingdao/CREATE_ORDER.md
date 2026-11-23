@@ -99,9 +99,9 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 
 原格式 X5 启动时读取运行配置和授权登记。以下任一信号存在即返回固定原因「050 配置已禁用原格式 X5 入口」，此时明道云请求和写入均为零。判据按键或文件是否存在判断，空名单也生效。
 
-- 运行目录内存在 `.private/trial-config.json`，或命令指定的配置含 `trial`。
-- 配置含 `official.tag_search`、050 网页字段标签，或 `order_snapshot` 中的 `web_rules`、`verified_combinations`、`concurrent_policies`、`condition_scenario`、`tariffs`、`upgrade_tasks`、`upgrade_task_id`、`template_sources`、`member_names`。
-- 私有授权登记中任一条含 `tag_scope`、`concurrent_scope` 或 `web_rules_sha256`。
+- 代码所在仓库根目录或当前运行目录内存在 `.private/trial-config.json`，或命令指定的配置含 `trial`。
+- 配置含 `official.tag_search`、`official.tariffs`、`official.tasks`、050 网页字段标签，或 `order_snapshot` 中的 `web_rules`、`verified_combinations`、`concurrent_policies`、`condition_scenario`、`tariffs`、`upgrade_tasks`、`upgrade_task_id`、`template_sources`、`member_names`。
+- 私有授权登记中任一条含 `tag_scope`、`concurrent_scope`、`tariffs_scope`、`tasks_scope` 或 `web_rules_sha256`。
 
 序 2a 和正式单由 #154 共同核验邮件审批、绑定预览、确认有效同意、存档并交接建单。序 2a 不能调用旧 X5 或复制模板审批链接。X7 删除另验当次授权与通知登记。
 
@@ -114,3 +114,6 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 - 适用条件选项键和显示名须与当前模板相同。展示和资费定位共用已核实的计划。关联计划取平台关联行的标识和全名，资费行须有对应的 `price_plan_id`、业务全名及生效区间。标量计划直接核模板关联行内的值。
 - 交接前在登录态读取之后复核所选标签标识、全名及全名唯一性。最后一次查询和写入间仍可能发生改名。逐条官方回读同时核实际关联标识及标签表当前全名，差异写入私有报告，建单资格保持锁定，保留记录交人工。关联分页仅有总数、首屏未达总数且缺少页码和续页信号时记为未确认。
 - `template_sources` 登记模板复制及工作流控件的类型与显示名，`member_names` 登记成员标识对应的业务名。逐项确认后才进入 D15。真实组合放行、工作流回填、同期命中率及平台完整读取能力须另行取证。
+- 出卡和交接均从当次登记的 `tariffs_scope` 核对当前资费表。全表视图、分页版本和列绑定须能证明节目包、计划标识与全名、生效区间和周期。按资费计算金额时同时核对价格和版本。指定目标包的升包任务从 `tasks_scope` 登记的行和状态列回读，并核对公司与目标包。
+- 全表唯一性核实后，交接前按所选标签 ID 逐条读取全名。最后一条平台查询返回后，再检查本地授权、配置（含放行名单）及其余本地来源。
+- 卡片预览在私有目录保存请求值与业务显示值。申请人成员名先与模板官方成员对象核对。回读逐字段比较选项键与显示名、关联 ID 与名称、价格计划及成员。确认与卡片不同记「写错」，缺证或无法解析记「未确认」。单内任一字段写错即整单写错。私有回读报告、台账和返回对象的 `conclusion` 提供整单结论，供 #154 接入停写和告警。

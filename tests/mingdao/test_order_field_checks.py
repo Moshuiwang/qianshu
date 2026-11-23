@@ -1,4 +1,5 @@
 """建单来源与回读的合成验收。"""
+from copy import deepcopy
 import json
 
 import httpx
@@ -197,6 +198,19 @@ def web_order(case, platform, business_cli, monkeypatch, registered_entry):
         **case.evidence["tag_scope"], "path": case.config["official"]["search"]["path"], "view": "all-policies",
         "columns": {name: name for name in ("name", "company", "end", "created_at")},
     }
+    case.rate_rows = deepcopy(snapshot["tariffs"])
+    case.task_rows = {}
+    case.readback_change = lambda row: None
+    case.target_reads = []
+    platform.template[case.control["member"]] = [{"accountId": case.ids["member"], "name": "登记申请人"}]
+    scope = case.evidence["tag_scope"]
+    for table in ("tariffs", "tasks"):
+        path = f"/v3/app/worksheets/{table}/rows/" + ("list" if table == "tariffs" else "{record_id}")
+        case.config["official"][table] = {"path": path}
+        case.evidence[table + "_scope"] = {"path": path, "origin": scope["origin"], "app_sha256": scope["app_sha256"]}
+    case.evidence["tariffs_scope"].update(view="全部资费", snapshot="第一版", coverage="full_table",
+        columns={k: k for k in ("package", "price_plan", "price_plan_id", "start", "end", "unit")})
+    case.rate_rows[0]["price_plan_id"] = None
     case.tag_version = "第一版"
     queries = []
     check_cards = []
@@ -207,6 +221,15 @@ def web_order(case, platform, business_cli, monkeypatch, registered_entry):
     case.review_cards = check_cards
     base = platform.official
     def exchange(request):
+        path = request.url.path
+        if path == case.config["official"]["tariffs"]["path"]:
+            return platform.response({"rows": [{"rowId": case.ids["package"], **r} for r in case.rate_rows],
+                                      "total": len(case.rate_rows), "snapshotVersion": "第一版"})
+        if path.startswith("/v3/app/worksheets/tasks/rows/"):
+            return platform.response(case.task_rows[path.split("/")[-1]])
+        if path == case.config["official"]["tag_search"]["path"].removesuffix("list") + case.ids["tag"]:
+            case.target_reads.append((events(case)[-1], platform.create_count))
+            return platform.response(rows[0])
         if (request.url.path == case.config["official"]["search"]["path"]
                 and json.loads(request.content)["viewId"] == "all-policies"):
             candidates = snapshot["concurrent_policies"]["rows"]
@@ -222,6 +245,20 @@ def web_order(case, platform, business_cli, monkeypatch, registered_entry):
             payload = response.json()
             payload["data"]["total"] = len(payload["data"]["rows"])
             return httpx.Response(200, json=payload)
+        if (response.json().get("success") and request.method == "GET"
+                and path.endswith("/" + case.ids["created"])):
+            row = response.json()["data"]
+            for key, cell in platform.template.items():
+                spec = case.config["fields"].get(key, {})
+                if spec.get("type") in (9, 10, 11, 26) and key in row and row[key] not in ("", "[]"):
+                    if key != case.control["status"]:
+                        row[key] = cell
+            concurrent = field_rules["同期有效优惠政策"]["control"]
+            if row[concurrent] != "[]":
+                row[concurrent] = [{"政策": [{"sid": r["id"], "name": r["name"]}]}
+                    for r in snapshot["concurrent_policies"]["rows"] if r["company"] == case.values["company"]]
+            case.readback_change(row)
+            return platform.response(row)
         return response
     from functools import partial
     monkeypatch.setattr(httpx, "Client", partial(httpx.Client.func, transport=httpx.MockTransport(exchange)))
@@ -393,7 +430,7 @@ def test_web_nonempty_concurrent_at_date_boundary(case, platform, business_cli, 
     assert "同日结束" in business_cli.summaries[0] and "其他主体" not in business_cli.summaries[0]
 
 
-def test_web_task_reads_unique_status_column(case, platform, business_cli, web_order):
+def task_export(case, platform, web_order):
     rules, _, _ = web_order
     offer_export(case, platform, "升级权益")
     target = "合成目标包"
@@ -412,6 +449,15 @@ def test_web_task_reads_unique_status_column(case, platform, business_cli, web_o
     export = private_export(case.values)
     text = "合成当前包可获合成受赠包"
     replace_order_quotes(export, "packages", text, [(0, len(text))])
+    task, = snapshot["upgrade_tasks"]
+    case.task_rows[task["id"]] = {"rowId": task["id"], **task}
+    case.evidence["tasks_scope"].update(record_id=task["id"], columns={"package": "package", "company": "company", "status": "状态"})
+    return export
+
+
+def test_web_task_reads_unique_status_column(case, platform, business_cli, web_order):
+    rules, _, _ = web_order
+    export = task_export(case, platform, web_order)
     assert business_cli.run(export) == (0, "")
     assert platform.created_cells[rules["升包执行任务状态值"]["control"]] == "待执行"
 
@@ -647,6 +693,7 @@ def test_billing_uses_platform_plan(case, platform, business_cli, web_order, reg
     platform.relations[control][0][price] = [{"sid": plan, "name": "月计划"}]
     rate, = case.config["order_snapshot"]["tariffs"]
     rate.update(price_plan=registered, price_plan_id=plan if matched_id else case.ids["tag"], unit=registered[0])
+    case.rate_rows[0].update(price_plan="月计划", price_plan_id=plan, unit="月")
     code, _ = business_cli.run()
     if registered == "日计划" or not matched_id:
         assert code == 1 and platform.create_count == 0
@@ -723,3 +770,125 @@ def test_legacy_x5_refuses_trial_configuration(case, platform, business_cli, mar
     code, error = business_cli.run()
     assert (code, error) == (1, "已停止：050 配置已禁用原格式 X5 入口\n")
     assert platform.actions == [] and platform.create_count == 0
+
+
+@pytest.mark.parametrize("source", ["authorization", "allowlist"])
+def test_final_query_revocation(case, platform, business_cli, web_order, monkeypatch, source):
+    original = order.Official.tag_index
+    def query(api, *args, **kwargs):
+        result = original(api, *args, **kwargs)
+        if business_cli.summaries and "create_attempt" in events(case):
+            path = case.private / ("config.json" if source == "allowlist" else "create-authorizations.json")
+            data = json.loads(path.read_bytes())
+            if source == "allowlist":
+                data["order_snapshot"]["verified_combinations"] = []
+            else:
+                data.clear()
+            path.write_text(json.dumps(data))
+        return result
+    monkeypatch.setattr(order.Official, "tag_index", query)
+    assert business_cli.run()[0] == 1 and platform.create_count == 0
+    assert events(case)[-1] == "approval_closed"
+
+
+@pytest.mark.parametrize("source", ["rate", "task", "member"])
+def test_current_platform_field_source(case, platform, business_cli, web_order, source):
+    export = None
+    if source == "rate":
+        case.rate_rows[0]["unit"] = "月"
+    elif source == "task":
+        export = task_export(case, platform, web_order)
+        platform.before_search = lambda: case.task_rows[case.ids["created"]].update(状态="已取消")
+    else:
+        platform.template[case.control["member"]][0]["name"] = "其他申请人"
+    assert business_cli.run(export)[0] == 1 and platform.create_count == 0
+    assert bool(business_cli.summaries) == (source == "task")
+
+
+def test_deployment_marker_outside_cwd(case, platform, business_cli, monkeypatch):
+    root = case.private.parent / "deployment"
+    marker = root / ".private"
+    marker.mkdir(parents=True)
+    (root / "rules").symlink_to(order.Path(order.__file__).resolve().parents[3] / "rules")
+    (marker / "trial-config.json").touch()
+    monkeypatch.setattr(order, "__file__", str(root / "src/qianshu/mingdao/create_order.py"))
+    monkeypatch.setattr(order, "Official", lambda *args: pytest.fail("原格式入口已构造明道云客户端"))
+    assert business_cli.run() == (1, "已停止：050 配置已禁用原格式 X5 入口\n")
+    assert platform.actions == []
+
+
+@pytest.mark.parametrize("field", ["tag", "cycle", "condition", "member", "plan", "missing_name", "bad_number"])
+def test_confirmed_business_readback(case, platform, business_cli, web_order, monkeypatch, field):
+    returned = []
+    run_order = order.run_order
+
+    def record_result(*args, **kwargs):
+        result = run_order(*args, **kwargs)
+        returned.append(result.conclusion)
+        return result
+
+    monkeypatch.setattr(order, "run_order", record_result)
+    rules, tags, _ = web_order
+    if field == "tag":
+        platform.before_handoff = lambda: tags[0].update(全名="改名")
+    elif field in ("cycle", "bad_number"):
+        case.readback_change = lambda row: row.update({rules["billingCycle"]["control"]: "0" if field == "cycle" else "?"})
+    elif field == "condition":
+        case.readback_change = lambda row: row[rules["标签与适用条件关系"]["control"]][0].update(value="有适用条件")
+    elif field == "plan":
+        key = case.control["packages"]
+        price = case.child["price"]
+        plan = case.ids["template"]
+        case.config["fields"][key]["children"][price] = {
+            "type": 29, "business_names": {order.compact([{"sid": plan}]): "月计划"}}
+        platform.relations[key][0][price] = [{"sid": plan, "name": "月计划"}]
+        case.config["order_snapshot"]["tariffs"][0].update(price_plan="月计划", price_plan_id=plan, unit="月")
+        case.rate_rows[0].update(price_plan="月计划", price_plan_id=plan, unit="月")
+        def changed(control, rows):
+            if control == key:
+                rows[0][price][0]["name"] = "其他计划"
+            return platform.relation_response(rows)
+        platform.created_relation_response = changed
+    else:
+        def member(row):
+            cell = row[case.control["member"]][0]
+            if field == "missing_name":
+                del cell["name"]
+            else:
+                cell["name"] = "其他申请人"
+        case.readback_change = member
+    assert business_cli.run()[0] == 1 and platform.create_count == 1
+    assert "delete" not in platform.actions
+    report = json.loads(next(case.private.glob("create-readback-*")).read_bytes())
+    conclusion = "未确认" if field in ("missing_name", "bad_number") else "写错"
+    assert returned == [conclusion]
+    assert report["结论"] == conclusion
+    assert [r["结论"] for r in report["逐项核对"] if r["结论"] != "一致"] == [conclusion]
+    assert json.loads((case.private / "trial-orders.jsonl").read_text().splitlines()[-1])["结论"] == conclusion
+
+
+@pytest.mark.parametrize(("field", "text", "span"), [
+    ("recharge_amount", "固定实付－8元", (5, 6)), ("recharge_days", "充值1300天", (3, 5)),
+])
+def test_complete_numeric_evidence(case, platform, business_cli, web_order, field, text, span):
+    export = offer_export(case, platform, "特价优惠") if field == "recharge_amount" else private_export(case.values)
+    replace_order_quotes(export, field, text, [span])
+    assert business_cli.run(export)[0] == 1 and platform.create_count == 0
+
+
+def test_handoff_targeted_tag_read(case, platform, business_cli, web_order):
+    assert business_cli.run() == (0, "")
+    assert ("create_attempt", 0) in case.target_reads
+
+@pytest.mark.parametrize(("text", "excerpt", "value", "complete"), [
+    ("金额，＋１，３００．５０元", "＋１，３００．５０", 1300.5, True),
+    ("金额＋１，３００．５０元", "３００．５０", 300.5, False),
+    ("倍数＋．５", "＋．５", 0.5, True),
+    ("赠送三十一天", "三十", 30, False),
+    ("赠送若干天", "若干", 30, False),
+])
+def test_number_token_at_original_coordinates(text, excerpt, value, complete):
+    sources = order.Sources([order.SourceBlock(id="body", source_id="body", start=0, text=text)])
+    start = text.index(excerpt)
+    quote = {"span": {"source_id": "body", "start": start, "end": start + len(excerpt)}, "text": excerpt}
+    assert order.complete_number_in_source(value, quote, sources) is complete
