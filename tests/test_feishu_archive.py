@@ -6,6 +6,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date
+from unittest.mock import Mock
 
 import pytest
 
@@ -374,10 +375,39 @@ def excerpt_batch(batch, field, context, quote):
     return replace(batch, body=body, policies=(a.ArchivePolicy("定向政策", (fields,)),))
 
 
+def test_thread_topic_fold_blocks_even_with_previously_matching_preview(setup):
+    batch, _, cfg, _, register, run = setup
+    detail = "模拟折行"
+    plain = excerpt_batch(batch, "使用场景", detail, detail)
+    old_preview = a.preview_archive_batch(plain, config=cfg)
+    context = "> Thread-Topic: 模拟字段\r\n> \t" + detail
+    batch = excerpt_batch(batch, "使用场景", context, detail)
+    register(batch, preview_fingerprint=old_preview.fingerprint)
+    transport = Mock()
+    assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
+    transport.request.assert_not_called()
+    with pytest.raises(ValueError):
+        a.preview_archive_batch(batch, config=cfg)
+
+
+@pytest.mark.parametrize("anchor", ["tHrEaD-ToPiC", "Thread-Index", "Sent"])
+def test_preview_masks_entire_header_block(setup, anchor):
+    batch, _, cfg, _, _, _ = setup
+    context = (
+        "> Extra!: 甲\r\n>  乙\r\n"
+        f"> {anchor}: 丙\r\n> \t丁\r\n"
+        "> Extra-Tail: 戊\r\n>  己\r\n>\r\nScenario: 可见明细"
+    )
+    batch = excerpt_batch(batch, "使用场景", context, context)
+    preview = a.preview_archive_batch(batch, config=cfg)
+    assert preview.blocks[3].split("　", 1)[1] == "[已脱敏]\r\n>\r\nScenario: 可见明细"
+
+
 @pytest.mark.parametrize("label,quote,allowed", [
     ("> From: synthetic\r\n> \t", "模拟续行", False),
     ("Scenario: ", "仅面向现有用户", True),
-    ("> From: synthetic\r\n> Scenario: ", "仅面向现有用户", True),
+    # 紧跟已知头字段的「标签:」行属于同一头部块，按块遮盖（第 2 轮口径），必需明细缺失即失败。
+    ("> From: synthetic\r\n> Scenario: ", "仅面向现有用户", False),
     (">From: synthetic\r\n> ", "模拟续行", False),
     ("Subject: ", "模拟主题", False),
 ])

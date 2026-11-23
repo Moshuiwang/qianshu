@@ -37,13 +37,16 @@ _JOURNALS = Path(__file__).resolve().parents[3] / ".private" / "archive-journals
 _WAIT = 0.5
 _PAGE = re.compile(r"https://(?:[a-z0-9-]+\.)?feishu\.cn/(wiki|docx)/([a-zA-Z0-9]+)")
 _HEADER = re.compile(
-    r"(?im)^(?P<header_prefix>[ \t>]*)(?:from|to|cc|bcc|subject|date|sender|reply-to|message-id|in-reply-to|references|"
+    r"(?im)^(?P<header_prefix>[ \t>]*)(?:from|to|cc|bcc|subject|date|sent|thread-topic|thread-index|"
+    r"sender|reply-to|message-id|in-reply-to|references|"
     r"received|return-path|delivered-to|mime-version|content-type|content-disposition|"
     r"content-transfer-encoding|content-id|content-language|authentication-results|dkim-signature|"
     r"resent-(?:from|to|cc|bcc|date|sender|message-id)|x-(?:mailer|original-to|forwarded-to)|"
     r"发件人|收件人|抄送|主题|发送时间)[ \t]*[:：]"
     r"[^\r\n]*(?:\r?\n(?:(?P=header_prefix)|(?:[ \t]*>[ ]?+)*)[ \t]+[^\r\n]*)*"
 )
+_QUOTE_PREFIX = re.compile(r"(?:[ \t]*>[ ]?)+")
+_FIELD = re.compile(r"[!-9;-~]+:")  # RFC 5322 ftext
 _ADDRESS = re.compile(r"(?i)https?://[^\s<>]+|[\w.+%-]+@[\w.-]+")
 _DOCS = "/open-apis/docx/v1/documents"
 
@@ -209,6 +212,33 @@ def _token(value):
     return value
 
 
+def _header_blocks(body):
+    """在完整原文上定位连续头部，保留引文所用的字符坐标。"""
+    start = None
+    known = False
+    end = 0
+    field_prefix = ""
+    for line in re.finditer(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$", body):
+        raw = line[0].rstrip("\r\n")
+        prefix = _QUOTE_PREFIX.match(raw)
+        quote_prefix = prefix[0] if prefix else ""
+        content = raw[len(quote_prefix):]
+        known_field = _HEADER.match(raw)
+        if known_field or _FIELD.match(content):
+            if start is None:
+                start = line.start()
+            known |= bool(known_field)
+            field_prefix = quote_prefix
+        elif not (content.startswith((" ", "\t")) or raw.startswith((field_prefix + " ", field_prefix + "\t"))):
+            if known:
+                yield start, end
+            start = None
+            known = False
+        end = line.start() + len(raw)
+    if known:
+        yield start, end
+
+
 def _material(batch, config, registered):
     if not batch.policies or type(batch.utc_date) is not date or not batch.version or not batch.registration:
         raise ValueError
@@ -223,7 +253,7 @@ def _material(batch, config, registered):
     patterns.extend(map(re.escape, sorted(literals, key=len, reverse=True)))
     sensitive = re.compile("(?im:" + "|".join(patterns) + ")")
     fragments = {s[i:i+4] for s in literals for i in range(len(s)-3)}
-    redact = _CardRedaction(batch.body, sensitive, fragments)
+    redact = _CardRedaction(batch.body, sensitive, fragments, source_spans=_header_blocks(batch.body))
     quotes = []
     layout = []
     for number, policy in enumerate(batch.policies, 1):
