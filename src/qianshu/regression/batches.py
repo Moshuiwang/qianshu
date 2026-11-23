@@ -70,9 +70,8 @@ def capture_requests(snapshot, rules, legacy, settings):
     def capture(request):
         wires[token] = request.content.decode("utf-8")
         raise Captured
-    transport = httpx.MockTransport(capture)
-    def http_client(**kwargs):
-        return httpx.Client(transport=transport, **kwargs)
+    def http_client(*, transport=None, **kwargs):
+        return httpx.Client(transport=httpx.MockTransport(capture), **kwargs)
     # 仅替换本地回归进程中这一轮 SDK 的传输，离开上下文即恢复。
     with patch.object(anthropic, "DefaultHttpxClient", http_client):
         model = configured_model({**settings, "ANTHROPIC_API_KEY": "offline-capture"}, max_retries=0)
@@ -328,5 +327,7 @@ def instant_transport(recording):
             raw = request.content.decode("utf-8")
             recording.document["request"] = raw
             recording.document["request_sha256"] = digest(common_body(raw).encode())
-        return factory(**options, event_hooks={"request": [capture]})
+        http_client = factory(**options)
+        http_client.event_hooks["request"].append(capture)
+        return http_client
     return patch.object(anthropic, "DefaultHttpxClient", client)
