@@ -15,6 +15,11 @@ from qianshu.logs import JsonFormatter, JsonStreamHandler, setup_logging
 # 独立列出应脱敏项，避免测试与实现同时跳过被误放行的配置。
 EXPECTED_REDACTED_CONFIG_KEYS = (
     "AI_PLATFORM",
+    "AI_ACTIVE_PROFILE",
+    "AI_BACKUP_PLATFORM",
+    "AI_BACKUP_MODEL",
+    "AI_BACKUP_BASE_URL",
+    "AI_BACKUP_API_KEY",
     "FEISHU_APP_ID",
     "FEISHU_APP_SECRET",
     "FEISHU_CHAT_ID",
