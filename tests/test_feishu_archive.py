@@ -443,13 +443,23 @@ def test_sdk_project_log_hides_document_ids(setup, monkeypatch):
     stream = io.StringIO()
     root = logging.getLogger()
     with monkeypatch.context() as patch:
+        # 与测试顺序无关：其他测试可能全局禁用日志或改动子日志器，这里只在本测试内复位。
+        previous_disable = logging.root.manager.disable
+        logging.disable(logging.NOTSET)
         patch.setattr(root, "handlers", [])
         patch.setattr(root, "level", logging.INFO)
+        for name in ("httpx", "httpcore", "qianshu", "lark_oapi", "Lark"):
+            child = logging.getLogger(name)
+            patch.setattr(child, "disabled", False)
+            patch.setattr(child, "propagate", True)
+            patch.setattr(child, "level", logging.NOTSET)
+            patch.setattr(child, "handlers", [])
         patch.setattr("sys.stderr", stream)
         setup_logging(cfg)
         register()
         assert isinstance(run(transport=None), a.ArchiveSuccess)
         logging.getLogger("httpx").info("ordinary request")
+        logging.disable(previous_disable)
     assert "archive_request " in stream.getvalue()
     assert "ordinary request" in stream.getvalue()
     assert all(s not in stream.getvalue() for s in ("Created", "Target", "/open-apis/"))
