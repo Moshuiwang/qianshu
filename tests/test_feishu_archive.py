@@ -147,7 +147,9 @@ def test_late_summary_ack_cannot_thaw_unknown(setup):
     stub.pause = "Public"
     with ThreadPoolExecutor(1) as pool:
         owner = pool.submit(run)
-        assert stub.landed.wait(3)
+        while not owner.done() and not stub.landed.wait(0.1):
+            continue
+        assert stub.landed.is_set()
         try:
             result = run()
             assert isinstance(result, a.ArchiveUnknown) and not hasattr(result, "url")
@@ -445,21 +447,23 @@ def test_sdk_project_log_hides_document_ids(setup, monkeypatch):
     with monkeypatch.context() as patch:
         # 与测试顺序无关：其他测试可能全局禁用日志或改动子日志器，这里只在本测试内复位。
         previous_disable = logging.root.manager.disable
-        logging.disable(logging.NOTSET)
-        patch.setattr(root, "handlers", [])
-        patch.setattr(root, "level", logging.INFO)
-        for name in ("httpx", "httpcore", "qianshu", "lark_oapi", "Lark"):
-            child = logging.getLogger(name)
-            patch.setattr(child, "disabled", False)
-            patch.setattr(child, "propagate", True)
-            patch.setattr(child, "level", logging.NOTSET)
-            patch.setattr(child, "handlers", [])
-        patch.setattr("sys.stderr", stream)
-        setup_logging(cfg)
-        register()
-        assert isinstance(run(transport=None), a.ArchiveSuccess)
-        logging.getLogger("httpx").info("ordinary request")
-        logging.disable(previous_disable)
+        try:
+            logging.disable(logging.NOTSET)
+            patch.setattr(root, "handlers", [])
+            patch.setattr(root, "level", logging.INFO)
+            for name in ("httpx", "httpcore", "qianshu", "lark_oapi", "Lark"):
+                child = logging.getLogger(name)
+                patch.setattr(child, "disabled", False)
+                patch.setattr(child, "propagate", True)
+                patch.setattr(child, "level", logging.NOTSET)
+                patch.setattr(child, "handlers", [])
+            patch.setattr("sys.stderr", stream)
+            setup_logging(cfg)
+            register()
+            assert isinstance(run(transport=None), a.ArchiveSuccess)
+            logging.getLogger("httpx").info("ordinary request")
+        finally:
+            logging.disable(previous_disable)
     assert "archive_request " in stream.getvalue()
     assert "ordinary request" in stream.getvalue()
     assert all(s not in stream.getvalue() for s in ("Created", "Target", "/open-apis/"))
