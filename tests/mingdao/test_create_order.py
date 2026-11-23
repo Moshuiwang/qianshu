@@ -1746,7 +1746,7 @@ def order_fixture(case, platform):
                "parent_offer_id,offer_level_type,offer_level,status,sale_start_date,sale_end_date")
     package = case.ids["package"]
     case.config["order_snapshot"] = {
-        "version": "synthetic-1", "companies": [{"id": "01", "name": "合成公司", "country": "合成国家"}],
+        "version": "cfgver-1", "companies": [{"id": "01", "name": "合成公司", "country": "合成国家"}],
         "tags": [{"name": name, "id": case.ids["tag"], "end": values["end_date"], "shadow": False}
                  for name in values["user_tags"]],
         "package_levels": "\n".join([columns,
@@ -2178,20 +2178,26 @@ def test_sensitive_write_value_stops_before_approval(case, platform, business_cl
 
 
 @pytest.mark.parametrize("source", ["display", "template", "fragment"])
-def test_credential_stop_announces_manual_handoff(case, platform, business_cli, source):
+def test_credential_stop_announces_manual_handoff(case, platform, business_cli, source, block_external):
     if source == "display":
         case.config["fields"][case.control["user_scope"]]["label"] += case.session_token
     elif source == "template":
         platform.template[case.control["approval_url"]] += "/" + case.official_token
     else:
         case.values["user_scope"] += case.session_token[4:13]
+    if source == "display":
+        block_external()
     code, error = business_cli.run()
     assert code == 1 and "凭据" in error
     assert not business_cli.summaries and platform.create_count == 0
-    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    if source == "display":
+        assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+        assert business_cli.notices == []
+    else:
+        assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
 
 
-def test_unknown_create_reentry_with_credential_conflict(case, platform, business_cli, capsys):
+def test_unknown_create_reentry_with_credential_conflict(case, platform, business_cli, capsys, block_external):
     platform.create_effect = "timeout"
     code, error = business_cli.run()
     assert code == 1 and "需人工对账" in error
@@ -2203,22 +2209,24 @@ def test_unknown_create_reentry_with_credential_conflict(case, platform, busines
         stream.write(f"PLACEHOLDER_EXTRA={case.values['policy_name']}\n")
     before = events(case)
     actions = platform.actions.copy()
+    block_external()
     code = order.main(["--config", str(case.private / "config.json"), "--registration", case.ids["registration"],
                        "--env-file", str(settings), str(case.private / "draft.json")])
 
-    assert code == 1 and "登记编号已使用" in capsys.readouterr().err
+    assert (code, capsys.readouterr().err) == (1, "凭据冲突，已停止，详见私有核对\n")
     assert events(case) == before
     assert platform.actions == actions
     assert platform.create_count == 1
     assert all("未建单" not in message for message in business_cli.notices)
 
 
-def test_fresh_registration_with_credential_conflict(case, platform, business_cli):
+def test_fresh_registration_with_credential_conflict(case, platform, business_cli, block_external):
     case.config["fields"][case.control["user_scope"]]["label"] += case.session_token
+    block_external()
     code, error = business_cli.run()
-    assert code == 1 and "展示字段与凭据冲突" in error
+    assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
     assert not business_cli.summaries and platform.create_count == 0
-    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert business_cli.notices == []
 
 
 def test_unmapped_inactive_control_stops_before_approval(case, platform, business_cli):
@@ -2544,15 +2552,16 @@ def test_package_proof_survives_card_redaction(case, platform, business_cli, mon
 
 
 @pytest.mark.parametrize("key", ["id", "label"])
-def test_contact_credential_collision_announces_fixed_handoff(case, platform, business_cli, monkeypatch, key):
+def test_contact_credential_collision_announces_fixed_handoff(case, platform, business_cli, monkeypatch, key, block_external):
     secret = "synthetic<&>credential" if key == "id" else "synthetic-contact-credential"
     read_settings = order.dotenv_values
     monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": secret})
     case.config["configurator"][key] = secret
+    block_external()
     code, error = business_cli.run()
-    assert code == 1 and "凭据冲突" in error
+    assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
     assert not business_cli.summaries and platform.create_count == 0
-    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert business_cli.notices == []
     assert secret not in error + "".join(business_cli.notices)
 
 
@@ -2632,15 +2641,16 @@ def test_package_quote_retains_at_least_half(case, platform, business_cli, monke
     assert not business_cli.summaries and platform.create_count == 0
 
 
-def test_trimmed_tenant_key_cannot_appear_in_contact(case, platform, business_cli, monkeypatch):
+def test_trimmed_tenant_key_cannot_appear_in_contact(case, platform, business_cli, monkeypatch, block_external):
     secret = "synthetic-tenant-check"
     read_settings = order.dotenv_values
     monkeypatch.setattr(order, "dotenv_values",
                         lambda **kw: {**read_settings(**kw), "FEISHU_TENANT_KEY": " " + secret + " "})
     case.config["configurator"]["label"] = secret
+    block_external()
     code, error = business_cli.run()
-    assert code == 1 and "凭据冲突" in error and secret not in error
-    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n") and secret not in error
+    assert business_cli.notices == []
     assert not business_cli.summaries and platform.create_count == 0
 
 
@@ -2771,7 +2781,7 @@ def test_tracked_credential_fragment(case, platform, business_cli, target):
 
 @pytest.mark.parametrize(("target", "limit"), [("registration", 200), ("id", 64)])
 @pytest.mark.parametrize("change", ["character", "length", "contains", "contained", "equal", "overlap"])
-def test_opaque_identifier_credential_gate(case, platform, business_cli, monkeypatch, target, limit, change):
+def test_opaque_identifier_credential_gate(case, platform, business_cli, monkeypatch, target, limit, change, block_external):
     secret = "synthetic-secret"
     read_settings = order.dotenv_values
     monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": f" {secret} "})
@@ -2781,10 +2791,16 @@ def test_opaque_identifier_credential_gate(case, platform, business_cli, monkeyp
     }[change]
     holder = case.ids if target == "registration" else case.config["configurator"]
     holder[target] = identifier
+    if target == "id" and change in ("contains", "contained", "equal"):
+        block_external()
     code, error = business_cli.run()
     if change == "overlap":
         assert (code, error, platform.create_count) == (0, "", 1)
         assert len(business_cli.summaries) == 1
+    elif target == "id" and change in ("contains", "contained", "equal"):
+        assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+        assert business_cli.notices == [] and identifier not in error
+        assert not business_cli.summaries and platform.create_count == 0
     else:
         assert code == 1 and "凭据冲突" in error and identifier not in error
         assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
@@ -2815,7 +2831,7 @@ def test_conflicting_source_blocks_stop_before_card(case, platform, business_cli
     ("id", 7, "approve"),
     ("registration", 8, "approve"),
 ])
-def test_identifier_contiguous_credential_gate(case, platform, business_cli, monkeypatch, target, overlap, decision):
+def test_identifier_contiguous_credential_gate(case, platform, business_cli, monkeypatch, target, overlap, decision, block_external):
     from qianshu.feishu.sdk import _Transport
 
     secret = case.session_token = "X0123456789abcdef01234Z"
@@ -2834,10 +2850,17 @@ def test_identifier_contiguous_credential_gate(case, platform, business_cli, mon
     transport.announce = partial(_Transport.announce, transport)
     monkeypatch.setattr(Approvals, "approval_status", lambda *args: decision)
 
+    if overlap == 21:
+        block_external()
     code, error = business_cli.run()
     if overlap == 7:
         assert (code, error, platform.create_count) == (0, "", 1)
         assert len(business_cli.summaries) == 1
+    elif overlap == 21:
+        assert (code, error) == (1, "凭据冲突，已停止，详见私有核对\n")
+        assert bodies == []
+        assert not business_cli.summaries and platform.create_count == 0 and identifier not in error
+        assert all(identifier not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
     else:
         body, = bodies
         assert all(secret[i:i + 8] not in body.content for i in range(len(secret) - 7))
@@ -2855,22 +2878,23 @@ def outlet_case(case):
 
 
 @pytest.mark.parametrize(("field", "missing"), [("key", True), ("label", True), ("label", False)])
-def test_outlet_notice_reports(outlet_case, platform, business_cli, field, missing):
+def test_outlet_notice_reports(outlet_case, platform, business_cli, field, missing, block_external):
     case = outlet_case
     fragment = case.session_token[1:9]
     case.config["notice_recipients"][0][field] += fragment
     if missing:
         case.evidence["notices"].clear()
+    block_external()
     code, error = business_cli.run()
     assert (code, platform.create_count) == (1, 0)
     assert error.strip() == "凭据冲突，已停止，详见私有核对"
-    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert business_cli.notices == []
     for pattern in ("create-preflight-*.json", "create-fields-*.json"):
         assert all(fragment not in path.read_text() for path in case.private.glob(pattern))
 
 
 @pytest.mark.parametrize("location", ["receive_id", "unsafe_destination", "card", "announcement", "stderr", "log"])
-def test_outlet_positions(outlet_case, platform, business_cli, monkeypatch, caplog, location):
+def test_outlet_positions(outlet_case, platform, business_cli, monkeypatch, caplog, location, block_external):
     from qianshu.feishu.sdk import _Transport
 
     case = outlet_case
@@ -2916,6 +2940,8 @@ def test_outlet_positions(outlet_case, platform, business_cli, monkeypatch, capl
                 logging.getLogger("qianshu").warning("诊断 %s", case.config["diagnostic"])
             raise order.Stop(case.config["diagnostic"])
         monkeypatch.setattr(order, "check_catalog", diagnostic)
+    if location in ("stderr", "log"):
+        block_external()
     code, error = business_cli.run()
     if location == "receive_id":
         assert (code, error, platform.create_count) == (0, "", 1)
@@ -2926,6 +2952,9 @@ def test_outlet_positions(outlet_case, platform, business_cli, monkeypatch, capl
     assert case.session_token[1:9] not in caplog.text
     if location == "unsafe_destination":
         assert bodies == []
+    elif location in ("stderr", "log"):
+        assert bodies == []
+        assert all(chat not in order.compact(content) for _, _, content in bodies)
     else:
         announcements = [content for _, kind, content in bodies if kind == "text"]
         assert announcements == [{"text": "未建单（凭据冲突），转人工处理"}]
@@ -3082,3 +3111,41 @@ def test_success_stdout_is_checked_before_printing(monkeypatch, capsys):
     assert order.main(["--config", "config", "--registration", "trial", "draft"]) == 1
     captured = capsys.readouterr()
     assert (captured.out, captured.err) == ("", "凭据冲突，已停止，详见私有核对\n")
+
+
+@pytest.fixture
+def block_external(monkeypatch):
+    from unittest.mock import Mock
+
+    blocked = []
+
+    def install():
+        for name in ("Official", "CreateRequest", "FeishuService", "_Transport", "extract_token"):
+            stub = Mock(side_effect=AssertionError("配置冲突后进入下游"))
+            monkeypatch.setattr(order, name, stub)
+            blocked.append(stub)
+
+    yield install
+    for stub in blocked:
+        stub.assert_not_called()
+
+
+@pytest.mark.parametrize(("key", "expected"), [
+    ("configurator", "configurator"), ("MAIL_FOLDER", "MAIL_FOLDER"), ("dynamic", "--config"),
+])
+def test_configuration_conflict_project_log(runtime_case, business_cli, monkeypatch, caplog,
+                                            block_external, key, expected):
+    fragment = runtime_case.session_token[2:10]
+    if key == "MAIL_FOLDER":
+        parse = order.dotenv_values
+        monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), key: fragment})
+    elif key == "dynamic":
+        runtime_case.config[fragment] = fragment
+    else:
+        runtime_case.config[key]["label"] += fragment
+    block_external()
+    assert business_cli.run() == (1, "凭据冲突，已停止，详见私有核对\n")
+    assert [record.getMessage() for record in caplog.records if record.name == "qianshu"] == [
+        f"凭据冲突，已停止，详见私有核对 键={expected}"
+    ]
+    assert fragment not in caplog.text

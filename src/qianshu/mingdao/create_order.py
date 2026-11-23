@@ -28,7 +28,7 @@ import httpx
 from dotenv import dotenv_values
 from pydantic import TypeAdapter
 
-from qianshu.config import LOGGABLE_CONFIG_KEYS
+from qianshu.config import CONFIG_KEYS, LOGGABLE_CONFIG_KEYS
 from qianshu.draft import DraftField, OfferPolicyDraft, PolicyDraft
 from qianshu.parse import _normalized_value, _read_options
 from qianshu.parse.benefits import (
@@ -1921,6 +1921,32 @@ def run(args, directory, *, clock=time.time):
     return _run(args, directory, clock, guard)
 
 
+# 只记录固定配置键名；扩展键和动态标识使用对应的入口参数名。
+_CONFIG_SECTIONS = frozenset({
+    "applicant_control", "configurator", "create", "fields", "fixed", "notice_recipients",
+    "official", "order_snapshot", "readback_skip", "template",
+})
+
+
+def check_configuration(guard, secrets, config):
+    for settings, known_keys, source in (
+        (secrets, CONFIG_KEYS, "--env-file"), (config, _CONFIG_SECTIONS, "--config"),
+    ):
+        for key, value in settings.items():
+            try:
+                guard.check(key)
+                guard.check(value, key if settings is secrets else None)
+            except OutletConflict:
+                # 键名本身也可能命中凭据；这种情况只写固定入口名。
+                label = key if key in known_keys else source
+                try:
+                    guard.check(label)
+                except OutletConflict:
+                    label = "配置"
+                logging.getLogger("qianshu").error("%s 键=%s", _LOCAL_CONFLICT, label)
+                raise
+
+
 def _run(args, directory, clock, guard):
     require(not directory.is_symlink() and directory.is_dir() and directory.stat().st_mode & 0o777 == 0o700,
             "运行目录下 .private 须为 0700 的私有目录")
@@ -1949,10 +1975,7 @@ def _run(args, directory, clock, guard):
         if receipt(cookie.get("value")):
             credentials[("cookie", index)] = cookie["value"]
     guard.configure(credentials)
-    for key, value in secrets.items():
-        guard.check(key)
-        guard.check(value, key)
-    guard.check(config)
+    check_configuration(guard, secrets, config)
     token = extract_token(login, config["create"]["session_cookie"])
     guard.session_owner = next(key for key in credentials if isinstance(key, tuple) and credentials[key] == token)
     official_token = official_setting("token_key")
