@@ -15,7 +15,7 @@ from qianshu.pipeline import Pipeline
 
 from . import _fingerprint
 from .imap import MailError, TrialMailbox, connect
-from .message import body_parts, request_text
+from .message import snapshot_parts, request_text
 from .triage import MailItem, classify, inspect_mail, input_limit, trial_model
 from .trial_state import Hold, Store
 
@@ -26,6 +26,8 @@ _NOTICES = {
     "conflict": "身份冲突，已冻结 {n} 封，待人工核对。",
     "duplicate": "疑似重复，{n} 封待人工核对。",
     "freeze": "邮箱水位已冻结，本账户已登记 {n} 封，待人工对账。",
+    "ledger": "费用账本不完整，待人工对账。",
+    "gap": "收信水位区间有 {n} 个未知位置，待人工对账。",
     "fee15": "开发与试运行已花及已预占费用合计达到 15 美元报告线。",
     "parse8": "试运行解析已花及已预占费用合计超过 8 美元报告线。",
     "stop20": "费用停线，请守望者核对预算及开关。",
@@ -36,7 +38,7 @@ class Trial:
     def __init__(self, store, config, switches, send, stop, *, connector=partial(connect, mailbox_type=TrialMailbox),
                  clock=lambda: datetime.now(UTC),
                  companies=None, sensitive=(), legacy_path=None):
-        self.store, self.config, self.switches, self.send = store, config, switches, send
+        self.store, self.config, self.switches, self.send = store, config, dict(switches()), send
         self.stop, self.connector, self.clock = stop, connector, clock
         self.companies, self.sensitive = companies, sensitive
         self.scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"])
@@ -45,7 +47,7 @@ class Trial:
         self.folder = config.get("MAIL_FOLDER", "INBOX")
 
     def enabled(self, card=False):
-        settings = self.switches()
+        settings = self.switches
         return (not self.stop.is_set() and settings["MAIL_TRIAL_RECEIVE_ENABLED"] == "true"
                 and (not card or settings["MAIL_TRIAL_CARD_ENABLED"] == "true"))
 
@@ -66,8 +68,7 @@ class Trial:
             item = inspect_mail(raw)
             text = None
             if parse:
-                header = raw.split(b"\r\n\r\n", 1)[0].split(b"\n\n", 1)[0]
-                text = request_text(body_parts(mailbox, uid, header))
+                text = request_text(snapshot_parts(raw))
             return item, text
         finally:
             if mailbox.read_seen(uid) != before:
@@ -146,8 +147,7 @@ class Trial:
             if not self.verify_generation(mailbox):
                 return
             self.store.register(self.scope, gen, uid, item)
-        budget = self.store.row("SELECT stopped FROM budget")
-        if not budget or budget[0]:
+        if not self.store.budget_open():
             self.flush()
             return
         rows = list(self.store.db.execute("""SELECT r.*,min(l.uid) uid FROM registration r
@@ -189,8 +189,7 @@ class Trial:
     def charge_limits(self, req, family):
         data = json.loads(req.content)
         model = {"haiku": "claude-haiku-5-5", "sonnet": "claude-sonnet-5-5"}[family]
-        budget = self.store.row("SELECT stopped FROM budget")
-        if not budget or budget[0] or data["model"] != model:
+        if data["model"] != model:
             raise Hold()
         if model not in self.input_limits:
             self.input_limits[model] = input_limit(self.config, model)
@@ -237,7 +236,7 @@ class Trial:
                 if stage == "sonnet":
                     if row["due"] and row["due"] > day.isoformat():
                         raise Hold()
-                    limit = int(self.switches()["MAIL_TRIAL_DAILY_PARSE_LIMIT"])
+                    limit = int(self.switches["MAIL_TRIAL_DAILY_PARSE_LIMIT"])
                     used = self.store.row("SELECT count(*) FROM registration WHERE parse_day=?", day.isoformat())[0]
                     if used >= limit:
                         with self.store.write() as db:

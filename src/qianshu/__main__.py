@@ -778,9 +778,9 @@ def main(argv: list[str] | None = None) -> int:
             if args.trial_switches:
                 from .config import trial_config
                 from .mail.trial import run_service
-                switches = partial(trial_config, args.trial_switches)
-                if switches()["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
-                    run_service(args, settings, path, switches)
+                switches = trial_config(args.trial_switches)
+                if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
+                    run_service(args, settings, path, lambda: switches)
                     return 0
             with closing(MentionLog(path, settings, create=True)) as store:
                 HandoffService(store).run()

@@ -94,12 +94,17 @@ def test_switch_journey_queue_budget_attachments_and_rebuild(tmp_path, monkeypat
             "usage": {"input_tokens": 10, "output_tokens": 2}})
 
     monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
-    trial = Trial(store, config, lambda: switches, lambda content, uid, card, check: check() or sent.append((content, uid, card)), Event(),
-                  connector=lambda _: opened.append(1) or nullcontext(box), clock=lambda: clock[0],
-                  companies=Path("tests/parse/fixtures/companies.tsv"))
+    def restart():
+        return Trial(store, config, lambda: switches,
+                     lambda content, uid, card, check: check() or sent.append((content, uid, card)), Event(),
+                     connector=lambda _: opened.append(1) or nullcontext(box), clock=lambda: clock[0],
+                     companies=Path("tests/parse/fixtures/companies.tsv"))
+
+    trial = restart()
     trial.poll()
     assert not opened
     switches["MAIL_TRIAL_RECEIVE_ENABLED"] = "true"
+    trial = restart()
     trial.poll()
     assert not box.reads
     for i, text in enumerate(("first", "discard", "uncertain"), 2):
@@ -115,6 +120,7 @@ def test_switch_journey_queue_budget_attachments_and_rebuild(tmp_path, monkeypat
     assert [x[0] for x in sent] == ["收到，待核对 1 封。"] * 2
     assert store.batch(1, 1) == (1, 1, 1, "附件未解析")
     switches["MAIL_TRIAL_CARD_ENABLED"] = "true"
+    trial = restart()
     trial.poll()
     assert requests.count("claude-sonnet-5-5") == 1
     assert "含 1 个附件未解析，请对照原件核对" in json.dumps(sent, ensure_ascii=False)
@@ -575,3 +581,139 @@ def test_cli_import_and_receive_only_service_use_same_private_ledger(tmp_path, m
     with sqlite3.connect(state) as db:
         assert db.execute("SELECT imported FROM budget").fetchone()[0] == 1250000000
         assert db.execute("SELECT amount FROM charge").fetchone()[0] == 2500
+
+
+def revision_trial(store, inbox, sent, switches=None):
+    return Trial(store, dict(MAIL_HOST="synthetic", MAIL_USER="local", ANTHROPIC_API_KEY="synthetic"),
+                 switches or (lambda: dict(MAIL_TRIAL_RECEIVE_ENABLED="true", MAIL_TRIAL_CARD_ENABLED="true",
+                                            MAIL_TRIAL_DAILY_PARSE_LIMIT="15")),
+                 lambda content, uid, card, check: check() or sent.append((card, content)), Event(),
+                 connector=lambda _: nullcontext(inbox), companies=Path("tests/parse/fixtures/companies.tsv"))
+
+
+@pytest.mark.parametrize("damage", ["DROP TABLE charge", "DELETE FROM charge"])
+def test_incomplete_imported_ledger_holds_pending(tmp_path, damage):
+    from qianshu.mail.triage import inspect_mail
+    store = Store(tmp_path / "ledger")
+    inbox, sent = Inbox(), []
+    trial = revision_trial(store, inbox, sent)
+    trial.poll()
+    store.observe(trial.scope, 1, 2, 3, [2])
+    reg = store.register(trial.scope, 1, 2, inspect_mail(synthetic(2, "pending").as_bytes()))
+    trial.status(reg, "parse")
+    store.import_spend("19.00")
+    store.reserve("sonnet", 50000, 1, reg)
+    assert store.row("SELECT amount FROM charge")[0] == 500002000
+    with store.db:
+        store.db.execute(damage)
+    store.db.close()
+    store = Store(store.path)
+    with pytest.raises(Hold):
+        store.reserve("sonnet", 60000, 1, reg, stage="sonnet")
+    trial = revision_trial(store, inbox, sent)
+    trial.flush()
+    assert [text for card, text in sent if not card and "待人工对账" in text] == ["费用账本不完整，待人工对账。"]
+    assert store.row("SELECT status FROM registration")[0] == "parse"
+
+
+@pytest.mark.parametrize("prefix", ["\ufeff", "\u200b"])
+def test_prefixed_quote_absent_from_triage_http(monkeypatch, prefix):
+    from qianshu.mail.triage import classify, inspect_mail
+    requests = []
+    def receive(req):
+        requests.append(req.content)
+        return httpx.Response(503)
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    item = inspect_mail(synthetic(1, prefix + "> HISTORY_SENTINEL").as_bytes())
+    classify({"ANTHROPIC_API_KEY": "synthetic"}, item, lambda req: None)
+    request, = requests
+    assert request.count(b"HISTORY_SENTINEL") == 0
+
+
+def test_nested_received_changes_attachment_identity(tmp_path):
+    from qianshu.mail.triage import inspect_mail
+    msg = synthetic(1, "current")
+    nested = synthetic(2, "attached")
+    nested["Received"] = "inner-a"
+    msg.add_attachment(nested)
+    raw = msg.as_bytes()
+    first = inspect_mail(raw)
+    assert first.digest and first.attachments == 1
+    assert inspect_mail(b"Received: outer\r\n" + raw).digest == first.digest
+    second = inspect_mail(raw.replace(b"inner-a", b"inner-b"))
+    store = Store(tmp_path / "trial")
+    store.begin("scope")
+    store.activate("scope", 1, 1, 0)
+    store.observe("scope", 1, 1, 3, [1, 2])
+    assert store.register("scope", 1, 1, first) != store.register("scope", 1, 2, second)
+    assert {r[0] for r in store.db.execute("SELECT reason FROM registration")} == {"conflict"}
+
+
+def test_vanished_offline_uid_persists_unknown_and_notifies_once(tmp_path):
+    path = tmp_path / "trial"
+    inbox, sent = Inbox(), []
+    inbox.next_uid = 100
+    trial = revision_trial(Store(path), inbox, sent)
+    trial.poll()
+    trial.store.db.close()
+    inbox.next_uid = 101
+    trial = revision_trial(Store(path), inbox, sent)
+    trial.poll()
+    trial.poll()
+    assert len(sent) == 1 and not sent[0][0] and "待人工对账" in sent[0][1]
+    assert tuple(trial.store.row("SELECT first,last,status FROM unknown_range")) == (100, 100, "unknown")
+
+
+def test_sonnet_http_uses_verified_snapshot(tmp_path, monkeypatch):
+    from qianshu.mail.triage import inspect_mail
+    store = Store(tmp_path / "trial")
+    inbox = Inbox()
+    trial = revision_trial(store, inbox, [])
+    trial.poll()
+    msg = synthetic(2, "BODY_SNAPSHOT_A")
+    inbox.add(msg)
+    store.observe(trial.scope, 1, 2, 3, [2])
+    reg = store.register(trial.scope, 1, 2, inspect_mail(msg.as_bytes()))
+    trial.status(reg, "parse")
+    store.import_spend("0")
+    trial.input_limits["claude-sonnet-5-5"] = 100000
+    monkeypatch.setattr(inbox, "section", lambda *args: b"BODY_SNAPSHOT_B")
+    requests = []
+    def receive(req):
+        requests.append(req.content)
+        raise httpx.ReadTimeout("synthetic")
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    trial.poll()
+    raw, = requests
+    assert b"BODY_SNAPSHOT_A" in raw and b"BODY_SNAPSHOT_B" not in raw
+
+
+def test_card_switch_file_changes_only_after_restart(tmp_path):
+    from qianshu.mail.triage import inspect_mail
+    path = tmp_path / "switches"
+    def configure(value):
+        path.write_text("MAIL_TRIAL_RECEIVE_ENABLED=true\nMAIL_TRIAL_CARD_ENABLED=" + value)
+    configure("true")
+    reads = []
+    def load():
+        reads.append(1)
+        return trial_config(path)
+    store = Store(tmp_path / "trial")
+    inbox, sent = Inbox(), []
+    trial = revision_trial(store, inbox, sent, load)
+    trial.poll()
+    store.import_spend("0")
+    configure("false")
+    for uid in (2, 3):
+        msg = synthetic(uid, "")
+        inbox.add(msg)
+        store.observe(trial.scope, 1, uid, uid + 1, [uid])
+        reg = store.register(trial.scope, 1, uid, inspect_mail(msg.as_bytes()))
+        trial.status(reg, "parse")
+        trial.poll()
+        if uid == 2:
+            assert sent and all(card for card, _ in sent)
+            assert len(reads) == 1
+            sent.clear()
+            trial = revision_trial(store, inbox, sent, load)
+    assert not sent and len(reads) == 2

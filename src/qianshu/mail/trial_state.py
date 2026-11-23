@@ -1,6 +1,8 @@
 """050 私有登记。费用用十亿分之一美元整数记账。"""
 
 import fcntl
+import hashlib
+import json
 import os
 import sqlite3
 from contextlib import closing, contextmanager
@@ -44,9 +46,8 @@ CREATE TABLE IF NOT EXISTS trial_folder(scope TEXT PRIMARY KEY, folder TEXT NOT 
 CREATE TABLE IF NOT EXISTS card_intent(
  uuid TEXT PRIMARY KEY, registration INTEGER NOT NULL, version INTEGER NOT NULL, page INTEGER NOT NULL,
  status TEXT NOT NULL, at TEXT NOT NULL, UNIQUE(registration,version,page));
-CREATE TABLE IF NOT EXISTS budget(id INTEGER PRIMARY KEY CHECK(id=1), imported INTEGER, at TEXT, stopped INTEGER DEFAULT 0);
-CREATE TABLE IF NOT EXISTS charge(id INTEGER PRIMARY KEY, registration INTEGER, model TEXT, at TEXT,
- amount INTEGER, inputs INTEGER, outputs INTEGER, partial_inputs INTEGER, partial_outputs INTEGER);
+CREATE TABLE IF NOT EXISTS unknown_range(scope TEXT, generation INTEGER, first INTEGER, last INTEGER,
+ status TEXT NOT NULL, PRIMARY KEY(scope,generation,first));
 CREATE TABLE IF NOT EXISTS notice(event TEXT PRIMARY KEY, scope TEXT, registration INTEGER, kind TEXT,
  status TEXT DEFAULT 'pending', uuid TEXT, at TEXT, quantity INTEGER, generation INTEGER);
 CREATE TABLE IF NOT EXISTS legacy(source TEXT PRIMARY KEY, status TEXT);
@@ -57,14 +58,30 @@ CREATE TABLE IF NOT EXISTS reconciliation(scope TEXT, generation INTEGER, uid IN
 """
 
 
+_LEDGER_SCHEMA = """
+CREATE TABLE budget(id INTEGER PRIMARY KEY CHECK(id=1), imported INTEGER, at TEXT, stopped INTEGER DEFAULT 0);
+CREATE TABLE charge(id INTEGER PRIMARY KEY, registration INTEGER, model TEXT, at TEXT,
+ amount INTEGER, inputs INTEGER, outputs INTEGER, partial_inputs INTEGER, partial_outputs INTEGER);
+CREATE TABLE ledger_check(id INTEGER PRIMARY KEY CHECK(id=1), digest TEXT NOT NULL);
+"""
+
+
 class Store:
     def __init__(self, path: Path):
         self.path = path
         os.close(_file(path, create=True))
         self.db = sqlite3.connect(path)
         self.db.row_factory = sqlite3.Row
-        self.db.executescript(_SCHEMA)
         self._locked = False
+        with self.write() as db:
+            fresh = not self.row("SELECT 1 FROM sqlite_master WHERE type='table'")
+            for statement in (_SCHEMA + (_LEDGER_SCHEMA if fresh else "")).split(";"):
+                if statement.strip():
+                    db.execute(statement)
+            if fresh:
+                self._seal_ledger()
+            else:
+                self._ledger_valid()
 
     @contextmanager
     def gate(self):
@@ -134,6 +151,14 @@ class Store:
     def observe(self, scope, generation, start, next_uid, uids):
         with self.write() as db:
             db.execute("DELETE FROM scan_range WHERE scope=?", (scope,))
+            uids = sorted(set(uids))
+            first = start
+            for uid in [*uids, next_uid]:
+                if first < uid:
+                    db.execute("INSERT INTO unknown_range VALUES(?,?,?,?,'unknown')",
+                               (scope, generation, first, uid - 1))
+                    self.notice(f"gap:{scope}:{generation}:{first}", scope, None, "gap", uid - first)
+                first = uid + 1
             db.executemany("INSERT OR IGNORE INTO location(scope,generation,uid) VALUES(?,?,?)",
                            ((scope, generation, uid) for uid in uids))
             if db.execute("""UPDATE mailbox SET cursor=? WHERE scope=? AND generation=?
@@ -193,11 +218,48 @@ class Store:
         from qianshu.feishu.state import trial_batch
         return trial_batch(self.db, reg, version)
 
+    def _ledger_digest(self):
+        digest = hashlib.sha256()
+        for table in ("budget", "charge"):
+            digest.update(table.encode())
+            for row in self.db.execute(f"SELECT * FROM {table} ORDER BY id"):
+                digest.update(json.dumps(tuple(row), separators=(",", ":")).encode())
+        return digest.hexdigest()
+
+    def _seal_ledger(self):
+        self.db.execute("INSERT OR REPLACE INTO ledger_check VALUES(1,?)", (self._ledger_digest(),))
+
+    def _ledger_valid(self):
+        try:
+            seal = self.row("SELECT digest FROM ledger_check WHERE id=1")
+            if seal and seal[0] == self._ledger_digest():
+                return True
+        except (sqlite3.DatabaseError, TypeError):
+            pass
+        self.notice("ledger", None, None, "ledger")
+        return False
+
+    @contextmanager
+    def ledger_write(self):
+        with self.write() as db:
+            if self._ledger_valid():
+                yield db
+                self._seal_ledger()
+                return
+        raise Hold()
+
+    def budget_open(self):
+        with self.write():
+            if self._ledger_valid():
+                budget = self.row("SELECT stopped FROM budget")
+                return bool(budget and not budget[0])
+            return False
+
     def import_spend(self, amount):
         amount = Decimal(amount)
         if not amount.is_finite() or not 0 <= amount <= Decimal("9000000000") or amount.as_tuple().exponent < -9:
             raise ValueError("开发期金额无效。")
-        with self.write() as db:
+        with self.ledger_write() as db:
             db.execute("INSERT INTO budget VALUES(1,?,?,?)", (int(amount * 10**9), now(), int(amount >= 20)))
             if amount >= 15:
                 self.notice("fee15", None, None, "fee15")
@@ -210,7 +272,7 @@ class Store:
         input_rate, output_rate, estimate = {"sonnet": (2000, 10000, 221000000),
                                              "haiku": (100, 500, 195000)}[model]
         upper = max(estimate, input_bound * input_rate + maximum * output_rate)
-        with self.write() as db:
+        with self.ledger_write() as db:
             budget = self.row("SELECT * FROM budget")
             if not budget or budget["stopped"]:
                 raise Hold()
@@ -241,14 +303,13 @@ class Store:
         def known(value):
             return value if type(value) is int and value >= 0 else None
 
-        if known(inputs) is None or known(outputs) is None:
-            with self.write() as db:
+        with self.ledger_write() as db:
+            if known(inputs) is None or known(outputs) is None:
                 db.execute("""UPDATE charge SET partial_inputs=?,partial_outputs=?
                     WHERE id=? AND inputs IS NULL""",
                            (known(partial_inputs if inputs is None else inputs),
                             known(partial_outputs if outputs is None else outputs), attempt))
-            return False
-        with self.write() as db:
+                return False
             row = self.row("SELECT model,amount FROM charge WHERE id=?", attempt)
             a, b = (2000, 10000) if row[0] == "sonnet" else (100, 500)
             db.execute("UPDATE charge SET inputs=?,outputs=?,amount=? WHERE id=? AND inputs IS NULL",
@@ -260,11 +321,10 @@ class Store:
         with self.gate():
             row = self.row("""SELECT r.status,m.generation,m.state FROM registration r
                 JOIN mailbox m USING(scope) WHERE r.scope=? AND r.id=?""", scope, reg)
-            stopped = self.row("SELECT stopped FROM budget")
             if (not enabled() or not row or row["state"] != "active" or row["generation"] != generation
                     or row["status"] not in {"haiku": ("triage",), "sonnet": ("parse",), "correction": ("parsing",),
                                              "card": ("sending",), "received": ("parse",), "deferred": ("parse",)}[stage]
-                    or not stopped or stopped[0]):
+                    or not self.budget_open()):
                 raise Hold()
             yield
 

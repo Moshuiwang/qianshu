@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from dataclasses import dataclass, field
 from email import policy
 from email.errors import MessageError
@@ -41,6 +42,27 @@ def inspect_mail(raw: bytes) -> MailItem:
         return MailItem(None, None, None, None, fields)
 
 
+def _wire_body(wire):
+    separator = re.search(rb"(?m)^\r?\n", wire)
+    if separator is None:
+        raise ValueError
+    return wire[separator.end():]
+
+
+def _wire_children(part, wire, count):
+    # 从原始字节定位子段，避免重新序列化时折行、编码或内嵌邮件头发生变化。
+    boundary = part.get_boundary()
+    if not boundary:
+        raise ValueError
+    body = _wire_body(wire)
+    markers = list(re.finditer(rb"(?m)^--" + re.escape(boundary.encode("ascii"))
+                               + rb"(--)?[ \t]*(?:\r?\n|\Z)", body))
+    if (len(markers) != count + 1 or not markers[-1][1]
+            or any(marker[1] for marker in markers[:-1])):
+        raise ValueError
+    return [body[first.end():last.start()] for first, last in zip(markers, markers[1:])]
+
+
 def _inspect_mail(raw: bytes) -> MailItem:
     msg = BytesParser(policy=policy.default).parsebytes(raw)
     key = message_id(msg)
@@ -61,7 +83,7 @@ def _inspect_mail(raw: bytes) -> MailItem:
         digest.update(len(value).to_bytes(8, "big"))
         digest.update(value)
 
-    def visit(part, visible):
+    def visit(part, visible, wire):
         nonlocal count
         kind = part.get_content_type()
         for name in ("Content-Type", "Content-Disposition", "Content-Transfer-Encoding", "Content-ID"):
@@ -79,6 +101,8 @@ def _inspect_mail(raw: bytes) -> MailItem:
         if visible and attached:
             count += 1
             visible = False
+        if not visible:
+            frame(_wire_body(wire) if part is msg else wire)
         if (visible and kind.startswith("multipart/")
                 and kind not in {"multipart/mixed", "multipart/alternative", "multipart/related"}):
             raise ValueError
@@ -95,18 +119,17 @@ def _inspect_mail(raw: bytes) -> MailItem:
                 if len(matches) != 1:
                     raise ValueError
                 root = matches[0]
-            for i, child in enumerate(children):
-                resource = kind == "multipart/related" and i != root
-                if resource and visible:
-                    count += 1
-                visit(child, visible and not resource)
-            # 附件内整封邮件的非 MIME 头也属于附件内容。
             if kind.startswith("message/"):
                 if kind != "message/rfc822" or len(children) != 1:
                     raise ValueError
-                nested = [(k.lower(), str(v)) for k, v in children[0].items()
-                          if not k.lower().startswith("content-") and k.lower() not in {"received", "return-path"}]
-                frame(json.dumps(nested).encode())
+                child_wires = [_wire_body(wire)]
+            else:
+                child_wires = _wire_children(part, wire, len(children))
+            for i, (child, child_wire) in enumerate(zip(children, child_wires, strict=True)):
+                resource = kind == "multipart/related" and i != root
+                if resource and visible:
+                    count += 1
+                visit(child, visible and not resource, child_wire)
         else:
             if part.get("Content-Transfer-Encoding", "7bit").lower() not in {
                 "7bit", "8bit", "binary", "base64", "quoted-printable"
@@ -114,7 +137,7 @@ def _inspect_mail(raw: bytes) -> MailItem:
                 raise ValueError
             frame(part.get_payload(decode=True))
             if visible:
-                content = part.get_content(errors="strict")
+                content = part.get_content(errors="strict").lstrip("\ufeff\u200b\u200c\u200d\u2060")
                 if "\0" in content:
                     raise ValueError
                 eligible = True
@@ -128,7 +151,7 @@ def _inspect_mail(raw: bytes) -> MailItem:
             raise ValueError
 
     try:
-        visit(msg, True)
+        visit(msg, True, raw)
     except (ValueError, TypeError, LookupError, RecursionError, AssertionError):
         return MailItem(_fingerprint(key) if key else None, None, None, None, fields)
     for preferred in ("text/plain", "text/html"):

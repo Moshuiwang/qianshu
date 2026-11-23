@@ -214,6 +214,43 @@ def _plain_text(kind: str, content: str) -> str:
     return parser.get_text()
 
 
+def _body_leaf(mime: EmailMessage) -> bool:
+    return (mime.get_content_type() in {"text/plain", "text/html"}
+            and mime.get_content_disposition() in {None, "inline"} and mime.get_filename() is None)
+
+
+def _decode_body(part: EmailMessage) -> tuple[str, str]:
+    decoded = part.get_content(errors="strict")
+    if part.defects or "\x00" in decoded:
+        raise MailError("邮件正文编码无效。")
+    return part.get_content_type(), decoded
+
+
+def snapshot_parts(raw: bytes) -> tuple[tuple[str, str], ...]:
+    """按原正文选段口径读取本轮已取全的 MIME 快照。"""
+    def visit(part):
+        if part.get_content_maintype() == "multipart":
+            if part.get_content_disposition() == "attachment":
+                return
+            children = list(part.iter_parts())
+            if part.get_content_subtype() == "related":
+                start = part.get_param("start")
+                if start is not None:
+                    children = [child for child in children if child.get("Content-ID") == start]
+                    if len(children) != 1:
+                        raise MailError("邮件的正文根段不确定。")
+                children = children[:1]
+            for child in children:
+                yield from visit(child)
+        elif _body_leaf(part):
+            yield _decode_body(part)
+
+    try:
+        return tuple(visit(_PARSER.parsebytes(raw)))
+    except (AttributeError, IndexError, LookupError, MessageError, TypeError, ValueError, RecursionError):
+        raise MailError("无法解析邮件正文。") from None
+
+
 def body_parts(mailbox: ReadOnlyMailbox, uid: int, raw_headers: bytes) -> tuple[tuple[str, str], ...]:
     """只读取正文用的文本段，跳过文件附件、转发邮件及内嵌资源。"""
     mime_sections: dict[str, bytes] = {"": raw_headers}
@@ -227,20 +264,12 @@ def body_parts(mailbox: ReadOnlyMailbox, uid: int, raw_headers: bytes) -> tuple[
     try:
         for section in _text_sections(mailbox.structure(uid), read_mime):
             mime = read_mime(section)
-            kind = mime.get_content_type()
-            if (
-                kind not in {"text/plain", "text/html"}
-                or mime.get_content_disposition() not in {None, "inline"}
-                or mime.get_filename() is not None
-            ):
+            if not _body_leaf(mime):
                 continue
             raw_body = mailbox.section(uid, section or "TEXT")
             raw_mime = mime_sections[section]
             part = _PARSER.parsebytes(raw_mime.rstrip(b"\r\n") + b"\r\n\r\n" + raw_body)
-            decoded = part.get_content(errors="strict")
-            if part.defects or "\x00" in decoded:
-                raise MailError("邮件正文编码无效。")
-            parts.append((kind, decoded))
+            parts.append(_decode_body(part))
     except (AttributeError, IndexError, LookupError, MessageError, TypeError, ValueError):
         raise MailError("无法解析邮件正文。") from None
     return tuple(parts)
