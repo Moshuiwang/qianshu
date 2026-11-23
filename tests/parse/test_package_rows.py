@@ -398,3 +398,37 @@ def test_unresolved_inputs_keep_only_evidenced_names_without_lookup(monkeypatch,
     assert "未查表、不可建单" in card_text(body, reply)
     with pytest.raises(ValueError):
         assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)
+
+
+@pytest.mark.parametrize("quote_second", [False, True])
+def test_titleless_package_rows_require_each_current_name_in_field_evidence(tmp_path, quote_second):
+    rows = [dict(current_package=name, gift_package=name + "_copy") for name in NAMES[:2]]
+    passages = list(NAMES[:2] if quote_second else NAMES[:1])
+    body, reply = scenario("赠送时长", packages=field(rows, *passages),
+                           cancel_on_downgrade=field("是", "降包取消"))
+    reply["policies"][0]["has_title"] = False
+    assert "_copy" not in body
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    if quote_second:
+        assert [(row.current_package, row.gift_package) for row in draft.packages.value] == [
+            (name, name + "_copy") for name in NAMES[:2]]
+        assert assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)
+    else:
+        assert NAMES[1] not in body
+        assert draft.packages.value is None
+        candidate, = draft.packages.uncertainty.candidates
+        assert candidate.value == [{"节目包行": "1", "当前包": NAMES[0], "状态": "未查表、不可建单"}]
+        with pytest.raises(ValueError, match="待确认"):
+            assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)
+
+
+@pytest.mark.parametrize("kind", ["升级权益", "特价优惠"])
+def test_gift_name_in_another_field_does_not_verify_package_row(tmp_path, kind):
+    current, gift = NAMES[:2]
+    body, reply = scenario(kind, packages=field([dict(current_package=current, gift_package=gift)], current))
+    assert gift in body
+    draft = parse_one(body, reply, load(tmp_path / "levels.csv", details()))
+    assert draft.packages.value is None
+    assert draft.field_results["packages"].issues == ("package_name_missing_evidence",)
+    with pytest.raises(ValueError, match="待确认"):
+        assemble_offer_fields(draft, today=TODAY, facts=FACTS, catalog=CATALOG)

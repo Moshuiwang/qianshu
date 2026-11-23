@@ -12,6 +12,10 @@ from .package_levels import Offer, PackageLevels, copy_for, unique_offer
 from .protocol import Evidence, FieldResult, RequestedPackage, RequestedTier, ValueSource
 
 
+def _quoted_name(name: str, quotes: Sequence[Evidence]) -> bool:
+    return bool(name) and name.strip() == name and any(name in quote.text for quote in quotes)
+
+
 class _PendingRows(list[RequestedPackage]):
     """保持原声明的行与序列化内容，附上待核投影所用的引文。"""
 
@@ -24,7 +28,7 @@ class _PendingRows(list[RequestedPackage]):
         for index, row in enumerate(self, 1):
             names = {
                 role: name for role, name in (("当前包", row.current_package), ("活动期受赠包", row.gift_package))
-                if name and name.strip() == name and any(name in quote.text for quote in self.quotes)
+                if name is not None and _quoted_name(name, self.quotes)
             }
             if names:
                 shown.append({"节目包行": str(index), **names, "状态": "未查表、不可建单"})
@@ -105,6 +109,12 @@ def resolve_packages(results: dict[str, FieldResult], *, levels_snapshot: Callab
     candidates = _candidates(rows, tiers.value, day) if verified_tier else ()
     if not verified_value(result):
         return pending("package_tier_pending", unlooked_up=True)
+    for row in result.value:
+        if not _quoted_name(row.current_package, result.evidence):
+            return pending("package_name_missing_evidence", unlooked_up=True)
+        if (benefit.value in ("升级权益", "特价优惠") and row.gift_package is not None
+                and not _quoted_name(row.gift_package, result.evidence)):
+            return pending("package_name_missing_evidence", unlooked_up=True)
     selected = []
     seen = set()
     for row in result.value:
