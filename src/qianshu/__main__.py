@@ -782,7 +782,7 @@ def main(argv: list[str] | None = None) -> int:
                 if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
                     run_service(args, settings, path, lambda: switches)
                     return 0
-            with closing(MentionLog(path, settings, create=True)) as store:
+            with MentionLog.listening(path, settings) as store:
                 HandoffService(store).run()
         except ConfigError as error:
             print(error, file=sys.stderr)
