@@ -108,7 +108,7 @@ class PrivateFiles:
         finally:
             os.close(current)
 
-    def read(self, path: str | Path) -> bytes:
+    def read(self, path: str | Path, *, limit: int | None = None) -> bytes:
         path = _relative(path)
         self._check_ignore(Path(".private") / path)
         with self._directory(path.parent) as parent:
@@ -117,7 +117,12 @@ class PrivateFiles:
                 info = os.fstat(stream.fileno())
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise RegressionError("私有资料必须是普通文件且没有硬链接。")
-                return stream.read()
+                if limit is None:
+                    return stream.read()
+                data = stream.read(limit + 1)
+                if len(data) > limit:
+                    raise ValueError("文件超过读取上限。")
+                return data
 
     @contextmanager
     def new_output(self, path: Path, names: tuple[str, ...]):

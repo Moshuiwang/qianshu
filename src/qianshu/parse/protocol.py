@@ -59,7 +59,23 @@ class ProposedValue[T](Declaration):
     evidence: list[Evidence]
 
 
+class ImageReference(Declaration):
+    source_id: Identifier | None = None
+    region: list[float] | None = None
+
+
+def _image_reference(value, handler):
+    try:
+        return handler(value)
+    except ValidationError:
+        return ImageReference()
+
+
+type OptionalImage = Annotated[ImageReference | None, WrapValidator(_image_reference)]
+
+
 class Finding[T](Declaration):
+    image_evidence: OptionalImage = Field(default=None, exclude_if=lambda value: value is None)
     status: StatementStatus
     reason_code: Identifier
     value: T | None
@@ -210,7 +226,8 @@ class Findings(Declaration):
 
 class Policy(Declaration):
     id: Identifier
-    main: PolicyAnchor
+    main: PolicyAnchor | None
+    image_main: OptionalImage = Field(default=None, exclude_if=lambda value: value is None)
     continuations: list[PolicyAnchor]
     has_title: bool
     fields: Findings
@@ -224,6 +241,31 @@ class UnusedPassage(Declaration):
 class ApplicationReply(Declaration):
     policies: list[Policy]
     unused_passages: list[UnusedPassage] | None = None
+
+    @classmethod
+    def model_json_schema(cls, *args, images=False, **kwargs):
+        schema = super().model_json_schema(*args, **kwargs)
+        if images:
+            return schema
+
+        # 文本请求维持原工具声明（包括内联的可选优惠字段）。
+        def text_only(node):
+            if isinstance(node, dict):
+                props = node.get("properties", {})
+                props.pop("image_evidence", None)
+                if "image_main" in props:
+                    del props["image_main"]
+                    props["main"] = props["main"]["anyOf"][0]
+                for child in node.values():
+                    text_only(child)
+            elif isinstance(node, list):
+                for child in node:
+                    text_only(child)
+
+        schema["$defs"].pop("ImageReference", None)
+        schema["$defs"].pop("OptionalImage", None)
+        text_only(schema)
+        return schema
 
     @field_validator("unused_passages", mode="before")
     @classmethod
@@ -248,6 +290,10 @@ class SourceBlock:
     text: str
     source_id: str
     start: int = 0
+    media_type: str | None = None
+    image: bytes = b""
+    original_id: str = ""
+    missing: bool = False
 
 
 @dataclass(frozen=True, repr=False)

@@ -376,3 +376,48 @@ class Corpus:
              "gift_package": _linked_name(row[columns["gift_package"]])}
             for row in rows
         ]
+
+
+def bind_attachments(files, snapshot, manifest_path, frozen_sha):
+    """只读准入清单，原件保存在清单旁 objects/<sha256>，不读取答案。"""
+    from email.errors import MessageError
+    from qianshu.mail.message import attachment_block, _MAX_PART, _MAX_WIRE
+    from qianshu.parse.protocol import SourceBlock
+
+    raw = files.read(manifest_path)
+    manifest = read_json(raw)
+    if not isinstance(manifest, dict) or manifest.get("freeze_sha256") != frozen_sha:
+        raise RegressionError("附件清单与冻结题本指纹不符。")
+    rows = manifest.get("documents")
+    if not isinstance(rows, dict):
+        raise RegressionError("附件清单缺少篇目映射。")
+    documents = {}
+    for token, doc in snapshot["documents"].items():
+        entries = rows.get(token)
+        if not isinstance(entries, list):
+            raise RegressionError("附件清单未登记所选篇目，无法复验。")
+        blocks = []
+        sections = set()
+        size = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise RegressionError("附件清单行无效。")
+            section, sha = entry.get("section"), entry.get("sha256")
+            if (not isinstance(section, str) or not re.fullmatch(r"[1-9][0-9]*(\.[1-9][0-9]*)*", section)
+                    or section in sections or not isinstance(sha, str) or not re.fullmatch("[0-9a-f]{64}", sha)):
+                raise RegressionError("附件清单来源号或指纹无效。")
+            sections.add(section)
+            try:
+                if size >= _MAX_WIRE:
+                    raise ValueError
+                data = files.read(manifest_path.parent / "objects" / sha, limit=min(_MAX_PART, _MAX_WIRE - size))
+                size += len(data)
+                if digest(data) != sha or size > _MAX_WIRE or len(data) > _MAX_PART:
+                    raise ValueError
+                block = attachment_block(section, entry.get("media_type"), data, original_id=sha)
+            except (FileNotFoundError, LookupError, MessageError, ValueError, TypeError, AssertionError, RecursionError):
+                source = f"part-{section}"
+                block = SourceBlock(source, "", source, missing=True, original_id=sha)
+            blocks.append(block)
+        documents[token] = {**doc, "additional_blocks": tuple(blocks)}
+    return {**snapshot, "documents": documents, "attachment_manifest_sha256": digest(raw)}

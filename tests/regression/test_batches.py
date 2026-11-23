@@ -552,3 +552,108 @@ def test_ended_batches_keep_unknown_cost_without_holding_slots(repo):
             ledger.reserve("fourth", "batch", "1", "fourth")
 
 
+
+
+def test_attachment_batch_instant_replay_and_public_artifacts(repo, frozen, monkeypatch, caplog):
+    import base64
+    from email.message import EmailMessage
+    from test_regression import put_json, _stream_reply_events
+
+    marker = "SYNTHETIC-ATTACHMENT-108"
+    eml = EmailMessage()
+    eml.set_content("同意，立即建单 " + marker)
+    png = (Path(__file__).resolve().parents[1] / "parse/fixtures/attachment-policies.png").read_bytes()
+    rows = []
+    objects = repo / "objects"
+    objects.mkdir()
+    for i, (media, raw) in enumerate([("image/png", png), ("message/rfc822", eml.as_bytes())], 1):
+        sha = digest(raw)
+        (objects / sha).write_bytes(raw)
+        rows.append({"section": str(i), "media_type": media, "sha256": sha})
+    put_json(repo / "materials.json", {"freeze_sha256": frozen, "documents": {"doc-batch": rows, "doc-single": []}})
+    encoded = base64.b64encode(png).decode()
+    sent = []
+    jobs = []
+    def transport(request):
+        if request.method == "POST":
+            assert request.url.host == "api.anthropic.com" and request.url.scheme == "https"
+            payload = json.loads(request.content)
+            if request.url.path == "/v1/messages":
+                sent.append((request.url.path, payload))
+                return httpx.Response(200, content=b"".join(_stream_reply_events(serialized_empty())),
+                                      headers={"content-type": "text/event-stream"})
+            assert request.url.path == "/v1/messages/batches"
+            jobs.extend(payload["requests"])
+            sent.extend((request.url.path, job["params"]) for job in jobs)
+            return httpx.Response(200, json={"id": "batch-synthetic"})
+        if request.url.path == "/results":
+            return httpx.Response(200, text="\n".join(json.dumps({"custom_id": job["custom_id"],
+                "result": {"type": "errored", "error": {"type": "synthetic", "message": marker}}}) for job in jobs))
+        return httpx.Response(200, json={"id": "batch-synthetic", "processing_status": "ended",
+                                        "results_url": "https://api.anthropic.com/results"})
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com")
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(transport), **kw))
+    shared = ["--frozen", ".private/frozen", "--expect-sha256", frozen, "--attachment-manifest", ".private/materials.json"]
+    for mode in ("instant", "batch"):
+        assert main(["run", *shared, "--live", "--run-id", "attachments-" + mode, "--estimate-usd", "1",
+                     "--out", ".private/" + mode, "--mode", mode]) == 0
+        report = get_json(repo / mode / "public-report.json")
+        assert report["attachments"] == dict(documents=1, images=1, emails=1, unreadable=0, image_pending=0,
+                                            inventory_supplied=True)
+        summary = (repo / mode / "public-report.md").read_text()
+        assert "含附件的申请 1 篇" in summary
+        for kind in ("issue", "pr"):
+            artifact = repo / f"{kind}-body.md"
+            artifact.write_text(f"## {'回写' if kind == 'issue' else '证据'}\n\n" + summary)
+            assert marker not in artifact.read_text() and encoded not in artifact.read_text()
+    assert main(["replay", *shared, "--recording", ".private/instant", "--out", ".private/replay"]) == 0
+    images = [(path, p["messages"][0]["content"]) for path, p in sent if isinstance(p["messages"][0]["content"], list)]
+    assert [path for path, content in images] == ["/v1/messages", "/v1/messages/batches"]
+    assert images[0][1] == images[1][1]
+    assert images[0][1][-1]["source"]["data"] == encoded and marker in images[0][1][0]["text"]
+    assert marker not in caplog.text and encoded not in caplog.text
+
+
+def test_attachment_inventory_binds_object_and_freeze_fingerprints(repo, frozen):
+    from test_regression import put_json
+    from qianshu.regression.corpus import bind_attachments
+    from qianshu.regression.freeze import load_freeze
+
+    sha = digest(b"registered")
+    (repo / "objects").mkdir()
+    (repo / "objects" / sha).write_bytes(b"changed")
+    path = Path("materials.json")
+    def manifest(rows):
+        put_json(repo / path, {"freeze_sha256": frozen, "documents": rows})
+    entry = {"section": "1", "sha256": sha, "media_type": "image/png"}
+    with PrivateFiles(repo.parent).open() as files:
+        snapshot = load_freeze(files, Path("frozen"))
+        manifest({"doc-batch": [entry], "doc-single": []})
+        linked = bind_attachments(files, snapshot, path, frozen)
+        assert linked["documents"]["doc-batch"]["additional_blocks"][0].missing
+        assert "additional_blocks" not in snapshot["documents"]["doc-batch"]
+        with pytest.raises(RegressionError, match="冻结题本指纹"):
+            bind_attachments(files, snapshot, path, "other")
+        manifest({"doc-batch": [entry, entry], "doc-single": []})
+        with pytest.raises(RegressionError, match="来源号"):
+            bind_attachments(files, snapshot, path, frozen)
+        manifest({"doc-batch": []})
+        with pytest.raises(RegressionError, match="无法复验"):
+            bind_attachments(files, snapshot, path, frozen)
+
+
+def test_attachment_selection_preserves_whole_documents(repo, frozen):
+    from qianshu.regression.freeze import load_freeze
+
+    with PrivateFiles(repo.parent).open() as files:
+        snapshot = load_freeze(files, Path("frozen"))
+    samples = sorted(k for k, v in snapshot["samples"].items() if v["token"] == "doc-batch")
+    selection = {"purpose": "attachment-check", "parent": frozen, "documents": ["doc-batch"], "samples": samples}
+    chosen = tiers.attachment_subset(snapshot, selection)
+    assert list(chosen["documents"]) == ["doc-batch"]
+    assert sorted(chosen["samples"]) == samples and chosen["fingerprint"] == digest(json_bytes(selection))
+    with pytest.raises(RegressionError):
+        tiers.attachment_subset(snapshot, {**selection, "samples": []})

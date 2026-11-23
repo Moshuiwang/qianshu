@@ -60,6 +60,15 @@ def project(snapshot, selection):
     return _subset(snapshot, selection)
 
 
+def attachment_subset(snapshot, selection):
+    docs = selection.get("documents")
+    if (snapshot["dataset"] != "exam" or selection.get("parent") != snapshot["fingerprint"]
+            or not isinstance(docs, list) or not 1 <= len(docs) <= 5
+            or len(set(docs)) != len(docs) or set(docs) - snapshot["documents"].keys()):
+        raise RegressionError("附件快检需从同一冻结题本指定一至五篇。")
+    return _subset(snapshot, selection)
+
+
 def trial(snapshot, size):
     tokens = sorted(snapshot["documents"])[:size]
     if not tokens:

@@ -16,6 +16,8 @@ from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE, PROTOCOL_VERSION, REP
 
 from .business import PAIRING_VERSION, measure_fingerprint, pairing_fingerprint
 from .runner import RULES, IncompleteReply
+from qianshu.parse.materials import content_bytes
+
 from .storage import Output, PrivateFiles, RegressionError, digest, json_bytes, read_json
 
 MANIFEST = "recording.json"
@@ -146,7 +148,7 @@ class SavedReplies:
             from .batches import common_body
             wire = json.loads(self.request)
             if (digest(common_body(self.request).encode()) != self.request_sha256
-                or digest(wire["messages"][0]["content"].encode()) != user_sha
+                or digest(content_bytes(wire["messages"][0]["content"])) != user_sha
                 or digest(wire["system"].encode()) != system_sha):
                 raise RegressionError("录制的请求正文或业务字节指纹不同。")
         if record.get("document_sha256", digest(token.encode())) != digest(token.encode()):
@@ -218,7 +220,7 @@ class Recording:
         self.document = {"user_sha256": None, "system_sha256": None, "attempts": []}
 
         def call(*, system: str, user: str) -> str:
-            user_sha, system_sha = digest(user.encode()), self.source_system_sha or digest(system.encode())
+            user_sha, system_sha = digest(content_bytes(user)), self.source_system_sha or digest(system.encode())
             self.document.update(user_sha256=user_sha, system_sha256=system_sha)
             saved = self.source if isinstance(self.source, SavedReplies) else None
             if saved is not None:

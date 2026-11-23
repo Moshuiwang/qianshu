@@ -12,6 +12,7 @@ STRUCTURE_REASONS = {
     "unlocated_policy_main": "政策主段无法定位",
     "unlocated_policy_continuation": "政策续行无法定位",
     "overlapping_policy_mains": "政策主段相交",
+    "attachment_missing": "附件未能读取，请对照申请原件",
     "empty_material": "申请材料为空",
 }
 
@@ -40,6 +41,22 @@ class Sources:
                 ):
                     raise ValueError
             by_source[block.source_id].append(block)
+
+    def image_label(self, ref):
+        if ref is None:
+            return None
+        block = self.blocks.get(ref.source_id)
+        if block is None or not block.image:
+            return None
+        label = f"{block.original_id} / {block.id}"
+        if ref.region is not None:
+            if len(ref.region) != 4:
+                return None
+            left, top, right, bottom = ref.region
+            if not (0 <= left < right <= 1 and 0 <= top < bottom <= 1):
+                return None
+            label += " 区域 " + ", ".join(map(str, ref.region))
+        return label
 
     def locate(self, span: Span) -> Span | None:
         block = self.blocks.get(span.source_id)
@@ -112,7 +129,7 @@ def _quotes(statement: Finding) -> Iterable[Evidence]:
 def _declared_quotes(reply: ApplicationReply) -> Iterable[tuple[Span, str]]:
     for policy in reply.policies:
         for span in (policy.main, *policy.continuations):
-            if span.text is not None:
+            if span is not None and span.text is not None:
                 yield span, span.text
         for name in policy.fields.__class__.model_fields:
             statement = getattr(policy.fields, name)
@@ -129,8 +146,10 @@ class EvidenceReview:
             key = span, text
             if key not in self._locations:
                 self._locations[key] = sources.locate_quote(span, text)
-            self.evidence_locations[self._locations[key][1]] += 1
-        self.main = {id(policy): self._locate(policy.main) for policy in reply.policies}
+            block = sources.blocks.get(span.source_id)
+            if block is None or not block.image:
+                self.evidence_locations[self._locations[key][1]] += 1
+        self.main = {id(policy): self._locate(policy.main) if policy.main else None for policy in reply.policies}
         self.structure_issues = tuple(dict.fromkeys(self._check_structure(reply.policies)))
 
     def corrected_span(self, span: Span) -> Span | None:
@@ -144,12 +163,14 @@ class EvidenceReview:
         return tuple(located for span in spans if (located := self._locate(span)) is not None)
 
     def _check_structure(self, policies: list[Policy]) -> Iterable[PolicyStructureIssue]:
+        if any(block.missing for block in self.sources.blocks.values()):
+            yield PolicyStructureIssue(None, "attachment_missing")
         ids = Counter(policy.id for policy in policies)
         for policy in policies:
             main = self.main[id(policy)]
             if ids[policy.id] > 1:
                 yield PolicyStructureIssue(main, "duplicate_policy_id", (policy.id,))
-            if main is None:
+            if main is None and (policy.main is not None or not self.sources.image_label(policy.image_main)):
                 yield PolicyStructureIssue(None, "unlocated_policy_main", (policy.id,))
             if len(self._locate_all(policy.continuations)) != len(policy.continuations):
                 yield PolicyStructureIssue(None, "unlocated_policy_continuation", (policy.id,))
@@ -166,6 +187,9 @@ class EvidenceReview:
         quotes = [self.verified_quote(quote) for quote in _quotes(statement)]
         valid = tuple(quote for quote in quotes[:len(statement.evidence)] if quote is not None)
         codes = ["invalid_evidence"] if None in quotes else []
+        if statement.image_evidence is not None:
+            self.evidence_locations["image_pending"] += 1
+            codes.append("image_pending")
         status = statement.status
         if status is StatementStatus.UNWRITTEN and (statement.evidence or statement.candidates or statement.value is not None):
             codes.append("invalid_unwritten_shape")

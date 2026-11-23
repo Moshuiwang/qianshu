@@ -17,6 +17,8 @@ from qianshu.parse.protocol import ApplicationReply
 
 from .ledger import transaction
 from .recording import reference_cost
+from qianshu.parse.materials import ANTHROPIC_ORIGIN, content_bytes, image_settings
+
 from .storage import RegressionError, digest, json_bytes, read_json
 
 
@@ -66,6 +68,8 @@ class Captured(Exception):
 
 
 def capture_requests(snapshot, rules, legacy, settings):
+    if any(b.image for doc in snapshot["documents"].values() for b in doc.get("additional_blocks", ())):
+        settings = image_settings(settings)
     wires = {}
     def capture(request):
         wires[token] = request.content.decode("utf-8")
@@ -79,7 +83,7 @@ def capture_requests(snapshot, rules, legacy, settings):
         for token, doc in snapshot["documents"].items():
             try:
                 parse_application(doc["body"], rules_dir=rules, companies_text=snapshot["companies_text"],
-                                  legacy_companies=legacy, model=model)
+                                  legacy_companies=legacy, model=model, additional_blocks=doc.get("additional_blocks", ()))
             except (ModelError, Captured):
                 if token in wires:
                     continue
@@ -204,11 +208,14 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
     keys = {token: digest(json_bytes([run_id, token])) for token in wires}
     expected = {keys[token]: common_body(raw) for token, raw in wires.items()}
     requests = [{"custom_id": k, "params": json.loads(v)} for k, v in expected.items()]
+    includes_images = any(isinstance(item["params"]["messages"][0]["content"], list) for item in requests)
     identity = digest(json_bytes([config, expected]))
     journal = ledger.journal(run_id)
     def verify(request):
         if (request.url.scheme, request.url.host, request.url.port) != origin:
             raise RegressionError("批量接口返回了不同来源的地址。")
+        if includes_images and request.method == "POST" and str(request.url) != ANTHROPIC_ORIGIN + "/v1/messages/batches":
+            raise RegressionError("图片批量请求目的地未获准。")
         if request.method == "POST":
             if request.content != captured[0].encode():
                 raise RegressionError("待发送批量字节与预先登记的信封不同。")
@@ -311,7 +318,7 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
     def source(token, user_sha, system_sha):
         request = json.loads(wires[token])
         if (digest(request["system"].encode()) != system_sha
-            or digest(request["messages"][0]["content"].encode()) != user_sha):
+            or digest(content_bytes(request["messages"][0]["content"])) != user_sha):
             raise RegressionError("批量录制与计分输入不同。")
         attempt = batch_attempt(rows[keys[token]])
         attempt["effort"] = config.get("effort")

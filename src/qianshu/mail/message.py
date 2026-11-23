@@ -6,6 +6,7 @@ from email import policy
 from email.errors import MessageError
 from email.message import EmailMessage
 from email.parser import BytesHeaderParser, BytesParser
+from hashlib import sha256
 from html.parser import HTMLParser
 
 from .imap import MailError, ReadOnlyMailbox
@@ -293,3 +294,98 @@ def authored_reply(kind: str, content: str) -> str | None:
         if _HEADER_FIELD.match(stripped) or _UNKNOWN_DIVIDER.match(stripped):
             return None
     return "\n".join(lines)
+
+
+# 只在申请路径读取附件。IMAP BODYSTRUCTURE 的大小为传输编码后的字节数。
+_MAX_PART = 5 * 1024 * 1024
+_MAX_WIRE = 32 * 1024 * 1024
+_IMAGE_TYPES = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+
+def attachment_block(section, kind, data, *, original_id):
+    """从本地原件生成解析块。来源号按 MIME 段定位，同名附件互不覆盖。"""
+    from qianshu.parse.protocol import SourceBlock
+
+    source = f"part-{section}"
+    if not data or len(data) > _MAX_PART:
+        raise ValueError
+    if kind in _IMAGE_TYPES:
+        signatures = {
+            "image/png": (data.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR")
+                          and data.endswith(b"\x00\x00\x00\x00IEND\xaeB`\x82")),
+            "image/jpeg": data.startswith(b"\xff\xd8\xff") and data.endswith(b"\xff\xd9"),
+            "image/gif": data.startswith((b"GIF87a", b"GIF89a")) and data.endswith(b";"),
+            "image/webp": data.startswith(b"RIFF") and data[8:12] == b"WEBP"
+                          and int.from_bytes(data[4:8], "little") + 8 == len(data),
+        }
+        if not signatures[kind]:
+            raise ValueError
+        return SourceBlock(source, "", source, media_type=kind, image=data, original_id=original_id)
+    if kind != "message/rfc822":
+        raise ValueError
+    mail = _PARSER.parsebytes(data)
+    part = mail.get_body(preferencelist=("plain", "html"))
+    if mail.defects or part is None or part.get_filename() or part.is_multipart():
+        raise ValueError
+    body = request_text(((part.get_content_type(), part.get_content(errors="strict")),))
+    if not body or part.defects or "\x00" in body:
+        raise ValueError
+    return SourceBlock(source, body, source, original_id=original_id)
+
+
+def _attachment_leaves(node, path=""):
+    if not node or not isinstance(node[0], list):
+        yield path, node
+        return
+    for number, child in enumerate(node, 1):
+        if not isinstance(child, list):
+            break
+        section = f"{path}.{number}" if path else str(number)
+        yield from _attachment_leaves(child, section)
+
+
+def application_attachments(mailbox, uid, raw_headers, fingerprint):
+    """仅使用 PEEK 分段，逐个登记无法读取的受支持材料。"""
+    from qianshu.parse.protocol import SourceBlock
+
+    original_id = f"UID {uid}（{fingerprint}）"
+    blocks = []
+    remaining = _MAX_WIRE
+    for section, node in _attachment_leaves(mailbox.structure(uid)):
+        if not node or len(node) < 2:
+            continue
+        # 普通无名正文及无名二进制段无需再取 MIME 头。文件形式的 .eml
+        # 也可能声明为 text/plain；从参数/处置字段判断是否有文件元数据。
+        if node[0].upper() not in {b"IMAGE", b"MESSAGE"} and not any(isinstance(item, list) for item in node):
+            continue
+        ordinal = section or "1"
+        source = f"part-{ordinal}"
+        try:
+            mime = headers(mailbox.section(uid, f"{section}.MIME") if section else raw_headers)
+            kind = mime.get_content_type()
+            if kind not in _IMAGE_TYPES and kind != "message/rfc822":
+                if (mime.get_filename() or "").lower().endswith(".eml"):
+                    kind = "message/rfc822"
+                elif node[0].upper() == b"IMAGE":
+                    raise ValueError
+                else:
+                    continue
+            size = int(node[6])
+            if not 0 < size <= min(2 * _MAX_PART, remaining):
+                raise ValueError
+            remaining -= size
+            raw = mailbox.section(uid, section or "TEXT")
+            if len(raw) != size:
+                raise ValueError
+            # 先按外层 CTE 解码，包括 base64 包装的 message/rfc822。
+            wrapper = EmailMessage(policy=policy.default)
+            wrapper["Content-Transfer-Encoding"] = str(mime.get("Content-Transfer-Encoding", "7bit"))
+            wrapper.set_payload(raw)
+            data = wrapper.get_payload(decode=True)
+            if wrapper.defects or data is None:
+                raise ValueError
+            blocks.append(attachment_block(ordinal, kind, data,
+                                           original_id=f"{original_id} 原件 {sha256(data).hexdigest()}"))
+        except (MailError, LookupError, MessageError, ValueError, TypeError, RecursionError, AssertionError):
+            blocks.append(SourceBlock(source, "", source, missing=True, original_id=original_id))
+    return tuple(blocks)

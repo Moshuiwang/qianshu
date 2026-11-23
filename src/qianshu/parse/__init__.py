@@ -1,8 +1,7 @@
 """把结构化的模型声明核对成待校验的政策草稿。"""
 
-import json
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import asdict, fields, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import UTC, date, datetime
 from functools import cache
 from pathlib import Path
@@ -14,6 +13,7 @@ from qianshu.draft import Candidate, DraftField, OfferPolicyDraft, SourceExcerpt
 from . import benefits, country_company, dates, names, other_fields, packages
 from .companies import DEFAULT_COMPANIES_FILE, CompanyRules, load_company_rules
 from .evidence import EvidenceReview, PolicyStructureIssue, Sources, can_use_absence, issue
+from .materials import ATTACHMENT_RULES, image_settings, user_content
 from .model import ModelError, ModelReplyError, ParseModel, configured_model, validate_reply_json
 from .model import load_model_config as load_config
 from .package_levels import PackageLevels, load_package_levels
@@ -137,13 +137,14 @@ def parse_application(
     known_policy_names: Iterable[str] = (),
     recorded_reply: bool = False,
 ) -> ParseResult:
-    """解析正文及已转成文本的附件。on_reply 收到私有重放所需的结构化回复。"""
+    """解析正文、图片与本地提取的邮件附件。on_reply 收到私有重放所需的结构化回复。"""
     if recorded_reply and model is None:
         raise ParseError("旧回复投影须提供离线录制。")
     reference_date = today if recorded_reply or today is not None else datetime.now(UTC).date()
     attachments = tuple(additional_blocks)
-    if not body.strip() and not any(block.text.strip() for block in attachments):
-        return ParseResult(structure_issues=(PolicyStructureIssue(None, "empty_material"),))
+    if not body.strip() and not any(block.text.strip() or block.image for block in attachments):
+        reason = "attachment_missing" if any(block.missing for block in attachments) else "empty_material"
+        return ParseResult(structure_issues=(PolicyStructureIssue(None, reason),))
 
     try:
         prompt = (rules_dir / "parse-prompt.md").read_text(encoding="utf-8")
@@ -166,15 +167,14 @@ def parse_application(
         sources = Sources((SourceBlock(_BODY_ID, body, _BODY_ID), *attachments))
     except ValueError:
         raise ParseError("申请输入块映射无效。") from None
-    user_input = {"application": body}
-    if attachments:
-        user_input["attachments"] = [{"id": block.id, "text": block.text} for block in attachments]
     if model is None:
-        model = configured_model(config if config is not None else load_config())
+        settings = config if config is not None else load_config()
+        model = (configured_model(image_settings(settings), max_retries=0) if any(b.image for b in attachments)
+                 else configured_model(settings))
     try:
         reply = model(
-            system=system_message(prompt, rules, option_table),
-            user=json.dumps(user_input, ensure_ascii=False),
+            system=system_message(prompt, rules, option_table) + (ATTACHMENT_RULES if attachments else ""),
+            user=user_content(body, attachments),
         )
     except ModelReplyError as error:
         if on_reply is not None and error.reply is not None:
@@ -299,10 +299,18 @@ def _draft(
     draft.package_tier_candidates = tier_candidates
     draft.policy_id = policy.id
     corrected = policy.model_copy(update={
-        "main": review.corrected_span(policy.main) or policy.main,
+        "main": (review.corrected_span(policy.main) or policy.main) if policy.main else None,
         "continuations": [review.corrected_span(span) or span for span in policy.continuations],
     })
     draft.scope = corrected.model_dump(mode="json", exclude={"fields"})
+    if main_label := review.sources.image_label(policy.image_main):
+        hints.append(f"政策主段需对原图：{main_label}")
+    for field_name, result in results.items():
+        for quote in result.evidence:
+            block = review.sources.blocks[quote.span.source_id]
+            if block.original_id and block.text:
+                hints.append(f"{field_name} 引文出处：{block.original_id} / {block.id}，"
+                             f"字符 {quote.span.start}–{quote.span.end}")
     draft.hints = hints
     draft.field_results = results
     draft.source_span = _body_offsets(review.main[id(policy)])
@@ -319,8 +327,17 @@ def _body_offsets(span: Span | None) -> tuple[int, int] | None:
     return (span.start, span.end) if span is not None and span.source_id == _BODY_ID else None
 
 
+@dataclass(kw_only=True, repr=False)
+class AttachmentExcerpt(SourceExcerpt):
+    source_id: str
+    source_start: int
+
+
 def _excerpt(quote: Evidence, sources: Sources) -> SourceExcerpt:
-    offsets = _body_offsets(sources.locate(quote.span))
+    location = sources.locate(quote.span)
+    if location is not None and location.source_id != _BODY_ID:
+        return AttachmentExcerpt(text=quote.text, source_id=location.source_id, source_start=location.start)
+    offsets = _body_offsets(location)
     return SourceExcerpt(text=quote.text, start=offsets[0] if offsets is not None else None)
 
 
@@ -337,12 +354,20 @@ def _project(results: dict[str, FieldResult], name: str, review: EvidenceReview,
 
     candidates = []
     statement: Finding = result.statement
+    if statement.image_evidence is not None:
+        label = review.sources.image_label(statement.image_evidence)
+        reason = f"需对原图：{label}" if label else "图片来源或区域无法定位，请核对原申请。"
+        for proposed in [statement.value, *(candidate.value for candidate in statement.candidates)]:
+            if proposed is not None and (value := _normalized_value(name, proposed, options)) is not None:
+                candidates.append(Candidate(value=value, evidence=[]))
+        return DraftField(evidence=evidence, uncertainty=Uncertainty(reason=reason, candidates=candidates))
     for candidate in statement.candidates:
         value = _normalized_value(name, candidate.value, options)
         verified = [review.verified_quote(quote) for quote in candidate.evidence]
         if value is not None and verified and None not in verified:
             candidates.append(Candidate(value=value, evidence=[_excerpt(q, review.sources) for q in verified]))
-    if statement.value is not None and evidence:
+    has_image = any(block.image for block in review.sources.blocks.values())
+    if statement.value is not None and (evidence or has_image):
         value = _normalized_value(name, statement.value, options)
         if value is not None:
             candidates.append(Candidate(value=value, evidence=evidence))

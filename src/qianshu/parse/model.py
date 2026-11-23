@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from qianshu.config import Config, ConfigError, load_config
 
+from .materials import ANTHROPIC_ORIGIN
 from .protocol import ApplicationReply, Findings
 
 DEFAULT_MODEL = "claude-sonnet-5-5"
@@ -44,7 +45,7 @@ class ModelReplyError(ModelError):
 
 
 class ParseModel(Protocol):
-    def __call__(self, *, system: str, user: str) -> str: ...
+    def __call__(self, *, system: str, user: str | list[dict]) -> str: ...
 
 
 @dataclass(frozen=True)
@@ -69,7 +70,11 @@ class StreamingModel:
     send: Callable
     on_result: Callable[[CallResult], None] | None
 
-    def __call__(self, *, system: str, user: str) -> str:
+    images_allowed: bool = False
+
+    def __call__(self, *, system: str, user: str | list[dict]) -> str:
+        if isinstance(user, list) and not self.images_allowed:
+            raise ModelError("图片请求需要获准的解析接口与禁用重定向的客户端。")
         return self.send(system, [{"role": "user", "content": user}], self.on_result)
 
 
@@ -293,7 +298,7 @@ def configured_model(
                     tools=[{
                         "name": _REPLY_TOOL,
                         "description": "提交一份申请解析声明。",
-                        "input_schema": ApplicationReply.model_json_schema(),
+                        "input_schema": ApplicationReply.model_json_schema(images=isinstance(messages[0]["content"], list)),
                     }],
                     stream=True,
                 ) as stream:
@@ -368,4 +373,5 @@ def configured_model(
         record(reply, result)
         return result
 
-    return StreamingModel(attempt, on_result)
+    # 仅显式指定端点且已启用现有 follow_redirects=False 客户端的模型可组装原图请求。
+    return StreamingModel(attempt, on_result, base_url == ANTHROPIC_ORIGIN and max_retries is not None)

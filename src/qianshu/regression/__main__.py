@@ -23,11 +23,13 @@ from . import baseline, tiers
 from .ledger import Ledger, locked_directory, transaction
 from .batches import capture_requests, common_body, fetch_batch, instant_transport
 from .business import DEFAULT_THRESHOLD
-from .corpus import make_plan
+from .corpus import bind_attachments, make_plan
 from .freeze import freeze, load_exclusions, load_freeze
 from .packages import freeze_packages
 from .recording import MANIFEST, Recording, SavedReplies, configuration, doc_names, historical_cost, probe_replies, reference_cost
 from .runner import RULES, RUN_FILES, evaluate, markdown_report
+from qianshu.parse.materials import content_bytes, image_settings
+
 from .storage import PrivateFiles, RegressionError, digest, json_bytes, read_json, staged_output
 from .summary import summarize
 
@@ -113,6 +115,7 @@ def _arguments(argv: list[str] | None):
     imported.add_argument("--probe", required=True)
     imported.add_argument("--model-id", required=True, help="记录该历史回复所用的模型标识。")
     for command in (run, replay, imported):
+        command.add_argument("--attachment-manifest", help="绑定冻结指纹的私有附件清单。")
         command.add_argument("--frozen", required=True, help="冻结考题、盲测集或节目包补充集。")
         command.add_argument("--expect-sha256", required=True, help="冻结或 verify 返回的预期冻结指纹。")
         command.add_argument("--out", required=True)
@@ -172,14 +175,26 @@ def _decode_snapshot(data: bytes):
 
 def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: ExitStack) -> None:
     snapshot = load_freeze(files, files.argument(args.frozen))
-    parent_sha = snapshot["fingerprint"]
+    frozen_sha = parent_sha = snapshot["fingerprint"]
+    attachment_selection = False
     if args.selection:
-        snapshot = tiers.project(snapshot, read_json(files.read(files.argument(args.selection))))
+        selection = read_json(files.read(files.argument(args.selection)))
+        attachment_selection = selection.get("purpose") == "attachment-check" and bool(args.attachment_manifest)
+        if attachment_selection:
+            snapshot = tiers.attachment_subset(snapshot, selection)
+        else:
+            snapshot = tiers.project(snapshot, selection)
     if snapshot["fingerprint"] != args.expect_sha256:
         raise RegressionError("预期冻结指纹与实际冻结指纹不一致。")
     if getattr(args, "trial", None):
         snapshot = tiers.trial(snapshot, args.trial)
         parent_sha = snapshot["fingerprint"]
+    if args.attachment_manifest:
+        snapshot = bind_attachments(files, snapshot, files.argument(args.attachment_manifest), frozen_sha)
+        if attachment_selection and any(not any(b.image for b in doc["additional_blocks"])
+                                        or any(b.missing for b in doc["additional_blocks"])
+                                        for doc in snapshot["documents"].values()):
+            raise RegressionError("附件快检的所选篇须有截图且原件全部可读。")
     source = origin_run_id = effort = None
     legacy_recording = getattr(args, "legacy_recording", False)
     source_system_sha = None
@@ -188,6 +203,8 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
         saved = SavedReplies(files, files.argument(args.recording), legacy_recording=legacy_recording)
         manifest = saved.manifest
         prior = manifest["configuration"]
+        if prior.get("attachment_manifest_sha256") != snapshot.get("attachment_manifest_sha256"):
+            raise RegressionError("附件清单与来源录制不一致。")
         if prior["freeze_sha256"] not in {snapshot["fingerprint"], parent_sha}:
             raise RegressionError("录制与本次重放的冻结指纹不一致。")
         model_id = manifest["model"]
@@ -219,6 +236,8 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
             if not args.live:
                 raise RegressionError("实际调用模型须显式指定 --live。")
             settings = {key: os.environ[key] for key in _MODEL_SETTINGS if key in os.environ}
+            if any(b.image for doc in snapshot["documents"].values() for b in doc.get("additional_blocks", ())):
+                settings = image_settings(settings)
             model_id = settings.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
             effort = configured_effort(settings)
             origin = "live"
@@ -229,6 +248,8 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
     if baseline.binding:
         rules, versions = baseline.binding
     config = configuration(snapshot, rules, model_id, threshold, legacy, release, retries, effort=effort)
+    if "attachment_manifest_sha256" in snapshot:
+        config["attachment_manifest_sha256"] = snapshot["attachment_manifest_sha256"]
     if baseline.binding:
         config.update(versions)
     reconstruction = None
@@ -311,7 +332,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
         wires = capture_requests(snapshot, rules, legacy, {"ANTHROPIC_MODEL": model_id, "ANTHROPIC_EFFORT": effort})
         for token, wire in wires.items():
             params = read_json(wire.encode())
-            saved.for_attempts(token, digest(params["messages"][0]["content"].encode()), digest(params["system"].encode()))
+            saved.for_attempts(token, digest(content_bytes(params["messages"][0]["content"])), digest(params["system"].encode()))
             expected = reconstruction["common_sha256"].get(token) if reconstruction else saved.request_sha256
             actual = digest(common_body(wire).encode())
             if expected != actual or saved.request_sha256 not in (None, actual):
@@ -379,7 +400,7 @@ def _run(files: PrivateFiles, args, out: Path, model: ParseModel | None, stack: 
                               origin=origin, origin_run_id=origin_run_id, replaces_run_id=replaces_run_id,
                               source_system_sha=source_system_sha)
         recording.mode = mode
-        recording.tier = "quick" if args.selection else ("full" if snapshot["dataset"] == "exam" else "holdout")
+        recording.tier = "attachment-check" if attachment_selection else "quick" if args.selection else ("full" if snapshot["dataset"] == "exam" else "holdout")
         if origin == "live":
             recording.run_id = args.run_id
             recording.ledger = ledger

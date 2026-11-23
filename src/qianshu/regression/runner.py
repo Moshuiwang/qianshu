@@ -1,13 +1,13 @@
 """调用解析入口，对齐原稿段落并生成公开计数和私有明细。"""
 
 from collections import Counter, defaultdict
-from dataclasses import fields
+from dataclasses import fields, replace
 from datetime import date
 from pathlib import Path
 from typing import get_origin
 
 from qianshu.draft import DraftField, OfferPolicyDraft
-from qianshu.parse import ModelError, ParseError, _read_options, parse_application
+from qianshu.parse import AttachmentExcerpt, ModelError, ParseError, _read_options, parse_application
 from qianshu.parse.companies import DEFAULT_COMPANIES_FILE, load_company_rules
 from qianshu.parse.names import country_codes
 from qianshu.parse.evidence import STRUCTURE_REASONS
@@ -61,7 +61,7 @@ def _confirmed_targets(draft, targets: list[dict], body: str) -> list[str]:
         excerpt
         for field in fields(draft)
         if isinstance(value := getattr(draft, field.name), DraftField)
-        for excerpt in value.evidence
+        for excerpt in value.evidence if not isinstance(excerpt, AttachmentExcerpt)
     )
     for excerpt in excerpts:
         start = excerpt.start
@@ -183,7 +183,7 @@ def _document_model(recording, token):
                     first_request.update({key: recording.document[key] for key in ("request", "request_sha256")})
                 attempts.append(attempt)
 
-            observed = StreamingModel(model.send, collect)
+            observed = replace(model, on_result=collect)
             for _ in range(recording.config["retries"] + 1):
                 try:
                     observed(system=system, user=user)
@@ -286,7 +286,7 @@ def evaluate(
                 document["body"], model=call, rules_dir=rules_dir, companies_text=frozen["companies_text"],
                 legacy_companies=legacy_companies, company_rules=company_rules, on_reply=on_reply,
                 package_levels=package_levels, package_run_day=package_run_day, benefit_catalog=benefit_catalog,
-                today=today, country_codes=codes,
+                additional_blocks=document.get("additional_blocks", ()), today=today, country_codes=codes,
                 recorded_reply=getattr(recording, "origin", None) in ("replay", "probe"),
             )
         except IncompleteReply as error:
@@ -385,7 +385,14 @@ def evaluate(
     for name, entry in denominator["fields"].items():
         counts = Counter(entry["excluded"].values())
         excluded[name] = {reason: counts[reason] for reason in EXCLUSIONS}
+    materials = [doc.get("additional_blocks", ()) for doc in frozen["documents"].values()]
     report = {
+        "attachments": {"documents": sum(bool(blocks) for blocks in materials),
+                        "images": sum(bool(b.image) for blocks in materials for b in blocks),
+                        "emails": sum(bool(b.text) for blocks in materials for b in blocks),
+                        "unreadable": sum(b.missing for blocks in materials for b in blocks),
+                        "image_pending": evidence_locations["image_pending"],
+                        "inventory_supplied": "attachment_manifest_sha256" in frozen},
         "package_levels_supplied": snapshot_supplied,
         "freeze_sha256": frozen["fingerprint"],
         "rules_sha256": rules_hash,
@@ -444,6 +451,13 @@ def markdown_report(report: dict) -> bytes:
     review_line = f"- 需核对全文的卡片数 {review['cards']}（政策数 {review['policies']}），按政策结构与空材料计"
     reasons = report["full_document_review_reasons"]
     review_lines = [review_line, *(f"  - {label} {reasons[code]} 篇" for code, label in STRUCTURE_REASONS.items())]
+    if attachments := report.get("attachments"):
+        if attachments["inventory_supplied"]:
+            review_lines.append(f"- 含附件的申请 {attachments['documents']} 篇，图片 {attachments['images']}，"
+                                f"内嵌邮件 {attachments['emails']}，不可复验附件 {attachments['unreadable']}，"
+                                f"图片字段待核 {attachments['image_pending']}")
+        else:
+            review_lines.append("- 未提供附件清单，未评测附件。")
     review_lines.append(f"- 首次形状错误 {report['documents'].get('first_shape_errors', 0)} 篇，"
                         f"最终回复解析失败 {report['business']['counts']['reply_parse_failed']} 篇")
     if report.get("package_levels_supplied") is False:
