@@ -1,12 +1,14 @@
 """申请解析的模型调用边界。"""
 
 import json
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import Protocol
 
+import httpx
 from dotenv import dotenv_values
 from pydantic import ValidationError
 
@@ -133,6 +135,10 @@ def load_model_config(*, env_file: Path = Path(".env"), config: Config | None = 
     """为申请解析补充模型专用的配置项。"""
     if config is None:
         config = load_config(env_file=env_file)
+    if "ANTHROPIC_CUSTOM_HEADERS" in os.environ or (
+        "ANTHROPIC_BASE_URL" in os.environ and not config.get("ANTHROPIC_BASE_URL")
+    ):
+        raise ConfigError("请通过 .env 配置 AI 接口，并移除 SDK 的进程环境覆盖。")
     try:
         with env_file.open(encoding="utf-8-sig") as stream:
             values = dotenv_values(stream=stream, interpolate=False)
@@ -173,6 +179,12 @@ def configured_model(
         base_url = config.get("AI_BACKUP_BASE_URL")
         if not (platform and model and base_url):
             raise ConfigError("备用平台须填写 AI_BACKUP_PLATFORM、AI_BACKUP_MODEL 和 AI_BACKUP_BASE_URL。")
+        try:
+            endpoint = httpx.URL(base_url)
+        except httpx.InvalidURL:
+            raise ConfigError("备用端点必须是有效的 HTTPS 地址。") from None
+        if endpoint.scheme != "https" or not endpoint.host:
+            raise ConfigError("备用端点必须是有效的 HTTPS 地址。")
         effort = DEFAULT_EFFORT
     else:
         raise ConfigError("AI_ACTIVE_PROFILE 仅接受 primary 或 backup。")

@@ -6,6 +6,7 @@ import os
 from time import monotonic_ns
 from typing import get_args
 
+import httpx
 from pydantic import ValidationError
 
 from qianshu.config import ConfigError
@@ -72,12 +73,28 @@ def _accumulate_event(reply, event, tool_inputs: dict[int, list[str]]):
     return reply
 
 
+def _guard_redirect(response: httpx.Response) -> None:
+    if not response.is_redirect or "location" not in response.headers:
+        return
+    source = response.request.url
+    try:
+        target = httpx.URL(response.headers["location"])
+        if not target.scheme:
+            target = source.join(target)
+        if (source.scheme, source.raw_host, source.port) == (target.scheme, target.raw_host, target.port):
+            return
+    except (ValueError, httpx.InvalidURL):
+        pass
+    # HTTPX 尚未构造下一跳。保留 3xx 供 SDK 报错，同时禁止按响应头重试。
+    del response.headers["location"]
+    response.headers["x-should-retry"] = "false"
+
+
 def streaming_model(*, api_key, base_url, model, effort, on_result, max_retries, follow_redirects) -> StreamingModel:
     # 显式传入默认端点，防止 SDK 在解析 CLI 中另从进程环境取址。
     endpoint = base_url if base_url is not None else "https://api.anthropic.com"
 
     def attempt(system: str, messages: list, on_result, first_shape_error: str | None = None) -> str:
-        import httpx
         from anthropic import Anthropic, AnthropicError, DefaultHttpxClient
         from anthropic.types import StopReason
 
@@ -131,8 +148,9 @@ def streaming_model(*, api_key, base_url, model, effort, on_result, max_retries,
         options = {}
         if max_retries is not None:
             options["max_retries"] = max_retries
-        if not follow_redirects:
-            options["http_client"] = DefaultHttpxClient(follow_redirects=False)
+        http_client = DefaultHttpxClient(follow_redirects=follow_redirects)
+        http_client.event_hooks["response"].append(_guard_redirect)
+        options["http_client"] = http_client
         if first_shape_error:
             options["max_retries"] = 0
         reply = None

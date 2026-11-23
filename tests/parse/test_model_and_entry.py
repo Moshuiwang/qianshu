@@ -42,7 +42,7 @@ def test_service_help_describes_current_offline_input(capsys):
       for effort in ("medium", "high", "xhigh", "max")],
 ])
 def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, expected, effort, caplog):
-    client_type = anthropic.Anthropic
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient.invalid")
     raw = "  \r\n" + serialized_empty() + "\r\n"
 
     def mocked_reply(request):
@@ -106,10 +106,8 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
             text="".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events),
         )
 
-    http_client = httpx.Client(transport=httpx.MockTransport(mocked_reply))
-    monkeypatch.setattr(
-        anthropic, "Anthropic", lambda **kwargs: client_type(http_client=http_client, **kwargs),
-    )
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(mocked_reply), **kw))
     for name in ("anthropic", "httpx", "httpcore"):
         monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
     config = {
@@ -333,14 +331,12 @@ class _BrokenStream(httpx.SyncByteStream):
     (None, "text"),  # 流在 message_start 前正常结束
 ])
 def test_stream_interrupted_midway_is_sanitized(monkeypatch, error, block_type):
-    client_type = anthropic.Anthropic
-    http_client = httpx.Client(transport=httpx.MockTransport(lambda request: httpx.Response(
-        200, headers={"content-type": "text/event-stream"}, stream=_BrokenStream(error, block_type),
-    )))
-    monkeypatch.setattr(
-        anthropic, "Anthropic",
-        lambda **kwargs: client_type(http_client=http_client, max_retries=0, **kwargs),
-    )
+    def interrupted(request):
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              stream=_BrokenStream(error, block_type))
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(interrupted), **kw))
     config = {"ANTHROPIC_API_KEY": "placeholder-key", "ANTHROPIC_BASE_URL": "https://model.example.invalid"}
     captured = []
     with pytest.raises(ModelError) as exc:
@@ -771,7 +767,6 @@ def test_stream_requires_matching_indices_and_message_stop(monkeypatch, damage):
 
 
 def test_shape_correction_network_failure_has_no_sdk_retry(monkeypatch):
-    client_type = anthropic.Anthropic
     requests = []
 
     def transport(request):
@@ -796,8 +791,8 @@ def test_shape_correction_network_failure_has_no_sdk_retry(monkeypatch):
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
 
-    monkeypatch.setattr(anthropic, "Anthropic", lambda **kw: client_type(
-        http_client=httpx.Client(transport=httpx.MockTransport(transport)), **kw))
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+        transport=httpx.MockTransport(transport), **kw))
     results = []
     model = configured_model({"ANTHROPIC_API_KEY": "synthetic"}, on_result=results.append)
     with pytest.raises(ModelError):
@@ -923,18 +918,80 @@ def test_backup_uses_only_configured_endpoint_and_key(monkeypatch, tmp_path):
     assert json.loads(request.content)["model"] == "backup-model"
 
 
-def test_primary_default_ignores_sdk_environment_endpoint(monkeypatch):
+@pytest.mark.parametrize(("profile", "location"), [
+    ("primary", "https://backup.invalid"),
+    ("backup", "https://primary.invalid"),
+    ("primary", "https://primary.invalid:8443"),
+    ("backup", "http://backup.invalid"),
+])
+def test_cross_origin_redirect_stops_after_first_request(monkeypatch, profile, location):
+    config = {
+        "AI_ACTIVE_PROFILE": profile,
+        "ANTHROPIC_BASE_URL": "https://primary.invalid",
+        "ANTHROPIC_API_KEY": "primary-fixture",
+        "AI_BACKUP_PLATFORM": "anthropic",
+        "AI_BACKUP_MODEL": "fixture-model",
+        "AI_BACKUP_BASE_URL": "https://backup.invalid",
+        "AI_BACKUP_API_KEY": "backup-fixture",
+    }
     requests = []
 
-    def reject(request):
-        requests.append(request)
-        return httpx.Response(400, json={"error": {"type": "invalid_request_error", "message": "fixture"}})
+    def respond(request):
+        requests.append(request.url.host)
+        if len(requests) == 1:
+            return httpx.Response(307, headers={
+                "Location": location, "x-should-retry": "true",
+            })
+        return httpx.Response(400)
 
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda self, req: respond(req))
+    with pytest.raises(ModelError, match="模型调用失败"):
+        configured_model(config)(system="", user="合成申请")
+    assert requests == [f"{profile}.invalid"]
+
+
+def test_primary_follows_same_origin_redirect(monkeypatch):
+    urls = []
+
+    def respond(request):
+        urls.append(str(request.url))
+        if len(urls) == 1:
+            return httpx.Response(307, headers={"Location": "/redirected"})
+        return httpx.Response(400)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", lambda self, req: respond(req))
+    with pytest.raises(ModelError, match="模型调用失败"):
+        configured_model({
+            "ANTHROPIC_API_KEY": "fixture", "ANTHROPIC_BASE_URL": "https://primary.invalid",
+        })(system="", user="合成申请")
+    assert urls == ["https://primary.invalid/v1/messages", "https://primary.invalid/redirected"]
+
+
+def test_primary_rejects_ambient_endpoint_before_send(monkeypatch, tmp_path, capsys):
+    settings = tmp_path / "primary.conf"
+    settings.write_text("ANTHROPIC_API_KEY=primary-fixture\n", encoding="utf-8")
+    output = tmp_path / "draft.json"
+    companies = tmp_path / "companies.tsv"
+    companies.write_text("", encoding="utf-8")
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://ambient.invalid")
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
-        transport=httpx.MockTransport(reject), **kw))
-    model = configured_model({"ANTHROPIC_API_KEY": "primary-fixture"}, max_retries=0)
-    with pytest.raises(ModelError):
-        model(system="合成规则", user="合成申请")
-    request, = requests
-    assert request.url.host == "api.anthropic.com"
+    monkeypatch.setattr(sys, "argv", ["parse", "--env-file", str(settings), "--output", str(output),
+                                     "--companies-file", str(companies)])
+    monkeypatch.setattr(sys, "stdin", io.StringIO("合成申请"))
+    send = Mock(return_value=httpx.Response(400))
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", send)
+    assert main() == 1
+    assert "配置" in capsys.readouterr().err
+    send.assert_not_called()
+    assert not output.exists()
+
+
+def test_backup_rejects_plain_http_before_send(monkeypatch):
+    send = Mock(return_value=httpx.Response(400))
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", send)
+    with pytest.raises(ConfigError, match="HTTPS"):
+        configured_model({
+            "AI_ACTIVE_PROFILE": "backup", "AI_BACKUP_PLATFORM": "anthropic",
+            "AI_BACKUP_API_KEY": "fixture", "AI_BACKUP_MODEL": "fixture-model",
+            "AI_BACKUP_BASE_URL": "http://backup.invalid",
+        })(system="", user="合成申请")
+    send.assert_not_called()

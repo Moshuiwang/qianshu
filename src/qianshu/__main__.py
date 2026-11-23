@@ -615,11 +615,6 @@ def _serve(
     args: argparse.Namespace, settings: Settings, window: Window, tag_dates: dict[str, date],
     sensitive_values: tuple[str, ...], config: Config, *, mail_config: Config | None = None,
 ) -> None:
-    # Anthropic SDK 支持从进程环境覆盖请求头和默认地址。服务只采用 .env 配置。
-    if "ANTHROPIC_CUSTOM_HEADERS" in os.environ or (
-        "ANTHROPIC_BASE_URL" in os.environ and "ANTHROPIC_BASE_URL" not in config
-    ):
-        raise ConfigError("请通过 .env 配置 AI 接口，并移除 SDK 的进程环境覆盖。")
     model = configured_model(load_model_config(env_file=args.env_file, config=config))
 
     def complete(*, system: str, user: str) -> str:
