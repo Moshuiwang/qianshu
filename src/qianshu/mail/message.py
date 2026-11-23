@@ -247,6 +247,58 @@ def _wire_children(part, wire, count):
     return [body[first.end():last.start()] for first, last in zip(markers, markers[1:])]
 
 
+def _snapshot_body_children(part, children):
+    """把直接子段映射为带编号的文本占位段，交旧选段器返回正文子段序号。"""
+    subtype = part.get_content_subtype().upper().encode()
+    start = part.get_param("start") if subtype == b"RELATED" else None
+    params = [b"START", start.encode()] if start is not None else None
+
+    def select(parts):
+        node = [[b"TEXT", b"PLAIN"] for _ in parts] + [subtype, params]
+        return [int(section) - 1 for section in _text_sections(
+            node, lambda section: parts[int(section) - 1],
+        )]
+
+    selected = select(children)
+    if start is not None:
+        # 旧选段器返回首个匹配。反向复用同一选择口径，确认末个匹配也是它。
+        last, = select(children[::-1])
+        if selected != [len(children) - 1 - last]:
+            raise MailError("邮件的正文根段不确定。")
+    return selected
+
+
+class _SnapshotTextSection:
+    """为 body_parts 提供一个已选文本段的 BODYSTRUCTURE 和原始 TEXT。"""
+
+    def __init__(self, part, body):
+        self.node = [b"TEXT", part.get_content_subtype().upper().encode()]
+        self.body = body
+
+    def structure(self, uid):
+        return self.node
+
+    def section(self, uid, section):
+        if section != "TEXT":
+            raise MailError("快照文本段无效。")
+        return self.body
+
+
+def _snapshot_leaf(part, wire, child):
+    try:
+        body = _wire_body(wire)
+    except ValueError:
+        # 纯头子段可以省略空正文前的空行。
+        if not child or part.defects or not part.keys() or part.get_payload() != "":
+            raise
+        body = b""
+    mime = wire[:len(wire) - len(body)]
+    if child:
+        body = body.removesuffix(b"\r\n") if body.endswith(b"\r\n") else body.removesuffix(b"\n")
+    leaf, = body_parts(_SnapshotTextSection(part, body), 0, mime)
+    return leaf
+
+
 def snapshot_parts(raw: bytes) -> tuple[tuple[str, str], ...]:
     """按原正文选段口径读取本轮已取全的 MIME 快照。"""
     def visit(part, wire, *, child=False):
@@ -255,30 +307,10 @@ def snapshot_parts(raw: bytes) -> tuple[tuple[str, str], ...]:
                 return
             children = list(part.iter_parts())
             wires = _wire_children(part, wire, len(children))
-            segments = list(zip(children, wires, strict=True))
-            if part.get_content_subtype() == "related":
-                start = part.get_param("start")
-                if start is not None:
-                    segments = [(p, w) for p, w in segments if p.get("Content-ID") == start]
-                    if len(segments) != 1:
-                        raise MailError("邮件的正文根段不确定。")
-                segments = segments[:1]
-            for subpart, segment in segments:
-                yield from visit(subpart, segment, child=True)
+            for index in _snapshot_body_children(part, children):
+                yield from visit(children[index], wires[index], child=True)
         elif _body_leaf(part):
-            try:
-                body = _wire_body(wire)
-            except ValueError:
-                # 纯头子段可直接接下一个边界，省略头与空正文之间的空行。
-                if not child or part.defects or not part.keys() or part.get_payload() != "":
-                    raise
-                body = b""
-            mime = wire[:len(wire) - len(body)]
-            if child:
-                # 下一个 multipart 分隔符占用它前面的一个换行。
-                body = body.removesuffix(b"\r\n") if body.endswith(b"\r\n") else body.removesuffix(b"\n")
-            rebuilt = mime.rstrip(b"\r\n") + b"\r\n\r\n" + body
-            yield _decode_body(_PARSER.parsebytes(rebuilt))
+            yield _snapshot_leaf(part, wire, child)
 
     try:
         return tuple(visit(_PARSER.parsebytes(raw), raw))

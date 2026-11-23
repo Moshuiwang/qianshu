@@ -781,3 +781,26 @@ def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch, extra_hea
     assert trial.box()["state"] == "active"
     request, = requests
     assert b"FIRST" in request
+
+
+@pytest.mark.parametrize("category", ["Cc", "Cf", "Mn", "Me", "Zs"])
+@pytest.mark.parametrize("marker", [">", "＞"])
+def test_all_invisible_quote_prefixes(monkeypatch, category, marker):
+    from qianshu.mail.triage import classify, inspect_mail
+
+    requests = []
+
+    def receive(req):
+        requests.append(req.content)
+        return httpx.Response(503)
+
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    for code in range(sys.maxunicode + 1):
+        prefix = chr(code)
+        if unicodedata.category(prefix) != category or prefix.splitlines() != [prefix]:
+            continue
+        raw = synthetic(1, f"CURRENT\n{prefix}{marker} HISTORY_SENTINEL").as_bytes()
+        classify({"ANTHROPIC_API_KEY": "synthetic"}, inspect_mail(raw), lambda req: None)
+        request, = requests
+        assert request.count(b"HISTORY_SENTINEL") == 0, f"U+{code:04X}"
+        requests.clear()

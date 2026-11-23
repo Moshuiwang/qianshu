@@ -235,3 +235,91 @@ def test_mime_to_sonnet_matches_baseline(monkeypatch, baseline_modules, raw):
     actual = capture_sonnet(monkeypatch, True, request_text(snapshot_parts(raw)))
     assert len(expected) == len(actual) == 2
     assert [body == reference for body, reference in zip(actual, expected)] == [True, True]
+
+
+def test_related_root_trailing_space_poll(tmp_path, monkeypatch, baseline_modules):
+    from test_trial_journey import Inbox, Store, revision_trial, synthetic
+    from qianshu.ai import anthropic
+
+    header = b"Message-ID: " + synthetic(2, "").get("Message-ID").encode() + b'\r\nContent-Type: multipart/related; boundary=q; start="<root>"\r\n\r\n'
+    resource = b"Content-Type: text/plain\r\nContent-ID: <resource>\r\n\r\n"
+    root = b"Content-Type: multipart/alternative; boundary=a\r\nContent-ID: <root> \t\r\n\r\n"
+    plain = b"Content-Type: text/plain\r\n\r\n"
+    html = b"Content-Type: text/html\r\n\r\n"
+    sections = {"1.MIME": resource, "2.MIME": root, "2.1.MIME": plain, "2.2.MIME": html,
+                "2.1": b"CURRENT", "2.2": b"<p>alternative</p>"}
+    raw = (header + b"--q\r\n" + resource + b"RESOURCE\r\n--q\r\n" + root
+           + b"--a\r\n" + plain + sections["2.1"] + b"\r\n--a\r\n" + html + sections["2.2"]
+           + b"\r\n--a--\r\n--q--\r\n")
+
+    class Segments:
+        def structure(self, uid):
+            return [[b"TEXT", b"PLAIN"], [[b"TEXT", b"PLAIN"], [b"TEXT", b"HTML"], b"ALTERNATIVE"],
+                    b"RELATED", [b"START", b"<root>"]]
+
+        def section(self, uid, section):
+            return sections[section]
+
+    baseline, adapter = baseline_modules
+    text = baseline.request_text(baseline.body_parts(Segments(), 2, header))
+    assert text == "CURRENT"
+    with monkeypatch.context() as old:
+        expected = capture_sonnet(old, False, text, adapter=adapter)
+    assert len(expected) == 2
+
+    inbox, sent = Inbox(), []
+    store = Store(tmp_path / "trial")
+    trial = revision_trial(store, inbox, sent)
+    trial.poll()
+    inbox.add(synthetic(2, "placeholder"))
+    monkeypatch.setattr(inbox, "complete_message", lambda uid: raw)
+    store.import_spend("0")
+    trial.input_limits.update({"claude-haiku-5-5": 100000, "claude-sonnet-5-5": 100000})
+    requests = []
+
+    def receive(req):
+        data = json.loads(req.content)
+        requests.append(req.content)
+        if data["model"] == "claude-haiku-5-5":
+            assert json.loads(data["messages"][0]["content"])["body"] == text
+            return httpx.Response(200, json={"type": "message", "id": "msg", "role": "assistant",
+                "model": data["model"], "content": [{"type": "text", "text": "是"}], "stop_reason": "end_turn",
+                "usage": {"input_tokens": 10, "output_tokens": 2}})
+        if len(requests) == 3:
+            raise httpx.ReadTimeout("synthetic")
+        events = [{"type": "message_start", "message": {"id": "x", "type": "message", "role": "assistant",
+                   "model": "synthetic", "content": [], "usage": {"input_tokens": 1, "output_tokens": 0}}}]
+        for index in range(2):
+            events.extend([{"type": "content_block_start", "index": index, "content_block": {"type": "tool_use",
+                           "id": str(index), "name": "submit_application_reply", "input": {}}},
+                           {"type": "content_block_stop", "index": index}])
+        events.extend([{"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None},
+                        "usage": {"output_tokens": 1}}, {"type": "message_stop"}])
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
+
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    trial.poll()
+    assert tuple(store.row("SELECT status,verdict,attachments FROM registration")) == ("parse", "是", 1)
+    trial.poll()
+    trial.poll()
+    assert trial.box()["state"] == "active"
+    assert tuple(store.row("SELECT status,verdict,attachments FROM registration")) == ("manual", "是", 1)
+    assert requests[1:] == expected
+    assert sent and inbox.seen == {1}
+
+
+@pytest.mark.parametrize("ids", [(b"<root>", b"<root> \t"), (b"<first>", b"<second>")],
+                         ids=["ambiguous", "absent"])
+def test_related_requires_unique_normalized_root(ids):
+    from qianshu.mail.imap import MailError
+    from qianshu.mail.message import snapshot_parts
+    from qianshu.mail.triage import inspect_mail
+
+    raw = b'Content-Type: multipart/related; boundary=q; start="<root>"\r\n\r\n'
+    for content_id in ids:
+        raw += b"--q\r\nContent-ID: " + content_id + b"\r\n\r\nbody\r\n"
+    raw += b"--q--\r\n"
+    assert inspect_mail(raw).digest is None
+    with pytest.raises(MailError):
+        snapshot_parts(raw)

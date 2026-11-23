@@ -13,15 +13,16 @@ from qianshu.config import ConfigError
 from qianshu.parse.model import DEFAULT_MODEL, configured_effort
 
 from . import _fingerprint
+from .imap import MailError
 from .message import (
     _ATTRIBUTION, _DIVIDER, _HEADER_FIELD, _HTMLText, _UNKNOWN_DIVIDER,
-    _wire_body, _wire_children, message_id, sender,
+    _body_leaf, _snapshot_body_children, _snapshot_leaf, _wire_body, _wire_children, message_id, sender,
 )
 
 
 def _is_quote_line(line: str) -> bool:
     for index, char in enumerate(line):
-        if char == "\t" or unicodedata.category(char) in {"Cf", "Zs"}:
+        if char == "\t" or unicodedata.category(char) in {"Cc", "Cf", "Mn", "Me", "Zs"}:
             continue
         if char not in {">", "＞"}:
             return False
@@ -119,8 +120,10 @@ def _inspect_mail(raw: bytes) -> MailItem:
                            {"content-type", "content-transfer-encoding"}]
         params = [(k, v) for k, v in part.get_params()[1:] if k.lower() != "boundary"] if part["Content-Type"] else []
         frame(json.dumps([kind, params, content_headers]).encode())
-        attached = (part.get_filename() is not None or part.get_content_disposition() not in (None, "inline")
-                    or (not kind.startswith("multipart/") and kind not in {"text/plain", "text/html"}))
+        if kind.startswith("multipart/"):
+            attached = part.get_filename() is not None or part.get_content_disposition() not in (None, "inline")
+        else:
+            attached = not _body_leaf(part)
         if visible and attached:
             count += 1
             visible = False
@@ -136,20 +139,16 @@ def _inspect_mail(raw: bytes) -> MailItem:
             frame((part.epilogue or "").encode("utf-8", "surrogateescape"))
             children = list(part.iter_parts())
             frame(str(len(children)).encode())
-            root = 0
-            if kind == "multipart/related" and (start := part.get_param("start")) is not None:
-                matches = [i for i, child in enumerate(children) if child.get("Content-ID") == start]
-                if len(matches) != 1:
-                    raise ValueError
-                root = matches[0]
             if kind.startswith("message/"):
                 if kind != "message/rfc822" or len(children) != 1:
                     raise ValueError
                 child_wires = [_wire_body(wire)]
+                selected = {0}
             else:
+                selected = set(_snapshot_body_children(part, children))
                 child_wires = _wire_children(part, wire, len(children))
             for i, (child, child_wire) in enumerate(zip(children, child_wires, strict=True)):
-                resource = kind == "multipart/related" and i != root
+                resource = i not in selected
                 if resource and visible:
                     count += 1
                 visit(child, visible and not resource, child_wire)
@@ -160,16 +159,15 @@ def _inspect_mail(raw: bytes) -> MailItem:
                 raise ValueError
             frame(part.get_payload(decode=True))
             if visible:
-                content = part.get_content(errors="strict").lstrip("\ufeff\u200b\u200c\u200d\u2060")
-                if "\0" in content:
-                    raise ValueError
+                kind, content = _snapshot_leaf(part, wire, part is not msg)
+                content = content.lstrip("\ufeff\u200b\u200c\u200d\u2060")
                 bodies.append((kind, _triage_reply(kind, content)))
         if part.defects:
             raise ValueError
 
     try:
         visit(msg, True, raw)
-    except (ValueError, TypeError, LookupError, RecursionError, AssertionError):
+    except (MailError, ValueError, TypeError, LookupError, RecursionError, AssertionError):
         return MailItem(_fingerprint(key) if key else None, None, None, None, fields)
     for preferred in ("text/plain", "text/html"):
         selected = [text for kind, text in bodies if kind == preferred]
