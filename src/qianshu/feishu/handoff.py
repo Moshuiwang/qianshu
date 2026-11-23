@@ -11,7 +11,7 @@ import stat
 import time
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
@@ -78,7 +78,7 @@ class MentionLog:
 
     def __init__(
         self, path: Path, settings: Settings, *, create: bool = False,
-        clock: Callable[[], float] = time.time,
+        clock: Callable[[], float] = time.time, _listener_lifetime: ExitStack | None = None,
     ) -> None:
         self.path, self.settings, self.clock = path, settings, clock
         if len(settings.allowed_senders) != 1:
@@ -96,9 +96,25 @@ class MentionLog:
         self._redact = _Redactor(
             (value for value in (*sensitive_values, *exact_urls) if value), exact_values=exact_urls,
         )
-        os.close(_file(path, create=create))
         self._lock = Lock()
-        db = self._db = sqlite3.connect(path, timeout=0.5, autocommit=True, check_same_thread=False)
+        with ExitStack() as opening:
+            if create:
+                lifetime = _listener_lifetime if _listener_lifetime is not None else opening
+                lifetime.enter_context(self.listener(create=True))
+            else:
+                os.close(_file(path))
+            self._open_database(create)
+
+    @classmethod
+    @contextmanager
+    def listening(cls, path: Path, settings: Settings):
+        """从初始化前到服务退出，连续持有同一把监听锁。"""
+        with ExitStack() as lifetime:
+            with closing(cls(path, settings, create=True, _listener_lifetime=lifetime)) as store:
+                yield store
+
+    def _open_database(self, create: bool) -> None:
+        db = self._db = sqlite3.connect(self.path, timeout=0.5, autocommit=True, check_same_thread=False)
         db.row_factory = sqlite3.Row
         try:
             if create:
@@ -120,7 +136,7 @@ class MentionLog:
                     );
                     CREATE INDEX IF NOT EXISTS outbox_ready ON outbox(status, due);
                 """)
-                now = clock()
+                now = self.clock()
                 db.execute("INSERT OR IGNORE INTO recovery VALUES (1, ?, ?, ?)", (self.scope, now, now))
             binding = db.execute("SELECT scope FROM recovery WHERE singleton = 1").fetchone()
             if binding is None or binding["scope"] != self.scope:
@@ -134,11 +150,8 @@ class MentionLog:
         db = self._db
         members = self.settings.handoff_member_open_ids - {self.owner}
         db.create_function("listed_member", 1, members.__contains__)
-        authorized = "SELECT mentions.*, '产品负责人' AS sender FROM mentions"
-        initialized = db.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'member_mentions'"
-        ).fetchone()
-        if (members and not initialized) or (create and initialized):
+        initialized = self._has_member_tables()
+        if create and (members or initialized):
             with self._write():
                 db.execute("""CREATE TABLE IF NOT EXISTS memberships (
                     id INTEGER PRIMARY KEY, sender_id TEXT NOT NULL, since REAL NOT NULL, active INTEGER NOT NULL
@@ -149,33 +162,49 @@ class MentionLog:
                     ref TEXT PRIMARY KEY, message_id TEXT NOT NULL, created_ms INTEGER NOT NULL,
                     kind TEXT NOT NULL, content TEXT NOT NULL, membership INTEGER NOT NULL
                 )""")
-                if create:
-                    retired = db.execute(
-                        "UPDATE memberships SET active = 0 WHERE active = 1 AND NOT listed_member(sender_id)"
-                    )
-                    if retired.rowcount:
-                        db.execute("""
-                            UPDATE outbox SET status = CASE WHEN first_attempt IS NULL THEN 'cancelled'
-                                                            ELSE 'unconfirmed' END
-                            WHERE status = 'member_pending' AND ref IN (
-                                SELECT m.ref FROM member_mentions m JOIN memberships p ON p.id = m.membership
-                                WHERE p.active = 0
-                            )
-                        """)
-                    since = self.clock()
-                    db.executemany("INSERT OR IGNORE INTO memberships(sender_id, since, active) VALUES (?, ?, 1)",
-                                   [(member, since) for member in sorted(members)])
-                    if db.execute("""SELECT 1 FROM member_mentions m LEFT JOIN memberships p ON p.id = m.membership
-                                     WHERE p.id IS NULL LIMIT 1""").fetchone():
-                        _LOG.warning("feishu_handoff_unknown_membership")
-        if members:
+                retired = db.execute(
+                    "UPDATE memberships SET active = 0 WHERE active = 1 AND NOT listed_member(sender_id)"
+                )
+                if retired.rowcount:
+                    db.execute("""
+                        UPDATE outbox SET status = CASE WHEN first_attempt IS NULL THEN 'cancelled'
+                                                        ELSE 'unconfirmed' END
+                        WHERE status = 'member_pending' AND ref IN (
+                            SELECT m.ref FROM member_mentions m JOIN memberships p ON p.id = m.membership
+                            WHERE p.active = 0
+                        )
+                    """)
+                since = self.clock()
+                db.executemany("INSERT OR IGNORE INTO memberships(sender_id, since, active) VALUES (?, ?, 1)",
+                               [(member, since) for member in sorted(members)])
+                if db.execute("""SELECT 1 FROM member_mentions m LEFT JOIN memberships p ON p.id = m.membership
+                                 WHERE p.id IS NULL LIMIT 1""").fetchone():
+                    _LOG.warning("feishu_handoff_unknown_membership")
+            initialized = True
+        self._awaiting_member_tables = bool(members and not initialized)
+        self._create_authorized_view(bool(members and initialized))
+
+    def _has_member_tables(self) -> bool:
+        return self._db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'member_mentions'"
+        ).fetchone() is not None
+
+    def _create_authorized_view(self, include_members: bool) -> None:
+        authorized = "SELECT mentions.*, '产品负责人' AS sender FROM mentions"
+        if include_members:
             # 只有监听器登记资格。旧资格失效后重新加入会获得新 id。
             authorized += """
                 UNION ALL SELECT m.ref, m.message_id, m.created_ms, m.kind, m.content, '名单内同事'
                 FROM member_mentions m JOIN memberships p ON m.membership = p.id
                 WHERE p.active = 1 AND listed_member(p.sender_id)
             """
-        db.execute("CREATE TEMP VIEW authorized_mentions AS " + authorized)
+        self._db.execute("CREATE TEMP VIEW authorized_mentions AS " + authorized)
+
+    def _refresh_watcher_view(self) -> None:
+        if self._awaiting_member_tables and self._has_member_tables():
+            self._db.execute("DROP VIEW temp.authorized_mentions")
+            self._create_authorized_view(True)
+            self._awaiting_member_tables = False
 
     def sender_label(self, message: Message) -> str | None:
         if message.sender_type == "user":
@@ -202,8 +231,8 @@ class MentionLog:
                     db.execute("ROLLBACK")
 
     @contextmanager
-    def listener(self):
-        fd = _file(self.path)
+    def listener(self, *, create: bool = False):
+        fd = _file(self.path, create=create)
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield
@@ -274,6 +303,7 @@ class MentionLog:
 
     def pending(self) -> list[sqlite3.Row]:
         with self._lock:
+            self._refresh_watcher_view()
             return self._db.execute("""
                 SELECT mentions.*, CASE fallback.status WHEN 'member_pending' THEN 'pending'
                                     ELSE fallback.status END AS fallback_status
@@ -298,6 +328,8 @@ class MentionLog:
         self._validate_reply_text(text)
         if mention_owner:
             text = self._owner_tag + text
+        with self._lock:
+            self._refresh_watcher_view()
         with self._write() as db:
             mention = db.execute("SELECT message_id, sender FROM authorized_mentions WHERE ref = ?", (ref,)).fetchone()
             if mention is None:
@@ -499,28 +531,27 @@ class HandoffService:
                 await client._disconnect()
 
     def run(self) -> None:
-        with self.handoff.store.listener():
-            client = _Connection(self, approvals=False)
-            threads = (
-                Thread(target=self._recover, name="feishu-handoff-history"),
-                Thread(target=self._deliver, args=(False,), name="feishu-handoff-replies"),
-                Thread(target=self._deliver, args=(True,), name="feishu-handoff-reactions"),
-            )
+        client = _Connection(self, approvals=False)
+        threads = (
+            Thread(target=self._recover, name="feishu-handoff-history"),
+            Thread(target=self._deliver, args=(False,), name="feishu-handoff-replies"),
+            Thread(target=self._deliver, args=(True,), name="feishu-handoff-reactions"),
+        )
+        for thread in threads:
+            thread.start()
+        serving = ws.loop.create_task(self._serve(client))
+        try:
+            ws.loop.run_until_complete(serving)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self._stop.set()
+            self._scan.set()
+            serving.cancel()
+            ws.loop.run_until_complete(asyncio.gather(serving, return_exceptions=True))
+            self._receipts.shutdown(wait=True, cancel_futures=True)
             for thread in threads:
-                thread.start()
-            serving = ws.loop.create_task(self._serve(client))
-            try:
-                ws.loop.run_until_complete(serving)
-            except KeyboardInterrupt:
-                pass
-            finally:
-                self._stop.set()
-                self._scan.set()
-                serving.cancel()
-                ws.loop.run_until_complete(asyncio.gather(serving, return_exceptions=True))
-                self._receipts.shutdown(wait=True, cancel_futures=True)
-                for thread in threads:
-                    thread.join()
+                thread.join()
 
 
 def _utc(ms: int) -> str:

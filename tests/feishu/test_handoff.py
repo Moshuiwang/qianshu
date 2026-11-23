@@ -1311,3 +1311,92 @@ def test_member_cli_pipeline_isolation(tmp_path, monkeypatch):
     monkeypatch.setattr(handoff.HandoffService, "run", run)
     monkeypatch.setattr(entry, "setup_logging", lambda _: None)
     assert entry.main(["--handoff-only", "--env-file", str(config), "--business-env-file", str(config)]) == 0
+
+
+def _contending_start(config, now):
+    import multiprocessing
+
+    def start():
+        from functools import partialmethod
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(handoff.MentionLog, "__init__",
+                          partialmethod(handoff.MentionLog.__init__, clock=lambda: now))
+            patch.setattr(entry, "setup_logging", lambda _: None)
+            patch.setattr(handoff, "_Connection", lambda *a, **kw: pytest.fail("抢锁失败仍启动长连接"))
+            result = entry.main(["--handoff-only", "--env-file", str(config),
+                                 "--business-env-file", str(config)])
+            assert result == 1
+
+    child = multiprocessing.get_context("fork").Process(target=start)
+    child.start()
+    child.join(5)
+    try:
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.kill()
+            child.join()
+        child.close()
+
+
+def _member_config_for_log(config, path, members):
+    settings = member_settings(config, members)
+    with config.open("a") as stream:
+        stream.write(f"FEISHU_MENTION_LOG={path}\n")
+    return settings
+
+
+def test_failed_listener_activation_preserves_database_and_start_time(tmp_path):
+    config, path = tmp_path / "settings", tmp_path / "private" / "log"
+    disabled = member_settings(config, "")
+    enabled = _member_config_for_log(config, path, MEMBER)
+    with closing(handoff.MentionLog(path, disabled, create=True, clock=lambda: 1000)) as store:
+        with store.listener():
+            before = list(store._db.iterdump())
+            _contending_start(config, 1010)
+            after = list(store._db.iterdump())
+
+    client = FakeFeishu()
+    client.messages = [message("om_before", created=1029, sender=MEMBER),
+                       message("om_active", created=1030, sender=MEMBER)]
+    with closing(handoff.MentionLog(path, enabled, create=True, clock=lambda: 1030)) as restarted:
+        with restarted.listener():
+            restarted.recover(client, Event())
+            relay = handoff.Handoff(restarted, client)
+            while relay.send_one(reaction=True):
+                pass
+            assert [row["message_id"] for row in restarted.pending()] == ["om_active"]
+    assert before == after
+
+
+def test_failed_listener_revocation_preserves_pending_and_fallback(tmp_path):
+    config, path = tmp_path / "settings", tmp_path / "private" / "log"
+    enabled = member_settings(config, MEMBER)
+    _member_config_for_log(config, path, "")
+    with closing(handoff.MentionLog(path, enabled, create=True, clock=lambda: 1000)) as store:
+        with store.listener():
+            receive(handoff.Handoff(store, FakeFeishu()), message(sender=MEMBER))
+            row, = store.pending()
+            assert row["fallback_status"] == "pending"
+            before = list(store._db.iterdump())
+            _contending_start(config, 1010)
+            assert [(r["ref"], r["fallback_status"]) for r in store.pending()] == [(row["ref"], "pending")]
+            assert list(store._db.iterdump()) == before
+
+
+def test_watcher_before_member_initialization_reads_owner_without_schema_write(tmp_path, monkeypatch, capsys):
+    config, path = tmp_path / "settings", tmp_path / "private" / "log"
+    disabled = member_settings(config, "")
+    _member_config_for_log(config, path, MEMBER)
+    client = FakeFeishu()
+    monkeypatch.setattr(watch_mentions, "_Transport", lambda *args: client)
+    with closing(handoff.MentionLog(path, disabled, create=True, clock=lambda: 1000)) as store:
+        receive(handoff.Handoff(store, client), message())
+        row, = store.pending()
+        before = list(store._db.iterdump())
+        args = ["--env-file", str(config)]
+        assert watch_mentions.main([*args, "status", row["ref"]]) == 0
+        assert capsys.readouterr().out.strip() == "none"
+        assert watch_mentions.main([*args, "read"]) == 0
+        assert json.loads(capsys.readouterr().out)["ref"] == row["ref"]
+        assert list(store._db.iterdump()) == before
