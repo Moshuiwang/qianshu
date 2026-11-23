@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from math import isfinite
 from pathlib import Path
 from typing import Protocol
+from urllib.parse import urlsplit
 
 import httpx
 from dotenv import dotenv_values
@@ -158,6 +159,18 @@ def configured_effort(config: Mapping[str, str]) -> str:
     return effort
 
 
+def _validate_endpoint(value: str, profile: str) -> None:
+    message = f"{profile}端点必须是有效的 HTTPS 地址。"
+    try:
+        endpoint = httpx.URL(value)
+        # HTTPX 会在规范化时丢弃空的用户名分隔符。
+        has_userinfo = urlsplit(value).username is not None
+    except (ValueError, httpx.InvalidURL):
+        raise ConfigError(message) from None
+    if endpoint.scheme != "https" or not endpoint.host or endpoint.userinfo or has_userinfo:
+        raise ConfigError(message)
+
+
 def configured_model(
     config: Mapping[str, str], *, on_result: Callable[[CallResult], None] | None = None,
     max_retries: int | None = None,
@@ -170,6 +183,8 @@ def configured_model(
         platform = config.get("AI_PLATFORM", "anthropic")
         key_name = "ANTHROPIC_API_KEY"
         base_url = config.get("ANTHROPIC_BASE_URL")
+        if base_url is not None:
+            _validate_endpoint(base_url, "主用")
         model = config.get("ANTHROPIC_MODEL", DEFAULT_MODEL)
         effort = configured_effort(config)
     elif profile == "backup":
@@ -179,12 +194,7 @@ def configured_model(
         base_url = config.get("AI_BACKUP_BASE_URL")
         if not (platform and model and base_url):
             raise ConfigError("备用平台须填写 AI_BACKUP_PLATFORM、AI_BACKUP_MODEL 和 AI_BACKUP_BASE_URL。")
-        try:
-            endpoint = httpx.URL(base_url)
-        except httpx.InvalidURL:
-            raise ConfigError("备用端点必须是有效的 HTTPS 地址。") from None
-        if endpoint.scheme != "https" or not endpoint.host:
-            raise ConfigError("备用端点必须是有效的 HTTPS 地址。")
+        _validate_endpoint(base_url, "备用")
         effort = DEFAULT_EFFORT
     else:
         raise ConfigError("AI_ACTIVE_PROFILE 仅接受 primary 或 backup。")

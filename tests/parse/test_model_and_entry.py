@@ -1,6 +1,7 @@
 import io
 import json
 import logging
+import ssl
 import subprocess
 import sys
 from contextlib import nullcontext
@@ -106,7 +107,7 @@ def test_anthropic_request_with_recorded_transport(monkeypatch, model_config, ex
             text="".join(f"event: {event['type']}\ndata: {json.dumps(event)}\n\n" for event in events),
         )
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(mocked_reply), **kw))
     for name in ("anthropic", "httpx", "httpcore"):
         monkeypatch.setattr(logging.getLogger(name), "level", logging.DEBUG)
@@ -335,7 +336,7 @@ def test_stream_interrupted_midway_is_sanitized(monkeypatch, error, block_type):
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               stream=_BrokenStream(error, block_type))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(interrupted), **kw))
     config = {"ANTHROPIC_API_KEY": "placeholder-key", "ANTHROPIC_BASE_URL": "https://model.example.invalid"}
     captured = []
@@ -769,7 +770,7 @@ def test_stream_requires_matching_indices_and_message_stop(monkeypatch, damage):
 def test_shape_correction_network_failure_has_no_sdk_retry(monkeypatch):
     requests = []
 
-    def transport(request):
+    def reply(request):
         requests.append(json.loads(request.content)["messages"])
         if len(requests) > 1:
             return httpx.Response(503, json={"type": "error", "error": {"type": "api_error", "message": "synthetic"}})
@@ -791,8 +792,8 @@ def test_shape_correction_network_failure_has_no_sdk_retry(monkeypatch):
         return httpx.Response(200, headers={"content-type": "text/event-stream"},
                               text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
-        transport=httpx.MockTransport(transport), **kw))
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(reply), **kw))
     results = []
     model = configured_model({"ANTHROPIC_API_KEY": "synthetic"}, on_result=results.append)
     with pytest.raises(ModelError):
@@ -902,7 +903,7 @@ def test_backup_uses_only_configured_endpoint_and_key(monkeypatch, tmp_path):
         requests.append(request)
         return httpx.Response(307, headers={"Location": "https://other.invalid"})
 
-    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda **kw: httpx.Client(
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
         transport=httpx.MockTransport(redirect), **kw))
     model = configured_model(load_model_config(env_file=settings))
     monkeypatch.setenv("ANTHROPIC_CUSTOM_HEADERS", "x-test: synthetic")
@@ -995,3 +996,193 @@ def test_backup_rejects_plain_http_before_send(monkeypatch):
             "AI_BACKUP_BASE_URL": "http://backup.invalid",
         })(system="", user="合成申请")
     send.assert_not_called()
+
+
+def _endpoint_config(profile):
+    return {
+        "AI_ACTIVE_PROFILE": profile, "ANTHROPIC_API_KEY": "primary-fixture",
+        "AI_BACKUP_PLATFORM": "anthropic", "AI_BACKUP_MODEL": "fixture-model",
+        "AI_BACKUP_BASE_URL": "https://backup.invalid", "AI_BACKUP_API_KEY": "backup-fixture",
+    }
+
+
+@pytest.mark.parametrize("endpoint", ["http://model.invalid", "", "/relative", "https:///path", "https://[bad"])
+def test_primary_requires_valid_https_endpoint(endpoint, monkeypatch):
+    from qianshu.ai import ADAPTERS
+
+    dispatch = Mock()
+    monkeypatch.setitem(ADAPTERS, "anthropic", dispatch)
+    with pytest.raises(ConfigError, match="HTTPS"):
+        configured_model({**_endpoint_config("primary"), "ANTHROPIC_BASE_URL": endpoint})
+    dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize("profile", ["primary", "backup"])
+@pytest.mark.parametrize("userinfo", ["fixture-user:fixture-token", "fixture-user", ":fixture-token", ""])
+def test_endpoint_userinfo_rejected_before_send(monkeypatch, profile, userinfo):
+    send = Mock(return_value=httpx.Response(400))
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", send)
+    name = "ANTHROPIC_BASE_URL" if profile == "primary" else "AI_BACKUP_BASE_URL"
+    with pytest.raises(ConfigError, match="HTTPS") as error:
+        configured_model({**_endpoint_config(profile), name: f"https://{userinfo}@model.invalid"})
+    assert "fixture" not in str(error.value)
+    send.assert_not_called()
+
+
+@pytest.mark.parametrize(("source", "location"), [
+    ("http://model.invalid", "/again"), ("https://model.invalid", "http://model.invalid/again"),
+])
+def test_redirect_requires_https_at_both_ends(source, location):
+    from qianshu.ai.anthropic import _guard_redirect
+
+    responses = [httpx.Response(307, headers={"location": location, "x-should-retry": "true"}), httpx.Response(200)]
+    send = Mock(side_effect=responses)
+    with httpx.Client(transport=httpx.MockTransport(send), follow_redirects=True,
+                      event_hooks={"response": [_guard_redirect]}) as client:
+        response = client.get(source)
+    send.assert_called_once()
+    assert response.status_code == 307
+    assert "location" not in response.headers
+    assert response.headers["x-should-retry"] == "false"
+
+
+@pytest.fixture
+def transport_requests(monkeypatch):
+    requests = []
+
+    def respond(transport, request):
+        requests.append(request)
+        events = [
+            {"type": "message_start", "message": {"id": "msg_fixture", "type": "message", "role": "assistant",
+             "model": "fixture", "content": [], "stop_reason": None, "stop_sequence": None,
+             "usage": {"input_tokens": 1, "output_tokens": 0}}},
+            {"type": "content_block_start", "index": 0, "content_block": {
+                "type": "tool_use", "id": "toolu_fixture", "name": "submit_application_reply", "input": {}}},
+            {"type": "content_block_delta", "index": 0, "delta": {
+                "type": "input_json_delta", "partial_json": serialized_empty()}},
+            {"type": "content_block_stop", "index": 0},
+            {"type": "message_delta", "delta": {"stop_reason": "tool_use"}, "usage": {"output_tokens": 1}},
+            {"type": "message_stop"},
+        ]
+        return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                              text="".join(f"event: {e['type']}\ndata: {json.dumps(e)}\n\n" for e in events))
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
+    return requests
+
+
+@pytest.mark.parametrize("profile", ["primary", "backup"])
+@pytest.mark.parametrize("simulate_fallback", [False, True], ids=["locked-sdk", "token-fallback"])
+def test_model_uses_only_selected_credentials(profile, simulate_fallback, monkeypatch, transport_requests):
+    for name in ("API_KEY", "AUTH_TOKEN", "WEBHOOK_SIGNING_KEY"):
+        monkeypatch.setenv(f"ANTHROPIC_{name}", f"ambient-{name}")
+    constructor = anthropic.Anthropic
+    signing_keys = []
+
+    def create(**kwargs):
+        if simulate_fallback and kwargs.get("auth_token") is None:
+            kwargs["auth_token"] = "ambient-AUTH_TOKEN"
+        client = constructor(**kwargs)
+        signing_keys.append(client.webhook_key)
+        return client
+
+    monkeypatch.setattr(anthropic, "Anthropic", create)
+    assert configured_model(_endpoint_config(profile))(system="", user="") == serialized_empty()
+    request, = transport_requests
+    assert request.headers.get_list("x-api-key") == [f"{profile}-fixture"]
+    assert "Authorization" not in request.headers
+    assert all(b"ambient-" not in value for _, value in request.headers.raw)
+    assert b"ambient-" not in request.content
+    assert signing_keys[0] != "ambient-WEBHOOK_SIGNING_KEY"
+
+
+@pytest.mark.parametrize("profile", ["primary", "backup"])
+def test_environment_cannot_supply_missing_key(profile, monkeypatch, transport_requests):
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "ambient-key")
+    config = _endpoint_config(profile)
+    del config["ANTHROPIC_API_KEY" if profile == "primary" else "AI_BACKUP_API_KEY"]
+    with pytest.raises(ConfigError, match="API_KEY"):
+        configured_model(config)
+    assert not transport_requests
+
+
+@pytest.mark.parametrize("scheme", ["http", "ftp"])
+def test_client_ignores_credentialed_environment_proxy(scheme, monkeypatch, transport_requests):
+    # 检查 SDK 创建的每个传输；实际发送由内存存根接管。
+    initialize = httpx.HTTPTransport.__init__
+    proxies = []
+
+    def check_proxy(transport, *args, **kwargs):
+        if kwargs.get("proxy") is not None:
+            proxies.append(True)
+        initialize(transport, *args, **kwargs)
+
+    monkeypatch.setattr(httpx.HTTPTransport, "__init__", check_proxy)
+    for name in ("https_proxy", "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY", "REQUEST_METHOD"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", f"{scheme}://fixture-user:fixture-token@proxy.invalid")
+    assert configured_model(_endpoint_config("primary"))(system="", user="") == serialized_empty()
+    assert not proxies
+    assert len(transport_requests) == 1
+
+
+def test_direct_transport_ignores_environment_keylog(monkeypatch):
+    from qianshu.ai.anthropic import _direct_transport
+
+    assigned = []
+    monkeypatch.setattr(ssl.SSLContext, "keylog_filename",
+                        property(lambda self: None, lambda self, value: assigned.append(value)))
+    monkeypatch.setenv("SSLKEYLOGFILE", "fixture-keylog")
+    with _direct_transport(httpx.Limits()):
+        assert not assigned
+
+
+def test_client_construction_error_is_sanitized(monkeypatch, transport_requests):
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", Mock(side_effect=ValueError("fixture-user")))
+    with pytest.raises(ModelError, match="^申请解析模型调用失败。$") as error:
+        configured_model(_endpoint_config("primary"))(system="", user="")
+    assert error.value.__suppress_context__
+    assert not transport_requests
+
+
+def _request_bytes(request):
+    url = request.url
+    parts = [request.method.encode(), url.raw_scheme, url.raw_host,
+             str(url.port).encode() if url.port is not None else None, url.raw_path]
+    for key, value in request.headers.raw:
+        parts.extend((key, value))
+    parts.append(request.content)
+    return b"".join(b"-1:" if part is None else str(len(part)).encode() + b":" + part for part in parts)
+
+
+def test_default_request_matches_baseline_bytes(monkeypatch, transport_requests, tmp_path):
+    # 两份请求共用解释器和 SDK，保留平台相关的原始请求头。
+    for name in ("BASE_URL", "CUSTOM_HEADERS", "AUTH_TOKEN"):
+        monkeypatch.delenv(f"ANTHROPIC_{name}", raising=False)
+    assert configured_model({"ANTHROPIC_API_KEY": "fixture"})(system="合成规则", user="合成正文") == serialized_empty()
+    actual, = transport_requests
+    (tmp_path / "default-request.bin").write_bytes(_request_bytes(actual))
+
+    with anthropic.Anthropic(api_key="fixture", http_client=anthropic.DefaultHttpxClient()) as baseline:
+        with baseline.messages.create(
+            model="claude-sonnet-5-5", system="合成规则", messages=[{"role": "user", "content": "合成正文"}],
+            max_tokens=128000, output_config={"effort": "medium"},
+            tools=[{"name": "submit_application_reply", "description": "提交一份申请解析声明。",
+                    "input_schema": ApplicationReply.model_json_schema()}],
+            stream=True,
+        ) as stream:
+            assert [event.delta.partial_json for event in stream if event.type == "content_block_delta"] == [
+                serialized_empty(),
+            ]
+    _, reference = transport_requests
+    assert _request_bytes(actual) == _request_bytes(reference)
+
+
+@pytest.mark.parametrize("endpoint", ["http://model.invalid", "https:///path", "https://user@model.invalid",
+                                      "https://@model.invalid"])
+def test_streaming_adapter_rejects_invalid_endpoint(endpoint):
+    from qianshu.ai.anthropic import streaming_model
+
+    with pytest.raises(ConfigError, match="HTTPS"):
+        streaming_model(api_key="fixture", base_url=endpoint, model="fixture", effort="medium",
+                        on_result=None, max_retries=0, follow_redirects=False)
