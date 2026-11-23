@@ -445,21 +445,23 @@ def test_sdk_project_log_hides_document_ids(setup, monkeypatch):
     with monkeypatch.context() as patch:
         # 与测试顺序无关：其他测试可能全局禁用日志或改动子日志器，这里只在本测试内复位。
         previous_disable = logging.root.manager.disable
-        logging.disable(logging.NOTSET)
-        patch.setattr(root, "handlers", [])
-        patch.setattr(root, "level", logging.INFO)
-        for name in ("httpx", "httpcore", "qianshu", "lark_oapi", "Lark"):
-            child = logging.getLogger(name)
-            patch.setattr(child, "disabled", False)
-            patch.setattr(child, "propagate", True)
-            patch.setattr(child, "level", logging.NOTSET)
-            patch.setattr(child, "handlers", [])
-        patch.setattr("sys.stderr", stream)
-        setup_logging(cfg)
-        register()
-        assert isinstance(run(transport=None), a.ArchiveSuccess)
-        logging.getLogger("httpx").info("ordinary request")
-        logging.disable(previous_disable)
+        try:
+            logging.disable(logging.NOTSET)
+            patch.setattr(root, "handlers", [])
+            patch.setattr(root, "level", logging.INFO)
+            for name in ("httpx", "httpcore", "qianshu", "lark_oapi", "Lark"):
+                child = logging.getLogger(name)
+                patch.setattr(child, "disabled", False)
+                patch.setattr(child, "propagate", True)
+                patch.setattr(child, "level", logging.NOTSET)
+                patch.setattr(child, "handlers", [])
+            patch.setattr("sys.stderr", stream)
+            setup_logging(cfg)
+            register()
+            assert isinstance(run(transport=None), a.ArchiveSuccess)
+            logging.getLogger("httpx").info("ordinary request")
+        finally:
+            logging.disable(previous_disable)
     assert "archive_request " in stream.getvalue()
     assert "ordinary request" in stream.getvalue()
     assert all(s not in stream.getvalue() for s in ("Created", "Target", "/open-apis/"))
@@ -514,3 +516,109 @@ def test_split_secret_with_visible_detail_on_both_sides(setup):
     payload = json.dumps(stub.writes, ensure_ascii=False)
     assert "活动说明[已脱敏]" in payload and "[已脱敏]数量说明" in payload
     assert "材料" not in payload and "禁止" not in payload
+
+
+_SCENARIO = "Scenario: 仅面向现有用户"
+_QUOTED_FROM = "> From: synthetic"
+_FOLDS = (
+    "> From: synthetic\r\n \t\r\n> X-Internal: 合成内部字段值",
+    "> From: synthetic\n> X-Internal: synthetic\n>> \t合成内部字段值",
+)
+_SAME_DEPTH = "> Extra!: 甲\r\n>  乙\r\n\t> Subject: 丙\r\n>Tail: 尾字段值\r\n>\t丁"
+_NESTED = ("> From: 甲", ">> Extra: 引用明细", "> Sent: 乙",
+           "> > Subject: 丙", "\t>> Tail: 丁", ">> \t折行")
+
+
+@pytest.fixture(scope="module")
+def baseline_archive(tmp_path_factory):
+    import importlib.util
+    import subprocess
+    from pathlib import Path
+
+    source = subprocess.check_output(
+        ["git", "show", "ec8917f:src/qianshu/feishu/archive.py"], cwd=Path(a.__file__).parent,
+    )
+    path = tmp_path_factory.mktemp("archive_baseline") / "archive.py"
+    path.write_bytes(source)
+    spec = importlib.util.spec_from_file_location("qianshu.feishu.archive_baseline", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def published_paragraphs(stub):
+    return tuple(child["text"]["elements"][0]["text_run"]["content"] for child in stub.pages["Created"])
+
+
+@pytest.mark.parametrize("lines", [(_SCENARIO, _QUOTED_FROM), (_QUOTED_FROM, _SCENARIO)])
+def test_unquoted_scenario_adjacent_to_quoted_header(setup, lines):
+    batch, _, cfg, stub, register, run = setup
+    batch = excerpt_batch(batch, "使用场景", "\n".join(lines), _SCENARIO)
+    preview = a.preview_archive_batch(batch, config=cfg)
+    assert preview.blocks[3].split("　", 1)[1] == _SCENARIO
+    register(batch, preview_fingerprint=preview.fingerprint)
+    assert isinstance(run(batch), a.ArchiveSuccess)
+    assert published_paragraphs(stub) == preview.blocks
+
+
+@pytest.mark.parametrize("context", (*_FOLDS, _SAME_DEPTH))
+def test_required_fold_or_same_depth_tail_stops_publication(setup, context):
+    batch, _, _, _, register, run = setup
+    detail = "尾字段值" if context == _SAME_DEPTH else "合成内部字段值"
+    batch = excerpt_batch(batch, "使用场景", context, detail)
+    register(batch)
+    transport = Mock()
+    assert run(batch, transport=transport) == a.ArchiveFailed("prepare", "material")
+    transport.request.assert_not_called()
+
+
+@pytest.mark.parametrize("headers", [_SAME_DEPTH, "\n".join(_NESTED), "\r\n".join(_NESTED)])
+def test_quoted_header_block_remains_fully_masked(setup, headers):
+    batch, _, cfg, _, _, _ = setup
+    assert list(a._header_blocks(headers)) == [(0, len(headers))]
+    context = headers + "\r\n可见明细"
+    batch = excerpt_batch(batch, "使用场景", context, context)
+    preview = a.preview_archive_batch(batch, config=cfg)
+    assert preview.blocks[3].split("　", 1)[1] == "[已脱敏]\r\n可见明细"
+
+
+@pytest.mark.parametrize("use_old", [True, False], ids=["old", "new"])
+def test_quote_depth_changes_preview_registration(setup, baseline_archive, use_old):
+    batch, _, cfg, stub, register, run = setup
+    context = "可见明细\n" + _QUOTED_FROM + "\n" + _SCENARIO
+    batch = excerpt_batch(batch, "使用场景", context, context)
+    old = baseline_archive.preview_archive_batch(batch, config=cfg)
+    new = a.preview_archive_batch(batch, config=cfg)
+    assert _SCENARIO not in old.body and _SCENARIO in new.body
+    assert old.fingerprint != new.fingerprint
+    register(batch, preview_fingerprint=(old if use_old else new).fingerprint)
+    if use_old:
+        assert run(batch) == a.ArchiveFailed("prepare", "preview")
+        assert stub.writes == []
+    else:
+        assert isinstance(run(batch), a.ArchiveSuccess)
+        assert published_paragraphs(stub) == new.blocks
+
+
+def test_quote_depth_mask_covers_baseline(baseline_archive):
+    cases = [
+        *[(context, ()) for context in (*_FOLDS, _SAME_DEPTH, ">From: 甲\n> 续行",
+                                        "> Extra: 甲\n>  续行\n> From: 乙\n>\n" + _SCENARIO,
+                                        "Subject: 甲\n" + _SCENARIO,
+                                        _SCENARIO + "\n \t\nSubject: 甲",
+                                        "> Extra: 甲\n\n" + _SCENARIO)],
+        *[(ending.join(_NESTED), ()) for ending in ("\n", "\r\n")],
+        ("> From: 甲\n" + _SCENARIO + "\n 续行", (_SCENARIO,)),
+        (_SCENARIO + "\r\n>> \t折行\r\n>> Subject: 甲", (_SCENARIO,)),
+        (_SCENARIO + "\n" + _QUOTED_FROM, (_SCENARIO,)),
+        (_QUOTED_FROM + "\n" + _SCENARIO, (_SCENARIO,)),
+    ]
+
+    def covered(spans):
+        return {i for start, end in spans for i in range(start, end)}
+
+    for body, ordinary_fields in cases:
+        allowed = covered((body.index(field), body.index(field) + len(field)) for field in ordinary_fields)
+        old = covered(baseline_archive._header_blocks(body))
+        new = covered(a._header_blocks(body))
+        assert old <= new | allowed, body

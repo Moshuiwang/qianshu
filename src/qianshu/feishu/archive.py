@@ -15,6 +15,7 @@ from contextlib import closing, contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import date
+from itertools import groupby
 from pathlib import Path
 from typing import Protocol
 from uuid import NAMESPACE_URL, uuid5
@@ -214,8 +215,27 @@ def _token(value):
 
 def _header_blocks(body):
     """在完整原文上定位连续头部，保留引文所用的字符坐标。"""
-    start = None
-    known = False
+    # 保留连续头部原有的遮盖范围，只从中扣除无引用、同层没有已知头的普通字段。
+    # 每个字段仅记录本行正文坐标，折行和分隔换行始终留在遮盖范围内。
+    fields = []
+
+    def masked_ranges(end):
+        if not any(known for _, _, _, known in fields):
+            return
+        cursor = fields[0][1]
+        for depth, group in groupby(fields, key=lambda field: field[0]):
+            if depth:
+                continue
+            unquoted = list(group)
+            if any(known for _, _, _, known in unquoted):
+                continue
+            for _, start, stop, _ in unquoted:
+                if cursor < start:
+                    yield cursor, start
+                cursor = stop
+        if cursor < end:
+            yield cursor, end
+
     end = 0
     field_prefix = ""
     for line in re.finditer(r"[^\r\n]*(?:\r\n|[\r\n])|[^\r\n]+$", body):
@@ -223,20 +243,15 @@ def _header_blocks(body):
         prefix = _QUOTE_PREFIX.match(raw)
         quote_prefix = prefix[0] if prefix else ""
         content = raw[len(quote_prefix):]
-        known_field = _HEADER.match(raw)
-        if known_field or _FIELD.match(content):
-            if start is None:
-                start = line.start()
-            known |= bool(known_field)
+        known = bool(_HEADER.match(raw))
+        if known or _FIELD.match(content):
+            fields.append((quote_prefix.count(">"), line.start(), line.start() + len(raw), known))
             field_prefix = quote_prefix
         elif not (content.startswith((" ", "\t")) or raw.startswith((field_prefix + " ", field_prefix + "\t"))):
-            if known:
-                yield start, end
-            start = None
-            known = False
+            yield from masked_ranges(end)
+            fields.clear()
         end = line.start() + len(raw)
-    if known:
-        yield start, end
+    yield from masked_ranges(end)
 
 
 def _material(batch, config, registered):
