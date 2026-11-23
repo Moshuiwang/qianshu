@@ -18,10 +18,9 @@ from . import _fingerprint
 from .imap import MailError, trial_connect
 from .segmented import read_segmented
 from .triage import MailItem, classify, input_limit, trial_model
-from .trial_state import Hold, Store
+from .trial_state import BODY_NOTICE, FormatHold, Hold, Store
 
 _LOG = logging.getLogger(__name__)
-_BODY_NOTICE = "部分正文未参与解析，请人工核对原邮件"
 _NOTICES = {
     "received": "收到，待核对 1 封。",
     "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
@@ -109,7 +108,7 @@ class Trial:
                 self.flush()
                 return
         if box["state"] == "frozen" or validity != box["validity"] or next_uid < box["peak"]:
-            if box["state"] != "frozen":
+            if box["state"] != "frozen" or validity != box["validity"]:
                 self.store.freeze(self.scope, "generation")
             if self.store.uncovered(self.scope):
                 self.flush()
@@ -174,10 +173,6 @@ class Trial:
                     row["msgkey"], row["digest"], row["candidate"], row["attachments"]):
                 self.store.freeze(self.scope, "mapping")
                 break
-            if item.body_missed:
-                # 兼容升级前已经登记、这轮首次核实覆盖的邮件。
-                with self.store.write():
-                    self.store.record_coverage(self.scope, item)
             if card:
                 self.parse(row, gen, text, body_missed=item.body_missed)
             else:
@@ -292,7 +287,7 @@ class Trial:
                 self.store.notice(f"body:{reg}", self.scope, reg, "body_missed")
         notices = []
         if body_missed:
-            notices.append(CardLine("正文", _BODY_NOTICE))
+            notices.append(CardLine("正文", BODY_NOTICE))
         if row["attachments"] != 0:
             hint = f"含 {row['attachments']} 个附件未解析，请对照原件核对"
             if row["attachments"] is None:
@@ -337,6 +332,8 @@ class Trial:
             raise Hold()
 
     def flush(self):
+        with self.store.write():
+            self.store.review_stale_notices(self.scope)
         rows = list(self.store.db.execute("""SELECT * FROM notice WHERE status='pending'
             AND (scope=? OR scope IS NULL) ORDER BY rowid""", (self.scope,)))
         for row in rows:
@@ -360,7 +357,7 @@ class Trial:
                         if not warning and not db.execute("""UPDATE notice SET status='unknown' WHERE event=?
                             AND status='pending'""", (row["event"],)).rowcount:
                             continue
-                    content = (result_card(detail_pages("试运行邮件", [CardLine("正文", _BODY_NOTICE)])[0])
+                    content = (result_card(detail_pages("试运行邮件", [CardLine("正文", BODY_NOTICE)])[0])
                                if warning else _NOTICES[kind].format(n=row["quantity"]))
                     def before_send():
                         self.require_enabled(card)
@@ -447,6 +444,8 @@ def run_service(args, settings, path, switches):
                 *settings.handoff_sensitive_values, *settings.handoff_sensitive_urls,
             ))
             trial.run()
+        except FormatHold as exc:
+            _LOG.error("%s", exc)
         except Exception:
             _LOG.error("试运行收信已停止，请核对私有登记。")
         finally:

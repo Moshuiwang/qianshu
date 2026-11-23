@@ -736,7 +736,7 @@ def main(argv: list[str] | None = None) -> int:
                 or any((args.mail, args.handoff_only, args.trial_switches, args.inject, args.list_recovery))
                 or (args.trial_import_spend is not None and args.trial_reconcile)):
             parser.error("费用导入及人工对账须独立指定 --state 私有目录/trial-050.sqlite3。")
-        from .mail.trial_state import Store
+        from .mail.trial_state import FormatHold, Store
         try:
             check_output_path(args.state)
             store = Store(args.state)
@@ -746,6 +746,9 @@ def main(argv: list[str] | None = None) -> int:
                     store.reconcile(scope, *map(int, numbers))
                 else:
                     store.import_spend(args.trial_import_spend)
+        except FormatHold as exc:
+            print(exc, file=sys.stderr)
+            return 1
         except Exception:
             print("试运行私有登记失败，请核对金额、代次与已有登记。", file=sys.stderr)
             return 1

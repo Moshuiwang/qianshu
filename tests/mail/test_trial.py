@@ -267,7 +267,7 @@ def test_related_root_trailing_space_poll(tmp_path, monkeypatch, baseline_module
     trial.poll()
     trial.poll()
     assert trial.box()["state"] == "active"
-    assert tuple(store.row("SELECT status,verdict,attachments FROM registration")) == ("manual", "是", 1)
+    assert tuple(store.row("SELECT status,verdict,attachments FROM registration")) == ("转人工（正文未参与解析）", "是", 1)
     assert requests[1:] == expected
     assert inbox.commands.count(("FETCH", "2", "(BODY.PEEK[TEXT])")) == 2
     assert sent and inbox.seen == {1}

@@ -58,10 +58,10 @@ def test_body_selection_at_delivery(journey, baseline_modules, monkeypatch, plai
     row = worker.store.row("SELECT * FROM registration")
     assert row["verdict"] == verdict
     rendered = json.dumps([c for card, c in cards if card], ensure_ascii=False)
-    assert ("部分正文未参与解析，请人工核对原邮件" in rendered) == missed
+    assert ("正文结构超出自动处理范围，请人工核对原邮件" in rendered) == missed
     assert "CURRENT" not in rendered
     reason = worker.store.batch(row["id"], row["version"])[3]
-    assert reason == ("正文未参与解析" if missed else None)
+    assert reason == ("正文结构超出自动处理范围，请人工核对原邮件" if missed else None)
     assert row["status"] == ("转人工（正文未参与解析）" if missed else "done")
 
 

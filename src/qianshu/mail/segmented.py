@@ -2,15 +2,13 @@
 
 import hashlib
 import re
-from email import policy
 from email.errors import MessageError
-from email.parser import BytesParser
 from html.parser import HTMLParser
 
 from . import _fingerprint
 from .imap import MailError, _number
 from .message import _plain_text, body_parts, headers, message_id, request_text
-from .triage import MailItem, has_body, triage_fields
+from .triage import BodyShape, MailItem, has_body, triage_fields
 
 
 def _frame(digest, value):
@@ -112,81 +110,8 @@ class _AltText(HTMLParser):
     visible = False
 
     def handle_starttag(self, tag, attrs):
-        if any(name == "alt" and value and has_body(value) for name, value in attrs):
+        if tag == "img" and any(name == "alt" and value and has_body(value) for name, value in attrs):
             self.visible = True
-
-
-def _visible_text(kind, value):
-    if has_body(_plain_text(kind, value)):
-        return True
-    if kind == "text/html":
-        parser = _AltText()
-        parser.feed(value)
-        parser.close()
-        return parser.visible
-    return False
-
-
-def _inline_segments(part, node):
-    """按内封原件与结构逐段核对；边界不明与未读文本同样阻断整批。"""
-    if part.defects or not isinstance(node, list) or not node:
-        raise ValueError
-    if any(len(part.get_all(key, [])) > 1 for key in
-           ("Content-Type", "Content-Disposition", "Content-Transfer-Encoding")):
-        raise ValueError
-    if part.get_content_disposition() not in (None, "inline") or part.get_filename() is not None:
-        return 0
-    kind = part.get_content_type()
-    if isinstance(node[0], list):
-        children = list(part.iter_parts())
-        n = len(children)
-        if not n or kind != "multipart/" + node[n].decode().lower():
-            raise ValueError
-        return sum(_inline_segments(child, sub) for child, sub in zip(children, node[:n], strict=True))
-    if kind != b"/".join(node[:2]).decode().lower():
-        raise ValueError
-    if kind == "message/rfc822":
-        if node[5].upper() not in {b"7BIT", b"8BIT", b"BINARY"}:
-            raise ValueError
-        inner, = part.get_payload()
-        return _inline_segments(inner, node[8])
-    if kind in {"text/plain", "text/html"}:
-        value = part.get_content(errors="strict")
-        if part.defects or "\x00" in value:
-            raise ValueError
-        return int(_visible_text(kind, value))
-    return 0
-
-
-def _inline_uncovered(raw, node):
-    try:
-        if node[5].upper() not in {b"7BIT", b"8BIT", b"BINARY"}:
-            return True
-        inner = BytesParser(policy=policy.default).parsebytes(raw)
-        return bool(_inline_segments(inner, node[8]))
-    except (AttributeError, IndexError, LookupError, MessageError, TypeError, ValueError, RecursionError):
-        return True
-
-
-def _request_body(chosen, groups):
-    """旧请求独立生成；逐段判可见后才按纯文本叶子的替代组折叠。"""
-    text = ""
-    source_kind = None
-    for kind in ("text/plain", "text/html"):
-        parts = tuple(part for part in chosen.values() if part[0] == kind)
-        text = request_text(parts)
-        if text:
-            source_kind = kind
-            break
-    required, covered = set(), set()
-    for path, group in groups.items():
-        kind, value = chosen[path]
-        if _visible_text(kind, value):
-            required.add(group)
-            if text and kind == source_kind and has_body(_plain_text(kind, value)):
-                covered.add(group)
-    # 无文本也无请求时，沿用空正文的人工出口；纯附件保留附件提示。
-    return text, len(required) > 1 or required != covered or (not required and bool(text))
 
 
 def read_segmented(mailbox, uid, seen):
@@ -207,17 +132,22 @@ def read_segmented(mailbox, uid, seen):
                         {"received", "return-path", "delivered-to", "message-id"}])
         _frame(digest, read.tree)
         unknown_count = False
-        unverified_body = False
+        supported = True
+        alternatives = 0
+        groups = set()
+        sources = 0
+        text = request_text(parts)
+        plain = tuple(part for part in parts if part[0] == "text/plain")
+        source_kind = "text/plain" if request_text(plain) else "text/html"
         visible = set()
-        groups = {}
         selected_paths = {""} if chosen else set()
         for path in chosen:
             while path:
                 selected_paths.add(path)
                 path = path.rpartition(".")[0]
 
-        def visit(node, path="", resource=False, attachment=False):
-            nonlocal unknown_count, unverified_body
+        def visit(node, path="", resource=False, attachment=False, alternative=None):
+            nonlocal unknown_count, supported, sources, alternatives
             section = path or "TEXT"
             mime = headers(read.section(uid, path + ".MIME")) if path else outer
             multi = isinstance(node[0], list)
@@ -244,7 +174,7 @@ def read_segmented(mailbox, uid, seen):
             named = _named(params, b"NAME") or mime.get_filename() is not None
             disposition = _attached(disp)
             attached = mime.get_content_disposition() not in (None, "inline") or disposition is True
-            attachment = attachment or attached
+            attachment = attachment or named or attached
             uncertain = disposition is None and not (resource or named or attached) and (multi or section in chosen)
             unknown_count |= uncertain
             ambiguous = any(len(mime.get_all(name, [])) > 1 for name in
@@ -252,6 +182,19 @@ def read_segmented(mailbox, uid, seen):
             if (multi or section in chosen) and ambiguous:
                 raise MailError("正文或容器的 MIME 解释字段不唯一。")
             opaque = resource or named or attached or uncertain
+            kind = mime.get_content_type()
+            if not attachment:
+                structure_kind = ("multipart/" + node[n].decode() if multi else b"/".join(node[:2]).decode()).lower()
+                supported &= (not ambiguous and not mime.defects and disposition is not None and kind == structure_kind)
+                if multi and kind == "multipart/alternative":
+                    alternatives += 1
+                    alternative = path
+                    supported &= all(not isinstance(c[0], list) and c[0].upper() == b"TEXT"
+                                     and c[1].upper() in {b"PLAIN", b"HTML"} for c in children)
+                if (resource and multi) or kind == "message/rfc822":
+                    supported = False
+                if kind.startswith("text/") and section not in chosen:
+                    supported = False
             if multi:
                 prefix = path + "." if path else ""
                 if not opaque or path in selected_paths:
@@ -264,25 +207,30 @@ def read_segmented(mailbox, uid, seen):
                             raise MailError("已读段与根绑定不符。")
                         # 不透明容器只复核旧函数实际读出的后代，整棵子树计一。
                         if not opaque or child_path in selected_paths:
-                            count += visit(child, child_path, opaque or nonroot, attachment)
-                    if not opaque and node[n].upper() == b"ALTERNATIVE":
-                        paths = [f"{prefix}{i}" for i in range(1, n + 1)]
-                        if any(isinstance(child[0], list) for child in children):
-                            unverified_body = True
-                        elif all(p in visible for p in paths):
-                            groups.update(dict.fromkeys(paths, path))
+                            count += visit(child, child_path, opaque or nonroot, attachment, alternative)
                     if not opaque:
                         return count
             if section not in read.payloads:
-                raw_part = read.payload(section)
-                if (not multi and not (resource or named or attachment)
-                        and node[0].upper() == b"MESSAGE" and node[1].upper() == b"RFC822"):
-                    unverified_body |= (ambiguous or disposition is None or mime.get_content_type() != "message/rfc822"
-                                        or _inline_uncovered(raw_part, node))
+                read.payload(section)
             if not multi and str(octets) != read.payloads[section][0]:
                 raise MailError("邮件段长度与结构不符。")
-            if section in chosen and not attachment:
-                groups[section] = section
+            if section in chosen:
+                kind, value = chosen[section]
+                nonempty = has_body(_plain_text(kind, value))
+                selected = bool(text) and kind == source_kind
+                alt = False
+                if kind == "text/html" and not attachment:
+                    parser = _AltText()
+                    parser.feed(value)
+                    parser.close()
+                    alt = parser.visible
+                if not opaque and (nonempty or alt):
+                    groups.add(alternative if alternative is not None else section)
+                if selected and nonempty:
+                    sources += 1
+                    supported &= not opaque
+                if selected and alt:
+                    supported = False
             if section in chosen and not opaque:
                 visible.add(section)
                 return 0
@@ -299,15 +247,15 @@ def read_segmented(mailbox, uid, seen):
             _frame(digest, (path, fact))
         for path, part in chosen.items():
             _frame(digest, (path, part))
-        text, body_missed = _request_body(chosen, groups)
         preferred = "text/plain" if any(k == "text/plain" and has_body(s) for k, s in parts) else "text/html"
         visible_parts = [part for path, part in chosen.items() if path in visible]
         fields = triage_fields(outer, visible_parts, preferred)
         candidate = "2:" + digest.hexdigest()
         _frame(digest, [(k.lower(), v) for k, v in outer.raw_items() if k.lower() == "message-id"])
         key = message_id(outer)
+        shape = BodyShape(len(groups), sources, supported and alternatives <= 1)
         item = MailItem(_fingerprint(key) if key else None, "2:" + digest.hexdigest(),
-                        candidate, attachments, fields, body_missed or unverified_body)
+                        candidate, attachments, fields, shape)
         complete = True
         return item, text
     except (AttributeError, IndexError, LookupError, MessageError, ValueError, TypeError, RecursionError, AssertionError):

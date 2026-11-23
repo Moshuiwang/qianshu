@@ -14,20 +14,28 @@ from uuid import uuid4
 from qianshu.feishu.handoff import _file
 
 from . import _fingerprint
+from .triage import BodyShape
 
 
+FORMAT_VERSION = 1
+FORMAT_HOLD = "登记库格式版本不符，已整体冻结，请人工处理"
+BODY_NOTICE = "正文结构超出自动处理范围，请人工核对原邮件"
 MANUAL_BODY_MISSED = "转人工（正文未参与解析）"
 
 
-# 供日报的只读连接直接执行。顺序为待发、发送结果未知需人工核对。
+# 供日报的只读连接直接执行。顺序为待发、需人工核对。
 BODY_NOTICE_COUNTS_SQL = """
-SELECT count(*) FILTER (WHERE status='pending'), count(*) FILTER (WHERE status='unknown')
+SELECT count(*) FILTER (WHERE status='pending'), count(*) FILTER (WHERE status IN ('unknown','review'))
 FROM notice WHERE kind='body_missed'
 """
 
 
 class Hold(RuntimeError):
     """未获派发资格。"""
+
+
+class FormatHold(Hold):
+    """已有登记库需要人工处理。"""
 
 
 def now():
@@ -44,7 +52,7 @@ CREATE TABLE IF NOT EXISTS snapshot(
 CREATE TABLE IF NOT EXISTS scan_range(scope TEXT PRIMARY KEY, generation INTEGER, first INTEGER, last INTEGER);
 CREATE TABLE IF NOT EXISTS observed_range(scope TEXT PRIMARY KEY, generation INTEGER, next_uid INTEGER);
 CREATE TABLE IF NOT EXISTS location(
- scope TEXT, generation INTEGER, uid INTEGER, registration INTEGER, status TEXT DEFAULT 'pending',
+ scope TEXT, generation INTEGER, uid INTEGER, registration INTEGER, status TEXT DEFAULT 'pending', initial_seen INTEGER,
  PRIMARY KEY(scope,generation,uid));
 CREATE TABLE IF NOT EXISTS registration(
  id INTEGER PRIMARY KEY, scope TEXT, msgkey TEXT, digest TEXT, candidate TEXT, attachments INTEGER,
@@ -53,7 +61,8 @@ CREATE TABLE IF NOT EXISTS registration(
 CREATE INDEX IF NOT EXISTS trial_identity ON registration(scope,msgkey);
 CREATE INDEX IF NOT EXISTS trial_candidate ON registration(scope,candidate);
 CREATE TABLE IF NOT EXISTS trial_target(id INTEGER PRIMARY KEY CHECK(id=1), fingerprint TEXT NOT NULL);
-CREATE TABLE IF NOT EXISTS missed_body(scope TEXT, digest TEXT, PRIMARY KEY(scope,digest));
+CREATE TABLE IF NOT EXISTS body_shape(scope TEXT, digest TEXT, groups_count INTEGER, sources INTEGER,
+ supported INTEGER, PRIMARY KEY(scope,digest));
 CREATE TABLE IF NOT EXISTS trial_folder(scope TEXT PRIMARY KEY, folder TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS card_intent(
  uuid TEXT PRIMARY KEY, registration INTEGER NOT NULL, version INTEGER NOT NULL, page INTEGER NOT NULL,
@@ -81,28 +90,27 @@ CREATE TABLE ledger_check(id INTEGER PRIMARY KEY CHECK(id=1), digest TEXT NOT NU
 class Store:
     def __init__(self, path: Path):
         self.path = path
-        os.close(_file(path, create=True))
-        self.db = sqlite3.connect(path)
-        self.db.row_factory = sqlite3.Row
         self._locked = False
-        with self.write() as db:
-            fresh = not self.row("SELECT 1 FROM sqlite_master WHERE type='table'")
-            for statement in (_SCHEMA + (_LEDGER_SCHEMA if fresh else "")).split(";"):
-                if statement.strip():
-                    db.execute(statement)
-            if "initial_seen" not in {r[1] for r in db.execute("PRAGMA table_info(location)")}:
-                db.execute("ALTER TABLE location ADD COLUMN initial_seen INTEGER")
-            if "reason" not in {r[1] for r in db.execute("PRAGMA table_info(reconciliation)")}:
-                db.execute("ALTER TABLE reconciliation ADD COLUMN reason TEXT")
-                # 旧库已停在对账页时，UIDNEXT 不变也要用 v2 重读一次。
-                db.execute("""UPDATE mailbox SET reason='originals' WHERE state='frozen' AND
-                    (reason='reconciling' OR (reason='legacy' AND EXISTS
-                    (SELECT 1 FROM registration WHERE scope=mailbox.scope AND digest LIKE '1:%')))""")
-            if fresh:
-                self._seal_ledger()
-            else:
-                self._ledger_valid()
-                self._recover_body_notices()
+        with self.gate():
+            fresh = not path.exists()
+            os.close(_file(path, create=fresh))
+            self.db = sqlite3.connect(path)
+            self.db.row_factory = sqlite3.Row
+            try:
+                with self.write() as db:
+                    if fresh:
+                        for statement in (_SCHEMA + _LEDGER_SCHEMA).split(";"):
+                            if statement.strip():
+                                db.execute(statement)
+                        db.execute(f"PRAGMA user_version={FORMAT_VERSION}")
+                        self._seal_ledger()
+                    elif self.row("PRAGMA user_version")[0] != FORMAT_VERSION:
+                        raise FormatHold(FORMAT_HOLD)
+                    else:
+                        self._ledger_valid()
+            except BaseException:
+                self.db.close()
+                raise
 
     @contextmanager
     def gate(self):
@@ -132,38 +140,11 @@ class Store:
             (SELECT generation FROM mailbox WHERE scope=?))""",
                         (event, scope, reg, kind, str(uuid4()), now(), quantity, scope))
 
-    def _recover_body_notices(self):
-        # 旧版本仅在卡片路径省略通知登记。首张卡的发送意图保留了交付证据。
-        rows = self.db.execute("""SELECT r.id,r.scope,r.status,
-            (SELECT max(l.generation) FROM location l WHERE l.registration=r.id) generation,
-            p.status page_status,p.uuid page_uuid
-            FROM registration r JOIN missed_body m USING(scope,digest)
-            LEFT JOIN card_intent p ON p.uuid=(SELECT i.uuid FROM card_intent i
-                WHERE i.registration=r.id AND i.page=1 ORDER BY i.version DESC LIMIT 1)
-            WHERE r.status IN (?, 'sending') AND NOT EXISTS
-            (SELECT 1 FROM notice n WHERE n.event='body:' || r.id)""", (MANUAL_BODY_MISSED,)).fetchall()
-        for row in rows:
-            event = f"body:{row['id']}"
-            self.notice(event, row["scope"], row["id"], "body_missed")
-            delivery = row["page_status"] or "pending"
-            if delivery == "sent" and row["status"] == "sending":
-                delivery = "unknown"
-            self.db.execute("UPDATE notice SET status=?,generation=?,uuid=coalesce(?,uuid) WHERE event=?",
-                            (delivery, row["generation"], row["page_uuid"], event))
-
-        # 兼容旧版已经完成人工对账、提示仍滞留在旧代次的登记。
-        for box in self.db.execute("""SELECT DISTINCT m.scope,m.generation FROM mailbox m
-                JOIN notice n USING(scope) WHERE m.state='active' AND n.kind='body_missed'
-                AND n.status='pending' AND n.generation IS NOT m.generation""").fetchall():
-            self._migrate_body_notices(*box)
-
-    def _migrate_body_notices(self, scope, generation):
-        self.db.execute("""UPDATE notice SET generation=? WHERE scope=? AND kind='body_missed'
-                AND status='pending' AND registration IN (
-                    SELECT r.id FROM reconciliation c JOIN registration r ON r.id=c.matched
-                    WHERE c.scope=? AND c.generation=? AND r.scope=c.scope AND r.msgkey=c.msgkey
-                    AND r.digest=c.digest AND r.candidate=c.candidate AND r.status=?)""",
-                       (generation, scope, scope, generation, MANUAL_BODY_MISSED))
+    def review_stale_notices(self, scope):
+        self.db.execute("""UPDATE notice SET status='review' WHERE scope=? AND kind='body_missed'
+            AND status='pending' AND EXISTS (SELECT 1 FROM mailbox m WHERE m.scope=notice.scope
+                AND (m.reason='generation' OR m.generation IS NOT notice.generation))""",
+                        (scope,))
 
     def body_notice_counts(self):
         return tuple(self.db.execute(BODY_NOTICE_COUNTS_SQL).fetchone())
@@ -244,6 +225,8 @@ class Store:
         if box["state"] != "frozen":
             self.db.execute("UPDATE registration SET version=version+1 WHERE scope=?", (scope,))
         self.db.execute("UPDATE mailbox SET state='frozen',reason=? WHERE scope=?", (reason, scope))
+        if reason == "generation":
+            self.review_stale_notices(scope)
         generation = self.row("SELECT generation FROM mailbox WHERE scope=?", scope)[0]
         count = self.row("SELECT count(*) FROM registration WHERE scope=?", scope)[0]
         self.notice(f"freeze:{scope}:{generation}", scope, None, "freeze", count)
@@ -259,8 +242,7 @@ class Store:
             LIMIT 1""", scope)
 
     def record_coverage(self, scope, item):
-        if item.body_missed:
-            self.db.execute("INSERT OR IGNORE INTO missed_body VALUES(?,?)", (scope, item.digest))
+        self.db.execute("INSERT OR REPLACE INTO body_shape VALUES(?,?,?,?,?)", (scope, item.digest, *item.shape))
 
     def review_reused(self, reg, status, item):
         if item.body_missed and status in {"done", "no", "manual", "correction_pending"}:
@@ -269,11 +251,11 @@ class Store:
 
     def finish(self, reg, status, *, reason=None):
         """在调用方事务内完成登记，同步登记尚待发送的人工提示。冻结优先。"""
-        row = self.row("""SELECT r.scope, m.digest IS NOT NULL missed FROM registration r
-            LEFT JOIN missed_body m USING(scope,digest) WHERE r.id=? AND r.status!='frozen'""", reg)
+        row = self.row("""SELECT r.scope, s.groups_count,s.sources,s.supported FROM registration r
+            LEFT JOIN body_shape s USING(scope,digest) WHERE r.id=? AND r.status!='frozen'""", reg)
         if row is None:
             return
-        if row["missed"]:
+        if not BodyShape(*row[1:]).allowed():
             status = MANUAL_BODY_MISSED
             self.notice(f"body:{reg}", row["scope"], reg, "body_missed")
         self.db.execute("UPDATE registration SET status=?,reason=coalesce(?,reason) WHERE id=?",
@@ -471,6 +453,7 @@ class Store:
                                ((scope, generation, *data) for data in observations))
             db.execute("""UPDATE mailbox SET generation=?,validity=?,cursor=?,peak=?,reason='reconciling'
                 WHERE scope=?""", (generation, validity, cursor, cursor, scope))
+            self.review_stale_notices(scope)
 
     def reconcile(self, scope, generation, validity, cursor):
         with self.write() as db:
@@ -488,7 +471,6 @@ class Store:
             for reg, in pending:
                 db.execute("UPDATE registration SET version=version+1 WHERE id=?", (reg,))
                 self.finish(reg, "manual", reason="reconciliation")
-            self._migrate_body_notices(scope, generation)
             for row in list(db.execute("""SELECT * FROM reconciliation WHERE scope=? AND generation=?
                     AND matched IS NULL""", (scope, generation))):
                 reg = db.execute("""INSERT INTO registration(scope,msgkey,digest,candidate,attachments,status,

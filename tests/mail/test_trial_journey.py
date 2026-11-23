@@ -2,7 +2,7 @@ import json
 import sqlite3
 import sys
 import unicodedata
-from contextlib import nullcontext
+from contextlib import closing, nullcontext
 from datetime import UTC, datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
@@ -1034,7 +1034,7 @@ def test_binary_only_no_cannot_spend_parse_quota(journey):
     assert json.loads(json.loads(requests[0])["messages"][0]["content"])["body"] == ""
     trial.poll()
     assert tuple(trial.store.row("SELECT verdict,attachments,parse_day,status FROM registration")) == (
-        "拿不准", 1, None, "manual")
+        "拿不准", 1, None, "转人工（正文未参与解析）")
     assert len(requests) == 1 and "含 1 个附件" in str(cards)
 
 
@@ -1053,22 +1053,21 @@ def test_unknown_attachment_count_disclosed_and_blocks_batch(tmp_path):
     assert store.batch(reg, 1)[2] is None and store.batch(reg, 1)[3]
 
 
-def test_upgrade_rechecks_frozen_v1_reconciliation(tmp_path):
+def test_old_format_freezes_reconciliation_snapshot(tmp_path):
     inbox = Inbox()
     trial = revision_trial(Store(tmp_path / "trial"), inbox, [])
     trial.poll()
     inbox.add(synthetic(2, "ORIGINAL"))
     with trial.store.write() as db:
-        db.execute("ALTER TABLE reconciliation DROP COLUMN reason")
+        db.execute("PRAGMA user_version=0")
         db.execute("UPDATE mailbox SET state='frozen',reason='reconciling',cursor=3,peak=3")
         db.execute("""INSERT INTO reconciliation(scope,generation,uid,msgkey,digest,candidate)
             VALUES(?,1,2,'old-key','1:old','old-candidate')""", (trial.scope,))
     trial.store.db.close()
-    trial.store = Store(tmp_path / "trial")
-    trial.poll()
-    assert trial.box()["state"] == "frozen"
-    assert trial.store.row("SELECT digest FROM reconciliation WHERE generation=? AND uid=2",
-                           trial.box()["generation"])[0].startswith("2:")
+    with pytest.raises(Hold, match="登记库格式版本不符"):
+        Store(tmp_path / "trial")
+    with closing(sqlite3.connect(tmp_path / "trial")) as db:
+        assert db.execute("SELECT digest FROM reconciliation").fetchone() == ("1:old",)
 
 
 @pytest.mark.parametrize("replacement", [False, True])

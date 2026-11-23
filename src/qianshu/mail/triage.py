@@ -3,6 +3,7 @@
 import json
 import unicodedata
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from qianshu.ai import anthropic
 from qianshu.config import ConfigError
@@ -27,6 +28,17 @@ def _is_quote_line(line: str) -> bool:
     return line.startswith((">", "＞")) and following != "=" and not following.isdigit()
 
 
+class BodyShape(NamedTuple):
+    """仅保存终态白名单所需的结构事实，不保存正文。"""
+
+    groups: int = 0
+    sources: int = 0
+    supported: bool = False
+
+    def allowed(self):
+        return bool(self.supported) and self.groups == self.sources == 1
+
+
 @dataclass(repr=False)
 class MailItem:
     key: str | None
@@ -34,7 +46,11 @@ class MailItem:
     candidate: str | None
     attachments: int | None
     fields: dict = field(repr=False)
-    body_missed: bool = False
+    shape: BodyShape = BodyShape()
+
+    @property
+    def body_missed(self):
+        return not self.shape.allowed()
 
 
 class _StyledHTML(_HTMLText):

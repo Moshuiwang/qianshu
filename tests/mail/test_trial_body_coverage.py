@@ -66,10 +66,10 @@ def deliver(journey, monkeypatch, msg, answer, missed, *, empty_request=False):
         worker.poll()
         row = worker.store.row("SELECT * FROM registration")
         assert row["verdict"] == answer
-        assert row["status"] == (MANUAL_BODY_MISSED if missed else "done")
+        assert row["status"] == (MANUAL_BODY_MISSED if missed else ("no" if answer == "否" else "done"))
         assert len(requests) == 1 + int(answer != "否" and not empty_request)
-        assert ("正文未参与解析" in json.dumps(cards, ensure_ascii=False)) == missed
-        assert (worker.store.batch(row["id"], row["version"])[3] == "正文未参与解析") == missed
+        assert ("正文结构超出自动处理范围，请人工核对原邮件" in json.dumps(cards, ensure_ascii=False)) == missed
+        assert (worker.store.batch(row["id"], row["version"])[3] == "正文结构超出自动处理范围，请人工核对原邮件") == missed
 
 
 @pytest.mark.parametrize("shape", ["plain", "html", "alternative", "mixed", "nested", "embedded"])
@@ -101,7 +101,7 @@ def test_negative_verdict_after_invisible_plain(journey, monkeypatch):
 
 
 @pytest.mark.parametrize("shape", ["nested_alternative", "inline_message", "alt_text"])
-@pytest.mark.parametrize("answer", ["是", "否"])
+@pytest.mark.parametrize("answer", ["是", "拿不准", "否"])
 def test_additional_visible_segment(journey, monkeypatch, shape, answer):
 
     msg = synthetic(2, "CURRENT")
@@ -125,3 +125,31 @@ def test_additional_visible_segment(journey, monkeypatch, shape, answer):
         msg.make_mixed()
         msg.attach(leaf("html", '<img alt="OTHER">'))
     deliver(journey, monkeypatch, msg, answer, True)
+
+
+@pytest.mark.parametrize("shape", ["plain", "html", "alternative", "related", "enriched", "inline_enriched", "html_alt"])
+@pytest.mark.parametrize("answer", ["是", "拿不准", "否"])
+def test_whitelist_delivery(journey, monkeypatch, shape, answer):
+    msg = synthetic(2, "请查收")
+    if shape == "html_alt":
+        msg.set_content('<p>请查收</p><img alt="请配置合成政策甲">', subtype="html")
+    elif shape == "html":
+        msg.set_content("<p>请查收</p>", subtype="html")
+    elif shape in {"related", "alternative"}:
+        msg.add_alternative("<p>请查收</p>", subtype="html")
+        if shape == "related":
+            outer = synthetic(2, "")
+            outer.clear_content()
+            outer.make_related()
+            outer.attach(msg)
+            outer.add_related(b"inline", maintype="image", subtype="png")
+            msg = outer
+    elif shape == "enriched":
+        msg.make_mixed()
+        msg.attach(leaf("enriched", "请配置合成政策甲"))
+    elif shape == "inline_enriched":
+        inner = leaf("enriched", "请配置合成政策甲")
+        msg.add_attachment(inner, disposition="inline")
+        msg = Segments(msg.as_bytes())
+        msg.tree[1][7:7] = [[b"NIL"] * 10, Segments(inner.as_bytes()).tree, b"1"]
+    deliver(journey, monkeypatch, msg, answer, shape in {"enriched", "inline_enriched", "html_alt"})
