@@ -755,7 +755,7 @@ class Official:
                 require(previous[1] == row[control], "官方查询同一记录名称冲突")
         return [record for record, value in records.values() if value == name]
 
-    def verified_tag_version(self, scope, tags, selected, clock):
+    def tag_index(self, scope, *, approval_clock=None):
         """独立授权指定全表视图及写入窗口内的唯一性证明。任何未知均先于查询停止。"""
         spec = self.config.get("tag_search")
         error = "标签表范围或全名唯一性证明未确认"
@@ -766,22 +766,53 @@ class Official:
                 and all(receipt(spec[k]) for k in ("view", "name_control"))
                 and scope.get("origin") == self.origin and scope.get("coverage") == "full_table"
                 and scope.get("app_sha256") == digest(self._headers["HAP-Appid"].encode())
-                and receipt(scope.get("snapshot")) and utc(scope["unique_until"]).timestamp() > clock(), error)
+                and receipt(scope.get("snapshot")), error)
+        if approval_clock is not None:
+            require(utc(scope["unique_until"]).timestamp() > approval_clock(), error)
+
         def fetch(page):
             result = self._request("tag_search", body={"viewId": spec["view"], "pageIndex": page,
                                                         "pageSize": self.page_size})
-            constraint = {"field": spec["name_control"], "coverage": "full_table", "enforced": True,
-                          "version": scope["snapshot"], "validUntil": scope["unique_until"]}
-            require(compact(result.get("uniqueConstraint")) == compact(constraint), error)
+            if approval_clock is not None:
+                constraint = {"field": spec["name_control"], "coverage": "full_table", "enforced": True,
+                              "version": scope["snapshot"], "validUntil": scope["unique_until"]}
+                require(compact(result.get("uniqueConstraint")) == compact(constraint), error)
             return result
+        first = fetch(1)
+        snapshot = first.get("snapshotVersion")
+        require(receipt(snapshot) and (approval_clock is None or snapshot == scope["snapshot"]), error)
         by_name = {}
-        for row in self.page_rows(fetch, self.page_size, snapshot=scope["snapshot"]):
+        for row in self.page_rows(lambda page: first if page == 1 else fetch(page), self.page_size, snapshot=snapshot):
             name = row.get(spec["name_control"])
             require(receipt(name), error)
             by_name.setdefault(name, []).append(row["rowId"].lower())
+        return by_name
+
+    def verified_tag_version(self, scope, tags, selected, clock):
+        error = "标签表范围或全名唯一性证明未确认"
+        by_name = self.tag_index(scope, approval_clock=clock)
         require(len(tags) == len(selected) and all(by_name.get(tag) == [item["sid"].lower()]
                 for tag, item in zip(tags, selected)) and utc(scope["unique_until"]).timestamp() > clock(), error)
         return digest(compact([scope, by_name]).encode())
+
+    def concurrent_rows(self, scope):
+        reason = "同期政策完整来源未确认"
+        require(isinstance(scope, dict) and scope.get("path") == self.config["search"]["path"]
+                and scope.get("origin") == self.origin and scope.get("coverage") == "full_table"
+                and scope.get("app_sha256") == digest(self._headers["HAP-Appid"].encode())
+                and receipt(scope.get("view")) and receipt(scope.get("snapshot")), reason)
+        columns = scope.get("columns")
+        require(isinstance(columns, dict) and columns.keys() == {"name", "company", "end", "created_at"}
+                and all(receipt(key) for key in columns.values()) and len(set(columns.values())) == len(columns)
+                and all(key not in _OFFICIAL_METADATA or (name == "created_at" and key == "_createdAt")
+                        for name, key in columns.items()), reason)
+
+        def fetch(page):
+            return self._request("search", body={"viewId": scope["view"], "pageIndex": page, "pageSize": self.page_size})
+
+        rows = [{"id": row["rowId"], **{name: row[key] for name, key in columns.items()}}
+                for row in self.page_rows(fetch, self.page_size, snapshot=scope["snapshot"])]
+        return sorted(rows, key=lambda row: row["id"])
 
     def history(self, current):
         result = self._request("logs", current.record_id, params={"pageIndex": 1, "pageSize": _LOG_PAGE_SIZE})
@@ -883,6 +914,33 @@ _DEFAULTS = {
 }
 
 
+def amount_in_source(value, quote, sources):
+    span = sources.locate(Span.model_validate(quote["span"]))
+    blocks = [block for block in sources.blocks.values() if block.source_id == span.source_id]
+
+    def character(offset):
+        for block in blocks:
+            index = offset - block.start
+            if 0 <= index < len(block.text):
+                return block.text[index]
+        return None
+
+    for match in re.finditer(r"[0-9]+(?:,[0-9]{3})*(?:\.[0-9]+)?", quote["text"]):
+        left = span.start + match.start()
+        right = span.start + match.end()
+        before, after = character(left - 1), character(right)
+        if (before is None and left != 0) or (after is None and any(b.start > right for b in blocks)):
+            continue
+        if before and (before.isdecimal() or before in ".,．，٫٬−+-"):
+            continue
+        if after and (after.isdecimal() or after in ".．٫" or
+                      after in ",，٬" and (character(right + 1) or "").isdecimal()):
+            continue
+        if Decimal(match.group().replace(",", "")) == Decimal(str(value)):
+            return True
+    return False
+
+
 def check_derivation(name, value, result, draft, declared, reason):
     dependencies = {
         "policy_type": ["user_tags"], "policy_name": ["user_tags"],
@@ -918,9 +976,6 @@ def check_derivation(name, value, result, draft, declared, reason):
     elif name == "recharge_amount":
         if draft["amount_mode"]["value"] != "节目包资费" or original is not None:
             require(compact(value) == compact(original) and declared, reason)
-            number = Decimal(str(value))
-            require(any(Decimal(match.group()) == number for quote in declared
-                        for match in re.finditer(r"(?<![0-9.,−+-])[0-9]+(?:\.[0-9]+)?(?![0-9.]|,[0-9])", quote["text"])), reason)
     elif name == "after_offer_package":
         require(original == value, reason)
     elif name == "company":
@@ -966,7 +1021,7 @@ def verify_company_inputs(draft, sources, owners, snapshot, country):
     require(len(matches) == 1 and matches[0]["name"] == result["value"], reason)
 
 
-def order_evidence(values, fields_in, draft, sources, owners):
+def order_evidence(values, fields_in, draft, sources, owners, options_data):
     results = draft["field_results"]
     adjustments = []
     excerpts = []
@@ -994,8 +1049,7 @@ def order_evidence(values, fields_in, draft, sources, owners):
             original = statement.get("value")
             if name == "benefit_type":
                 require(isinstance(original, str), reason)
-                table = Path(__file__).resolve().parents[3] / "rules" / "parse-options.tsv"
-                original = _normalized_value(name, original, _read_options(table.read_text(encoding="utf-8")))
+                original = _normalized_value(name, original, _read_options(options_data.decode("utf-8")))
             if name in ("recharge_days", "gift_days", "watch_days", "penalty_days") and isinstance(original, dict):
                 duration = Duration.model_validate(original)
                 original = duration_days(duration)
@@ -1016,6 +1070,8 @@ def order_evidence(values, fields_in, draft, sources, owners):
         else:
             require(all(q in quotes for q in declared), reason)
             check_derivation(name, value, result, draft, declared, reason)
+        if name == "recharge_amount" and statement.get("value") is not None:
+            require(any(amount_in_source(value, quote, sources) for quote in declared), reason)
         projected = []
         for quote in quotes:
             span = Span.model_validate(quote["span"])
@@ -1033,7 +1089,7 @@ def order_evidence(values, fields_in, draft, sources, owners):
     return excerpts, adjustments
 
 
-def order_fields(draft, sources, owners, today):
+def order_fields(draft, sources, owners, today, options_data):
     require(draft.keys() <= _ORDER_FIELDS | {"hints", "scope", "policy_id", "policy_name_source",
             "package_tier_candidates", "field_results"}, "草稿字段无效")
     fields_in = {k: v for k, v in draft.items() if k in _ORDER_FIELDS}
@@ -1082,7 +1138,7 @@ def order_fields(draft, sources, owners, today):
     require(values["trigger_once"] == "否" and values["repeat_bonus"] in ("是", "否")
             and type(values["effective_multiplier"]) in (float, int) and values["effective_multiplier"] == 1,
             "触发次数、多买多送或生效倍数须人工确认")
-    excerpts, hints = order_evidence(values, fields_in, draft, sources, owners)
+    excerpts, hints = order_evidence(values, fields_in, draft, sources, owners, options_data)
     adjustments.extend(hints)
     original = calendar_date(values["start_date"], "草稿开始日期无效")
     effective = effective_start_date(original, today)
@@ -1247,7 +1303,7 @@ def relation_package_names(row, spec):
     return name(spec["current"]), name(spec["gift"])
 
 
-def select_package_rows(rows, spec, packages):
+def matching_package_rows(rows, spec, packages):
     by_names = {}
     children = spec["children"]
     for row in rows:
@@ -1260,11 +1316,13 @@ def select_package_rows(rows, spec, packages):
         matches = by_names.get(draft_package_names(package), [])
         require(len(matches) == 1, "节目包与模板不同，需人工")
         row = matches[0]
-        selected.append([
-            {"controlId": key, "value": row[key] if isinstance(row[key], str) else encode_cell(row[key], child)}
-            for key, child in children.items()
-        ])
+        selected.append(row)
     return selected
+
+
+def select_package_rows(rows, spec, packages):
+    return [[{"controlId": key, "value": row[key] if isinstance(row[key], str) else encode_cell(row[key], child)}
+             for key, child in spec["children"].items()] for row in matching_package_rows(rows, spec, packages)]
 
 
 def select_tag_ids(rows, name_keys, tags):
@@ -1529,7 +1587,7 @@ def price_plan_name(encoded, package_spec):
     return display
 
 
-def project_web_fields(config, evidence, values, company_row, packages, clock):
+def project_web_fields(config, evidence, values, company_row, packages, template, rows, clock):
     snapshot = config["order_snapshot"]
     rules = snapshot.get("web_rules")
     fields = config["fields"]
@@ -1547,8 +1605,29 @@ def project_web_fields(config, evidence, values, company_row, packages, clock):
     price = spec.get("price_plan_control")
     require(price in spec["children"] and price not in {spec[role]["control"] for role in ("current", "gift")},
             "当前节目包价格计划列未确认")
-    plans = [(package_row["current_package"], price_plan_name(row[price], spec)) for package_row, row in
-             zip(values["packages"], subtable_rows(packages), strict=True)]
+    plans = []
+    plan_names = {}
+    selected_rows = matching_package_rows(rows, spec, values["packages"])
+    for package_row, written, linked in zip(values["packages"], subtable_rows(packages), selected_rows, strict=True):
+        encoded = written[price]
+        field = spec["children"][price]
+        name = price_plan_name(encoded, spec)
+        raw = linked[price]
+        identifier = None
+        if field["type"] in _ARRAY:
+            reason = "当前节目包价格计划与平台全名不一致"
+            items = unpack_array(raw)
+            require(len(items) == 1 and isinstance(items[0], dict) and encode_cell(raw, field) == encoded, reason)
+            if field["type"] == 29:
+                identifier = decode(encoded)[0]["sid"]
+                require(uuid_record(identifier) and items[0].get("name") == name, reason)
+            else:
+                require(field["type"] in _SELECT and single_option(items, reason)[1] == name, reason)
+                identifier = items[0]["key"]
+        else:
+            require(type(raw) in (str, int, float) and plain_cell(raw) == encoded, "价格计划模板值未确认")
+        require(plan_names.setdefault(encoded, name) == name, "价格计划标识与全名不一致")
+        plans.append((package_row["current_package"], identifier, name))
     displays = {}
     for name, kind in WEB_TYPES.items():
         rule = rules[name]
@@ -1570,7 +1649,9 @@ def project_web_fields(config, evidence, values, company_row, packages, clock):
             value = web_value(name, rule, values, company_row, plans, snapshot)
             display = value
             if name == "标签与适用条件关系":
-                display = rule["default"]["value"]
+                option = rule["default"]
+                require(single_option(unpack_array(template[control]), reason) == (option["key"], option["value"]), reason)
+                display = option["value"]
             if name == "同期有效优惠政策":
                 require(set(spec["children"]) == {rule.get("child")} and spec["children"][rule["child"]]["type"] == 29,
                         reason)
@@ -1591,10 +1672,10 @@ def project_web_fields(config, evidence, values, company_row, packages, clock):
         except (ValueError, TypeError, KeyError, IndexError, Stop):
             raise Stop(reason) from None
         displays[control] = (encoded, display)
-    return displays
+    return displays, plan_names
 
 
-def request_display(payload, config, values, inactive, summary, web):
+def request_display(payload, config, values, inactive, summary, web, plan_names):
     """使用将要交接的请求生成展示。数组值仅显示已核对的业务名。"""
     snapshot = config["order_snapshot"]
     proofs = snapshot.get("template_sources", {})
@@ -1616,7 +1697,7 @@ def request_display(payload, config, values, inactive, summary, web):
             display = []
             price = spec["price_plan_control"]
             for row, pair in zip(rows, values["packages"], strict=True):
-                parts = [pair["current_package"], pair["gift_package"], "价格计划 " + price_plan_name(row[price], spec)]
+                parts = [pair["current_package"], pair["gift_package"], "价格计划 " + plan_names[row[price]]]
                 for child in row.keys() - {spec["current"]["control"], spec["gift"]["control"], price}:
                     definition = spec["children"][child]
                     require(receipt(definition.get("label")) and definition["type"] not in _ARRAY, reason)
@@ -1664,7 +1745,7 @@ def compare_company(control, actual, field, read_relations, display_name):
     return "一致" if company_id.lower() == decode(control["value"])[0]["sid"].lower() else "不确定"
 
 
-def compare_relation(control, count, field, read_relations, packages):
+def compare_relation(control, count, field, read_relations, packages, tag_names):
     try:
         rows = read_relations(control["controlId"])
     except OutletConflict:
@@ -1674,9 +1755,16 @@ def compare_relation(control, count, field, read_relations, packages):
     if type(count) is not int or count != len(rows):
         return "不一致"
     if field.get("draft") == "user_tags":
-        matches = {row["rowId"].lower() for row in rows} == {
+        matches = count == len(decode(control["value"])) and {row["rowId"].lower() for row in rows} == {
             item["sid"].lower() for item in decode(control["value"])
         }
+        if tag_names is not None:
+            try:
+                matches = matches and tag_names()
+            except OutletConflict:
+                raise
+            except Stop:
+                return "无法核对"
     else:
         # 写入的节目包行按草稿顺序从模板挑选，关联对象在写入值中只保留 sid。
         try:
@@ -1695,7 +1783,7 @@ def compare_relation(control, count, field, read_relations, packages):
     return "一致" if matches else "不一致"
 
 
-def compare(expected, raw_cells, config, *, read_relations, packages, company=None):
+def compare(expected, raw_cells, config, *, read_relations, packages, company=None, tag_names=None):
     results, differences, inactive = [], [], []
     for control in expected:
         key = control["controlId"]
@@ -1703,8 +1791,10 @@ def compare(expected, raw_cells, config, *, read_relations, packages, company=No
         actual = raw_cells.get(key, _NO_CELL)
         if field.get("draft") == "company":
             result = compare_company(control, actual, field, read_relations, company)
+        elif (field.get("draft") == "user_tags" and "tag_search" in config["official"] and tag_names is None):
+            result = "无法核对"
         elif field.get("draft") in ("user_tags", "packages") or (field["type"] == 34 and type(actual) is int):
-            result = compare_relation(control, actual, field, read_relations, packages)
+            result = compare_relation(control, actual, field, read_relations, packages, tag_names)
         elif actual is _NO_CELL:
             result = "缺失"
         else:
@@ -2033,7 +2123,7 @@ def package_mentions(text, start, end, catalog):
     return {name for left, right, name in spans if start <= left and right <= end
             and not (left and text[left-1].isascii() and text[left-1].isalnum() and name[0].isascii())
             and not (right < len(text) and text[right].isascii() and text[right].isalnum() and name[-1].isascii())
-            and not any((a, b) != (left, right) and a < right and left < b for a, b, _ in spans)}
+            and not any(a < right and left < b and (a < left or b > right) for a, b, _ in spans)}
 
 
 def credential_fragments(values, width=4):
@@ -2196,7 +2286,7 @@ def delete_test(api, ledger, record_id, recipients, evidence, announce, stop, re
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
               contact, login_check, stop, *, packages, company,
               clock=time.time, pause=time.sleep, monotonic=time.monotonic, check_start_date=None,
-              source_version=None, current_version=None):
+              source_version=None, current_version=None, tag_names=None):
     def announce(text, *, readback=False):
         prefix = "" if readback else f"{ledger.name} · "
         message = f"{prefix}{text}\n{contact}"
@@ -2227,6 +2317,7 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
 
     def final_approval(check_approval):
         login_check()
+        check_sources()
         stop_if_interrupted(stop)
         if check_start_date is not None:
             check_start_date()
@@ -2248,7 +2339,6 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
             raise Stop("群卡片已驳回" if status == "reject" else "审批到期或断线")
         with create.prepare(payload) as (transmit, read_id):
             def check_before_transport(check_approval):
-                check_sources()
                 transmit(lambda: final_approval(check_approval))
 
             require(feishu.send_first_create(approval_id, binding, prepare, record_attempt, check_before_transport),
@@ -2303,7 +2393,7 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
             exclusive(path, report)
             raise
         report, counts = compare(expected, observed, config, read_relations=lambda key: api.relations(record_id, key),
-                                 packages=packages, company=company)
+                                 packages=packages, company=company, tag_names=tag_names)
         exclusive(path, report)
         ledger.append("readback_compared", record_id, counts=dict(counts), total=len(expected))
         legacy = Counter(row["结果"] for row in report["字段比对"])
@@ -2382,13 +2472,31 @@ def load_settings(values):
 def _run(args, directory, clock, guard):
     require(not directory.is_symlink() and directory.is_dir() and directory.stat().st_mode & 0o777 == 0o700,
             "运行目录下 .private 须为 0700 的私有目录")
+    disabled = "050 配置已禁用原格式 X5 入口"
+    require(not os.path.lexists(directory / "trial-config.json"), disabled)
     config_data = private_bytes(args.config)
+    config = decode(config_data)
+    snapshot_keys = {"web_rules", "verified_combinations", "concurrent_policies", "condition_scenario",
+                     "tariffs", "upgrade_tasks", "upgrade_task_id", "template_sources", "member_names"}
+    require(not (snapshot_keys.intersection(config.get("order_snapshot", {}))
+                 or "tag_search" in config["official"] or "trial" in config
+                 or any(field.get("label") in WEB_TYPES for field in config["fields"].values())), disabled)
+    authorizations = decode(private_bytes(directory / "create-authorizations.json"))
+    require(not any({"tag_scope", "web_rules_sha256", "concurrent_scope"}.intersection(entry)
+                    for entry in authorizations.values()), disabled)
+    return _run_registered(args, directory, clock, guard, config_data, authorizations)
+
+
+def _run_registered(args, directory, clock, guard, config_data, authorizations):
+    config = decode(config_data)
     login_path = directory / "mingdao-state.json"
     login_data = private_bytes(login_path)
-    config = decode(config_data)
     login = decode(login_data)
-    with args.env_file.open(encoding="utf-8-sig") as stream:
-        secrets = dotenv_values(stream=stream, interpolate=False)
+    def read_settings():
+        with args.env_file.open(encoding="utf-8-sig") as stream:
+            return dotenv_values(stream=stream, interpolate=False)
+
+    secrets = read_settings()
     official = config["official"]
 
     def official_setting(key):
@@ -2427,7 +2535,7 @@ def _run(args, directory, clock, guard):
             raise CredentialConflict("展示字段与凭据冲突")
 
     draft_data = private_bytes(args.draft)
-    evidence = decode(private_bytes(directory / "create-authorizations.json"))[args.registration]
+    evidence = authorizations[args.registration]
     recipients = notice_recipients(config)
     notices = notice_summary(recipients, evidence.get("notices"))
     registration_hash = digest(args.registration.encode())
@@ -2439,8 +2547,10 @@ def _run(args, directory, clock, guard):
     try:
         window = preflight(evidence, recipients, config_data, draft_data, login_data, clock)
         draft, sources, owners = order_material(decode(draft_data), evidence.get("policy_id"))
+        options_path = Path(__file__).resolve().parents[3] / "rules" / "parse-options.tsv"
+        options_data = options_path.read_bytes()
         values, inactive, adjustments, excerpts, pending = order_fields(
-            draft, sources, owners, datetime.fromtimestamp(clock(), UTC).date())
+            draft, sources, owners, datetime.fromtimestamp(clock(), UTC).date(), options_data)
         require(values["policy_name"].startswith(_PREFIX), "X5 草稿名称缺少测试前缀")
         snapshot = config.get("order_snapshot", {})
         verify_company_inputs(draft, sources, owners, snapshot, config["template"]["country"]["value"])
@@ -2520,8 +2630,12 @@ def _run(args, directory, clock, guard):
             web_profile = ("web_rules" in snapshot or "web_rules_sha256" in evidence
                            or any(spec["label"] in WEB_TYPES for spec in config["fields"].values()))
             tag_profile = web_profile or "tag_search" in official or "tag_scope" in evidence
+            plan_names = {}
             def web_fields(company_row, packages):
-                return project_web_fields(config, evidence, values, company_row, packages, clock)
+                key = next(k for k, field in config["fields"].items() if field.get("draft") == "packages")
+                web, names = project_web_fields(config, evidence, values, company_row, packages, cells, relations[key], clock)
+                plan_names.update(names)
+                return web
 
             try:
                 controls, fields_summary, web = assemble_controls(
@@ -2532,18 +2646,22 @@ def _run(args, directory, clock, guard):
                                     and s["type"] in (10, 26, 29, 34)},
                 )
 
-                def tag_version():
-                    if not tag_profile:
-                        return None
+                if tag_profile:
                     key = next(key for key, field in config["fields"].items() if field.get("draft") == "user_tags")
-                    selected = next(decode(cell["value"]) for cell in controls if cell["controlId"] == key)
+                    selected_tags = next(decode(cell["value"]) for cell in controls if cell["controlId"] == key)
                     keys = official["tag_relation"]["name_keys"]
-                    for name, item in zip(values["user_tags"], selected, strict=True):
+                    for name, item in zip(values["user_tags"], selected_tags, strict=True):
                         require(any(row["rowId"] == item["sid"] and any(row.get(k) == name for k in keys)
                                     for row in relations[key]) and any(row["name"] == name and row["id"] == item["sid"]
                                     for row in snapshot["tags"]), "模板或快照标签全名未确认")
-                    return api.verified_tag_version(evidence.get("tag_scope"), values["user_tags"], selected, clock)
-                initial_tag_version = tag_version()
+                    def tag_version():
+                        return api.verified_tag_version(evidence.get("tag_scope"), values["user_tags"], selected_tags, clock)
+
+                    initial_tag_version = tag_version()
+                if web_profile:
+                    candidates = sorted(snapshot["concurrent_policies"]["rows"], key=lambda row: row["id"])
+                    require(api.concurrent_rows(evidence.get("concurrent_scope")) == candidates,
+                            "同期政策候选与完整来源不一致")
                 payload = create.payload(controls)
                 deadline, package_names = verify_order_request(
                     payload, config, cells, relations, values, inactive, sensitive,
@@ -2551,7 +2669,7 @@ def _run(args, directory, clock, guard):
                 )
                 check_outlet((payload, decode(payload)))
                 require(decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
-                lines = request_display(payload, config, values, inactive, fields_summary, web) if web_profile else []
+                lines = request_display(payload, config, values, inactive, fields_summary, web, plan_names) if web_profile else []
                 summary = order_summary(values, config, adjustments, excerpts, sources, sensitive, deadline,
                                         package_names, lines)
             except (KeyError, ValueError, TypeError, IndexError, AttributeError):
@@ -2583,28 +2701,49 @@ def _run(args, directory, clock, guard):
                 ledger.append("aborted_before_write", allowed_writes=0)
                 raise
             # X5 仅供原验收。序 2a 的邮件审批、预览、存档和同意由 #154 共用门禁接入。
-            def version(data, template, children, tag):
-                return digest(compact([digest(data), template, children, tag]).encode())
+            def read_authorizations():
+                return decode(private_bytes(directory / "create-authorizations.json"))
 
-            # 原格式 X5 保持既有验收读序；带 050 来源登记时须实时核对模板及关联。
-            refresh_template = tag_profile or "verified_combinations" in snapshot
-            source_version = version(config_data, cells, relations, initial_tag_version)
+            bound_sources = {
+                "authorizations": (authorizations, read_authorizations),
+                "config": (digest(config_data), lambda: digest(private_bytes(args.config))),
+            }
+            if tag_profile or "verified_combinations" in snapshot:
+                bound_sources.update({
+                    "draft_and_material": (digest(draft_data), lambda: digest(private_bytes(args.draft))),
+                    "parse_options": (digest(options_data), lambda: digest(options_path.read_bytes())),
+                    "settings": (digest(compact(secrets).encode()), lambda: digest(compact(read_settings()).encode())),
+                    "login": (digest(login_data), lambda: digest(private_bytes(login_path))),
+                    "template": (cells, lambda: api.detail(api.read(template_id), template_id)),
+                    "relations": (relations, lambda: {key: api.relations(template_id, key) for key in relations}),
+                })
+            else:
+                bound_sources["trial_config_present"] = (False, lambda: os.path.lexists(directory / "trial-config.json"))
+            if web_profile:
+                bound_sources["concurrent"] = (candidates, lambda: api.concurrent_rows(evidence["concurrent_scope"]))
+            if tag_profile:
+                bound_sources["tags"] = (initial_tag_version, tag_version)
+
+            fingerprints = {key: digest(compact(initial).encode()) for key, (initial, _) in bound_sources.items()}
+            source_version = digest(compact(fingerprints).encode())
 
             def current_version():
-                authorization = decode(private_bytes(directory / "create-authorizations.json"))
-                require(authorization.get(args.registration) == evidence, "当次授权登记已变化")
                 check_proof_window()
-                template, children = cells, relations
-                if refresh_template:
-                    template = api.detail(api.read(template_id), template_id)
-                    children = {key: api.relations(template_id, key) for key in relations}
-                tag = tag_version()
-                return version(private_bytes(args.config), template, children, tag)
+                # 先核本地授权与配置；撤权后不能继续按旧登记查询平台。
+                for key, (_, read) in bound_sources.items():
+                    require(digest(compact(read()).encode()) == fingerprints[key], "建单来源或放行登记已变化，需重新审批")
+                return source_version
+
+            def readback_tag_names():
+                index = api.tag_index(evidence["tag_scope"])
+                return all(index.get(name) == [item["sid"].lower()]
+                           for name, item in zip(values["user_tags"], selected_tags, strict=True))
 
             return service.run_create(lambda stop: run_order(
                 ledger, api, create, service, window, payload, summary, controls, config, evidence,
                 contact, login_check, stop, packages=values["packages"], company=values["company"], clock=clock,
                 check_start_date=check_start_date, source_version=source_version, current_version=current_version,
+                tag_names=readback_tag_names if tag_profile else None,
             ))
 
 

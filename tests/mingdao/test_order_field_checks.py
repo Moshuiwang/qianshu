@@ -57,7 +57,17 @@ def test_readback_checks_every_package_cell(case, platform, change):
     assert platform.create_count == 1 and "delete" not in platform.actions
 
 
+@pytest.fixture
+def registered_entry(monkeypatch):
+    """在内存存根上验收共用门禁。原命令行另测启动拒绝。"""
+    def enter(args, directory, clock, guard):
+        authorizations = json.loads(order.private_bytes(directory / "create-authorizations.json"))
+        return order._run_registered(args, directory, clock, guard, order.private_bytes(args.config), authorizations)
+    monkeypatch.setattr(order, "_run", enter)
+
+
 @pytest.mark.parametrize("change", ["price", "template", "catalog", "allowlist", "tags"])
+@pytest.mark.usefixtures("registered_entry")
 def test_current_sources_checked_after_card(case, platform, business_cli, change):
     snapshot = case.config["order_snapshot"]
     snapshot["verified_combinations"] = [[case.values["policy_type"], case.values["benefit_type"]]]
@@ -145,7 +155,7 @@ WEB_TYPES = {
 
 
 @pytest.fixture
-def web_order(case, platform, business_cli, monkeypatch):
+def web_order(case, platform, business_cli, monkeypatch, registered_entry):
     from test_create_order import company_relation
 
     company, display, matched = company_relation(case)
@@ -162,6 +172,7 @@ def web_order(case, platform, business_cli, monkeypatch):
     case.config["fields"][field_rules["同期有效优惠政策"]["control"]]["children"] = {"政策": {"type": 29}}
     field_rules["同期有效优惠政策"].update(child="政策")
     field_rules["标签与适用条件关系"].update(default={"key": "none", "value": "无适用条件"})
+    platform.template[field_rules["标签与适用条件关系"]["control"]] = [{"key": "none", "value": "无适用条件"}]
     field_rules["文本"].update(text="合成提示")
     field_rules["companyId"].update(column="企业编号")
     field_rules["billingCycle"].update(cycles={"日": 1, "月": 0})
@@ -182,6 +193,11 @@ def web_order(case, platform, business_cli, monkeypatch):
                                     "coverage": "full_table", "snapshot": "第一版",
                                     "unique_until": case.window.end.isoformat()})
     rows = [{"rowId": case.ids["tag"], "全名": case.values["user_tags"][0]}]
+    case.evidence["concurrent_scope"] = {
+        **case.evidence["tag_scope"], "path": case.config["official"]["search"]["path"], "view": "all-policies",
+        "columns": {name: name for name in ("name", "company", "end", "created_at")},
+    }
+    case.tag_version = "第一版"
     queries = []
     check_cards = []
     def review_card(card):
@@ -191,9 +207,14 @@ def web_order(case, platform, business_cli, monkeypatch):
     case.review_cards = check_cards
     base = platform.official
     def exchange(request):
+        if (request.url.path == case.config["official"]["search"]["path"]
+                and json.loads(request.content)["viewId"] == "all-policies"):
+            candidates = snapshot["concurrent_policies"]["rows"]
+            return platform.response({"rows": [{"rowId": r["id"], **r} for r in candidates],
+                                      "total": len(candidates), "snapshotVersion": "第一版"})
         if request.url.path.endswith("/rows/list") and request.url.path != case.config["official"]["search"]["path"]:
             queries.append(json.loads(request.content))
-            return platform.response({"rows": rows, "total": len(rows), "snapshotVersion": "第一版",
+            return platform.response({"rows": rows, "total": len(rows), "snapshotVersion": case.tag_version,
                 "uniqueConstraint": {"field": "全名", "coverage": "full_table", "enforced": True,
                                      "version": "第一版", "validUntil": case.evidence["tag_scope"]["unique_until"]}})
         response = base(request)
@@ -571,3 +592,134 @@ def test_readback_group_only_receives_counts_and_disposition(case, platform):
     for text in approval.notices:
         assert all(detail not in text for detail in (case.values["policy_name"], case.values["user_scope"],
                                                       case.ids["created"], "赠送天数"))
+
+
+@pytest.mark.parametrize("part", ["draft", "sources"])
+@pytest.mark.parametrize("stage", ["prepare", "handoff"])
+def test_bound_material_changes_after_card(case, platform, business_cli, web_order, part, stage, monkeypatch):
+    def change():
+        path = case.private / "draft.json"
+        export = json.loads(path.read_bytes())
+        if part == "draft":
+            export["drafts"][0]["user_scope"]["value"] = "其他范围"
+        else:
+            export["sources"][0]["text"] += "补充"
+        path.write_text(json.dumps(export))
+    if stage == "prepare":
+        platform.before_search = change
+    else:
+        append = order.Ledger.append
+        def after_prepare(ledger, event, *args, **kw):
+            append(ledger, event, *args, **kw)
+            if event == "create_attempt":
+                change()
+        monkeypatch.setattr(order.Ledger, "append", after_prepare)
+    assert business_cli.run()[0] == 1
+    assert ("create_attempt" in events(case)) == (stage == "handoff")
+    assert platform.create_count == 0 and events(case)[-1] == "approval_closed"
+
+
+def test_concurrent_candidate_added_after_card(case, platform, business_cli, web_order):
+    def change():
+        case.config["order_snapshot"]["concurrent_policies"]["rows"].append({
+            "id": case.ids["created"], "name": "新增同期", "end": case.values["end_date"],
+            "company": case.values["company"], "created_at": case.window.start.isoformat(),
+        })
+    platform.before_search = change
+    assert business_cli.run()[0] == 1
+    assert platform.create_count == 0 and events(case)[-1] == "approval_closed"
+
+
+def test_condition_template_disagrees(case, platform, business_cli, web_order):
+    rules, _, _ = web_order
+    platform.template[rules["标签与适用条件关系"]["control"]] = [{"key": "none", "value": "有适用条件"}]
+    assert business_cli.run()[0] == 1 and platform.create_count == 0
+
+
+@pytest.mark.parametrize(("registered", "matched_id"), [("日计划", True), ("月计划", False), ("月计划", True)])
+def test_billing_uses_platform_plan(case, platform, business_cli, web_order, registered, matched_id):
+    rules, _, _ = web_order
+    control = case.control["packages"]
+    price = case.child["price"]
+    plan = case.ids["template"]
+    field = {"type": 29, "business_names": {order.compact([{"sid": plan}]): registered}}
+    case.config["fields"][control]["children"][price] = field
+    platform.relations[control][0][price] = [{"sid": plan, "name": "月计划"}]
+    rate, = case.config["order_snapshot"]["tariffs"]
+    rate.update(price_plan=registered, price_plan_id=plan if matched_id else case.ids["tag"], unit=registered[0])
+    code, _ = business_cli.run()
+    if registered == "日计划" or not matched_id:
+        assert code == 1 and platform.create_count == 0
+    else:
+        assert code == 0 and platform.created_cells[rules["billingCycle"]["control"]] == "0"
+        assert registered in business_cli.summaries[0]
+
+
+@pytest.mark.parametrize("moment", ["login", "handoff", "handoff_new_version"])
+def test_tag_rename_at_transport(case, platform, business_cli, web_order, monkeypatch, moment):
+    _, rows, _ = web_order
+    def rename():
+        rows[0]["全名"] = "改名"
+        if moment == "handoff_new_version":
+            case.tag_version = "新版"
+    if moment.startswith("handoff"):
+        platform.before_handoff = rename
+    else:
+        read = order.private_bytes
+        def read_login(path):
+            data = read(path)
+            if path.name == "mingdao-state.json" and business_cli.summaries and "create_attempt" in events(case):
+                rename()
+            return data
+        monkeypatch.setattr(order, "private_bytes", read_login)
+    assert business_cli.run()[0] == 1
+    assert platform.create_count == int(moment.startswith("handoff")) and "delete" not in platform.actions
+    if moment.startswith("handoff"):
+        path, = case.private.glob("create-readback-*.json")
+        assert json.loads(path.read_bytes())["分类计数"]["不一致"] == 1
+        with order.ledger_open(case.private, "新的登记", case.values["policy_name"]) as ledger:
+            with pytest.raises(order.Stop, match="资格已占用"):
+                ledger.check_available()
+    else:
+        assert events(case)[-1] == "approval_closed"
+
+
+def test_clipped_amount_in_original(case, platform, business_cli):
+    export = offer_export(case, platform, "特价优惠")
+    results = export["drafts"][0]["field_results"]
+    for key in ("tariff", "tariff_multiplier"):
+        results[key] = {"evidence": [], "statement": {"value": None}}
+    results["recharge_amount"].update(source="查表派生",
+                                     input_fields=["start_date", "amount_mode", "tariff", "tariff_multiplier"])
+    replace_order_quotes(export, "recharge_amount", "固定实付180元", [(5, 6)])
+    assert business_cli.run(export)[0] == 1 and platform.create_count == 0
+
+
+def test_complete_long_package(case, platform, business_cli):
+    short = "合成当前包"
+    long = short + " Plus"
+    levels = case.config["order_snapshot"]["package_levels"]
+    case.config["order_snapshot"]["package_levels"] = levels.replace(short, long) + "\n" + (
+        levels.splitlines()[1].replace(case.ids["package"], case.ids["template"]))
+    package, = case.values["packages"]
+    linked = platform.relations[case.control["packages"]][0]
+    for role in ("current", "gift"):
+        field = role + "_package"
+        package[field] = package[field].replace(short, long)
+        linked[case.child[role]][0]["name"] = package[field]
+    export = private_export(case.values)
+    replace_order_quotes(export, "packages", long, [(0, len(long))])
+    assert business_cli.run(export) == (0, "") and platform.create_count == 1
+
+
+@pytest.mark.parametrize("marker", ["snapshot", "registration", "runtime"])
+def test_legacy_x5_refuses_trial_configuration(case, platform, business_cli, marker):
+    if marker == "snapshot":
+        case.config["order_snapshot"]["verified_combinations"] = []
+    elif marker == "registration":
+        case.evidence["tag_scope"] = {}
+    else:
+        (case.private / "trial-config.json").touch()
+    code, error = business_cli.run()
+    assert (code, error) == (1, "已停止：050 配置已禁用原格式 X5 入口\n")
+    assert platform.actions == [] and platform.create_count == 0

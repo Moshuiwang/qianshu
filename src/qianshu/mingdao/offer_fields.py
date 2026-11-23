@@ -91,9 +91,10 @@ def web_value(name, rule, values, company_row, plans, snapshot):
                                           for unit, value in cycles.items()))
         day = date.fromisoformat(values["start_date"])
         selected = set()
-        for package, plan in plans:
+        for package, identifier, plan in plans:
             rates = [row for row in snapshot["tariffs"] if row["package"] == package
-                     and row["price_plan"] == plan and date.fromisoformat(row["start"]) <= day
+                     and row.get("price_plan_id") == identifier and row["price_plan"] == plan
+                     and date.fromisoformat(row["start"]) <= day
                      <= date.fromisoformat(row["end"])]
             need(len(rates) == 1 and rates[0]["unit"] in cycles)
             selected.add(cycles[rates[0]["unit"]])
