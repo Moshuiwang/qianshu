@@ -2692,3 +2692,118 @@ def test_package_requires_fully_visible_quote(case, platform, business_cli, monk
         assert (code, platform.create_count) == (1, 0)
         assert "节目包原文归属依据已脱敏" in error
         assert not business_cli.summaries
+
+
+@pytest.mark.parametrize("field", ["after_offer_package", "tariff"])
+@pytest.mark.parametrize("kind", [10, 26, 29, 34])
+@pytest.mark.parametrize("change", ["label", "alias", "valid"])
+def test_array_extension_proves_card_value(case, platform, business_cli, field, kind, change):
+    values = case.values
+    if field == "tariff":
+        value = {"base_package": "合成当前包", "price_plan": "合成计划", "unit": "月", "version": "1"}
+        values.update(amount_mode="节目包资费", tariff=value, tariff_multiplier=1)
+        benefit, selector, catalog = "特价优惠", "amount_mode", {
+            "tariffs": [{**value, "amount": 8, "valid_from": values["start_date"]}]}
+    else:
+        value = "合成目标包"
+        benefit, selector, catalog = "升级权益", "after_offer", {"package_names": [value]}
+    offer_export(case, platform, benefit)
+    values[selector] = "节目包资费" if field == "tariff" else "指定节目包"
+    selected = platform.template[case.control[selector]][0]
+    selected["value"] = values[selector]
+    case.config["fields"][case.control[selector]]["draft_values"] = {order.compact(values[selector]): [selected["key"]]}
+    values[field] = value
+    case.config["order_snapshot"]["benefit_catalog"] = catalog
+    export = private_export(values)
+    text = "合成当前包可获合成受赠包"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    control = str(uuid4())
+    if field in case.control:
+        control = case.control[field]
+    label = order.OFFER_FIELD_LABELS[field]
+    spec = case.config["fields"][control] = {"draft": field, "label": label, "type": kind}
+    key = str(uuid4())
+    display = "合成其他值" if change == "label" else str(value)
+    id_key = {10: "key", 26: "accountId", 29: "sid", 34: "sid"}[kind]
+    name_key = "value" if kind == 10 else "name"
+    row = {id_key: key, name_key: display}
+    mapped = [key]
+    template = [row]
+    if kind == 34:
+        child = str(uuid4())
+        spec["children"] = {child: {"type": 29}}
+        mapped = [{child: [key]}]
+        template = [{child: [row]}]
+    platform.template[control] = template
+    spec["draft_values"] = {order.compact(value): mapped}
+    if change == "alias":
+        spec["draft_values"][order.compact("合成别名")] = mapped
+    code, error = business_cli.run(export)
+    if change != "valid":
+        assert code == 1 and label in error
+        assert not business_cli.summaries and platform.create_count == 0
+    else:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        written, = json.loads(platform.created_cells[control])
+        if kind == 34:
+            cell, = written
+            assert cell["controlId"] == child
+            written, = json.loads(cell["value"])
+        assert (written if kind == 10 else written[id_key]) == row[id_key]
+        card, = business_cli.summaries
+        assert f"{label}：{row[name_key]}" in card.splitlines()
+
+
+@pytest.mark.parametrize("target", ["field", "label"])
+def test_tracked_credential_fragment(case, platform, business_cli, target):
+    fragment = case.session_token[4:8]
+    if target == "field":
+        case.config["fields"][case.control["user_scope"]]["label"] += fragment
+    else:
+        case.config["configurator"][target] += fragment
+    code, error = business_cli.run()
+    assert code == 1 and "凭据冲突" in error
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert not business_cli.summaries and platform.create_count == 0
+    assert fragment not in error
+    assert all(fragment not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
+
+
+@pytest.mark.parametrize(("target", "limit"), [("registration", 200), ("id", 64)])
+@pytest.mark.parametrize("change", ["character", "length", "contains", "contained", "equal", "overlap"])
+def test_opaque_identifier_credential_gate(case, platform, business_cli, monkeypatch, target, limit, change):
+    secret = "synthetic-secret"
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": f" {secret} "})
+    identifier = {
+        "character": "trial/id", "length": "x" * (limit + 1), "contains": "id-" + secret,
+        "contained": secret[2:-2], "equal": secret, "overlap": "synt" + "x" * (limit - 4),
+    }[change]
+    holder = case.ids if target == "registration" else case.config["configurator"]
+    holder[target] = identifier
+    code, error = business_cli.run()
+    if change == "overlap":
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert len(business_cli.summaries) == 1
+    else:
+        assert code == 1 and "凭据冲突" in error and identifier not in error
+        assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+        assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_conflicting_source_blocks_stop_before_card(case, platform, business_cli):
+    export = private_export(case.values)
+    prefix = "适用于合成当前包"
+    export["sources"].extend([
+        {"id": "b1", "source_id": "att1", "start": 0, "text": "无敏感占位文本" * 12},
+        {"id": "b2", "source_id": "att1", "start": 0, "text": prefix + case.session_token},
+    ])
+    text = prefix + case.session_token[:3]
+    quote = {"text": text, "span": {"source_id": "b2", "start": 0, "end": len(text)}}
+    draft = export["drafts"][0]
+    result = draft["field_results"]["packages"]
+    result["statement"]["evidence"] = result["evidence"] = [quote]
+    draft["packages"]["evidence"] = [{"text": text, "start": None}]
+    code, error = business_cli.run(export)
+    assert code == 1 and "建单草稿缺少整批来源证据" in error
+    assert not business_cli.summaries and platform.create_count == 0

@@ -16,6 +16,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from html import escape
 from pathlib import Path
 from stat import S_ISREG
 from types import SimpleNamespace
@@ -1058,6 +1059,52 @@ def draft_cell(value, spec):
     return encode_cell(value, spec)
 
 
+def verified_array_cell(template, value, spec):
+    reason = f"字段 {spec['label']} 的模板显示名、标识或写入值不一致"
+    try:
+        # 一个卡片显示值只授权一个选项或关联对象。子表须能定位唯一关联子控件。
+        field = spec
+        if field["type"] == 34:
+            row, = subtable_rows(template, metadata=spec.get("row_metadata", []))
+            child, = spec["children"]
+            require(row.keys() == {child}, reason)
+            field = spec["children"][child]
+            require(field["type"] in (26, 29), reason)
+            template = row[child]
+        entry, = unpack_array(template)
+        require(isinstance(entry, dict), reason)
+        kind = field["type"]
+        if kind == 10:
+            key, label = single_option([entry], reason)
+            id_key = None
+        else:
+            id_key = "sid" if kind == 29 else "accountId"
+            source = (field.get("relation_id_key", "rowid") if kind == 29
+                      else field.get("member_id_key", "accountId"))
+            key = relation_item(entry, id_key, source)[id_key]
+            label = entry.get(field.get("display_name_key", "name"))
+        require(label == str(value), reason)
+        selected = [key]
+        if spec["type"] == 34:
+            selected = [{child: selected}]
+        expected = encode_cell(selected, spec)
+        mapping = spec.get("draft_values")
+        require(isinstance(mapping, dict) and draft_cell(value, spec) == expected, reason)
+        for other, mapped in mapping.items():
+            if other == compact(value):
+                continue
+            cells = [mapped]
+            if spec["type"] == 34:
+                cells = [row[child] for row in subtable_rows(mapped)]
+            for cell in cells:
+                for item in decode(encode_cell(cell, field)):
+                    other_id = item[id_key] if id_key else item
+                    require(other_id.casefold() != key.casefold(), reason)
+        return expected
+    except (Stop, KeyError, TypeError, ValueError, AttributeError):
+        raise Stop(reason) from None
+
+
 def fixed_cells(config, schema, draft_controls):
     fixed = config.get("fixed")
     official = config["official"]
@@ -1079,7 +1126,7 @@ def fixed_cells(config, schema, draft_controls):
     return encoded
 
 
-def assemble(values, template_cells, config, read_relations, *, is_test):
+def assemble(values, template_cells, config, read_relations, *, is_test, array_controls=()):
     schema = config["fields"]
     draft_controls = cell_schema(schema, config["readback_skip"])
     require(is_test is True, "正式单不得照抄任务审批链接，需人工")
@@ -1143,6 +1190,16 @@ def assemble(values, template_cells, config, read_relations, *, is_test):
             source, encoded = ("草稿" if company_is_relation else "模板"), company_value
         elif key in _VARIABLE:
             source, encoded = "草稿", encode_cell(values[key], spec)
+        elif control in array_controls:
+            reason = f"字段 {spec['label']} 的模板单元格无效"
+            try:
+                cell = template_cells[control]
+                if spec["type"] == 10:
+                    key, _ = single_option(unpack_array(cell), reason)
+                    cell = [key]
+                source, encoded = "模板", encode_cell(cell, spec)
+            except (Stop, KeyError, TypeError, ValueError):
+                raise Stop(reason) from None
         else:
             source, encoded = "模板", encode_cell(template_cells[control], spec)
         controls.append({"controlId": control, "type": spec["type"], "value": encoded})
@@ -1395,7 +1452,7 @@ def verify_order_request(payload, config, template, relations, values, inactive,
             require(equivalent(actual[control], expected, spec)
                     and equivalent(draft_cell(values[name], spec), expected, spec), reason)
         else:
-            require(equivalent(actual[control], draft_cell(values[name], spec), spec), reason)
+            require(actual[control] == verified_array_cell(template[control], values[name], spec), reason)
     snapshot = config.get("order_snapshot", {})
     require(receipt(snapshot.get("version")), "未登记查表快照版本")
     deadline = verify_selected_tags(config, controls, actual, relations, values, snapshot)
@@ -1484,13 +1541,17 @@ def verify_selected_packages(config, controls, actual, relations, values, snapsh
     return required_names
 
 
+def credential_fragments(secrets):
+    return {value[i:i + 4] for value in secrets for i in range(len(value) - 3)}
+
+
 def registered_windows(text, fragments):
     return ((i, i + 4) for i in range(len(text) - 3) if text[i:i + 4] in fragments)
 
 
 def order_summary(values, config, adjustments, excerpts, sources, secrets, deadline, package_names):
     pattern = re.compile("|".join(map(re.escape, sorted(secrets, key=len, reverse=True))))
-    fragments = {value[i:i + 4] for value in secrets for i in range(len(value) - 3)}
+    fragments = credential_fragments(secrets)
     # 同一来源可拆为多个连续或重叠块。拼回连续区间再判引文与凭据的交集。
     redactions = {}
     for origin in {block.source_id for block in sources.blocks.values()}:
@@ -1723,7 +1784,11 @@ class Arguments(argparse.ArgumentParser):
 def run(args, directory, *, clock=time.time):
     require(not directory.is_symlink() and directory.is_dir() and directory.stat().st_mode & 0o777 == 0o700,
             "运行目录下 .private 须为 0700 的私有目录")
-    require(receipt(args.registration) and len(args.registration) <= 200, "登记编号无效")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", args.registration):
+        # 历史登记编号可能不符合新字符集，结果未知时仍须先对账。
+        with ledger_open(directory, args.registration, None) as ledger:
+            ledger.check_available()
+            raise CredentialConflict("展示字段与凭据冲突")
     config_data = private_bytes(args.config)
     draft_data = private_bytes(args.draft)
     login_path = directory / "mingdao-state.json"
@@ -1772,7 +1837,6 @@ def run(args, directory, *, clock=time.time):
     official_token = official_setting("token_key")
     official_app_id = official_setting("app_id_key")
     configurator = config["configurator"]
-    contact = mention(configurator["id"], configurator["label"])
     sensitive = {token, official_token, official_app_id}
     display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
     for key, value in secrets.items():
@@ -1801,9 +1865,22 @@ def run(args, directory, *, clock=time.time):
     settings = load_settings(args.env_file)
     with ledger_open(directory, args.registration, values["policy_name"]) as ledger:
         ledger.check_available()
-        tracked = [values["policy_name"], args.registration, configurator["id"], configurator["label"], contact,
-                   *(spec["label"] for spec in config["fields"].values())]
-        require(not any(secret in item for item in tracked for secret in sensitive), "展示字段与凭据冲突", CredentialConflict)
+        reason = "展示字段与凭据冲突"
+        contact_id = configurator.get("id")
+        require(isinstance(contact_id, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", contact_id),
+                reason, CredentialConflict)
+        require(not any(secret in identifier or identifier in secret
+                        for identifier in (args.registration, contact_id) for secret in sensitive),
+                reason, CredentialConflict)
+        label = configurator["label"]
+        contact = mention(contact_id, label)
+        displayed = [values["policy_name"], label, escape(label),
+                     *(spec["label"] for spec in config["fields"].values())]
+        fragments = credential_fragments(sensitive)
+        require(not any(secret in contact for secret in sensitive)
+                and not any(secret in item for item in displayed for secret in sensitive)
+                and not any(any(registered_windows(item, fragments)) for item in displayed),
+                reason, CredentialConflict)
         summary = card_summary(values)
         require(not any(secret in summary for secret in (token, official_token, official_app_id)),
                 "展示字段与凭据冲突", CredentialConflict)
@@ -1822,6 +1899,9 @@ def run(args, directory, *, clock=time.time):
                 controls, fields_summary = assemble(
                     projected, cells, assembly_config, template_rows,
                     is_test=evidence["is_test"],
+                    array_controls={c for c, s in config["fields"].items()
+                                    if s.get("draft") in values and "draft" not in assembly_config["fields"][c]
+                                    and s["type"] in (10, 26, 29, 34)},
                 )
                 payload = create.payload(controls)
                 deadline, package_names = verify_order_request(
