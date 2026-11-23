@@ -266,7 +266,14 @@ def snapshot_parts(raw: bytes) -> tuple[tuple[str, str], ...]:
             for subpart, segment in segments:
                 yield from visit(subpart, segment, child=True)
         elif _body_leaf(part):
-            body = _wire_body(wire)
+            try:
+                body = _wire_body(wire)
+            except ValueError:
+                # 纯头子段可直接接下一个边界，省略头与空正文之间的空行。
+                if (not child or part.defects or not part.keys() or part.get_payload() != ""
+                        or any(value.defects for value in part.values())):
+                    raise
+                body = b""
             mime = wire[:len(wire) - len(body)]
             if child:
                 # 下一个 multipart 分隔符占用它前面的一个换行。

@@ -188,7 +188,9 @@ def baseline_modules(tmp_path_factory):
     b"Content-Type: multipart/mixed; boundary=q\r\n\r\n"
     b"--q\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable\r\n"
     b"\r\nENCODED=20=E6=B5=8B=\r\n=E8=AF=95\r\n\r\n--q--\r\n",
-], ids=["mixed-headerless", "plain", "alternative", "quoted-printable"])
+    b"Content-Type: multipart/mixed; boundary=q\r\n\r\n"
+    b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\n--q--\r\n",
+], ids=["mixed-headerless", "plain", "alternative", "quoted-printable", "mixed-header-only"])
 def test_mime_to_sonnet_matches_baseline(monkeypatch, baseline_modules, raw):
     from qianshu.mail.message import request_text, snapshot_parts
     baseline, adapter = baseline_modules
@@ -197,6 +199,8 @@ def test_mime_to_sonnet_matches_baseline(monkeypatch, baseline_modules, raw):
         if wire.startswith(b"\r\n"):
             return wire[:2], wire[2:]
         fields, separator, body = wire.partition(b"\r\n\r\n")
+        if wire == b"Content-Type: text/plain":
+            return wire, b""
         assert separator
         return fields + separator, body
 

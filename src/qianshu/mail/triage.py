@@ -7,17 +7,21 @@ from dataclasses import dataclass, field
 from email import policy
 from email.errors import MessageError
 from email.parser import BytesParser
-from html.parser import HTMLParser
 
 from qianshu.ai import anthropic
 from qianshu.config import ConfigError
 from qianshu.parse.model import DEFAULT_MODEL, configured_effort
 
 from . import _fingerprint
-from .message import _wire_body, _wire_children, authored_reply, message_id, sender
+from .message import (
+    _ATTRIBUTION, _DIVIDER, _HEADER_FIELD, _HTMLText, _UNKNOWN_DIVIDER,
+    _wire_body, _wire_children, message_id, sender,
+)
 
 
-_QUOTE_LINE = re.compile(r"[\s\u200b\u200c\u200d\u2060\ufeff]*[>＞]")
+_QUOTE_LINE = re.compile(
+    r"[\s\u200b-\u200f\u202a-\u202e\u2060\u2066-\u2069\ufeff]*[>＞](?=[ \t>＞]|$)"
+)
 
 
 @dataclass(repr=False)
@@ -29,12 +33,42 @@ class MailItem:
     fields: dict = field(repr=False)
 
 
-class _StyledHTML(HTMLParser):
-    uncertain = False
-
+class _StyledHTML(_HTMLText):
     def handle_starttag(self, tag, attrs):
         if tag in {"link", "style"} or any(key == "style" for key, _ in attrs):
             self.uncertain = True
+        super().handle_starttag(tag, attrs)
+
+
+def _triage_reply(kind, content):
+    structured_quote = False
+    if kind == "text/html":
+        parser = _StyledHTML(authored_only=True)
+        parser.feed(content)
+        parser.close()
+        if parser.uncertain or parser.excluded or "".join(parser.tail).strip():
+            return None
+        content = parser.get_text()
+        structured_quote = parser.structured_quote
+
+    lines = content.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if _QUOTE_LINE.match(line):
+            return None
+        if _DIVIDER.fullmatch(stripped) or _ATTRIBUTION.fullmatch(stripped):
+            offset = index + 1
+            while offset < len(lines) and (not lines[offset].strip() or _DIVIDER.fullmatch(lines[offset].strip())):
+                offset += 1
+            quoted = lines[offset:]
+            if (quoted or structured_quote) and all(_QUOTE_LINE.match(item) for item in quoted):
+                return "\n".join(lines[:index]).strip()
+            return None
+        if _HEADER_FIELD.match(stripped) or _UNKNOWN_DIVIDER.match(stripped):
+            return None
+    return "\n".join(lines).strip()
 
 
 def inspect_mail(raw: bytes) -> MailItem:
@@ -122,17 +156,7 @@ def _inspect_mail(raw: bytes) -> MailItem:
                 content = part.get_content(errors="strict").lstrip("\ufeff\u200b\u200c\u200d\u2060")
                 if "\0" in content:
                     raise ValueError
-                eligible = True
-                if kind == "text/html":
-                    parser = _StyledHTML()
-                    parser.feed(content)
-                    parser.close()
-                    eligible = not parser.uncertain
-                reply = authored_reply(kind, content) if eligible else None
-                # 在提取后的可见文本逐行检查，也覆盖 HTML 实体解码后的引文前缀。
-                if reply and any(_QUOTE_LINE.match(line) for line in reply.splitlines()):
-                    reply = None
-                bodies.append((kind, reply))
+                bodies.append((kind, _triage_reply(kind, content)))
         if part.defects:
             raise ValueError
 

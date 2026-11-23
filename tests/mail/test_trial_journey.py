@@ -718,3 +718,57 @@ def test_card_switch_file_changes_only_after_restart(tmp_path):
             sent.clear()
             trial = revision_trial(store, inbox, sent, load)
     assert not sent and len(reads) == 2
+
+
+@pytest.mark.parametrize("line", [
+    "\u200e> HISTORY_SENTINEL", "\u200f＞ HISTORY_SENTINEL",
+    "\u202a\u202b\u202c\u202d\u202e>\tHISTORY_SENTINEL",
+    "\u2066\u2067\u2068\u2069＞>HISTORY_SENTINEL",
+    "\u200b>10", ">10", ">=", "＞10",
+])
+def test_triage_http_quote_marker_boundary(monkeypatch, line):
+    from qianshu.mail.triage import classify, inspect_mail
+    text = "CURRENT\n" + line
+    requests = []
+
+    def receive(request):
+        requests.append(request.content)
+        return httpx.Response(503)
+
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    classify({"ANTHROPIC_API_KEY": "synthetic"}, inspect_mail(synthetic(1, text).as_bytes()), lambda req: None)
+    request, = requests
+    if "HISTORY_SENTINEL" in line:
+        assert request.count(b"HISTORY_SENTINEL") == 0
+    else:
+        fields = json.loads(json.loads(request)["messages"][0]["content"])
+        assert fields["body"] == text
+
+
+def test_header_only_child_keeps_mailbox_active(tmp_path, monkeypatch):
+    from qianshu.mail.triage import inspect_mail
+    store = Store(tmp_path / "trial")
+    inbox = Inbox()
+    trial = revision_trial(store, inbox, [])
+    trial.poll()
+    msg = synthetic(2, "FIRST")
+    inbox.add(msg)
+    raw = (b"Message-ID: " + msg["Message-ID"].encode() + b"\r\nContent-Type: multipart/mixed; boundary=q\r\n\r\n"
+           b"--q\r\nContent-Type: text/plain\r\n\r\nFIRST\r\n--q\r\nContent-Type: text/plain\r\n--q--\r\n")
+    monkeypatch.setattr(inbox, "complete_message", lambda uid: raw)
+    store.observe(trial.scope, 1, 2, 3, [2])
+    reg = store.register(trial.scope, 1, 2, inspect_mail(raw))
+    trial.status(reg, "parse")
+    store.import_spend("0")
+    trial.input_limits["claude-sonnet-5-5"] = 100000
+    requests = []
+
+    def receive(request):
+        requests.append(request.content)
+        raise httpx.ReadTimeout("synthetic")
+
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    trial.poll()
+    assert trial.box()["state"] == "active"
+    request, = requests
+    assert b"FIRST" in request
