@@ -86,3 +86,37 @@ def test_signal_scope(service, monkeypatch, phase):
         if process.is_alive():
             process.kill()
         process.join()
+
+
+def test_handoff_close_failure_keeps_listener(service, monkeypatch):
+    path, settings, run = service
+    ctx = multiprocessing.get_context("fork")
+    closing, resume, failed = (ctx.Event() for _ in range(3))
+
+    def fail(log):
+        closing.set()
+        assert resume.wait(5)
+        signal.raise_signal(signal.SIGINT)
+        raise RuntimeError
+
+    monkeypatch.setattr(trial.Trial, "run", lambda self: None)
+    monkeypatch.setattr(HandoffService, "run", lambda self: None)
+    monkeypatch.setattr(MentionLog, "close", fail)
+    monkeypatch.setattr(trial._LOG, "critical", lambda *args: failed.set())
+    process = ctx.Process(target=run, args=(settings,))
+    process.start()
+    try:
+        assert closing.wait(5)
+        with path.open("rb") as contender, pytest.raises(BlockingIOError):
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        resume.set()
+        assert failed.wait(3)
+        os.kill(process.pid, signal.SIGINT)
+        process.join(0.1)
+        assert process.is_alive()
+        with path.open("rb") as contender, pytest.raises(BlockingIOError):
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        if process.is_alive():
+            process.kill()
+        process.join()

@@ -10,7 +10,7 @@ from qianshu.ai import anthropic
 from qianshu.mail import segmented
 from qianshu.mail.trial_state import MANUAL_BODY_MISSED
 from test_trial_journey import journey, mixed
-from trial_segments import synthetic
+from trial_segments import Segments, synthetic
 
 
 def leaf(kind, text):
@@ -75,7 +75,8 @@ def deliver(journey, monkeypatch, msg, answer, missed, *, empty_request=False):
 @pytest.mark.parametrize("shape", ["plain", "html", "alternative", "mixed", "nested", "embedded"])
 @pytest.mark.parametrize("missed,answer", [(False, "是"), (True, "是"), (True, "拿不准"), (True, "否")])
 def test_structure_coverage(journey, monkeypatch, shape, missed, answer):
-    deliver(journey, monkeypatch, message(shape, missed), answer, missed,
+    must_review = missed or shape in {"mixed", "nested", "embedded"}
+    deliver(journey, monkeypatch, message(shape, missed), answer, must_review,
             empty_request=missed and shape in {"plain", "html"})
 
 
@@ -97,3 +98,30 @@ def test_independent_html_after_container(journey, monkeypatch, named):
 
 def test_negative_verdict_after_invisible_plain(journey, monkeypatch):
     deliver(journey, monkeypatch, mixed(("plain", "\ufeff\u200b"), ("html", "<p>请配置合成政策甲</p>")), "否", True)
+
+
+@pytest.mark.parametrize("shape", ["nested_alternative", "inline_message", "alt_text"])
+@pytest.mark.parametrize("answer", ["是", "否"])
+def test_additional_visible_segment(journey, monkeypatch, shape, answer):
+
+    msg = synthetic(2, "CURRENT")
+    if shape == "nested_alternative":
+        msg.make_mixed()
+        msg.attach(leaf("html", "OTHER"))
+        outer = EmailMessage()
+        outer["Message-ID"] = msg["Message-ID"]
+        outer.make_alternative()
+        outer.attach(msg)
+        outer.attach(leaf("html", "CURRENT OTHER"))
+        msg = outer
+    elif shape == "inline_message":
+        inner = leaf("plain", "OTHER")
+        msg.add_attachment(inner, disposition="inline")
+        parts = Segments(msg.as_bytes())
+        node = parts.tree[1]
+        node[7:7] = [[b"NIL"] * 10, Segments(inner.as_bytes()).tree, b"1"]
+        msg = parts
+    else:
+        msg.make_mixed()
+        msg.attach(leaf("html", '<img alt="OTHER">'))
+    deliver(journey, monkeypatch, msg, answer, True)

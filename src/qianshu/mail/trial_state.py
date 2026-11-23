@@ -19,6 +19,13 @@ from . import _fingerprint
 MANUAL_BODY_MISSED = "转人工（正文未参与解析）"
 
 
+# 供日报的只读连接直接执行。顺序为待发、发送结果未知需人工核对。
+BODY_NOTICE_COUNTS_SQL = """
+SELECT count(*) FILTER (WHERE status='pending'), count(*) FILTER (WHERE status='unknown')
+FROM notice WHERE kind='body_missed'
+"""
+
+
 class Hold(RuntimeError):
     """未获派发资格。"""
 
@@ -95,6 +102,7 @@ class Store:
                 self._seal_ledger()
             else:
                 self._ledger_valid()
+                self._recover_body_notices()
 
     @contextmanager
     def gate(self):
@@ -123,6 +131,42 @@ class Store:
         self.db.execute("""INSERT OR IGNORE INTO notice VALUES(?,?,?,?,'pending',?,?,?,
             (SELECT generation FROM mailbox WHERE scope=?))""",
                         (event, scope, reg, kind, str(uuid4()), now(), quantity, scope))
+
+    def _recover_body_notices(self):
+        # 旧版本仅在卡片路径省略通知登记。首张卡的发送意图保留了交付证据。
+        rows = self.db.execute("""SELECT r.id,r.scope,r.status,
+            (SELECT max(l.generation) FROM location l WHERE l.registration=r.id) generation,
+            p.status page_status,p.uuid page_uuid
+            FROM registration r JOIN missed_body m USING(scope,digest)
+            LEFT JOIN card_intent p ON p.uuid=(SELECT i.uuid FROM card_intent i
+                WHERE i.registration=r.id AND i.page=1 ORDER BY i.version DESC LIMIT 1)
+            WHERE r.status IN (?, 'sending') AND NOT EXISTS
+            (SELECT 1 FROM notice n WHERE n.event='body:' || r.id)""", (MANUAL_BODY_MISSED,)).fetchall()
+        for row in rows:
+            event = f"body:{row['id']}"
+            self.notice(event, row["scope"], row["id"], "body_missed")
+            delivery = row["page_status"] or "pending"
+            if delivery == "sent" and row["status"] == "sending":
+                delivery = "unknown"
+            self.db.execute("UPDATE notice SET status=?,generation=?,uuid=coalesce(?,uuid) WHERE event=?",
+                            (delivery, row["generation"], row["page_uuid"], event))
+
+        # 兼容旧版已经完成人工对账、提示仍滞留在旧代次的登记。
+        for box in self.db.execute("""SELECT DISTINCT m.scope,m.generation FROM mailbox m
+                JOIN notice n USING(scope) WHERE m.state='active' AND n.kind='body_missed'
+                AND n.status='pending' AND n.generation IS NOT m.generation""").fetchall():
+            self._migrate_body_notices(*box)
+
+    def _migrate_body_notices(self, scope, generation):
+        self.db.execute("""UPDATE notice SET generation=? WHERE scope=? AND kind='body_missed'
+                AND status='pending' AND registration IN (
+                    SELECT r.id FROM reconciliation c JOIN registration r ON r.id=c.matched
+                    WHERE c.scope=? AND c.generation=? AND r.scope=c.scope AND r.msgkey=c.msgkey
+                    AND r.digest=c.digest AND r.candidate=c.candidate AND r.status=?)""",
+                       (generation, scope, scope, generation, MANUAL_BODY_MISSED))
+
+    def body_notice_counts(self):
+        return tuple(self.db.execute(BODY_NOTICE_COUNTS_SQL).fetchone())
 
     def begin(self, scope, folder=None):
         with self.write() as db:
@@ -218,7 +262,12 @@ class Store:
         if item.body_missed:
             self.db.execute("INSERT OR IGNORE INTO missed_body VALUES(?,?)", (scope, item.digest))
 
-    def finish(self, reg, status, *, reason=None, warned=False):
+    def review_reused(self, reg, status, item):
+        if item.body_missed and status in {"done", "no", "manual", "correction_pending"}:
+            self.db.execute("UPDATE registration SET version=version+1 WHERE id=?", (reg,))
+            self.finish(reg, "manual")
+
+    def finish(self, reg, status, *, reason=None):
         """在调用方事务内完成登记，同步登记尚待发送的人工提示。冻结优先。"""
         row = self.row("""SELECT r.scope, m.digest IS NOT NULL missed FROM registration r
             LEFT JOIN missed_body m USING(scope,digest) WHERE r.id=? AND r.status!='frozen'""", reg)
@@ -226,8 +275,7 @@ class Store:
             return
         if row["missed"]:
             status = MANUAL_BODY_MISSED
-            if not warned:
-                self.notice(f"body:{reg}", row["scope"], reg, "body_missed")
+            self.notice(f"body:{reg}", row["scope"], reg, "body_missed")
         self.db.execute("UPDATE registration SET status=?,reason=coalesce(?,reason) WHERE id=?",
                         (status, reason, reg))
 
@@ -250,6 +298,7 @@ class Store:
                 reason = "conflict"
             if same and not reason:
                 reg = same[0]["id"]
+                self.review_reused(reg, same[0]["status"], item)
             else:
                 for row in same + related:
                     db.execute("UPDATE registration SET status='frozen',version=version+1,reason=? WHERE id=?",
@@ -408,6 +457,8 @@ class Store:
                 matches = list(db.execute("""SELECT id,status FROM registration WHERE scope=?
                     AND msgkey=? AND digest=?""", (scope, item.key, item.digest)))
                 match = matches[0][0] if len(matches) == 1 and matches[0][1] != "frozen" else None
+                if match is not None:
+                    self.review_reused(match, matches[0]["status"], item)
                 observations.append((uid, item.key, item.digest, item.candidate, item.attachments, match))
             old = [tuple(r) for r in db.execute("""SELECT uid,msgkey,digest,candidate,attachments,matched
                 FROM reconciliation WHERE scope=? AND generation=? ORDER BY uid""", (scope, generation))]
@@ -437,6 +488,7 @@ class Store:
             for reg, in pending:
                 db.execute("UPDATE registration SET version=version+1 WHERE id=?", (reg,))
                 self.finish(reg, "manual", reason="reconciliation")
+            self._migrate_body_notices(scope, generation)
             for row in list(db.execute("""SELECT * FROM reconciliation WHERE scope=? AND generation=?
                     AND matched IS NULL""", (scope, generation))):
                 reg = db.execute("""INSERT INTO registration(scope,msgkey,digest,candidate,attachments,status,

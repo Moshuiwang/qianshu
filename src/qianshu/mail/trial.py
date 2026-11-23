@@ -21,7 +21,7 @@ from .triage import MailItem, classify, input_limit, trial_model
 from .trial_state import Hold, Store
 
 _LOG = logging.getLogger(__name__)
-_BODY_NOTICE = "HTML 正文未参与解析，请人工核对原邮件"
+_BODY_NOTICE = "部分正文未参与解析，请人工核对原邮件"
 _NOTICES = {
     "received": "收到，待核对 1 封。",
     "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
@@ -288,6 +288,8 @@ class Trial:
             if not db.execute("UPDATE registration SET status='sending' WHERE id=? AND status=?",
                               (reg, expected)).rowcount:
                 return
+            if body_missed:
+                self.store.notice(f"body:{reg}", self.scope, reg, "body_missed")
         notices = []
         if body_missed:
             notices.append(CardLine("正文", _BODY_NOTICE))
@@ -303,18 +305,36 @@ class Trial:
             for index, page in enumerate(pages, 1):
                 page = replace(page, elements=(*heading, *page.elements[1:]), number=index, total=len(pages))
                 with self.store.dispatch(self.scope, gen, reg, "card", lambda: self.enabled(True)):
-                    request_id = str(uuid4())
+                    warning_page = body_missed and index == 1
+                    request_id = (self.store.row("SELECT uuid FROM notice WHERE event=?", f"body:{reg}")[0]
+                                  if warning_page else str(uuid4()))
                     with self.store.write() as db:
-                        db.execute("INSERT INTO card_intent VALUES(?,?,?,?,'unknown',?)",
-                                   (request_id, reg, row["version"], index, self.clock().isoformat()))
-                    self.send(result_card(page), request_id, True, lambda: self.require_enabled(True))
+                        db.execute("INSERT INTO card_intent VALUES(?,?,?,?,?,?)",
+                                   (request_id, reg, row["version"], index,
+                                    "pending" if warning_page else "unknown", self.clock().isoformat()))
+
+                    def before_send():
+                        self.require_enabled(True)
+                        if warning_page:
+                            with self.store.write() as db:
+                                self.claim_body_notice(f"body:{reg}")
+                                db.execute("UPDATE card_intent SET status='unknown' WHERE uuid=?", (request_id,))
+
+                    self.send(result_card(page), request_id, True, before_send)
                     with self.store.write() as db:
                         db.execute("UPDATE card_intent SET status='sent' WHERE uuid=?", (request_id,))
+                        if warning_page:
+                            db.execute("UPDATE notice SET status='sent' WHERE event=?", (f"body:{reg}",))
         except Exception:
             unknown = True
         status = "manual" if unknown or attempt is None else "done"
         with self.store.write():
-            self.store.finish(reg, status, warned=body_missed)
+            self.store.finish(reg, status)
+
+    def claim_body_notice(self, event):
+        if not self.store.db.execute("""UPDATE notice SET status='unknown'
+                WHERE event=? AND status='pending'""", (event,)).rowcount:
+            raise Hold()
 
     def flush(self):
         rows = list(self.store.db.execute("""SELECT * FROM notice WHERE status='pending'
@@ -335,15 +355,20 @@ class Trial:
             try:
                 with gate:
                     self.require_enabled(card)
+                    warning = kind == "body_missed"
                     with self.store.write() as db:
-                        if not db.execute("""UPDATE notice SET status='unknown' WHERE event=?
+                        if not warning and not db.execute("""UPDATE notice SET status='unknown' WHERE event=?
                             AND status='pending'""", (row["event"],)).rowcount:
                             continue
-                    warning = kind == "body_missed"
                     content = (result_card(detail_pages("试运行邮件", [CardLine("正文", _BODY_NOTICE)])[0])
                                if warning else _NOTICES[kind].format(n=row["quantity"]))
-                    self.send(content, row["uuid"], warning,
-                              lambda: self.require_enabled(card))
+                    def before_send():
+                        self.require_enabled(card)
+                        if warning:
+                            with self.store.write():
+                                self.claim_body_notice(row["event"])
+
+                    self.send(content, row["uuid"], warning, before_send)
                     with self.store.write() as db:
                         db.execute("UPDATE notice SET status='sent' WHERE event=?", (row["event"],))
             except Hold:
@@ -435,6 +460,13 @@ def run_service(args, settings, path, switches):
 
     class TrialLog(MentionLog):
         _listener_thread = None
+
+        def close(self):
+            try:
+                super().close()
+            except Exception:
+                _LOG.critical("转交库关闭失败，监听锁保留，须人工停机核对。")
+                Event().wait()
 
         @contextmanager
         def listener(self, *, create=False):
