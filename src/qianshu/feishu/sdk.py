@@ -14,12 +14,14 @@ from http import HTTPStatus
 from pathlib import Path
 from secrets import token_urlsafe
 from threading import Event, Lock
+from types import SimpleNamespace
 from urllib.parse import parse_qs, quote, urlparse
 from uuid import NAMESPACE_OID, uuid5
 
 import httpx
 import lark_oapi as lark
 from lark_oapi.api.im.v1 import (
+    CreateMessageResponse, GetChatMembersResponse,
     CreateMessageReactionRequest, CreateMessageReactionRequestBody,
     CreateMessageRequest, CreateMessageRequestBody, Emoji,
     GetChatMembersRequest, GetMessageResourceRequest, ListMessageRequest,
@@ -34,6 +36,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse,
 )
 from lark_oapi.ws import client as ws
+from websockets.uri import parse_uri
 
 from .cards import Report, approval_card, decided_approval_card
 from .entrance import Application, Attachment, Entrance, Message
@@ -90,13 +93,129 @@ def _message(
     )
 
 
+def _before_send(target, outlet, value):
+    check = getattr(target, "before_send", None)
+    if check is not None:
+        check(outlet, value)
+
+
+class CheckedHTTPTransport(httpx.BaseTransport, httpx.AsyncBaseTransport):
+    """在 HTTPX 交付最终请求时执行检查。仅用于无代理、无 mounts 的建单客户端。"""
+
+    def __init__(self, client, check):
+        # HTTPX 没有公开的已创建客户端传输装饰器。保留客户端原有的发送和关闭行为。
+        if any(transport is not None for transport in client._mounts.values()):
+            raise RuntimeError("建单传输不能使用额外路由。")
+        self.transport = client._transport
+        self.check = check
+        client._transport = self
+
+    def handle_request(self, request):
+        self.check(request)
+        return self.transport.handle_request(request)
+
+    async def handle_async_request(self, request):
+        self.check(request)
+        return await self.transport.handle_async_request(request)
+
+    def close(self):
+        self.transport.close()
+
+    async def aclose(self):
+        await self.transport.aclose()
+
+    def __exit__(self, *exc):
+        return self.transport.__exit__(*exc)
+
+    async def __aexit__(self, *exc):
+        return await self.transport.__aexit__(*exc)
+
+
+class _OrderHTTP:
+    """建单专用 SDK 请求适配，只开放审批所需的消息、成员和令牌接口。"""
+
+    def __init__(self, config, check):
+        self.config = config
+        self.check = check
+        self.cached_token = (None, 0.0)
+
+    def check_request(self, request):
+        purpose, token = request.extensions.pop("order_approval")
+        self.check("http", (request, purpose, token))
+
+    def request(self, client, model, purpose, token=None):
+        path = model.uri
+        for key, value in (model.paths or {}).items():
+            path = path.replace(":" + key, quote(value, safe=""))
+        body = None if model.body is None else json.loads(lark.JSON.marshal(model.body))
+        request = client.build_request(model.http_method.name, self.config.domain + path,
+                                       params=model.queries, json=body,
+                                       headers={"Authorization": "Bearer " + token} if token else {})
+        request.extensions["order_approval"] = purpose, token
+        return request
+
+    def token_request(self):
+        body = CreateTokenRequestBodyBuilder(CreateTokenRequestBody()).app_id(
+            self.config.app_id).app_secret(self.config.app_secret).build()
+        return CreateSelfTenantTokenRequestBuilder(CreateSelfTenantTokenRequest()).request_body(body).build()
+
+    @staticmethod
+    def result(response, model):
+        response.raise_for_status()
+        return _checked(lark.JSON.unmarshal(response.text, model))
+
+    def token(self, response):
+        result = self.result(response, AccessTokenResponse)
+        token = result.tenant_access_token
+        if not token or type(result.expire) is not int or result.expire <= 0:
+            raise RuntimeError("飞书未返回有效租户令牌。")
+        self.check("tenant_credential", token)
+        self.cached_token = token, time.monotonic() + result.expire - 600
+        return token
+
+    def valid_token(self):
+        token, deadline = self.cached_token
+        return token if time.monotonic() < deadline else None
+
+    def create(self, model):
+        with httpx.Client(timeout=_HTTP_TIMEOUT, trust_env=False) as client:
+            CheckedHTTPTransport(client, self.check_request)
+            token = self.valid_token() or self.token(client.send(self.request(client, self.token_request(), "token")))
+            return self.result(client.send(self.request(client, model, "message", token)), CreateMessageResponse)
+
+    async def tenant_token(self):
+        token = self.valid_token()
+        if token:
+            return token
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, trust_env=False) as client:
+            CheckedHTTPTransport(client, self.check_request)
+            return self.token(await client.send(self.request(client, self.token_request(), "token")))
+
+    async def async_request(self, model, option, purpose, response_type):
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT, trust_env=False) as client:
+            CheckedHTTPTransport(client, self.check_request)
+            request = self.request(client, model, purpose, option.tenant_access_token)
+            return self.result(await client.send(request), response_type)
+
+    async def acreate(self, model, option):
+        return await self.async_request(model, option, "message", CreateMessageResponse)
+
+    async def aget(self, model, option):
+        return await self.async_request(model, option, "members", GetChatMembersResponse)
+
+
 class _Transport:
-    def __init__(self, settings: Settings, window: Window | None, clock: Callable[[], float]):
+    def __init__(self, settings: Settings, window: Window | None, clock: Callable[[], float],
+                 http_check=None):
         self.settings, self.window, self.clock = settings, window, clock
         self.im = (
             lark.Client.builder().app_id(settings.app_id).app_secret(settings.app_secret)
             .log_level(lark.LogLevel.ERROR).timeout(_HTTP_TIMEOUT).enable_set_token(True).build().im.v1
         )
+
+        self.order_http = _OrderHTTP(self.im.message.config, http_check) if http_check else None
+        if self.order_http:
+            self.im = SimpleNamespace(message=self.order_http, chat_members=self.order_http)
 
     def _require_window(self) -> None:
         if self.window is not None and not self.window.contains(self.clock()):
@@ -170,6 +289,8 @@ class _Transport:
         self, request: ReplyMessageRequest, token: str, trace: Callable[[str, dict], Awaitable[None]],
     ) -> ReplyMessageResponse:
         # SDK 的异步回复接口不接收 HTTPX 请求扩展。
+        if getattr(self, "order_http", None):
+            raise RuntimeError("建单入口只接受审批操作。")
         path = request.uri.replace(":message_id", quote(request.message_id, safe=""))
         async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
             response = await client.post(
@@ -183,6 +304,8 @@ class _Transport:
 
     async def _tenant_token(self) -> str:
         # 复用 SDK 1.8 的令牌缓存和请求模型，用可取消的异步传输处理缓存未命中。
+        if getattr(self, "order_http", None):
+            return await self.order_http.tenant_token()
         config = self.im.message.config
         cache_key = f"self_tenant_token:{config.app_id}"
         token = TokenManager.cache.get(cache_key)
@@ -196,6 +319,7 @@ class _Transport:
         request = (
             CreateSelfTenantTokenRequestBuilder(CreateSelfTenantTokenRequest()).request_body(body).build()
         )
+        _before_send(self, "token", {"app_id": body.app_id, "app_secret": body.app_secret})
         raw = await SDKTransport.aexecute(config, request)
         if raw.status_code != HTTPStatus.OK:
             raise RuntimeError("飞书租户令牌请求失败。")
@@ -219,6 +343,7 @@ class _Transport:
             )
             if page:
                 request.page_token(page)
+            _before_send(self, "members", {"chat_id": self.settings.chat_id, "page_token": page})
             response = await self.im.chat_members.aget(request.build(), option)
             data = _checked(response).data
             if data.trigger_security_conf_limit or type(data.has_more) is not bool:
@@ -239,6 +364,7 @@ class _Transport:
         ).content(json.dumps(card, ensure_ascii=False)).build()
         request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body)
         self._require_window()
+        _before_send(self, "message", vars(body))
         response = _checked(self.im.message.create(request.build()))
         if not response.data or not response.data.message_id:
             raise RuntimeError("飞书未返回卡片消息标识。")
@@ -250,6 +376,7 @@ class _Transport:
             "text",
         ).content(json.dumps({"text": text}, ensure_ascii=False)).build()
         request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+        _before_send(self, "message", vars(body))
         _checked(self.im.message.create(request))
 
     async def notify_callback_timeout(self, notice=_CALLBACK_TIMEOUT_NOTICE) -> None:
@@ -261,6 +388,7 @@ class _Transport:
             ).content(json.dumps({"text": notice}, ensure_ascii=False)).build()
             request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
             self._require_window()
+            _before_send(self, "message", vars(body))
             _checked(await self.im.message.acreate(request, option))
 
     def _history_items(
@@ -368,6 +496,27 @@ class _Transport:
         return data
 
 
+def checked_websocket_connection(url, check):
+    expected = parse_uri(url)
+
+    def create(protocol, **options):
+        if protocol.uri != expected:
+            raise RuntimeError("审批长连接地址已变化。")
+        send = protocol.send_request
+
+        def send_request(upgrade):
+            if upgrade.path != expected.resource_name:
+                raise RuntimeError("审批长连接路径已变化。")
+            request = httpx.Request("GET", url, headers=list(upgrade.headers.raw_items()))
+            check("http", (request, "websocket", None))
+            send(upgrade)
+
+        protocol.send_request = send_request
+        return ws.websockets.ClientConnection(protocol, **options)
+
+    return create
+
+
 class _Connection(ws.Client):
     """绑定 SDK 帧与当前连接。SDK 升级时需复核这些私有生命周期方法。"""
 
@@ -395,12 +544,17 @@ class _Connection(ws.Client):
                 if self._conn is not None:
                     return
                 conn_url = await self._discover_endpoint()
+                _before_send(self.service, "websocket", conn_url)
                 query = parse_qs(urlparse(conn_url).query)
                 conn_id, service_id = query[ws.DEVICE_ID][0], query[ws.SERVICE_ID][0]
                 self.service.transport._require_window()
+                options = ws._ws_connect_kwargs()
+                http_check = getattr(self.service, "http_check", None)
+                if http_check:
+                    options["create_connection"] = checked_websocket_connection(conn_url, http_check)
                 try:
                     self._conn = await ws.websockets.connect(
-                        conn_url, close_timeout=1, **ws._ws_connect_kwargs(),
+                        conn_url, close_timeout=1, **options,
                     )
                 except ws.InvalidHandshake as error:
                     ws._parse_ws_conn_exception(error)
@@ -414,11 +568,17 @@ class _Connection(ws.Client):
         # 固定版本的 SDK 在这里直接调用无超时的 requests.post。
         headers = {"locale": "zh", ws.USER_AGENT: self._user_agent}
         body = {"AppID": self._app_id, "AppSecret": self._app_secret}
+        _before_send(self.service, "endpoint", body)
+        _before_send(self.service, "endpoint_metadata", [headers, self._domain + ws.GEN_ENDPOINT_URI])
         remaining = self.service._remaining()
         limit = _HTTP_TIMEOUT if remaining is None else min(_HTTP_TIMEOUT, remaining)
         try:
             async with asyncio.timeout(limit):
-                async with httpx.AsyncClient(timeout=httpx.Timeout(limit, connect=limit)) as client:
+                http_check = getattr(self.service, "http_check", None)
+                options = {"trust_env": False} if http_check else {}
+                async with httpx.AsyncClient(timeout=httpx.Timeout(limit, connect=limit), **options) as client:
+                    if http_check:
+                        CheckedHTTPTransport(client, lambda req: http_check("http", (req, "endpoint", None)))
                     response = await client.post(self._domain + ws.GEN_ENDPOINT_URI, headers=headers, json=body)
         except (TimeoutError, httpx.TransportError):
             raise _EndpointUnavailable(0, "飞书长连接地址暂不可用。") from None
@@ -468,7 +628,9 @@ class _Connection(ws.Client):
             try:
                 if self._conn is not None:
                     frame = ws._new_ping_frame(int(self._service_id))
-                    await self._write_message(frame.SerializeToString())
+                    encoded = frame.SerializeToString()
+                    _before_send(self.service, "ping", encoded)
+                    await self._write_message(encoded)
             except Exception:
                 _LOG.error("feishu_connection_ping_failed")
             await asyncio.sleep(self._ping_interval)
@@ -516,6 +678,7 @@ class _Connection(ws.Client):
             if payload is None:
                 return
 
+        _before_send(self.service, "callback_headers", [(h.key, h.value) for h in headers])
         response = ws.Response(code=HTTPStatus.OK)
         timing = self._dispatch.set((origin, started, deadline))
         try:
@@ -525,7 +688,9 @@ class _Connection(ws.Client):
                     raise ValueError("卡片帧缺少卡片回调类型。")
             result = self._event_handler._do_without_validation(payload)
             if result is not None:
-                response.data = base64.b64encode(ws.JSON.marshal(await result).encode())
+                encoded = ws.JSON.marshal(await result).encode()
+                _before_send(self.service, "callback_content", encoded)
+                response.data = base64.b64encode(encoded)
         except Exception:
             _LOG.error("feishu_event_dispatch_failed")
             if frame_type == ws.MessageType.CARD.value:
@@ -545,7 +710,9 @@ class _Connection(ws.Client):
         async with asyncio.timeout(remaining):
             async with self._lock:
                 if origin is not None and origin is self._conn and origin.close_code is None:
-                    await origin.send(frame.SerializeToString())
+                    encoded = frame.SerializeToString()
+                    _before_send(self.service, "callback_response", encoded)
+                    await origin.send(encoded)
 
     def _combine(self, msg_id, count, sequence, data):
         # SDK 分片缓存跨重连保留，给每次连接独立的缓存键。
@@ -617,6 +784,8 @@ class FeishuService:
         process: Callable[[Application], Report] | None, *, clock: Callable[[], float] = time.time,
         membership_check: Callable[[str], Awaitable[bool]] | None = None,
         callback_response_margin: float = _CALLBACK_RESPONSE_MARGIN,
+        before_send: Callable[[str, object], None] | None = None,
+        http_check: Callable[[str, object], None] | None = None,
     ):
         if not 0 < callback_response_margin < _CALLBACK_BUDGET:
             raise ValueError("飞书卡片回调的应答预留时间无效。")
@@ -627,10 +796,13 @@ class FeishuService:
         self._approval_disconnected = Event()
         self._approval_disconnected.set()
         self._connected_at: float | None = None
+        self.before_send = before_send
+        self.http_check = http_check
         self._membership_check = membership_check
         self._callback_response_margin = callback_response_margin
         self._callback_notices = set()
         self._callback_notice_failures = 0
+        _before_send(self, "approval_scope", (settings.app_id, settings.chat_id))
         self._state = State(state_path, settings)
         self._state.close_approvals()
         self._callback_claim_lock = asyncio.Lock()
@@ -638,7 +810,9 @@ class FeishuService:
         # SDK 和 HTTP 请求日志可能包含响应原文或消息标识。
         logging.getLogger("Lark").disabled = True
         logging.getLogger("httpx").disabled = True
-        self.transport = _Transport(settings, window, clock)
+        self.transport = (_Transport(settings, window, clock, http_check) if http_check
+                          else _Transport(settings, window, clock))
+        self.transport.before_send = before_send
         self.entrance = (
             Entrance(settings, window, self._state, self.transport, process, clock=clock)
             if process is not None else None
@@ -682,6 +856,7 @@ class FeishuService:
                 or not self.window.contains(self.clock())
             ):
                 raise RuntimeError("发送审批卡片期间审批已关闭。")
+            _before_send(self, "approval_state", (approval_id, message_id, record_id, self.window.end.timestamp()))
             self._state.bind(approval_id, message_id, record_id, self.window.end.timestamp())
         return approval_id
 
@@ -748,6 +923,8 @@ class FeishuService:
             for item in (context.open_message_id, approval_id, record_id, event_id, operator_id)
         ):
             return _approval_warning("审批回调缺少有效标识或决定")
+        _before_send(self, "approval_state", (approval_id, record_id, decision, context.open_message_id,
+                                              event_id, operator_id))
         raw_time = data.header.create_time
         if isinstance(raw_time, str) and re.fullmatch(r"[0-9]+", raw_time):
             try:

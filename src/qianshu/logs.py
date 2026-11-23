@@ -2,6 +2,7 @@
 
 import json
 import logging
+import os
 import re
 import sys
 from collections.abc import Collection, Iterable, Mapping
@@ -170,10 +171,18 @@ class JsonStreamHandler(logging.StreamHandler):
             pass
 
 
+class _JsonFileHandler(JsonStreamHandler):
+    def __init__(self, path: str, config: Mapping[str, str]) -> None:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW, 0o600)
+        super().__init__(os.fdopen(fd, "a", encoding="utf-8"), sensitive_values=config)
+
+    def close(self) -> None:
+        self.stream.close()
+        super().close()
+
+
 def setup_logging(config: Mapping[str, str]) -> None:
     """为根日志器配置项目 JSON 日志。"""
-    logging.basicConfig(
-        handlers=[JsonStreamHandler(sensitive_values=config)],
-        level=logging.INFO,
-        force=True,
-    )
+    path = os.environ.get("QIANSHU_LOG_FILE")
+    handler = _JsonFileHandler(path, config) if path else JsonStreamHandler(sensitive_values=config)
+    logging.basicConfig(handlers=[handler], level=logging.INFO, force=True)
