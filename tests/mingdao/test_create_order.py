@@ -128,8 +128,8 @@ def case(tmp_path):
         statuses=statuses, status_labels=status_labels,
         cells={control[key]: value for key, value in template.items()}, private=private, window=window,
         relations=relations,
-        session_token="placeholder-sensitive-" + uuid4().hex,
-        official_token="placeholder-sensitive-" + uuid4().hex,
+        session_token="zq-sens-" + uuid4().hex,
+        official_token="vx-auth-" + uuid4().hex,
     )
 
 
@@ -1557,8 +1557,9 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         platform.template[tag_control] = True
     if mode == "relation_total_mismatch":
         platform.relation_response = lambda rows: platform.response({"rows": rows, "total": len(rows) + 1})
+    draft_inputs = order_fixture(case, platform)
     order.exclusive(config_path, case.config)
-    draft = deepcopy(case.values)
+    draft = {**deepcopy(case.values), **draft_inputs}
     if mode == "template_conflict":
         draft["maintain_mutual_exclusion_group"] = "否"
     if mode == "missing_user_scope":
@@ -1568,7 +1569,7 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
             {"current_package": "PLACEHOLDER__Basic", "gift_package": "PLACEHOLDER_Gift"},
             {"current_package": " placeholder basic ", "gift_package": "placeholder gift"},
         ]
-    order.exclusive(draft_path, {key: {"value": value} for key, value in draft.items()})
+    order.exclusive(draft_path, private_export(draft))
     order.exclusive(login_path, {"cookies": [{
         "name": case.config["create"]["session_cookie"], "value": case.session_token,
         # 明道云真实下发形态：父域、会话期、未标 secure（2026-11-20 X5 首跑实测）
@@ -1586,6 +1587,7 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         f"FEISHU_APPROVED_FINGERPRINT={'f' * 64}",
     ]))
     env_file.chmod(0o600)
+    case.evidence["policy_id"] = "p1"
     for key, path in (("config", config_path), ("draft", draft_path), ("login", login_path)):
         case.evidence[key + "_sha256"] = order.digest(path.read_bytes())
     if mode == "missing_review":
@@ -1705,3 +1707,1722 @@ def test_extract_token_accepts_real_mingdao_cookie_shape_and_keeps_other_checks(
             order.extract_token({"cookies": [{**real, **bad}]}, "md_pss_id")
     with pytest.raises(order.Stop, match="登录会话无法核实"):
         order.extract_token({"cookies": [real, dict(real)]}, "md_pss_id")
+
+
+@pytest.fixture(autouse=True)
+def synthetic_uuids(monkeypatch):
+    from random import Random
+    from uuid import UUID
+
+    # 每个用例重放同一组合成凭据和字段 ID，使两者的片段检查与运行顺序无关。
+    random = Random(57)
+    monkeypatch.setitem(globals(), "uuid4", lambda: UUID(int=random.getrandbits(128), version=4))
+
+
+def order_fixture(case, platform):
+    # X5 名称与标签共同使用测试前缀；保留模拟主名、别名及歧义关系。
+    tags = ["【测试】" + tag for tag in case.values["user_tags"]]
+    case.values["user_tags"] = tags
+    if tags:
+        case.values["policy_name"] = tags[0]
+    for row in platform.relations[case.control["user_tags"]]:
+        for key in case.config["official"]["tag_relation"]["name_keys"]:
+            if key in row:
+                row[key] = "【测试】" + row[key]
+    today = case.window.start.date()
+    values = deepcopy(case.values)
+    values.update(start_date=(today + timedelta(days=1)).isoformat(),
+                  end_date=(today + timedelta(days=4)).isoformat(),
+                  policy_type="定向政策" if values["user_tags"] else "公开政策",
+                  benefit_type="赠送时长", cancel_on_downgrade="否", trigger_once="否",
+                  repeat_bonus="是", effective_multiplier=1)
+    for key, label in (("policy_type", "政策类型"), ("benefit_type", "优惠类型"),
+                       ("cancel_on_downgrade", "降包用户取消优惠"), ("trigger_once", "只触发一次"),
+                       ("repeat_bonus", "多买多送"), ("effective_multiplier", "生效倍数")):
+        control = case.control[key] = str(uuid4())
+        spec = {"type": 6, "label": label, "draft": key}
+        value = values[key]
+        if key != "effective_multiplier":
+            option = str(uuid4())
+            spec.update(type=11, draft_values={order.compact(value): [option]})
+            value = [{"key": option, "value": value}]
+        case.config["fields"][control] = spec
+        platform.template[control] = value
+    set_mutex_template(case, platform, "是")
+    gift = "合成当前包_copy"
+    values["packages"][0]["gift_package"] = gift
+    platform.relations[case.control["packages"]][0][case.child["gift"]][0]["name"] = gift
+    columns = ("record_type,company_id,company_name,offer_id,offer_name,offer_type,is_synchronized,"
+               "parent_offer_id,offer_level_type,offer_level,status,sale_start_date,sale_end_date")
+    package = case.ids["package"]
+    case.config["order_snapshot"] = {
+        "version": "cfgver-1", "companies": [{"id": "01", "name": "合成公司", "country": "合成国家"}],
+        "tags": [{"name": name, "id": case.ids["tag"], "end": values["end_date"], "shadow": False}
+                 for name in values["user_tags"]],
+        "package_levels": "\n".join([columns,
+            f"OFFER,01,合成公司,{package},合成当前包,基本,否,,A,1,在售,2000-01-01,2100-01-01",
+            f"OFFER,01,合成公司,{case.ids['gift_package']},{gift},附属,是,{package},A,1,在售,2000-01-01,2100-01-01"]),
+    }
+    case.config["order_snapshot"]["companies"][0]["keyword"] = "合成公司"
+    return {key: value for key, value in values.items() if value != case.values.get(key)}
+
+
+def set_mutex_template(case, platform, value):
+    control = case.control["maintain_mutual_exclusion_group"]
+    option, = case.config["fields"][control]["draft_values"][order.compact(value)]
+    platform.template[control] = [{"key": option, "value": value}]
+
+
+def private_export(values):
+    # 独立合成来源，各引文以来源坐标标识。模型字段值可在测试中单独变动。
+    text = ""
+    results = {}
+    fields = {}
+    for name, value in values.items():
+        examples = {"company": "本活动由合成公司办理", "user_scope": "适用于合成召回用户",
+                    "packages": "当前节目包为合成当前包", "recharge_days": "充三十天",
+                    "gift_days": "送三十一天", "benefit_type": "活动赠送时长",
+                    "trigger_once": "允许重复触发", "repeat_bonus": "多买多送",
+                    "effective_multiplier": "生效倍数为一", "cancel_on_downgrade": "降包后保留优惠",
+                    "maintain_mutual_exclusion_group": "需要维护互斥组"}
+        quote_text = examples.get(name, f"{name}（合成申请）{value}")
+        span = {"source_id": "body", "start": len(text), "end": len(text) + len(quote_text)}
+        text += quote_text + "\n"
+        quotes = [{"span": span, "text": quote_text}]
+        fields[name] = {"value": value, "uncertainty": None, "evidence": [
+            {"text": quote_text, "start": span["start"]}]}
+        results[name] = {"value": value, "has_value": True, "needs_confirmation": False,
+                         "issues": [], "source": "原文", "evidence": quotes, "input_fields": [],
+                         "statement": {"value": value, "status": "确定", "evidence": quotes, "candidates": []}}
+    for name, value, literals in (
+        ("country", "合成国家", ["合成国家"]),
+        ("company_keyword", ["合成公司"], ["合成公司"]),
+        ("user_tags", values["user_tags"], values["user_tags"]),
+    ):
+        quotes = []
+        for literal in literals:
+            span = {"source_id": "body", "start": len(text), "end": len(text) + len(literal)}
+            quotes.append({"text": literal, "span": span})
+            text += literal + "\n"
+        results[name] = {"value": value, "has_value": True, "needs_confirmation": False, "source": "原文",
+                         "issues": [], "evidence": quotes, "input_fields": [],
+                         "statement": {"status": "确定", "value": value, "evidence": quotes, "candidates": []}}
+        if name == "user_tags":
+            fields[name]["evidence"] = [{"text": q["text"], "start": q["span"]["start"]} for q in quotes]
+    if "policy_type" in results and "user_tags" in results:
+        tag_quote = results["user_tags"]["evidence"]
+        result = results["policy_type"]
+        result.update(source="查表派生", input_fields=["user_tags"], evidence=tag_quote, rule="R8")
+        result["statement"].update(value=None, evidence=[], status="原文未写")
+        fields["policy_type"]["evidence"] = deepcopy(fields["user_tags"]["evidence"])
+    if values.get("packages") and all(row["gift_package"] for row in values["packages"]):
+        results["packages"].update(source="查表派生", rule="6.2.R6",
+                                   input_fields=["benefit_type", "company", "start_date", "packages"])
+        results["packages"]["statement"]["value"] = [
+            {"current_package": row["current_package"],
+             "gift_package": None if values.get("benefit_type") == "赠送时长" else row["gift_package"].removesuffix("_copy")}
+            for row in values["packages"]]
+    scope = {"id": "p1", "main": {"source_id": "body", "start": 0, "end": 1}, "continuations": [],
+             "has_title": True}
+    return {"drafts": [{**fields, "policy_id": "p1", "scope": scope, "field_results": results}],
+            "sources": [{"id": "body", "source_id": "body", "start": 0, "text": text}],
+            "requires_full_review": False, "structure_issues": []}
+
+
+@pytest.fixture
+def business_cli(case, platform, monkeypatch, capsys):
+    private = case.private
+    case.values.update(order_fixture(case, platform))
+    now = [case.window.start.timestamp() + 1]
+    approvals = Approvals(platform)
+    summaries = []
+    publish = approvals.publish_approval
+
+    def record_card(binding, summary):
+        summaries.append(summary)
+        return publish(binding, summary)
+
+    approvals.publish_approval = record_card
+    approvals.run_create = lambda work: work(Event())
+    monkeypatch.chdir(private.parent)
+    monkeypatch.setattr(order, "_Transport", lambda *args: approvals.transport)
+    monkeypatch.setattr(order, "FeishuService", lambda *args, **kwargs: approvals)
+    monkeypatch.setattr(order, "load_settings", lambda _: None)
+    monkeypatch.setattr(order, "run", partial(order.run, clock=lambda: now[0]))
+    monkeypatch.setattr(order, "run_order", partial(order.run_order, pause=lambda _: None, monotonic=lambda: 0))
+    monkeypatch.setattr(order, "CreateRequest", partial(order.CreateRequest, connect=platform.connection))
+    monkeypatch.setattr(httpx, "Client", partial(httpx.Client, transport=httpx.MockTransport(platform.official)))
+
+    def run(export=None, *, tamper=None):
+        case.evidence["policy_id"] = "p1"
+        login = {"cookies": [{"name": case.config["create"]["session_cookie"], "value": case.session_token,
+                              "domain": ".mingdao.com", "path": "/", "secure": False, "expires": -1}]}
+        for key, filename, material in (("draft", "draft.json", private_export(case.values) if export is None else export),
+                                        ("config", "config.json", case.config), ("login", "mingdao-state.json", login)):
+            path = private / filename
+            order.exclusive(path, material)
+            case.evidence[key + "_sha256"] = order.digest(path.read_bytes())
+            if tamper == key:
+                path.write_bytes(path.read_bytes() + b" ")
+        order.exclusive(private / "create-authorizations.json", {case.ids["registration"]: case.evidence})
+        settings = private / "synthetic-settings"
+        settings.write_text(f"PLACEHOLDER_OFFICIAL_TOKEN={case.official_token}\n"
+                            f"PLACEHOLDER_OFFICIAL_APP={case.ids['official_app']}\n")
+        code = order.main(["--config", str(private / "config.json"), "--registration", case.ids["registration"],
+                           "--env-file", str(settings), str(private / "draft.json")])
+        return code, capsys.readouterr().err
+
+    return SimpleNamespace(run=run, summaries=summaries, now=now, notices=approvals.notices)
+
+
+@pytest.mark.parametrize(("mode", "reason"), [
+    ("legacy", "整批来源证据"), ("missing_type", "优惠类型"), ("mutex_no", "互斥组"),
+    ("public", "政策类型"), ("invalid_date", "日期"), ("expired", "调整后晚于"),
+    ("no_date", "标签截止日"), ("alias_conflict", "截止日登记冲突"), ("late", "晚于标签截止日"),
+    ("bad_quote", "可核证据"), ("no_quote", "可核证据"), ("exclusive", "归属声明矛盾"),
+    ("stale_watch", "watch_days"), ("stale_penalty", "penalty_days"), ("inactive", "watch_days"),
+    ("no_gift", "销售品"), ("wrong_parent", "销售品"), ("duplicate_offer", "销售品"),
+    ("other_gift_id", "销售品"), ("other_tag_id", "记录标识"), ("wrong_label", "优惠类型"),
+    ("wrong_key", "优惠类型"), ("ambiguous_key", "优惠类型"), ("replaced", "优惠类型"),
+    ("upgrade", "after_offer"), ("special", "amount_mode"), ("bad_default", "可核证据"),
+    ("penalty_format", "penalty_days"), ("missing_scope", "整批结构"), ("missing_target", "目标政策"),
+])
+def test_order_business_stops(case, platform, business_cli, mode, reason, monkeypatch):
+    values = case.values
+    snapshot = case.config["order_snapshot"]
+    tag = snapshot["tags"][0]
+    benefit = case.control["benefit_type"]
+    gift = platform.relations[case.control["packages"]][0][case.child["gift"]]
+    if mode == "missing_type":
+        del values["benefit_type"]
+    elif mode == "mutex_no":
+        values["maintain_mutual_exclusion_group"] = "否"
+        set_mutex_template(case, platform, "否")
+    elif mode == "public":
+        values["policy_type"] = "公开政策"
+    elif mode == "invalid_date":
+        values["start_date"] = "2025-02-29"
+    elif mode == "expired":
+        values.update(start_date="2000-01-01", end_date="2000-01-02")
+    elif mode == "no_date":
+        tag.pop("end")
+    elif mode == "late":
+        tag["end"] = values["start_date"]
+    elif mode == "alias_conflict":
+        snapshot["tags"].append({**tag, "name": tag["name"] + " ", "end": values["start_date"]})
+    elif mode in ("stale_watch", "stale_penalty"):
+        name = "watch_days" if mode == "stale_watch" else "penalty_days"
+        control = str(uuid4())
+        case.config["fields"][control] = {"type": 6, "label": name, "draft": name}
+        platform.template[control] = "9"
+    elif mode == "inactive":
+        values["watch_days"] = 12
+    elif mode == "no_gift":
+        gift.clear()
+        values["packages"][0]["gift_package"] = None
+    elif mode == "wrong_parent":
+        snapshot["package_levels"] = snapshot["package_levels"].replace("是," + case.ids["package"], "是,wrong")
+    elif mode == "duplicate_offer":
+        snapshot["package_levels"] += "\n" + snapshot["package_levels"].splitlines()[-1]
+    elif mode == "other_gift_id":
+        gift[0]["sid"] = str(uuid4())
+    elif mode == "other_tag_id":
+        tag["id"] = str(uuid4())
+    elif mode == "wrong_label":
+        platform.template[benefit][0]["value"] += " "
+    elif mode == "wrong_key":
+        platform.template[benefit][0]["key"] = str(uuid4())
+    elif mode == "ambiguous_key":
+        mapping = case.config["fields"][benefit]["draft_values"]
+        mapping[order.compact("其他")] = next(iter(mapping.values()))
+    elif mode == "replaced":
+        payload = order.CreateRequest.func.payload
+        def corrupt(self, controls):
+            cells = deepcopy(controls)
+            next(cell for cell in cells if cell["controlId"] == benefit)["value"] = "[]"
+            return payload(self, cells)
+        monkeypatch.setattr(order.CreateRequest.func, "payload", corrupt)
+    elif mode == "upgrade":
+        values["benefit_type"] = "升级权益"
+    elif mode == "special":
+        values.update(benefit_type="特价优惠", after_offer="恢复原包", forbid_package_change="是",
+                      watch_days=3, recharge_amount=5)
+        del values["recharge_days"], values["gift_days"]
+    elif mode == "penalty_format":
+        values["penalty_days"] = -1
+
+    export = private_export(values)
+    draft = export["drafts"][0]
+    scope = draft["field_results"]["user_scope"]
+    if mode == "legacy":
+        export = {key: {"value": v} for key, v in values.items()}
+    elif mode == "bad_quote":
+        scope["evidence"][0]["span"]["start"] += 1
+    elif mode == "no_quote":
+        scope["evidence"] = []
+    elif mode == "exclusive":
+        other_policy(export, scope["evidence"][0]["span"], exclusive=True)
+    elif mode == "bad_default":
+        draft["field_results"]["maintain_mutual_exclusion_group"]["source"] = "默认规则"
+    elif mode == "missing_scope":
+        export["requires_full_review"] = True
+    elif mode == "missing_target":
+        draft["scope"]["id"] = draft["policy_id"] = "p2"
+    code, error = business_cli.run(export)
+    assert code == 1 and reason in error
+    assert business_cli.summaries == [] and platform.create_count == 0
+
+
+def other_policy(export, span, *, exclusive):
+    scope = {"id": "p2", "main": span, "continuations": []}
+    if exclusive:
+        scope["exclusive_spans"] = [span]
+    export["drafts"].append({"policy_id": "p2", "scope": scope})
+
+
+@pytest.mark.parametrize("end_today", [True, False])
+def test_business_card_and_request(case, platform, business_cli, end_today):
+    today = datetime.fromtimestamp(business_cli.now[0], UTC).date().isoformat()
+    case.values["start_date"] = "2000-01-01"
+    if end_today:
+        case.values["end_date"] = today
+    export = private_export(case.values)
+    results = export["drafts"][0]["field_results"]
+    for key in ("maintain_mutual_exclusion_group", "effective_multiplier"):
+        results[key].update(source="默认规则", evidence=[])
+        results[key]["statement"].update(status="原文未写", evidence=[], value=None)
+        export["drafts"][0][key]["evidence"] = []
+    other_policy(export, results["start_date"]["evidence"][0]["span"], exclusive=False)
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert all(text in card for text in ("政策类型按用户标签判定", "互斥组按默认填是", "生效倍数按默认填 1",
+                                        "优惠类型：赠送时长", "互斥组：是", "政策类型：定向政策",
+                                        f"开始日期由 2000-01-01 调整至 {today}"))
+    for name in ("start_date", "end_date", "user_scope"):
+        assert platform.created_cells[case.control[name]] in card
+
+
+@pytest.mark.parametrize("key", ["config", "draft"])
+def test_registered_order_material_cannot_change(business_cli, platform, key):
+    code, error = business_cli.run(tamper=key)
+    assert code == 1 and "摘要与登记不符" in error
+    assert not platform.actions and platform.create_count == 0
+
+
+@pytest.mark.parametrize("mode", ["downgrade", "midnight"])
+def test_approval_cannot_release_unconfirmed_value(case, platform, business_cli, mode):
+    if mode == "midnight":
+        today = case.window.start.date()
+        case.values["start_date"] = today.isoformat()
+        tomorrow = datetime.combine(today + timedelta(days=1), datetime.min.time(), UTC)
+        case.evidence["window"]["end"] = (tomorrow + timedelta(days=1)).isoformat()
+        platform.before_search = lambda: business_cli.now.__setitem__(0, tomorrow.timestamp())
+    export = private_export(case.values)
+    if mode == "downgrade":
+        key = "cancel_on_downgrade"
+        draft = export["drafts"][0]
+        draft[key].update(value=None, uncertainty={"reason": "待确认", "candidates": []}, evidence=[])
+        result = draft["field_results"][key]
+        result.update(value=None, source=None, has_value=False, needs_confirmation=True, evidence=[],
+                      issues=["downgrade_confirmation"])
+        result["statement"].update(value=None, status="原文未写", evidence=[])
+    code, _ = business_cli.run(export)
+    assert code == 1 and platform.create_count == 0
+    card, = business_cli.summaries
+    if mode == "downgrade":
+        assert "降包用户取消优惠待确认，请选择是或否" in card
+    reason = "降包用户取消优惠" if mode == "downgrade" else "开始日期"
+    assert any("未建单" in notice and reason in notice for notice in business_cli.notices)
+
+
+def test_order_evidence_masks_intersection_with_loaded_secret(case, platform, business_cli):
+    # 引文只取合成凭据中间一段，字段值是模型概括出的自由文本。
+    secret = case.session_token
+    fragment = secret[4:13]
+    case.values["user_scope"] = "合成范围" + fragment
+    export = private_export(case.values)
+    block = export["sources"][0]
+    start = len(block["text"]) + 4
+    block["text"] += secret
+    draft = export["drafts"][0]
+    quote = {"text": fragment, "span": {"source_id": "body", "start": start, "end": start + len(fragment)}}
+    result = draft["field_results"]["user_scope"]
+    result["evidence"] = result["statement"]["evidence"] = [quote]
+    draft["user_scope"]["evidence"] = [{"text": fragment, "start": start}]
+    code, error = business_cli.run(export)
+    assert (code, error) == (1, "E-CRED-STOP\n")
+    assert not business_cli.summaries
+    assert platform.create_count == 0
+    assert fragment not in error + "".join(business_cli.notices)
+
+
+@pytest.mark.parametrize(("name", "mutate", "reason"), [
+    ("maintain_mutual_exclusion_group", "candidate", "可核证据"),
+    ("user_scope", "uncertain", "待确认"), ("effective_multiplier", "value", "生效倍数"),
+    ("trigger_once", "value", "触发次数"), ("policy_type", "dependency", "可核证据"),
+    ("benefit_type", "fixed", "优惠类型"), ("benefit_type", "skip", "优惠类型"),
+    ("benefit_type", "prefix", "优惠类型"), ("benefit_type", "encoding", "优惠类型"),
+    ("end_date", "calendar", "日期"), ("penalty_days", "required", "penalty_days"),
+])
+def test_business_field_proof(case, platform, business_cli, name, mutate, reason):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    if mutate == "candidate":
+        draft["field_results"][name]["statement"]["candidates"].append({"value": "否", "evidence": []})
+    elif mutate == "uncertain":
+        draft[name]["uncertainty"] = {"reason": "带条件"}
+    elif mutate == "value":
+        draft[name]["value"] = 2 if name == "effective_multiplier" else "是"
+    elif mutate == "dependency":
+        draft["field_results"][name]["input_fields"] = ["company"]
+    elif mutate == "fixed":
+        applicant = case.config["applicant_control"]
+        control = case.control[name]
+        del case.config["fields"][control]["draft"]
+        case.config["fields"][applicant]["draft"] = name
+    elif mutate == "skip":
+        case.config["readback_skip"].append(case.control[name])
+    elif mutate == "prefix":
+        platform.template[case.control[name]][0]["value"] = "赠送"
+    elif mutate == "encoding":
+        case.config["fields"][case.control[name]]["draft_values"][order.compact("赠送时长")] = [str(uuid4())]
+    elif mutate == "calendar":
+        draft[name]["value"] = "2026-13-31"
+    elif mutate == "required":
+        draft["field_results"][name] = {"statement": {"status": "确定", "value": 10, "candidates": []}}
+    code, error = business_cli.run(export)
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize(("kind", "change", "reason"), [
+    ("升级权益", "valid", "after_offer"), ("特价优惠", "valid", "after_offer"),
+    ("升级权益", "inactive", "watch_days"), ("特价优惠", "inactive", "gift_days"),
+    ("特价优惠", "bad_amount", "recharge_amount"), ("特价优惠", "no_rate", "资费"),
+    ("特价优惠", "wrong_total", "充值金额"), ("特价优惠", "rate", "after_offer"),
+    ("升级权益", "missing_target", "目标节目包"),
+])
+def test_conditional_offer_before_projection(case, platform, business_cli, kind, change, reason):
+    values = case.values
+    values.update(benefit_type=kind, after_offer="恢复原包", forbid_package_change="是")
+    if kind == "特价优惠":
+        del values["recharge_days"], values["gift_days"]
+        values.update(watch_days=2, amount_mode="自定义", recharge_amount=8)
+    if change == "inactive":
+        values["watch_days" if kind == "升级权益" else "gift_days"] = 5
+    if change == "bad_amount":
+        values["recharge_amount"] = -1
+    if change == "missing_target":
+        values.update(after_offer="指定节目包", after_offer_package="合成目标包")
+    if change in ("no_rate", "wrong_total", "rate"):
+        ref = {"base_package": "合成当前包", "price_plan": "合成计划", "unit": "月", "version": "1"}
+        values.update(amount_mode="节目包资费", tariff=ref, tariff_multiplier=1.5,
+                      recharge_amount=8 if change == "wrong_total" else 7)
+        if change != "no_rate":
+            case.config["order_snapshot"]["benefit_catalog"] = {
+                "tariffs": [{**ref, "amount": 5, "valid_from": values["start_date"]}]}
+    code, error = business_cli.run()
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_shadow_tag_alias_mixed_with_ordinary_tag(case, platform, business_cli):
+    keys = case.config["official"]["tag_relation"]["name_keys"]
+    control = case.control["user_tags"]
+    selected, = platform.relations[control]
+    selected[keys[1]], selected[keys[0]] = selected[keys[0]], "合成主名_image"
+    ordinary = {**record_identity(str(uuid4())), keys[0]: "合成普通标签"}
+    platform.relations[control].append(ordinary)
+    platform.template[control] = 2
+    case.values["user_tags"].append(ordinary[keys[0]])
+    case.config["order_snapshot"]["tags"].append({
+        "name": ordinary[keys[0]], "id": ordinary["rowId"], "end": case.values["end_date"], "shadow": False})
+    code, error = business_cli.run()
+    assert code == 1 and "影子标签须单选" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_rendered_full_secret_stops_before_card(case, platform, business_cli, monkeypatch):
+    original = order._CardRedaction.display
+
+    def broken_renderer(self, text, start=None, **kwargs):
+        if start is not None:
+            return case.session_token
+        return original(self, text, start, **kwargs)
+
+    monkeypatch.setattr(order._CardRedaction, "display", broken_renderer)
+    code, error = business_cli.run()
+    assert code == 1 and "展示字段与凭据冲突" in error
+    assert not business_cli.summaries and platform.create_count == 0
+    failure, = case.private.glob("create-preflight-*.json")
+    assert case.session_token not in error + failure.read_text() + "".join(business_cli.notices)
+
+
+def test_card_explicit_values_match_selected_options(case, platform, business_cli):
+    code, error = business_cli.run()
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    for name in ("benefit_type", "policy_type", "maintain_mutual_exclusion_group", "cancel_on_downgrade",
+                 "trigger_once", "repeat_bonus"):
+        control = case.control[name]
+        spec = case.config["fields"][control]
+        value = case.values[name]
+        assert json.loads(platform.created_cells[control]) == spec["draft_values"][order.compact(value)]
+        assert f"{spec['label']}：{value}" in card
+    assert "互斥组按默认" not in card and "生效倍数按默认" not in card
+    assert json.loads(platform.created_cells[case.control["user_tags"]]) == [{"sid": case.ids["tag"]}]
+    assert case.values["user_tags"][0] in card
+
+
+@pytest.mark.parametrize("source", ["session", "template", "fragment"])
+def test_sensitive_write_value_stops_before_approval(case, platform, business_cli, source):
+    if source == "template":
+        platform.template[case.control["approval_url"]] += "/" + case.official_token
+    else:
+        value = case.session_token if source == "session" else case.session_token[4:13]
+        case.values["user_scope"] = "合成范围" + value
+    code, error = business_cli.run()
+    assert code == 1 and ("E-CRED-STOP\n" == error if source == "fragment" else "凭据" in error)
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("source", ["display", "template", "fragment"])
+def test_credential_stop_announces_manual_handoff(case, platform, business_cli, source, block_external):
+    if source == "display":
+        case.config["fields"][case.control["user_scope"]]["label"] += case.session_token
+    elif source == "template":
+        platform.template[case.control["approval_url"]] += "/" + case.official_token
+    else:
+        case.values["user_scope"] += case.session_token[4:13]
+    if source == "display":
+        block_external()
+    code, error = business_cli.run()
+    assert code == 1 and ("凭据" in error if source == "template" else error == "E-CRED-STOP\n")
+    assert not business_cli.summaries and platform.create_count == 0
+    if source == "display":
+        assert (code, error) == (1, "E-CRED-STOP\n")
+        assert business_cli.notices == []
+    else:
+        assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+
+
+def test_unknown_create_reentry_with_credential_conflict(case, platform, business_cli, capsys, block_external):
+    platform.create_effect = "timeout"
+    code, error = business_cli.run()
+    assert code == 1 and "需人工对账" in error
+    assert events(case)[-2:] == ["create_unknown", "create_reconciled_read"]
+    assert platform.actions[-4:] == ["card", "search", "create", "search"]
+
+    settings = case.private / "synthetic-settings"
+    with settings.open("a") as stream:
+        stream.write(f"PLACEHOLDER_EXTRA={case.values['policy_name']}\n")
+    before = events(case)
+    actions = platform.actions.copy()
+    block_external()
+    code = order.main(["--config", str(case.private / "config.json"), "--registration", case.ids["registration"],
+                       "--env-file", str(settings), str(case.private / "draft.json")])
+
+    assert (code, capsys.readouterr().err) == (1, "E-CRED-STOP\n")
+    assert events(case) == before
+    assert platform.actions == actions
+    assert platform.create_count == 1
+    assert all("未建单" not in message for message in business_cli.notices)
+
+
+def test_fresh_registration_with_credential_conflict(case, platform, business_cli, block_external):
+    case.config["fields"][case.control["user_scope"]]["label"] += case.session_token
+    block_external()
+    code, error = business_cli.run()
+    assert (code, error) == (1, "E-CRED-STOP\n")
+    assert not business_cli.summaries and platform.create_count == 0
+    assert business_cli.notices == []
+
+
+def test_unmapped_inactive_control_stops_before_approval(case, platform, business_cli):
+    control = str(uuid4())
+    case.config["fields"][control] = {"type": 6, "label": "可看天数"}
+    platform.template[control] = "9"
+    code, error = business_cli.run()
+    assert code == 1 and "watch_days" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_midnight_during_login_read_stops_transmission(case, platform, business_cli, monkeypatch):
+    today = case.window.start.date()
+    case.values["start_date"] = today.isoformat()
+    midnight = datetime.combine(today + timedelta(days=1), datetime.min.time(), UTC)
+    case.evidence["window"]["end"] = (midnight + timedelta(days=1)).isoformat()
+    read = order.private_bytes
+
+    def read_across_midnight(path):
+        data = read(path)
+        if path.name == "mingdao-state.json" and business_cli.summaries:
+            business_cli.now[0] = midnight.timestamp()
+        return data
+
+    monkeypatch.setattr(order, "private_bytes", read_across_midnight)
+    code, _ = business_cli.run()
+    assert code == 1 and platform.create_count == 0
+    assert len(business_cli.summaries) == 1
+    assert any("未建单" in msg and "开始日期" in msg for msg in business_cli.notices)
+
+
+@pytest.mark.parametrize("closure", ["disconnect", "expiry"])
+def test_approval_lost_during_date_check_stops_transmission(
+        case, platform, business_cli, live_approval, monkeypatch, closure):
+    service, now, socket, notices = live_approval
+    monkeypatch.setattr(order, "FeishuService", lambda *args, **kwargs: service)
+    monkeypatch.setattr(service, "run_create", lambda work: work(Event()))
+    effective_start_date = order.effective_start_date
+
+    def date_check(start, today):
+        if "card" in platform.actions:
+            if closure == "disconnect":
+                socket.close_code = 1000
+            else:
+                now[0] = case.window.end.timestamp()
+        return effective_start_date(start, today)
+
+    monkeypatch.setattr(order, "effective_start_date", date_check)
+    code, _ = business_cli.run()
+    assert platform.create_count == 0
+    assert code == 1 and platform.actions.count("card") == 1
+    assert events(case)[-3:] == ["create_attempt", "aborted_before_write", "approval_closed"]
+    assert any("未建单" in notice for notice in notices)
+
+
+@pytest.mark.parametrize("multiple", [True, False])
+def test_targeted_original_name_requires_matching_unique_tag(case, platform, business_cli, multiple):
+    if multiple:
+        control = case.control["user_tags"]
+        key, _ = case.config["official"]["tag_relation"]["name_keys"]
+        tag = "第二普通标签"
+        row = {**record_identity(str(uuid4())), key: tag}
+        platform.relations[control].append(row)
+        platform.template[control] = 2
+        case.values["user_tags"].append(tag)
+        case.config["order_snapshot"]["tags"].append(
+            {"name": tag, "id": row["rowId"], "end": case.values["end_date"], "shadow": False})
+    else:
+        case.values["policy_name"] = "【测试】不同名"
+    code, error = business_cli.run()
+    assert code == 1 and "唯一标签" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_selected_tag_requires_its_own_quote(case, platform, business_cli):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    results = draft["field_results"]
+    quote = results["user_scope"]["evidence"]
+    for key in ("user_tags", "policy_type"):
+        results[key]["evidence"] = quote
+        draft[key]["evidence"] = draft["user_scope"]["evidence"]
+    results["user_tags"]["statement"]["evidence"] = quote
+    code, error = business_cli.run(export)
+    assert code == 1 and "标签引文" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_original_company_requires_confirmed_country(case, platform, business_cli):
+    export = private_export(case.values)
+    country = export["drafts"][0]["field_results"].setdefault("country", {"statement": {}})
+    country.update(has_value=False, needs_confirmation=True)
+    country["statement"]["status"] = "歧义"
+    code, error = business_cli.run(export)
+    assert code == 1 and "公司主体查表输入" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_published_days_and_package_names_match_request(case, platform, business_cli):
+    code, error = business_cli.run()
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    cells = platform.created_cells
+    days = [cells[case.control[key]] for key in ("recharge_days", "gift_days")]
+    assert "充值 / 赠送天数：" + " / ".join(days) in card.splitlines()
+    packages = case.control["packages"]
+    names = {entry["sid"]: entry["name"] for row in platform.relations[packages]
+             for key in ("current", "gift") for entry in row[case.child[key]]}
+    pairs = []
+    for row in json.loads(cells[packages]):
+        children = {cell["controlId"]: json.loads(cell["value"]) for cell in row}
+        pairs.append(" / ".join(names[children[case.child[key]][0]["sid"]] for key in ("current", "gift")))
+    assert "节目包（当前 / 赠送）：" + "；".join(pairs) in card.splitlines()
+
+
+def test_only_evidence_intersects_secret_and_stays_masked(case, platform, business_cli):
+    export = private_export(case.values)
+    block = export["sources"][0]
+    offset = 4
+    fragment = case.session_token[offset:13]
+    start = len(block["text"]) + offset
+    block["text"] += case.session_token
+    draft = export["drafts"][0]
+    result = draft["field_results"]["user_scope"]
+    quote = {"text": fragment, "span": {"source_id": "body", "start": start, "end": start + len(fragment)}}
+    result["evidence"] = result["statement"]["evidence"] = [quote]
+    draft["user_scope"]["evidence"] = [{"text": fragment, "start": start}]
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert "用户范围依据：[已脱敏]" in card
+    assert fragment not in card + "".join(business_cli.notices)
+    assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
+
+
+def replace_order_quotes(export, field, text, parts):
+    block = export["sources"][0]
+    start = len(block["text"])
+    block["text"] += text + "\n"
+    quotes = [{"text": text[left:right], "span": {"source_id": "body", "start": start + left,
+                                                  "end": start + right}} for left, right in parts]
+    draft = export["drafts"][0]
+    result = draft["field_results"][field]
+    result["statement"]["evidence"] = result["evidence"] = quotes
+    draft[field]["evidence"] = [{"text": q["text"], "start": q["span"]["start"]} for q in quotes]
+
+
+def offer_export(case, platform, kind, option_type=11):
+    values = case.values
+    values.update(benefit_type=kind, after_offer="恢复原包", forbid_package_change="是")
+    if kind == "特价优惠":
+        del values["recharge_days"], values["gift_days"]
+        values.update(watch_days=3, amount_mode="自定义", recharge_amount=8, first_recharge_day_only="是")
+    benefit = case.control["benefit_type"]
+    key = platform.template[benefit][0]["key"]
+    platform.template[benefit][0]["value"] = kind
+    case.config["fields"][benefit]["draft_values"] = {order.compact(kind): [key]}
+    for name in values.keys() & order.OFFER_FIELD_LABELS.keys():
+        value = values[name]
+        control = case.control[name] = str(uuid4())
+        spec = {"draft": name, "label": order.OFFER_FIELD_LABELS[name], "type": 6}
+        if isinstance(value, str):
+            key = str(uuid4())
+            spec.update(type=option_type, draft_values={order.compact(value): [key]})
+            value = [{"key": key, "value": value}]
+        case.config["fields"][control] = spec
+        platform.template[control] = value
+    snapshot = case.config["order_snapshot"]
+    base_id = str(uuid4())
+    header, current, gift = snapshot["package_levels"].splitlines()
+    base = current.replace("合成当前包", "合成受赠包").replace(case.ids["package"], base_id)
+    gift = gift.replace("合成当前包", "合成受赠包").replace(case.ids["package"], base_id)
+    snapshot["package_levels"] = "\n".join((header, current, base, gift))
+    gift_name = "合成受赠包_copy"
+    values["packages"][0]["gift_package"] = gift_name
+    platform.relations[case.control["packages"]][0][case.child["gift"]][0]["name"] = gift_name
+    export = private_export(values)
+    text = "合成当前包可获合成受赠包"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    return export
+
+
+@pytest.mark.parametrize("name", ["after_offer", "forbid_package_change", "amount_mode", "first_recharge_day_only"])
+@pytest.mark.parametrize("change", ["label", "shared_key", "wrong_type", "payload"])
+def test_extended_single_option_requires_template_label_key_and_type(
+        case, platform, business_cli, monkeypatch, name, change):
+    export = offer_export(case, platform, "特价优惠")
+    control = case.control[name]
+    spec = case.config["fields"][control]
+    if change == "label":
+        platform.template[control][0]["value"] = "指定节目包"
+    elif change == "shared_key":
+        spec["draft_values"][order.compact("其他")] = [platform.template[control][0]["key"], str(uuid4())]
+    elif change == "wrong_type":
+        spec["type"] = 2
+        del spec["draft_values"]
+        platform.template[control] = case.values[name]
+    else:
+        payload = order.CreateRequest.func.payload
+
+        def corrupt(self, controls):
+            cells = deepcopy(controls)
+            next(c for c in cells if c["controlId"] == control)["value"] = order.compact([str(uuid4())])
+            return payload(self, cells)
+
+        monkeypatch.setattr(order.CreateRequest.func, "payload", corrupt)
+    code, error = business_cli.run(export)
+    assert code == 1 and spec["label"] in error
+    assert business_cli.summaries == [] and platform.create_count == 0
+
+
+@pytest.mark.parametrize("option_type", [9, 11])
+def test_extended_single_option_card_matches_created_key(case, platform, business_cli, option_type):
+    export = offer_export(case, platform, "特价优惠", option_type)
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    for name in ("after_offer", "forbid_package_change", "amount_mode", "first_recharge_day_only"):
+        control = case.control[name]
+        option, = platform.template[control]
+        assert json.loads(platform.created_cells[control]) == [option["key"]]
+        assert f"{order.OFFER_FIELD_LABELS[name]}：{option['value']}" in card.splitlines()
+
+
+@pytest.mark.parametrize("size", [1, 2, 3, 4, 9, "split"])
+def test_order_evidence_masks_registered_fragment_without_full_secret(case, platform, business_cli, size):
+    export = private_export(case.values)
+    text = case.session_token[1:]
+    if size == "split":
+        text = text[:2] + "隔开" + text[2:4]
+        parts = [(0, 2), (4, 6)]
+    else:
+        parts = [(3, 3 + size)]
+    replace_order_quotes(export, "user_scope", text, parts)
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert [line for line in card.splitlines() if line.startswith("用户范围依据：")] == ["用户范围依据：[已脱敏]"] * len(parts)
+    if isinstance(size, int) and size >= 4:
+        assert text[3:3 + size] not in card + error + "".join(business_cli.notices)
+    assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
+
+
+@pytest.mark.parametrize("source", ["查表派生", "原文", "升级权益"])
+def test_titleless_package_card_matches_approved_request(case, platform, business_cli, source):
+    export = offer_export(case, platform, source) if source == "升级权益" else private_export(case.values)
+    draft = export["drafts"][0]
+    draft["scope"]["has_title"] = False
+    result = draft["field_results"]["packages"]
+    if source == "原文":
+        result.update(source=source, input_fields=[])
+        result["statement"]["value"] = result["value"]
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    card, = business_cli.summaries
+    assert "节目包依据：" + result["statement"]["evidence"][0]["text"] in card.splitlines()
+    control = case.control["packages"]
+    names = {entry["sid"]: entry["name"] for row in platform.relations[control]
+             for role in ("current", "gift") for entry in row[case.child[role]]}
+    row, = json.loads(platform.created_cells[control])
+    pair = {cell["controlId"]: json.loads(cell["value"]) for cell in row if cell["controlId"] in
+            (case.child["current"], case.child["gift"])}
+    assert "节目包（当前 / 赠送）：" + " / ".join(names[pair[case.child[k]][0]["sid"]]
+                                              for k in ("current", "gift")) in card.splitlines()
+
+
+@pytest.mark.parametrize("mode", ["original", "derived", "dependency", "missing", "coordinates", "exclusive"])
+def test_order_packages_require_names_in_own_verified_quotes(case, platform, business_cli, mode):
+    export = offer_export(case, platform, "升级权益") if mode == "dependency" else private_export(case.values)
+    draft = export["drafts"][0]
+    result = draft["field_results"]["packages"]
+    text = "合成当前包" if mode == "dependency" else "本次活动"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    reason = "节目包缺少原文归属依据"
+    if mode == "original":
+        draft["scope"]["has_title"] = False
+        result.update(source="原文", input_fields=[])
+        result["statement"]["value"] = result["value"]
+    elif mode == "dependency":
+        replace_order_quotes(export, "benefit_type", "合成受赠包", [(0, 5)])
+        result["evidence"] = result["evidence"] + draft["field_results"]["benefit_type"]["evidence"]
+        draft["packages"]["evidence"] += draft["benefit_type"]["evidence"]
+    elif mode == "missing":
+        result["evidence"] = []
+        reason = "可核证据"
+    elif mode == "coordinates":
+        result["evidence"][0]["span"]["end"] -= 1
+        reason = "可核证据"
+    elif mode == "exclusive":
+        other_policy(export, result["evidence"][0]["span"], exclusive=True)
+        reason = "归属声明矛盾"
+    code, error = business_cli.run(export)
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("hidden", [False, True])
+@pytest.mark.parametrize("has_title", [True, False])
+def test_package_proof_survives_card_redaction(case, platform, business_cli, monkeypatch, hidden, has_title):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    draft["scope"]["has_title"] = has_title
+    fragment = case.session_token[4:13]
+    if hidden:
+        read_settings = order.dotenv_values
+        monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": "密文合成当前包后缀"})
+    text = "本政策适用于合成当前包，联系编号 " + fragment
+    parts = [(0, len(text))]
+    if not hidden:
+        start = len(text) + 1
+        text += "\n本次选用合成当前包"
+        parts.append((start, len(text)))
+    replace_order_quotes(export, "packages", text, parts)
+    code, error = business_cli.run(export)
+    if hidden:
+        assert code == 1 and "节目包原文归属依据已脱敏" in error
+        assert not business_cli.summaries and platform.create_count == 0
+    else:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        card, = business_cli.summaries
+        assert "节目包依据：本政策适用于合成当前包，联系编号 [已脱敏]" in card.splitlines()
+        assert fragment not in card + "".join(business_cli.notices)
+
+
+@pytest.mark.parametrize("key", ["id", "label"])
+def test_contact_credential_collision_announces_fixed_handoff(case, platform, business_cli, monkeypatch, key, block_external):
+    secret = "synthetic<&>credential" if key == "id" else "synthetic-contact-credential"
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": secret})
+    case.config["configurator"][key] = secret
+    block_external()
+    code, error = business_cli.run()
+    assert (code, error) == (1, "E-CRED-STOP\n")
+    assert not business_cli.summaries and platform.create_count == 0
+    assert business_cli.notices == []
+    assert secret not in error + "".join(business_cli.notices)
+
+
+def test_same_tag_id_conflicting_deadline_stops_before_card(case, platform, business_cli):
+    tags = case.config["order_snapshot"]["tags"]
+    tags.append({**tags[0], "name": "合成另一标签", "end": case.values["start_date"]})
+    code, error = business_cli.run()
+    assert code == 1 and "标签截止日登记冲突" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_order_package_rows_require_unique_current_offer(case, platform, business_cli, duplicate):
+    offer_export(case, platform, "升级权益")
+    control = case.control["packages"]
+    row = deepcopy(platform.relations[control][0])
+    row.update(record_identity(str(uuid4())))
+    snapshot = case.config["order_snapshot"]
+    _, current, base, gift = snapshot["package_levels"].splitlines()
+    base_id, gift_id = str(uuid4()), str(uuid4())
+    old_base = base.split(",")[3]
+    base = base.replace("合成受赠包", "合成另一受赠包").replace(old_base, base_id)
+    gift = gift.replace("合成受赠包", "合成另一受赠包").replace(old_base, base_id).replace(case.ids["gift_package"], gift_id)
+    snapshot["package_levels"] += "\n" + base + "\n" + gift
+    current_name = "合成当前包"
+    if not duplicate:
+        current_id = str(uuid4())
+        current_name = "合成另一当前包"
+        snapshot["package_levels"] += "\n" + current.replace("合成当前包", current_name).replace(case.ids["package"], current_id)
+        row[case.child["current"]] = [{"sid": current_id, "name": current_name}]
+    gift_name = "合成另一受赠包_copy"
+    row[case.child["gift"]] = [{"sid": gift_id, "name": gift_name}]
+    platform.relations[control].append(row)
+    platform.template[control] = 2
+    case.values["packages"].append({"current_package": current_name, "gift_package": gift_name})
+    export = private_export(case.values)
+    text = "合成当前包可获合成受赠包或合成另一受赠包"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    code, error = business_cli.run(export)
+    reason = "当前销售品重复" if duplicate else "节目包缺少原文归属依据"
+    assert code == 1 and reason in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("name", ["recharge_amount", "watch_days", "approval_url"])
+def test_scalar_mapping_cannot_change_approved_value(case, platform, business_cli, name):
+    if name == "approval_url":
+        control = case.control[name]
+        value = platform.template[control].replace("placeholder", "sample")
+        case.values[name] = value
+        replacement = value + "/other"
+        export = private_export(case.values)
+    else:
+        export = offer_export(case, platform, "特价优惠")
+        control = case.control[name]
+        value = case.values[name]
+        replacement = 9
+    spec = case.config["fields"][control]
+    spec["draft_values"] = {order.compact(value): replacement}
+    platform.template[control] = replacement
+    code, error = business_cli.run(export)
+    assert code == 1 and f"字段 {spec['label']} 的写入值不一致" in error
+    assert business_cli.summaries == [] and platform.create_count == 0
+
+
+@pytest.mark.parametrize("hidden,allowed", [("本政策唯一适用的当前包为", False), ("末尾标记", True), ("五字整一半", True)])
+def test_package_quote_retains_at_least_half(case, platform, business_cli, monkeypatch, hidden, allowed):
+    export = private_export(case.values)
+    export["drafts"][0]["scope"]["has_title"] = False
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": hidden})
+    name = case.values["packages"][0]["current_package"]
+    text = hidden + name if not allowed else name + hidden
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    code, error = business_cli.run(export)
+    assert code == 1 and "节目包原文归属依据已脱敏" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_trimmed_tenant_key_cannot_appear_in_contact(case, platform, business_cli, monkeypatch, block_external):
+    secret = "synthetic-tenant-check"
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values",
+                        lambda **kw: {**read_settings(**kw), "FEISHU_TENANT_KEY": " " + secret + " "})
+    case.config["configurator"]["label"] = secret
+    block_external()
+    code, error = business_cli.run()
+    assert (code, error) == (1, "E-CRED-STOP\n") and secret not in error
+    assert business_cli.notices == []
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize("declared", ["充一送一", "赠送时长"])
+def test_benefit_declaration_uses_trusted_option(case, platform, business_cli, declared):
+    export = private_export(case.values)
+    draft = export["drafts"][0]
+    draft["scope"]["has_title"] = False
+    draft["field_results"]["benefit_type"]["statement"]["value"] = declared
+    replace_order_quotes(export, "benefit_type", declared, [(0, len(declared))])
+    code, error = business_cli.run(export)
+    assert (code, error, platform.create_count) == (0, "", 1)
+    control = case.control["benefit_type"]
+    assert "优惠类型：赠送时长" in business_cli.summaries[0].splitlines()
+    assert json.loads(platform.created_cells[control]) == [platform.template[control][0]["key"]]
+
+
+def test_template_conflict_reverse_direction(case, platform, business_cli):
+    assert case.values["maintain_mutual_exclusion_group"] == "是"
+    set_mutex_template(case, platform, "否")
+    code, error = business_cli.run()
+    assert code == 1 and "互斥组" in error
+    assert platform.create_count == 0
+    assert not business_cli.summaries and not business_cli.notices
+
+
+@pytest.mark.parametrize("first,hidden,complete", [
+    ("适用于合成当前包", "适用于", None),
+    ("适用于合成当前包", "适用于", "本次选用合成当前包"),
+    ("适用于合成当前包，后附合成凭据测试填充值", "后附合成凭据测试填充值", None),
+])
+def test_package_requires_fully_visible_quote(case, platform, business_cli, monkeypatch, first, hidden, complete):
+    export = private_export(case.values)
+    export["drafts"][0]["scope"]["has_title"] = False
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": hidden})
+    text = first
+    parts = [(0, len(first))]
+    if complete:
+        text += "\n" + complete
+        parts.append((len(first) + 1, len(text)))
+    replace_order_quotes(export, "packages", text, parts)
+    code, error = business_cli.run(export)
+    if complete:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        card, = business_cli.summaries
+        assert "节目包依据：" + complete in card.splitlines()
+    else:
+        assert (code, platform.create_count) == (1, 0)
+        assert "节目包原文归属依据已脱敏" in error
+        assert not business_cli.summaries
+
+
+@pytest.mark.parametrize("field", ["after_offer_package", "tariff"])
+@pytest.mark.parametrize("kind", [10, 26, 29, 34])
+@pytest.mark.parametrize("change", ["label", "alias", "valid"])
+def test_array_extension_proves_card_value(case, platform, business_cli, field, kind, change):
+    values = case.values
+    if field == "tariff":
+        value = {"base_package": "合成当前包", "price_plan": "合成计划", "unit": "月", "version": "1"}
+        values.update(amount_mode="节目包资费", tariff=value, tariff_multiplier=1)
+        benefit, selector, catalog = "特价优惠", "amount_mode", {
+            "tariffs": [{**value, "amount": 8, "valid_from": values["start_date"]}]}
+    else:
+        value = "合成目标包"
+        benefit, selector, catalog = "升级权益", "after_offer", {"package_names": [value]}
+    offer_export(case, platform, benefit)
+    values[selector] = "节目包资费" if field == "tariff" else "指定节目包"
+    selected = platform.template[case.control[selector]][0]
+    selected["value"] = values[selector]
+    case.config["fields"][case.control[selector]]["draft_values"] = {order.compact(values[selector]): [selected["key"]]}
+    values[field] = value
+    case.config["order_snapshot"]["benefit_catalog"] = catalog
+    export = private_export(values)
+    text = "合成当前包可获合成受赠包"
+    replace_order_quotes(export, "packages", text, [(0, len(text))])
+    control = str(uuid4())
+    if field in case.control:
+        control = case.control[field]
+    label = order.OFFER_FIELD_LABELS[field]
+    spec = case.config["fields"][control] = {"draft": field, "label": label, "type": kind}
+    key = str(uuid4())
+    display = "合成其他值" if change == "label" else str(value)
+    id_key = {10: "key", 26: "accountId", 29: "sid", 34: "sid"}[kind]
+    name_key = "value" if kind == 10 else "name"
+    row = {id_key: key, name_key: display}
+    mapped = [key]
+    template = [row]
+    if kind == 34:
+        child = str(uuid4())
+        spec["children"] = {child: {"type": 29}}
+        mapped = [{child: [key]}]
+        template = [{child: [row]}]
+    platform.template[control] = template
+    spec["draft_values"] = {order.compact(value): mapped}
+    if change == "alias":
+        spec["draft_values"][order.compact("合成别名")] = mapped
+    code, error = business_cli.run(export)
+    if change != "valid":
+        assert code == 1 and label in error
+        assert not business_cli.summaries and platform.create_count == 0
+    else:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        written, = json.loads(platform.created_cells[control])
+        if kind == 34:
+            cell, = written
+            assert cell["controlId"] == child
+            written, = json.loads(cell["value"])
+        assert (written if kind == 10 else written[id_key]) == row[id_key]
+        card, = business_cli.summaries
+        assert f"{label}：{row[name_key]}" in card.splitlines()
+
+
+@pytest.mark.parametrize("target", ["field", "label"])
+def test_tracked_credential_fragment(case, platform, business_cli, target):
+    fragment = case.session_token[4:8]
+    if target == "field":
+        case.config["fields"][case.control["user_scope"]]["label"] += fragment
+    else:
+        case.config["configurator"][target] += fragment
+    code, error = business_cli.run()
+    assert code == 1 and "凭据冲突" in error
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert not business_cli.summaries and platform.create_count == 0
+    assert fragment not in error
+    assert all(fragment not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
+
+
+@pytest.mark.parametrize(("target", "limit"), [("registration", 200), ("id", 64)])
+@pytest.mark.parametrize("change", ["character", "length", "contains", "contained", "equal", "overlap"])
+def test_opaque_identifier_credential_gate(case, platform, business_cli, monkeypatch, target, limit, change, block_external):
+    secret = "synthetic-secret"
+    read_settings = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), "EXTRA": f" {secret} "})
+    identifier = {
+        "character": "trial/id", "length": "x" * (limit + 1), "contains": "id-" + secret,
+        "contained": secret[2:-2], "equal": secret, "overlap": "synt" + "x" * (limit - 4),
+    }[change]
+    holder = case.ids if target == "registration" else case.config["configurator"]
+    holder[target] = identifier
+    if target == "id" and change in ("contains", "contained", "equal"):
+        block_external()
+    code, error = business_cli.run()
+    if change == "overlap":
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert len(business_cli.summaries) == 1
+    elif target == "id" and change in ("contains", "contained", "equal"):
+        assert (code, error) == (1, "E-CRED-STOP\n")
+        assert business_cli.notices == [] and identifier not in error
+        assert not business_cli.summaries and platform.create_count == 0
+    else:
+        assert code == 1 and "凭据冲突" in error and identifier not in error
+        assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+        assert not business_cli.summaries and platform.create_count == 0
+
+
+def test_conflicting_source_blocks_stop_before_card(case, platform, business_cli):
+    export = private_export(case.values)
+    prefix = "适用于合成当前包"
+    export["sources"].extend([
+        {"id": "b1", "source_id": "att1", "start": 0, "text": "无敏感占位文本" * 12},
+        {"id": "b2", "source_id": "att1", "start": 0, "text": prefix + case.session_token},
+    ])
+    text = prefix + case.session_token[:3]
+    quote = {"text": text, "span": {"source_id": "b2", "start": 0, "end": len(text)}}
+    draft = export["drafts"][0]
+    result = draft["field_results"]["packages"]
+    result["statement"]["evidence"] = result["evidence"] = [quote]
+    draft["packages"]["evidence"] = [{"text": text, "start": None}]
+    code, error = business_cli.run(export)
+    assert code == 1 and "建单草稿缺少整批来源证据" in error
+    assert not business_cli.summaries and platform.create_count == 0
+
+
+@pytest.mark.parametrize(("target", "overlap", "decision"), [
+    ("id", 21, "reject"),
+    ("id", 21, "approve"),
+    ("id", 7, "approve"),
+    ("registration", 8, "approve"),
+])
+def test_identifier_contiguous_credential_gate(case, platform, business_cli, monkeypatch, target, overlap, decision, block_external):
+    from qianshu.feishu.sdk import _Transport
+
+    secret = case.session_token = "X0123456789abcdef01234Z"
+    identifier = "ou_" + "7" * 6 + secret[1:1 + overlap] + "8" * 5
+    holder = case.config["configurator"] if target == "id" else case.ids
+    holder[target] = identifier
+    bodies = []
+
+    def capture(request):
+        bodies.append(request.request_body)
+        return SimpleNamespace(success=lambda: True)
+
+    transport = order._Transport()
+    transport.settings = SimpleNamespace(chat_id="synthetic-chat")
+    transport.im = SimpleNamespace(message=SimpleNamespace(create=capture))
+    transport.announce = partial(_Transport.announce, transport)
+    monkeypatch.setattr(Approvals, "approval_status", lambda *args: decision)
+
+    if overlap == 21:
+        block_external()
+    code, error = business_cli.run()
+    if overlap == 7:
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert len(business_cli.summaries) == 1
+    elif overlap == 21:
+        assert (code, error) == (1, "E-CRED-STOP\n")
+        assert bodies == []
+        assert not business_cli.summaries and platform.create_count == 0 and identifier not in error
+        assert all(identifier not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
+    else:
+        body, = bodies
+        assert all(secret[i:i + 8] not in body.content for i in range(len(secret) - 7))
+        assert json.loads(body.content) == {"text": "未建单（凭据冲突），转人工处理"}
+        assert (code, platform.create_count) == (1, 0)
+        assert not business_cli.summaries and "凭据冲突" in error and identifier not in error
+        assert all(identifier not in p.read_text() for p in case.private.glob("create-preflight-*.json"))
+
+
+@pytest.fixture
+def outlet_case(case):
+    case.session_token = "x" + uuid4().hex
+    case.official_token = "y" + uuid4().hex
+    return case
+
+
+@pytest.mark.parametrize(("field", "missing"), [("key", True), ("label", True), ("label", False)])
+def test_outlet_notice_reports(outlet_case, platform, business_cli, field, missing, block_external):
+    case = outlet_case
+    fragment = case.session_token[1:9]
+    case.config["notice_recipients"][0][field] += fragment
+    if missing:
+        case.evidence["notices"].clear()
+    block_external()
+    code, error = business_cli.run()
+    assert (code, platform.create_count) == (1, 0)
+    assert error.strip() == "E-CRED-STOP"
+    assert business_cli.notices == []
+    for pattern in ("create-preflight-*.json", "create-fields-*.json"):
+        assert all(fragment not in path.read_text() for path in case.private.glob(pattern))
+
+
+@pytest.mark.parametrize("location", ["receive_id", "unsafe_destination", "card", "announcement", "stderr", "log"])
+def test_outlet_positions(outlet_case, platform, business_cli, monkeypatch, caplog, location, block_external):
+    from qianshu.feishu.sdk import _Transport
+
+    case = outlet_case
+    chat = "group-" + (case.session_token[1:9] if location == "unsafe_destination" else uuid4().hex)
+    settings = SimpleNamespace(chat_id=chat)
+    monkeypatch.setattr(order, "load_settings", lambda _: settings)
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "FEISHU_CHAT_ID": chat})
+    bodies = []
+
+    def capture(request):
+        body = request.request_body
+        if body.msg_type == "interactive":
+            platform.actions.append("card")
+        bodies.append((body.receive_id, body.msg_type, json.loads(body.content)))
+        return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="card"))
+
+    transport = order._Transport()
+    transport.settings = settings
+    transport.window = None
+    transport._require_window = lambda: None
+    transport.im = SimpleNamespace(message=SimpleNamespace(create=capture))
+    transport.send_card = partial(_Transport.send_card, transport)
+    transport.announce = partial(_Transport.announce, transport)
+    factory = order.FeishuService
+
+    def service(*args, **kwargs):
+        approvals = factory(*args, **kwargs)
+        def publish(binding, summary):
+            return approvals.transport.send_card({"summary": summary, "extra": chat if location == "card" else ""})
+        approvals.publish_approval = publish
+        if location == "announcement":
+            def reject(*_):
+                raise order.Stop(chat)
+            approvals.approval_status = reject
+        return approvals
+
+    monkeypatch.setattr(order, "FeishuService", service)
+    if location in ("stderr", "log"):
+        case.config["diagnostic"] = chat if location == "stderr" else case.session_token[1:9]
+        def diagnostic(*_):
+            if location == "log":
+                logging.getLogger("qianshu").warning("诊断 %s", case.config["diagnostic"])
+            raise order.Stop(case.config["diagnostic"])
+        monkeypatch.setattr(order, "check_catalog", diagnostic)
+    if location in ("stderr", "log"):
+        block_external()
+    code, error = business_cli.run()
+    if location == "receive_id":
+        assert (code, error, platform.create_count) == (0, "", 1)
+        assert bodies and all(body[0] == chat and chat not in order.compact(body[2]) for body in bodies)
+        return
+    assert (code, platform.create_count) == (1, 0)
+    assert error.strip() == "E-CRED-STOP"
+    assert case.session_token[1:9] not in caplog.text
+    if location == "unsafe_destination":
+        assert bodies == []
+    elif location in ("stderr", "log"):
+        assert bodies == []
+        assert all(chat not in order.compact(content) for _, _, content in bodies)
+    else:
+        announcements = [content for _, kind, content in bodies if kind == "text"]
+        assert announcements == [{"text": "未建单（凭据冲突），转人工处理"}]
+        assert all(chat not in order.compact(content) for _, _, content in bodies)
+
+
+@pytest.fixture
+def runtime_case(outlet_case):
+    # 避免随机十六进制四字片段偶合草稿日期，使出口用例始终抵达指定注入点。
+    outlet_case.session_token = "ZQKLMNOPRSTUVW"
+    outlet_case.official_token = "YKJHGFDSAPOIU"
+    outlet_case.ids["official_app"] = "XNMBCVZLKJHQ"
+    return outlet_case
+
+
+@pytest.mark.parametrize("placement", ["unused", "nested", "duplicate_env", "trimmed_env"])
+def test_configuration_conflict_precedes_external_calls(runtime_case, platform, business_cli, monkeypatch, placement):
+    from unittest.mock import Mock
+
+    case = runtime_case
+    read_settings = order.dotenv_values
+    extra = {}
+    fragment = case.session_token[2:10]
+    if placement == "unused":
+        case.config["unused"] = "前" + fragment + "后"
+    elif placement == "nested":
+        case.config["unused"] = [{"value": fragment}]
+    elif placement == "duplicate_env":
+        extra["EXTRA"] = case.official_token
+    else:
+        extra["MAIL_FOLDER"] = " " + fragment + " "
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**read_settings(**kw), **extra})
+    blocked = [Mock(side_effect=AssertionError("预检冲突后进入下游")) for _ in range(4)]
+    for name, stub in zip(("Official", "FeishuService", "_Transport", "extract_token"), blocked):
+        monkeypatch.setattr(order, name, stub)
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert all(stub.call_count == 0 for stub in blocked)
+    assert platform.actions == [] and platform.create_count == 0
+    assert not list(case.private.glob("create-preflight-*"))
+    assert not (case.private / "trial-orders.jsonl").exists()
+
+
+def test_first_conflict_on_created_readback(runtime_case, platform, business_cli):
+    fragment = runtime_case.session_token[2:10]
+    platform.before_read = lambda row: row.update(extra="前" + fragment + "后")
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert platform.create_count == 1 and "delete" not in platform.actions
+    assert events(runtime_case)[-1] == "readback_unconfirmed"
+    assert not list(runtime_case.private.glob("create-readback-*"))
+    assert fragment not in (runtime_case.private / "trial-orders.jsonl").read_text()
+    assert business_cli.notices == ["建单请求已发出（凭据冲突），已停止，转人工核对"]
+
+
+@pytest.mark.parametrize("sink", ["preflight", "fields", "lock", "ledger", "official", "create", "stderr", "logging"])
+def test_runtime_outlet_blocks_before_create(runtime_case, platform, business_cli, monkeypatch, caplog, sink):
+    case = runtime_case
+    fragment = case.session_token[2:10]
+    if sink in {"preflight", "fields", "lock"}:
+        prefix = {"preflight": "create-preflight-", "fields": "create-fields-", "lock": "trace-12-create.lock"}[sink]
+        original = order.exclusive
+
+        def write(path, value):
+            if path.name.startswith(prefix):
+                value = {**value, "extra": fragment}
+            original(path, value)
+
+        monkeypatch.setattr(order, "exclusive", write)
+        if sink == "preflight":
+            case.evidence["notices"].clear()
+    elif sink == "ledger":
+        original = order.Ledger.append
+
+        def append(ledger, event, *args, **kwargs):
+            return original(ledger, event, *args, extra=fragment, **kwargs)
+
+        monkeypatch.setattr(order.Ledger, "append", append)
+    elif sink == "official":
+        original = order.Official._request
+
+        def request(api, action, *args, **kwargs):
+            kwargs["params"] = {"extra": fragment}
+            return original(api, action, *args, **kwargs)
+
+        monkeypatch.setattr(order.Official, "_request", request)
+    elif sink == "create":
+        original = order.CreateRequest.func.prepare
+
+        def prepare(create, payload):
+            return original(create, order.compact({**order.decode(payload), "extra": fragment}).encode())
+
+        monkeypatch.setattr(order.CreateRequest.func, "prepare", prepare)
+    else:
+        def stop(*args):
+            if sink == "logging":
+                logging.getLogger("qianshu").warning("诊断 %s", fragment)
+            raise order.Stop(fragment)
+
+        monkeypatch.setattr(order, "check_catalog", stop)
+
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert platform.create_count == 0
+    assert business_cli.notices == ["未建单（凭据冲突），转人工处理"]
+    assert fragment not in caplog.text
+    if sink == "official":
+        assert platform.actions == []
+    for pattern in ("create-preflight-*", "create-fields-*", "trace-12-create.lock", "trial-orders.jsonl"):
+        assert all(fragment not in path.read_text() for path in case.private.glob(pattern))
+
+
+def test_approval_state_rejects_returned_message_id(live_approval):
+    service, *_ = live_approval
+    guard = order.Outlet()
+    guard.configure({"EXTRA": "abcdefghijk"})
+    service.before_send = guard.sdk
+    service.transport.send_card = lambda card: "returned-abcdefgh"
+    with pytest.raises(order.OutletConflict):
+        FeishuService.publish_approval(service, "binding", "摘要")
+    with service._state.connection() as db:
+        assert db.execute("SELECT count(*) FROM feishu_approvals").fetchone() == (0,)
+
+
+def test_callback_response_rejects_inherited_frame_header(live_approval):
+    service, _, origin, _ = live_approval
+    guard = order.Outlet()
+    guard.configure({"EXTRA": "abcdefghijk"})
+    service.before_send = guard.sdk
+    sent = []
+
+    async def send(raw):
+        sent.append(raw)
+
+    origin.send = send
+    service._client._conn = origin
+    frame = ws.Frame(method=ws.FrameType.DATA.value, SeqID=0, LogID=0, service=1)
+    for key, value in ((ws.HEADER_TYPE, ws.MessageType.CARD.value), (ws.HEADER_SUM, "1"),
+                       (ws.HEADER_TRACE_ID, "trace-abcdefgh")):
+        header = frame.headers.add()
+        header.key, header.value = key, value
+    frame.payload = b"{}"
+    try:
+        ws.loop.run_until_complete(service._client._handle_message(frame.SerializeToString()))
+        assert sent == [] and guard.conflict
+    finally:
+        service._client._conn = None
+
+
+def test_success_stdout_is_checked_before_printing(monkeypatch, capsys):
+    def run(*args):
+        guard = order._outlet.get()
+        guard.configure({"EXTRA": "建单回读一致，D15"})
+        return True
+
+    monkeypatch.setattr(order, "run", run)
+    assert order.main(["--config", "config", "--registration", "trial", "draft"]) == 1
+    captured = capsys.readouterr()
+    assert (captured.out, captured.err) == ("", "E-CRED-STOP\n")
+
+
+@pytest.fixture
+def block_external(monkeypatch):
+    from unittest.mock import Mock
+
+    blocked = []
+
+    def install():
+        for name in ("Official", "CreateRequest", "FeishuService", "_Transport", "extract_token"):
+            stub = Mock(side_effect=AssertionError("配置冲突后进入下游"))
+            monkeypatch.setattr(order, name, stub)
+            blocked.append(stub)
+
+    yield install
+    for stub in blocked:
+        stub.assert_not_called()
+
+
+@pytest.mark.parametrize(("key", "expected"), [
+    ("configurator", "configurator"), ("MAIL_FOLDER", "MAIL_FOLDER"), ("dynamic", "--config"),
+])
+def test_configuration_conflict_project_log(runtime_case, business_cli, monkeypatch, caplog,
+                                            block_external, key, expected):
+    fragment = runtime_case.session_token[2:10]
+    if key == "MAIL_FOLDER":
+        parse = order.dotenv_values
+        monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), key: fragment})
+    elif key == "dynamic":
+        runtime_case.config[fragment] = fragment
+    else:
+        runtime_case.config[key]["label"] += fragment
+    block_external()
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert [record.getMessage() for record in caplog.records if record.name == "qianshu"] == [
+        f"E-CRED-STOP 键={expected}"
+    ]
+    assert fragment not in caplog.text
+
+
+_cli_load_settings = order.load_settings
+
+
+def test_checked_settings_read_once(runtime_case, business_cli, monkeypatch):
+    from io import StringIO
+    from pathlib import Path
+
+    reads = []
+    original = Path.open
+    def opened(path, mode="r", *args, **kwargs):
+        stream = original(path, mode, *args, **kwargs)
+        if path.name != "synthetic-settings" or mode != "r":
+            return stream
+        with stream:
+            content = stream.read()
+        reads.append(path)
+        chat = "group" if len(reads) == 1 else runtime_case.session_token[2:10]
+        return StringIO(content + f"FEISHU_CHAT_ID={chat}\nFEISHU_APP_ID=synth-a\nFEISHU_APP_SECRET=synth-b\n"
+                        "FEISHU_BOT_OPEN_ID=bot\nFEISHU_ALLOWED_SENDER_IDS=member\n")
+
+    monkeypatch.setattr(Path, "open", opened)
+    monkeypatch.setattr(order, "load_settings", _cli_load_settings)
+    assert business_cli.run()[0] == 0
+    assert len(reads) == 1
+
+
+@pytest.mark.parametrize("target", ["official", "create"])
+def test_final_authorization_prefix(runtime_case, business_cli, platform, monkeypatch, target):
+    token = "ZXKLMPQJHNG"
+    if target == "official":
+        runtime_case.official_token = token
+        overlap = "Bearer ZXK"
+    else:
+        runtime_case.session_token = token
+        overlap = "id ZXKLM"
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "EXTRA": overlap})
+    assert business_cli.run()[0] == 1
+    assert platform.create_count == 0
+    if target == "official":
+        assert not platform.actions
+
+
+@pytest.mark.parametrize("value", ["凭据冲突，已停止", "QunconfirmedZ", "E-CRED-STOP"])
+def test_stop_code_and_ledger_markers(runtime_case, business_cli, platform, monkeypatch, value):
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "EXTRA": value})
+    if value != "QunconfirmedZ":
+        runtime_case.config["diagnostic"] = value
+    code, error = business_cli.run()
+    assert code == 1 and value not in error
+    assert platform.actions == []
+
+
+def test_standalone_conflict_json_log(runtime_case, business_cli, monkeypatch):
+    monkeypatch.setattr(logging.getLogger(), "handlers", [])
+    path = runtime_case.private / "project.log"
+    monkeypatch.setenv("QIANSHU_LOG_FILE", str(path))
+    fragment = runtime_case.session_token[2:10]
+    runtime_case.config["configurator"]["label"] += fragment
+    code, error = business_cli.run()
+    assert code == 1 and fragment not in error
+    assert error == "E-CRED-STOP\n"
+    contents = path.read_text()
+    assert fragment not in contents
+    assert json.loads(contents)["message"] == "E-CRED-STOP 键=configurator"
+
+
+def test_unknown_response_conflict_reconciles_once(runtime_case, business_cli, platform, monkeypatch):
+    monkeypatch.setattr(order, "read_create_response",
+                        lambda _: order.compact({"extra": runtime_case.session_token[2:10]}).encode())
+    assert business_cli.run()[0] == 1
+    assert platform.create_count == 1 and "delete" not in platform.actions
+    assert platform.actions[platform.actions.index("create") + 1:] == ["search"]
+    assert events(runtime_case)[-2:] == ["create_unknown", "create_reconciled_read"]
+
+
+def test_tenant_exchange_checks_final_header(runtime_case, monkeypatch):
+    import requests
+    from qianshu.feishu.sdk import _Transport, TokenManager
+
+    settings = Settings("app", "secret", "chat", "bot", frozenset({"member"}))
+    guard = order.Outlet()
+    guard.configure({"EXTRA": runtime_case.session_token})
+    transport = _Transport(settings, None, lambda: 0, guard.sdk)
+    transport.before_send = guard.sdk
+    monkeypatch.setattr(TokenManager.cache, "get", lambda _: None)
+    sent = []
+    def response(request):
+        sent.append(request.url)
+        return {"code": 0, "expire": 7200, "tenant_access_token": "t" + runtime_case.session_token[2:10],
+                "data": {"message_id": "card"}}
+
+    def adapter(self, request, **kwargs):
+        result = requests.Response()
+        result.status_code = 200
+        result._content = json.dumps(response(request)).encode()
+        return result
+
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", adapter)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request",
+                        lambda self, req: httpx.Response(200, json=response(req)))
+    with pytest.raises(order.OutletConflict):
+        transport.announce("合成公告")
+    assert len(sent) == 1
+
+
+def test_complete_order_checks_every_http_send(runtime_case, platform, business_cli, monkeypatch):
+    from qianshu.feishu import sdk
+
+    import requests
+    from websockets.client import ClientProtocol
+    from websockets.uri import parse_uri
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("请求绕过了合成传输")
+    monkeypatch.setattr(requests.adapters.HTTPAdapter, "send", unexpected)
+    endpoint = httpx.URL(runtime_case.config["official"]["origin"]).copy_with(
+        scheme="wss", path="/approval", params={ws.DEVICE_ID: "device", ws.SERVICE_ID: "1"})
+    history = []
+    operations = []
+    def snapshot(request):
+        return (request.method, str(request.url), tuple(request.headers.raw), request.content)
+
+    check = order.Outlet.check_http
+    def checked(guard, request, **positions):
+        check(guard, request, **positions)
+        history.append(("check", snapshot(request)))
+    monkeypatch.setattr(order.Outlet, "check_http", checked)
+
+    def exchange(request):
+        history.append(("send", snapshot(request)))
+        path = request.url.path
+        if path.startswith("/v3/"):
+            operations.append("official")
+            return platform.official(request)
+        if path == ws.GEN_ENDPOINT_URI:
+            operations.append("endpoint")
+            data = {"data": {"URL": str(endpoint)}}
+        elif path.endswith("/internal"):
+            operations.append("token")
+            data = {"expire": 300, "tenant_access_token": "tenant-XYQJHB"}
+        elif path.endswith("/members"):
+            operations.append("members")
+            data = {"data": {"has_more": False, "items": [{"member_id_type": "open_id", "member_id": "member"}]}}
+        else:
+            assert path.endswith("/messages")
+            operations.append(json.loads(request.content)["msg_type"])
+            data = {"data": {"message_id": "card"}}
+        return httpx.Response(200, json={"code": 0, **data})
+
+    wire = httpx.MockTransport(exchange)
+    monkeypatch.setattr(httpx, "Client", partial(httpx.Client.func, transport=wire))
+    monkeypatch.setattr(httpx, "AsyncClient", partial(httpx.AsyncClient, transport=wire))
+    connect = platform.connection
+    def connection(host, **kwargs):
+        conn = connect(host, **kwargs)
+        putheader, endheaders = conn.putheader, conn.endheaders
+        headers = []
+        def header(key, value):
+            headers.append((key.encode(), value.encode()))
+            putheader(key, value)
+        def send(body):
+            history.append(("send", ("POST", "https://" + host + order._CREATE_PATH, tuple(headers), body)))
+            operations.append("create")
+            endheaders(body)
+        conn.putheader, conn.endheaders = header, send
+        return conn
+
+    monkeypatch.setattr(order, "CreateRequest", partial(order.CreateRequest.func, connect=connection))
+    settings = Settings("app-NJVLZ", "key-HYTJK", "chat-DWQPL", "bot", frozenset({"member"}))
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {
+        **parse(**kw), "FEISHU_APP_ID": settings.app_id, "FEISHU_APP_SECRET": settings.app_secret,
+        "FEISHU_CHAT_ID": settings.chat_id})
+    monkeypatch.setattr(order, "load_settings", lambda values: settings)
+    def service(settings, window, *args, clock, http_check, before_send, **kwargs):
+        approvals = Approvals(platform)
+        transport = sdk._Transport(settings, window, clock, http_check)
+        transport.before_send = before_send
+        approvals.transport = transport
+        client = sdk._Connection(SimpleNamespace(settings=settings, http_check=http_check, before_send=before_send,
+                                                  transport=transport, _remaining=lambda: 10, _connected=lambda _: None))
+
+        async def connect(url, *, create_connection, **kwargs):
+            protocol = ClientProtocol(parse_uri(url))
+            def send(upgrade):
+                history.append(("send", ("GET", url,
+                                         tuple((k.encode(), v.encode()) for k, v in upgrade.headers.raw_items()), b"")))
+                operations.append("upgrade")
+            protocol.send_request = send
+            socket = create_connection(protocol)
+            protocol.send_request(protocol.connect())
+            return socket
+
+        async def receive():
+            pass
+
+        monkeypatch.setattr(ws.websockets, "connect", connect)
+        monkeypatch.setattr(client, "_receive_message_loop", receive)
+        def publish(binding, summary):
+            ws.loop.run_until_complete(client._connect())
+            card = transport.send_card({"text": summary})
+            assert ws.loop.run_until_complete(transport.is_member("member"))
+            ws.loop.run_until_complete(transport.notify_callback_timeout())
+            platform.actions.append("card")
+            return card
+        approvals.publish_approval = publish
+        approvals.run_create = lambda work: work(Event())
+        return approvals
+    monkeypatch.setattr(order, "FeishuService", service)
+    assert business_cli.run() == (0, "")
+    assert operations.count("create") == 1
+    assert {"endpoint", "upgrade", "token", "interactive", "text", "members"} <= set(operations)
+    assert "official" in operations[:operations.index("create")]
+    assert "official" in operations[operations.index("create") + 1:]
+    checked_requests = [req for step, req in history if step == "check"]
+    sent_requests = [req for step, req in history if step == "send"]
+    assert checked_requests == sent_requests
+    assert [step for step, _ in history] == ["check", "send"] * len(sent_requests)
+
+
+def test_reconciliation_cookie_is_checked_at_transport(runtime_case, business_cli, platform, monkeypatch):
+    monkeypatch.setattr(order, "read_create_response", lambda _: b"{}")
+    find = order.Official.find
+    def lookup(api, name):
+        if platform.create_count:
+            api.client.cookies.set("extra", runtime_case.session_token[2:10])
+        return find(api, name)
+
+    monkeypatch.setattr(order.Official, "find", lookup)
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert platform.actions[-1] == "create"
+    assert platform.create_count == 1 and "delete" not in platform.actions
+    assert events(runtime_case)[-2:] == ["create_unknown", "readback_unconfirmed"]
+    assert business_cli.notices == ["建单请求已发出（凭据冲突），已停止，转人工核对"]
+
+
+def test_final_header_name_preserves_wire_case(runtime_case, business_cli, platform, monkeypatch):
+    parse = order.dotenv_values
+    monkeypatch.setattr(order, "dotenv_values", lambda **kw: {**parse(**kw), "EXTRA": "QZXCaseABC"})
+    send = httpx.Client.func.send
+    def attach(client, request, **kwargs):
+        request.headers["Extra-ZXCaseABC"] = "value"
+        return send(client, request, **kwargs)
+    monkeypatch.setattr(httpx.Client.func, "send", attach)
+    assert business_cli.run() == (1, "E-CRED-STOP\n")
+    assert platform.actions == [] and platform.create_count == 0
+
+
+def test_response_cookie_checked_across_header_separator(case):
+    sent = []
+    def respond(request):
+        sent.append(request)
+        return httpx.Response(200, headers={"Set-Cookie": "QZX=value; Path=/"})
+
+    guard = order.Outlet()
+    guard.configure({"EXTRA": "kie: QZX"})
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        order.CheckedHTTPTransport(client, guard.check_http)
+        url = case.config["official"]["origin"]
+        client.get(url)
+        with pytest.raises(order.OutletConflict):
+            client.get(url)
+    assert len(sent) == 1

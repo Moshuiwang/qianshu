@@ -282,3 +282,10 @@ def test_r10_blocks_ambiguous_company_and_reports_only_diagnostic_fields(draft):
         "warnings": (asdict(CUTOFF_WARNING),),
         "adjustments": (),
     }
+
+
+def test_r8_rejects_public_policy_with_tags(draft):
+    _, result = validate_draft(replace(draft, policy_type=DraftField(value="公开政策")),
+                               today=TODAY, facts=FACTS)
+    assert not result.can_create
+    assert any(error.rule == "R8" and error.field == "user_tags" for error in result.errors)

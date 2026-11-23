@@ -10,6 +10,8 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 
 在本 Trace 独占的运行目录执行。固定使用该目录下权限为 `0700` 的 `.private/`，运行之间保留整个目录及其资格锁。配置、草稿、登录态和授权登记使用 `0600`。会话取自登录检查脚本生成的 `.private/mingdao-state.json`。飞书沿用 #8 的私有配置，默认读当前目录的 `.env`，也可用 `--env-file` 指定私有文件。官方接口个人令牌和应用 ID 也从该文件取值，配置只登记键名。官方请求使用 `Authorization: Bearer <占位个人令牌>` 和 `HAP-Appid: <占位应用标识>`。台账、摘要、报告和错误信息均不记录这些值或网页会话令牌。
 
+凭据冲突时，独立入口以退出码 1 停止，标准错误输出短码 `E-CRED-STOP`。短码本身命中凭据门禁时保持静默。启动器可用 `QIANSHU_LOG_FILE` 为常驻服务与独立入口指定同一私有 JSON 日志文件，未指定时沿用标准错误。配置冲突日志只含短码和配置键标签。
+
 ## 授权登记
 
 `.private/create-authorizations.json` 按登记号索引，每项登记以下记录。
@@ -19,6 +21,7 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `is_test` | 固定为 `true` |
 | `window.start`、`window.end` | 带时区的 ISO 8601 时刻，开始包含、结束不包含 |
 | `config_sha256`、`draft_sha256`、`login_sha256` | 三份私有文件的完整原始字节 SHA-256 |
+| `policy_id` | 当次授权建单的目标政策标识，须在整批草稿中唯一，且与该条的 `scope.id` 相同 |
 | `create_endpoint` | 与配置逐字一致的 `host`、`method`、`path`，逐项批准 |
 | `owner_approval`、`readiness_confirmation`、`owner_login_confirmation` | 产品负责人当次建单授权、就绪自检确认和登录会话确认的私有回执 |
 | `notices` | 按 `notice_recipients` 的 `key` 逐人登记回执。每份回执须为非空字符串，回执须互异，名单外的键会导致停止。免通知时也须登记产品负责人的回执，例如 `{"placeholder_owner": "占位免通知回执"}` |
@@ -26,7 +29,19 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `two_reviews.internal`、`two_reviews.external` | 同一冻结候选的两份独立私有审核回执 |
 | `trace_decision`、`comparison_report`、`same_country_count_evidence` | 当次放行、拟写字段比对材料、同国家生效政策只读计数的私有证据 |
 
-草稿使用 `PolicyDraft.to_dict()` 的字段结构，每项为含 `value` 的对象。只传一条。名称以「【测试】」开头，起止日期用 `YYYY-MM-DD`，充值和赠送天数是非负整数，用户范围是必填自由文本，标签值是确定的名称列表，节目包每行给出 `current_package` 和 `gift_package`（无赠送包时用 `null`）。草稿的待确认项应交人工。未给定的互斥组按 R7 核对模板为「是」，在审批卡片注明默认值。采用模板值的字段须与草稿中的确定值一致，任务审批链接采用模板值。
+## 建单输入
+
+在私有解析流程中保留传给 `parse_application` 的正文和附件来源块，再将同次解析结果组装为一个 JSON 对象。普通解析 CLI 的输出缺少来源块，无法直接用作建单输入。
+
+| 顶层字段 | 生成方式 |
+| --- | --- |
+| `sources` | 正文块填 `{"id":"body","source_id":"body","start":0,"text":"合成正文"}`（示意）。附件逐块保留解析时的 `id`、`source_id`、`start`、`text`。引文的 `span.source_id` 指向块的 `id`，起止位置是块内字符偏移，左闭右开。保留原文和块边界供逐字核对 |
+| `drafts` | 对同批解析结果逐条调用 `draft.to_dict()`，保留全部政策及其 `policy_id`、`scope`、`field_results`、字段值和证据。入口按授权登记的 `policy_id` 选一条建单 |
+| `requires_full_review`、`structure_issues` | 保存本批解析结果的实际复核标志和结构问题列表。只有标志为 `false` 且列表为 `[]` 才能建单 |
+
+将整批对象写入权限为 `0600` 的私有草稿文件，再用该文件完整字节的 SHA-256 登记 `draft_sha256`。
+
+名称以「【测试】」开头，起止日期用 `YYYY-MM-DD`，充值和赠送天数是非负整数，用户范围是必填自由文本，标签值是确定的名称列表，节目包每行给出 `current_package` 和 `gift_package`（无赠送包时用 `null`）。草稿的待确认项应交人工。未给定的互斥组按 R7 核对模板为「是」，在审批卡片注明默认值。采用模板值的字段须与草稿中的确定值一致，任务审批链接采用模板值。
 
 ## 配置项
 
@@ -41,7 +56,7 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `template.country` | 国家字段的 `control` 及预期原始 `value`。国家控件须避开从草稿写入的字段 |
 | `fields` | 以控件 ID 为键，每项登记 `label`、数值 `type`。私有配置按 11 月 18 日 UTC 录制的 X5 建单请求登记全部 55 个字段，写入仅限这些字段。名称、日期、天数、用户范围、用户标签、节目包 6 项按草稿取值。政策名称、起止日期、充值与赠送天数和用户范围直接从草稿填写，用户标签和节目包从模板各自的官方关联行挑选。0.1.0 只建定向政策测试单，草稿无用户标签时停止并交人工。节目包按草稿逐行挑选并照抄匹配的模板行，任务审批链接、公司、互斥组及其他确定的草稿值也须映射到 `draft`。除固定字段外，配置字段须在模板中存在。模板的系统字段、自动计算字段及其他未配置的键均跳过 |
 | `fixed`、`applicant_control` | `fixed` 的键须恰好是 `official.status_control` 与 `applicant_control`，分别登记「新建」选项键与登录账号成员 ID，例如 `{"placeholder_status_control": ["placeholder_new_option"], "placeholder_applicant_control": ["placeholder_member"]}`。两个控件均须在 `fields` 内，且须避开可变标量字段和任务审批链接 |
-| `fields.<控件>.draft_values` | 枚举、关系等字段把草稿值映射到平台类型。键为草稿值的紧凑 JSON 字符串，例如文本值的键为 `"\"占位选项\""`，值形如 `["占位选项键"]`。字段比较时仅用该映射核对模板 |
+| `fields.<控件>.draft_values` | 枚举、关系等字段把草稿值映射到平台类型。键为草稿值的紧凑 JSON 字符串，例如文本值的键为 `"\"占位选项\""`，值形如 `["占位选项键"]`。单选须核对模板显示名、选项键及最终请求。数值与其他标量的映射须保留草稿业务值 |
 | `fields.<子表控件>` | `children` 以子控件 ID 为键，各含 `type`。`current`、`gift` 各含在 `children` 中登记的 `control` 及 `name_path`，用于从对应关联行的子格读取包名。子表关联行按 `children` 白名单取值。其他子表单元格解析可用 `row_metadata` 指定非控件元数据键 |
 | `readback_skip` | 经实测确认由工作流回填的控件 ID 列表，初次用空数组。可变字段和审批链接必须比对 |
 | `official.origin`、`official.token_key`、`official.app_id_key` | 官方 HTTPS 源及私有环境文件中的个人令牌、应用 ID 键名，例如 `https://placeholder.invalid`、`PLACEHOLDER_HAP_TOKEN`、`PLACEHOLDER_HAP_APP_ID` |
