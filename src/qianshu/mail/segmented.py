@@ -22,12 +22,13 @@ def _frame(digest, value):
 
 
 class _Read:
-    def __init__(self, mailbox, uid, seen):
+    def __init__(self, mailbox, uid, seen, original):
         self.mailbox, self.uid, self.seen = mailbox, uid, seen
         self.tree = None
         self.mime = {}
         self.payloads = {}
         self.selected = []
+        self.proof_leaves = {} if original else None
 
     def fetch(self, section):
         raw = self.mailbox.checked_section(self.uid, section)
@@ -42,6 +43,8 @@ class _Read:
 
     def payload(self, path):
         raw = self.fetch(path)
+        if self.proof_leaves is not None and (path != "TEXT" or not isinstance(self.tree[0], list)):
+            self.proof_leaves[path] = raw
         self.payloads[path] = (str(len(raw)), hashlib.sha256(raw).digest())
         return raw
 
@@ -106,26 +109,81 @@ def _related_root(children, params, read, prefix):
     return matches[0][0]
 
 
-def _original_proof(outer, part):
-    # 单文本叶可用旧函数已解出的文字和原 charset 还原 v1 的负载分帧。
-    # 旧摘要不符或内容不能无损表示时，不会补入候选索引。
-    kind, text = part
-    try:
-        payload = text.encode(outer.get_content_charset() or "ascii")
-    except (LookupError, UnicodeError):
-        return None
-    fields = [(k.lower(), str(v)) for k, v in outer.items() if k.lower().startswith("content-")
-              and k.lower() not in {"content-type", "content-transfer-encoding"}]
-    params = [(k, v) for k, v in (outer.get_params() or [])[1:] if k.lower() != "boundary"]
+def _original_proof(outer, read, visible):
+    """按旧摘要分帧，只为能由实读各段逐字节核实的归档生成证明。"""
     proof = hashlib.sha256(b"mime-v1")
-    for raw in (json.dumps([kind, params, fields]).encode(), payload):
-        proof.update(len(raw).to_bytes(8, "big"))
-        proof.update(raw)
-    return "1:" + proof.hexdigest()
+    wire = hashlib.sha256()
+
+    def frame(*chunks):
+        proof.update(sum(map(len, chunks)).to_bytes(8, "big"))
+        for chunk in chunks:
+            proof.update(chunk)
+
+    def visit(node, path, mime, header):
+        for name in ("Content-Type", "Content-Disposition", "Content-Transfer-Encoding", "Content-ID"):
+            values = mime.get_all(name, [])
+            if len(values) > 1 or any(value.defects for value in values):
+                return False
+        kind = mime.get_content_type()
+        encoding = mime.get("Content-Transfer-Encoding", "7bit").lower()
+        if encoding not in {"7bit", "8bit", "binary"} and (
+                isinstance(node[0], list) or encoding not in {"base64", "quoted-printable"}):
+            return False
+        params = [(k, v) for k, v in (mime.get_params() or [])[1:] if k.lower() != "boundary"]
+        fields = [(k.lower(), str(v)) for k, v in mime.items() if k.lower().startswith("content-")
+                  and k.lower() not in {"content-type", "content-transfer-encoding"}]
+        frame(json.dumps([kind, params, fields]).encode())
+        if path:
+            wire.update(header)
+        if isinstance(node[0], list):
+            children = []
+            for child in node:
+                if not isinstance(child, list):
+                    break
+                children.append(child)
+            if (kind not in {"multipart/mixed", "multipart/alternative", "multipart/related"}
+                    or not mime.get_boundary() or mime.get_filename() is not None
+                    or mime.get_content_disposition() not in (None, "inline")):
+                return False
+            delimiter = b"--" + mime.get_boundary().encode("ascii")
+            # 旧格式分别登记序言、尾声与子段数。这里的空值须由整段 TEXT 摘要证实。
+            frame(b"")
+            frame(b"")
+            frame(str(len(children)).encode())
+            for i, child in enumerate(children, 1):
+                child_path = f"{path}.{i}" if path else str(i)
+                child_header = read.mime.get(child_path + ".MIME")
+                if child_header is None:
+                    return False
+                wire.update(delimiter + b"\r\n")
+                if not visit(child, child_path, headers(child_header), child_header):
+                    return False
+                wire.update(b"\r\n")
+            wire.update(delimiter + b"--\r\n")
+        else:
+            section = path or "TEXT"
+            payload = read.proof_leaves.get(section)
+            if payload is None or kind.startswith(("message/", "multipart/")):
+                return False
+            wire.update(payload)
+            if section not in visible:
+                if path:
+                    frame(header, payload, b"\r\n")
+                else:
+                    frame(payload)
+            mime.set_payload(payload)
+            frame(mime.get_payload(decode=True))
+            if mime.defects:
+                return False
+        return True
+
+    if visit(read.tree, "", outer, b"") and wire.digest() == read.payloads["TEXT"][1]:
+        return "1:" + proof.hexdigest()
+    return None
 
 
 def read_segmented(mailbox, uid, seen, *, original=False):
-    read = _Read(mailbox, uid, seen)
+    read = _Read(mailbox, uid, seen, original)
     complete = False
     try:
         raw = read.fetch("HEADER")
@@ -225,8 +283,8 @@ def read_segmented(mailbox, uid, seen, *, original=False):
         key = message_id(outer)
         item = MailItem(_fingerprint(key) if key else None, "2:" + digest.hexdigest(),
                         candidate, attachments, fields)
-        if original and not isinstance(read.tree[0], list) and len(parts) == 1:
-            prior = _original_proof(outer, parts[0])
+        if original:
+            prior = _original_proof(outer, read, visible)
             if prior:
                 item.original = (prior, _fingerprint(sender(outer), fields["subject"], prior))
         complete = True

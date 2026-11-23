@@ -11,16 +11,16 @@ from qianshu.parse.model import DEFAULT_MODEL, configured_effort
 from .message import _ATTRIBUTION, _DIVIDER, _HEADER_FIELD, _HTMLText, _UNKNOWN_DIVIDER, sender
 
 
-def _is_quote_line(line: str) -> bool:
+def _structure_line(line: str) -> str:
     for index, char in enumerate(line):
-        if char == "\t" or unicodedata.category(char) in {"Cc", "Cf", "Mn", "Me", "Zs"}:
-            continue
-        if char not in {">", "＞"}:
-            return False
-        following = line[index + 1:index + 2]
-        return following != "=" and not following.isdigit()
-    return False
+        if unicodedata.category(char) not in {"Cc", "Cf", "Mn", "Me", "Zs"}:
+            return line[index:].rstrip()
+    return ""
 
+
+def _is_quote_line(line: str) -> bool:
+    following = line[1:2]
+    return line.startswith((">", "＞")) and following != "=" and not following.isdigit()
 
 
 @dataclass(repr=False)
@@ -52,23 +52,23 @@ def _triage_reply(kind, content):
         parser.feed(content)
         parser.close()
         if parser.uncertain or parser.excluded or "".join(parser.tail).strip():
-            open_boundary = any(_opens_boundary(line.strip()) for line in parser.get_text().splitlines())
+            open_boundary = any(_opens_boundary(_structure_line(line)) for line in parser.get_text().splitlines())
             return "", bool(open_boundary or parser.excluded or "".join(parser.tail).strip())
         content = parser.get_text()
         structured_quote = parser.structured_quote
 
     lines = content.splitlines()
-    while lines and not lines[-1].strip():
-        lines.pop()
-    for index, line in enumerate(lines):
-        stripped = line.strip()
-        if _is_quote_line(line):
-            return "", any(_opens_boundary(line.strip()) for line in lines[index + 1:])
+    structure = [_structure_line(line) for line in lines]
+    while structure and not structure[-1]:
+        structure.pop()
+    for index, stripped in enumerate(structure):
+        if _is_quote_line(stripped):
+            return "", any(_opens_boundary(line) for line in structure[index + 1:])
         if _DIVIDER.fullmatch(stripped) or _ATTRIBUTION.fullmatch(stripped):
             offset = index + 1
-            while offset < len(lines) and (not lines[offset].strip() or _DIVIDER.fullmatch(lines[offset].strip())):
+            while offset < len(structure) and (not structure[offset] or _DIVIDER.fullmatch(structure[offset])):
                 offset += 1
-            quoted = lines[offset:]
+            quoted = structure[offset:]
             if (quoted or structured_quote) and all(_is_quote_line(item) for item in quoted):
                 return "\n".join(lines[:index]).strip(), True
             return "", True
@@ -90,7 +90,7 @@ def triage_fields(msg, selected, preferred):
     for kind, content in selected:
         if kind != preferred:
             continue
-        text, boundary = _triage_reply(kind, content.lstrip("\ufeff\u200b\u200c\u200d\u2060"))
+        text, boundary = _triage_reply(kind, content)
         if text:
             confirmed.append(text)
         if boundary:

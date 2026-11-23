@@ -135,12 +135,16 @@ class ReadOnlyMailbox:
     def snapshot(self, folder):
         exists = self.select(folder)
         def number(key):
-            name, values = self._connection.response(key)
-            if name != key or len(values) != 1 or not isinstance(values[0], bytes) or not re.fullmatch(
-                rb"[1-9][0-9]{0,9}", values[0]
-            ) or int(values[0]) > 2**32 - 1:
+            try:
+                name, values = self._connection.response(key)
+            except (imaplib.IMAP4.error, OSError, TypeError, ValueError):
+                raise MailError("邮箱代次或水位不可读。") from None
+            if name != key or not isinstance(values, (tuple, list)) or len(values) != 1:
                 raise MailError("邮箱代次或水位不可读。")
-            return int(values[0])
+            value = values[0]
+            if not isinstance(value, bytes) or not re.fullmatch(rb"[1-9][0-9]{0,9}", value) or int(value) > 2**32 - 1:
+                raise MailError("邮箱代次或水位不可读。")
+            return int(value)
         return number("UIDVALIDITY"), number("UIDNEXT"), exists
 
     def interval(self, first, last):

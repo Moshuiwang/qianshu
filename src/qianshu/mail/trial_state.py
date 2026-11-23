@@ -433,7 +433,7 @@ class Store:
             raise Hold()
         item, _ = read_segmented(archive, uid, archive.read_seen(uid), original=True)
         if (archive.snapshot(folder)[:2] != (validity, cursor) or item.key != original["msgkey"]
-                or (item.original and item.original != (original["digest"], original["candidate"]))):
+                or item.original != (original["digest"], original["candidate"])):
             raise Hold()
         with self.write() as db:
             if not self.row("""SELECT 1 FROM mailbox WHERE scope=? AND state='frozen'

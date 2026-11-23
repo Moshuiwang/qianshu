@@ -133,12 +133,12 @@ class Trial:
                 return
             try:
                 item, _ = self.read(mailbox, uid)
+                if not self.verify_generation(mailbox):
+                    return
             except MailError:
                 # 无法确定已经观察到的定位指向谁，整代待对账。
                 self.store.freeze(self.scope, "missing")
                 self.flush()
-                return
-            if not self.verify_generation(mailbox):
                 return
             self.store.register(self.scope, gen, uid, item, seen=self.seen[uid])
             fresh[uid] = item
@@ -155,14 +155,14 @@ class Trial:
             try:
                 uid = row["uid"]
                 if not card and uid in fresh:
-                    mailbox.check_seen(uid, row["initial_seen"])
                     item, text = fresh.pop(uid), None
                 else:
                     item, text = self.read(mailbox, uid, row["initial_seen"])
+                if not self.verify_generation(mailbox):
+                    break
+                mailbox.check_seen(uid, self.seen[uid])
             except MailError:
                 self.store.freeze(self.scope, "mapping")
-                break
-            if not self.verify_generation(mailbox):
                 break
             if (item.key, item.digest, item.candidate, item.attachments) != (
                     row["msgkey"], row["digest"], row["candidate"], row["attachments"]):

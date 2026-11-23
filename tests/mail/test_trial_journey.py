@@ -1125,3 +1125,104 @@ def test_uncertain_or_extended_disposition_masks_selected_leaf(journey, disposit
     assert len(requests) == 2 and b"ATTACHED_SENTINEL" in requests[1]
     assert ("附件数量未知" if expected is None else "含 1 个附件") in str(cards)
     assert trial.store.batch(1, 1)[3]
+
+
+@pytest.mark.parametrize("prefix", ["\x01", "\t", "\u200e", "\u0301", "\u20dd", "\u00a0"],
+                         ids=["Cc", "tab", "Cf", "Mn", "Me", "Zs"])
+@pytest.mark.parametrize("layout", ["attribution", "divider", "siblings", "from"])
+def test_prefixed_structure_withholds_history_at_http(journey, prefix, layout):
+    marker = prefix + {"attribution": "On a date wrote:", "divider": "Original Message",
+                       "siblings": "On a date wrote:", "from": "From: previous"}[layout]
+    if layout == "siblings":
+        leaves = ["CURRENT", "> previous\n" + marker, "HISTORY_SENTINEL"]
+    else:
+        leaves = ["CURRENT\n" + marker + "\nHISTORY_SENTINEL"]
+    _, _, requests, _ = journey(mixed(*[("plain", leaf) for leaf in leaves]), "否")
+    request, = requests
+    assert request.count(b"HISTORY_SENTINEL") == 0
+
+
+@pytest.mark.parametrize("change", ["seen", "missing", "validity", "absent-response"])
+def test_final_examine_failure_requires_reconciliation(journey, monkeypatch, change):
+    trial, inbox, requests, cards = journey(synthetic(2, "CURRENT"), "是")
+    message = inbox.messages[2]
+    response = inbox.response
+    inbox.commands.clear()
+
+    def changed_response(key):
+        if key == "UIDVALIDITY" and any(cmd[0] == "FETCH" for cmd in inbox.commands):
+            if change == "absent-response":
+                return key, None
+            if change == "validity":
+                return key, [b"?"]
+            if change == "seen":
+                inbox.seen.add(2)
+            else:
+                inbox.messages.pop(2, None)
+        return response(key)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(inbox, "response", changed_response)
+        trial.poll()
+    assert trial.box()["state"] == "frozen"
+    inbox.seen.discard(2)
+    inbox.messages[2] = message
+    trial.poll()
+    assert (trial.box()["state"], trial.box()["reason"]) == ("frozen", "reconciling")
+    assert len(requests) == 1 and not any(card for card, _ in cards)
+
+
+@pytest.mark.parametrize("variant", ["original", "replacement", "unprovable", "invalid-encoding"])
+def test_archive_binding_blocks_changed_id_redelivery(tmp_path, monkeypatch, variant):
+    from dataclasses import replace
+
+    store, archive, live = Store(tmp_path / "trial"), Inbox(), Inbox()
+    trial = revision_trial(store, live, [])
+    trial.poll()
+    msg = synthetic(2, "ORIGINAL", attachment=True)
+    msg.set_boundary("synthetic-boundary")
+    raw = msg.as_bytes()
+    prior = replace(fixture_item(raw),
+                    digest="1:a83f0eb2ca4782658330cf37920118a7018a35152bb88dda1a6432dbe1ffd2f8",
+                    candidate="2efdffcf8459e07874ca884605a4e72b0bbed700bec5ff0b26cb5b689d7b900b")
+    store.observe(trial.scope, 1, 2, 3, [2])
+    reg = store.register(trial.scope, 1, 2, prior)
+    trial.status(reg, "no")
+    live.generation += 1
+    archived = raw
+    if variant == "replacement":
+        archived = raw.replace(b"ORIGINAL", b"REPLACED")
+    elif variant == "unprovable":
+        archived = raw.replace(b"--synthetic-boundary", b"PREAMBLE\r\n--synthetic-boundary", 1)
+    elif variant == "invalid-encoding":
+        archived = raw.replace(b"Encoding: 7bit", b"Encoding: unknown")
+    for box in (archive, live):
+        box.add(Segments(archived))
+    trial.poll()
+    gen = trial.box()["generation"]
+    if variant != "original":
+        with pytest.raises(Hold):
+            store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
+        assert not store.row("SELECT 1 FROM original_index")
+        with pytest.raises(Hold):
+            store.reconcile(trial.scope, gen, 2, 3)
+    else:
+        store.index_archived_original(trial.scope, gen, reg, archive, trial.folder, 2)
+        store.reconcile(trial.scope, gen, 2, 3)
+    requests = []
+
+    def receive(req):
+        requests.append(req.content)
+        return httpx.Response(503)
+
+    monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(receive))
+    trial.input_limits["claude-haiku-5-5"] = 100000
+    store.import_spend("0")
+    msg.replace_header("Message-ID", synthetic(3, "")["Message-ID"])
+    live.add(msg)
+    trial.poll()
+    assert requests == []
+    if variant != "original":
+        assert trial.box()["state"] == "frozen"
+    else:
+        assert store.row("SELECT reason FROM registration ORDER BY id DESC")[0] == "duplicate"
