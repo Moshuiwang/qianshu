@@ -943,3 +943,371 @@ def test_send_revalidates_reply_and_records_only_sanitized_warning(setup, caplog
         assert not client.replies
     assert "feishu_handoff_reply_blocked" in caplog.text
     assert text not in caplog.text and "om_wrong_target" not in caplog.text
+
+
+MEMBER = "ou_memberSynthetic"
+SECOND_MEMBER = "ou_secondSynthetic"
+
+
+def member_settings(path, members):
+    _config(path)
+    with path.open("a") as stream:
+        stream.write("FEISHU_ALLOWED_SENDER_IDS=ou_syntheticApplication\n")
+        if members is not None:
+            stream.write(f"FEISHU_HANDOFF_MEMBER_OPEN_IDS={members}\n")
+    return load_handoff_settings(path)[0]
+
+
+@pytest.mark.parametrize("value", [None, "", "   ", f" {MEMBER}, {OWNER}, {MEMBER} "])
+def test_member_config_scope(tmp_path, value):
+    path = tmp_path / "settings"
+    settings = member_settings(path, value)
+    assert settings.allowed_senders == {OWNER}
+    assert settings.handoff_member_open_ids == ({OWNER, MEMBER} if value and value.strip() else set())
+    from qianshu.feishu.settings import load_settings
+    assert load_settings(path).allowed_senders == {"ou_syntheticApplication"}
+    assert not load_settings(path).handoff_member_open_ids
+
+
+@pytest.mark.parametrize("value", [BOT, f"{MEMBER},", f",{MEMBER}", "ou_bad-id"])
+def test_member_config_invalid(tmp_path, value):
+    with pytest.raises(ValueError, match="FEISHU_HANDOFF_MEMBER_OPEN_IDS") as exc:
+        member_settings(tmp_path / "settings", value)
+    assert value not in str(exc.value)
+
+
+def test_member_revocation_stops_pending_and_outbox(tmp_path):
+    path = tmp_path / "private" / "log"
+    config = tmp_path / "settings"
+    client = FakeFeishu()
+    clock = SimpleNamespace(now=1000)
+    for ids in (f"{MEMBER},{SECOND_MEMBER}", SECOND_MEMBER, "", MEMBER):
+        settings = member_settings(config, ids)
+        with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: clock.now)) as store:
+            relay = handoff.Handoff(store, client)
+            if "," in ids:
+                receive(relay, message("om_pending", sender=MEMBER))
+                receive(relay, message("om_reply", sender=MEMBER))
+                assert len(store.pending()) == 2
+                queued = store.pending()[0]["ref"]
+                store.queue_reply(queued, "合成答复")
+                store.append(message("om_react", sender=MEMBER))
+                receive(relay, message("om_second", sender=SECOND_MEMBER))
+            elif ids == SECOND_MEMBER:
+                assert [r["message_id"] for r in store.pending()] == ["om_second"]
+                assert store.reply_status(queued) == "cancelled"
+                with pytest.raises(ValueError):
+                    store.queue_reply(queued, "合成答复")
+            else:
+                clock.now = 1602
+                assert not store.pending()
+                assert not relay.send_one(reaction=False)
+                assert not relay.send_one(reaction=True)
+                assert store._db.execute("SELECT count(*) FROM member_mentions").fetchone()[0] == 4
+    assert not client.replies
+
+
+def test_member_activation_excludes_prior_second(tmp_path):
+    config = tmp_path / "settings"
+    path = tmp_path / "private" / "log"
+    client = FakeFeishu()
+    for now, ids in [(1000, ""), (1020, MEMBER), (1030, MEMBER)]:
+        with closing(handoff.MentionLog(path, member_settings(config, ids), create=True, clock=lambda: now)) as store:
+            if now == 1030:
+                client.messages = [message("om_prior", created=1019, sender=MEMBER),
+                                   message("om_boundary", created=1020, sender=MEMBER),
+                                   message("om_owner", created=1019)]
+                store.recover(client, Event())
+                relay = handoff.Handoff(store, client)
+                while relay.send_one(reaction=True):
+                    pass
+                assert [r["message_id"] for r in store.pending()] == ["om_owner", "om_boundary"]
+                assert not relay.send_one(reaction=False)
+
+
+def test_member_v040_rollback_and_unknown_role(tmp_path):
+    import importlib.util
+    import subprocess
+
+    filename = tmp_path / "old_handoff.py"
+    filename.write_bytes(subprocess.check_output(["git", "show", "v0.4.0:src/qianshu/feishu/handoff.py"]))
+    spec = importlib.util.spec_from_file_location("qianshu.feishu.old_handoff", filename)
+    old = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(old)
+    settings = member_settings(tmp_path / "settings", MEMBER)
+    path = tmp_path / "private" / "log"
+    client = FakeFeishu()
+    with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: 1000)) as store:
+        receive(handoff.Handoff(store, client), message(sender=MEMBER))
+        assert len(store.pending()) == 1
+    with closing(old.MentionLog(path, settings, create=True, clock=lambda: 1602)) as legacy:
+        assert [old.watcher_input(r, client, legacy) for r in legacy.pending()] == []
+        assert not old.Handoff(legacy, client).send_one(reaction=False)
+        receive(old.Handoff(legacy, client), message("om_owner"))
+        legacy_row, = legacy.pending()
+        assert legacy_row["message_id"] == "om_owner"
+        assert old.watcher_input(legacy_row, client, legacy)["mention"]["sender"] == "产品负责人"
+    with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: 1602)) as store:
+        def labels():
+            return {r["message_id"]: handoff.watcher_input(r, client, store)["mention"]["sender"]
+                    for r in store.pending()}
+        assert labels() == {"om_first": "名单内同事", "om_owner": "产品负责人"}
+        store._db.execute("UPDATE member_mentions SET membership = -1")
+        assert labels() == {"om_owner": "产品负责人"}
+        assert store.reserve(reaction=False)["message_id"] == "om_owner"
+
+
+def test_member_context_delivery_and_reply_gates(tmp_path, caplog, monkeypatch, capsys):
+    import uuid
+
+    settings = member_settings(tmp_path / "settings", f"{MEMBER},{SECOND_MEMBER},{OWNER}")
+    path = tmp_path / "private" / "log"
+    client = FakeFeishu()
+    caplog.set_level(logging.INFO)
+    private_text, excluded, answer = (uuid.uuid4().hex for _ in range(3))
+    with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: 1000)) as store:
+        relay = handoff.Handoff(store, client)
+        target = replace(message(sender=MEMBER), content=private_text)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            list(pool.map(lambda _: receive(relay, target), range(12)))
+        outsider = replace(message("om_out", sender="ou_syntheticOther"), kind="image",
+                           content=json.dumps({"image_key": excluded}))
+        receive(relay, outsider)
+        assert relay.send_one(reaction=False)
+        client.messages = [replace(message("om_context", sender=SECOND_MEMBER, keys=()), content=private_text),
+                           outsider, outsider, replace(outsider, message_id="om_app", sender_id=MEMBER,
+                                                      sender_type="app"), target]
+        store.recover(client, Event())
+        assert client.reactions == [target.message_id]
+        assert client.replies == [("om_out", "denied", handoff.DENIED)]
+        row, = store.pending()
+        monkeypatch.setattr(watch_mentions, "load_handoff_settings", lambda _: (settings, path))
+        monkeypatch.setattr(watch_mentions, "_Transport", lambda *args: client)
+        def stop(_):
+            raise KeyboardInterrupt
+        monkeypatch.setattr(watch_mentions.time, "sleep", stop)
+        for command in ("read", "watch"):
+            assert watch_mentions.main([command]) == 0
+            output = capsys.readouterr()
+            entry = json.loads(output.out)
+            assert "initiator_role" not in entry
+            assert entry["mention"]["sender"] == "名单内同事"
+            assert [(m["sender"], m["content"]) for m in entry["group_context"]] == [("名单内同事", private_text)]
+            assert entry["other_message_count"] == 2 and excluded not in output.out
+            assert not output.err and not client.downloads
+        for secret in (MEMBER, SECOND_MEMBER, '<at user_id="all">合成</at>'):
+            with pytest.raises(ValueError):
+                store.queue_reply(row["ref"], secret)
+        assert all(excluded not in line for line in store._db.iterdump())
+        store.queue_reply(row["ref"], answer)
+        assert relay.send_one(reaction=False)
+        assert client.replies[-1] == (target.message_id, "reply", answer)
+        assert all(marker not in caplog.text for marker in (private_text, excluded, answer, MEMBER, target.message_id))
+
+
+def _empty_list_replay(folder, value):
+    """在独立进程中重放固定事件，记录原始库行和 CLI 的完整输出。"""
+    from contextlib import redirect_stderr, redirect_stdout
+
+    folder.mkdir()
+    path = folder / "private" / "log"
+    settings = member_settings(folder / "settings", value)
+    clock = SimpleNamespace(now=1000)
+    result = []
+
+    class ReplayFeishu(FakeFeishu):
+        def react(self, message_id, *, deadline):
+            result.append(["reaction_deadline", message_id, deadline])
+            super().react(message_id, deadline=deadline)
+
+    client = ReplayFeishu()
+    logs = io.StringIO()
+    logger = logging.getLogger(handoff.__name__)
+    logger.setLevel(logging.INFO)
+    logger.addHandler(logging.StreamHandler(logs))
+
+    def snapshot(store):
+        result.append({table: list(map(tuple, store._db.execute(f"SELECT * FROM {table} ORDER BY rowid")))
+                       for table in ("recovery", "mentions", "outbox")})
+
+    def command(*args):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = watch_mentions.main(list(args))
+        result.append([rc, out.getvalue().replace(str(folder), "PRIVATE"), err.getvalue()])
+
+    with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: clock.now)) as store:
+        relay = handoff.Handoff(store, client)
+        target = replace(message(), kind="image", content='{"image_key":"synthetic_picture"}')
+        for event in (target, target, message("om_plain", keys=()), message("om_other_at", keys=()),
+                      replace(message("om_wrong"), chat_id="oc_other"), message("om_denied", sender=MEMBER),
+                      message("om_denied", sender=OWNER)):
+            relay.receive(event, time.monotonic() + 3)
+        clock.now = 1100
+        store.recover(client, Event())
+        client.messages = [message("om_thread", created=1090)]
+        client.history_fails = True
+        with pytest.raises(RuntimeError):
+            store.recover(client, Event())
+        snapshot(store)
+    with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: clock.now)) as store:
+        relay = handoff.Handoff(store, client)
+        client.history_fails = False
+        store.recover(client, Event())
+        while relay.send_one(reaction=True):
+            pass
+        client.messages = [message("om_hidden", created=1000, sender=MEMBER),
+                           replace(message("om_bot", created=1000), sender_type="app",
+                                   sender_id=settings.app_id, content="合成" * 1400)]
+        client.history_fails = True
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(watch_mentions, "load_handoff_settings", lambda _: (settings, path))
+            patch.setattr(watch_mentions, "_Transport", lambda *args: client)
+            patch.setattr(watch_mentions, "MentionLog",
+                          lambda path, settings: handoff.MentionLog(path, settings, clock=store.clock))
+            def stop(_):
+                raise KeyboardInterrupt
+            patch.setattr(watch_mentions.time, "sleep", stop)
+            sequence = iter(range(10))
+            def image_folder(*, prefix, dir):
+                dest = dir / (prefix + str(next(sequence)))
+                dest.mkdir(mode=0o700)
+                return str(dest)
+            patch.setattr(handoff, "mkdtemp", image_folder)
+            command("read")
+            command("watch")
+            ref = store.pending()[0]["ref"]
+            for body in (OWNER, "合成答复", "合成答复"):
+                patch.setattr(watch_mentions.sys, "stdin", io.StringIO(body))
+                command("reply", ref)
+            def unsent(*args, **kwargs):
+                raise _ReplyNotSent()
+            with patch.context() as failed:
+                failed.setattr(client, "reply", unsent)
+                relay.send_one(reaction=False)
+            snapshot(store)
+            clock.now += 10
+            client.reply_fails = True
+            relay.send_one(reaction=False)
+            snapshot(store)
+            clock.now = 1700
+            client.reply_fails = False
+            while relay.send_one(reaction=False):
+                pass
+            command("status", ref)
+        snapshot(store)
+    with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: clock.now)) as store:
+        with pytest.MonkeyPatch.context() as patch:
+            _recover_synthetic_thread(store, OWNER, clock, client, patch)
+        snapshot(store)
+    result.extend([client.ranges, client.reactions, client.replies, client.downloads, logs.getvalue()])
+    return result
+
+
+def test_empty_member_list_matches_v040(tmp_path):
+    import subprocess
+    import sys
+    import tarfile
+
+    repo = Path(__file__).resolve().parents[2]
+    archived = subprocess.check_output(["git", "archive", "v0.4.0", "src"], cwd=repo)
+    with tarfile.open(fileobj=io.BytesIO(archived)) as archive:
+        archive.extractall(tmp_path, filter="data")
+    script = """
+import json, runpy, sys
+from pathlib import Path
+source, test, folder, value = sys.argv[1:]
+sys.path.insert(0, source)
+suite = runpy.run_path(test)
+assert Path(suite['handoff'].__file__).resolve().is_relative_to(Path(source))
+suite['time'].monotonic = lambda: 5000.0
+print(json.dumps(suite['_empty_list_replay'](Path(folder), json.loads(value))))
+"""
+    def replay(source, name, value):
+        output = subprocess.check_output([sys.executable, "-c", script, str(source), __file__,
+                                          str(tmp_path / name), json.dumps(value)])
+        return json.loads(output)
+    baseline = replay(tmp_path / "src", "baseline", None)
+    for i, value in enumerate((None, "", "   ")):
+        assert replay(repo / "src", f"candidate-{i}", value) == baseline
+
+
+def _recover_synthetic_thread(store, sender, clock, client, patch):
+    transport = _Transport(store.settings, None, store.clock)
+    root = history_item("om_root", 900, thread_id="omt_synthetic")
+    reply = history_item("om_thread_only", 1701, sender=sender,
+                         mentions=[{"key": "@_user_1", "id_type": "open_id", "id": BOT}])
+    unread = True
+
+    def pages(request):
+        if request.container_id_type == "chat":
+            return history_page([root])
+        if not request.page_token:
+            return history_page([reply], "next")
+        if unread:
+            raise RuntimeError("合成分页故障")
+        return history_page([root])
+
+    patch.setattr(transport.im.message, "list", pages)
+    clock.now = 1750
+    through = store._db.execute("SELECT through FROM recovery").fetchone()[0]
+    with pytest.raises(RuntimeError):
+        store.recover(transport, Event())
+    assert store._db.execute("SELECT through FROM recovery").fetchone()[0] == through
+    unread = False
+    store.recover(transport, Event())
+    store.recover(transport, Event())
+    relay = handoff.Handoff(store, client)
+    while relay.send_one(reaction=True):
+        pass
+    assert client.reactions.count("om_thread_only") == 1
+
+
+def test_member_thread_fallback_and_sender_recheck(tmp_path, monkeypatch, caplog):
+    settings = member_settings(tmp_path / "settings", f"{MEMBER},{SECOND_MEMBER}")
+    path = tmp_path / "private" / "log"
+    client = FakeFeishu()
+    clock = SimpleNamespace(now=1700)
+    with closing(handoff.MentionLog(path, settings, create=True, clock=lambda: clock.now)) as store:
+        _recover_synthetic_thread(store, SECOND_MEMBER, clock, client, monkeypatch)
+        row, = store.pending()
+        assert row["message_id"] == "om_thread_only" and row["sender"] == "名单内同事"
+        clock.now = 2301
+        relay = handoff.Handoff(store, client)
+        assert relay.send_one(reaction=False)
+        assert store.pending()[0]["fallback_status"] == "sent"
+        assert client.replies == [("om_thread_only", "fallback", handoff.FALLBACK)]
+        secret = "合成监听器独有配置"
+        listener_settings = replace(settings, handoff_sensitive_values=(secret,))
+        with closing(handoff.MentionLog(path, listener_settings, clock=store.clock)) as listener:
+            assert store.queue_reply(row["ref"], secret) == "pending"
+            assert handoff.Handoff(listener, client).send_one(reaction=False)
+            assert store.reply_status(row["ref"]) == "blocked"
+            assert len(client.replies) == 1 and secret not in caplog.text
+
+
+def test_member_cli_pipeline_isolation(tmp_path, monkeypatch):
+    config = tmp_path / "settings"
+    member_settings(config, MEMBER)
+    path = tmp_path / "private" / "log"
+    with config.open("a") as stream:
+        stream.write(f"FEISHU_MENTION_LOG={path}\n")
+    client = FakeFeishu()
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("转交名单启用后调用了申请专用组件")
+
+    def run(service):
+        service.handoff.transport = client
+        event = message(sender=MEMBER, created=int(time.time()) + 1)
+        service.inject_message(event, deadline=time.monotonic() + 3)
+        service._receipts.shutdown(wait=True)
+        row, = service.handoff.store.pending()
+        assert row["sender"] == "名单内同事"
+        assert not client.replies and client.reactions == [event.message_id]
+
+    for name in ("load_config", "_serve", "_load_mail_config", "configured_model", "Pipeline", "FeishuService"):
+        monkeypatch.setattr(entry, name, forbidden)
+    monkeypatch.setattr(handoff.HandoffService, "run", run)
+    monkeypatch.setattr(entry, "setup_logging", lambda _: None)
+    assert entry.main(["--handoff-only", "--env-file", str(config), "--business-env-file", str(config)]) == 0
