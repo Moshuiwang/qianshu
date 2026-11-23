@@ -88,11 +88,14 @@ class _ModelLine(CardLine):
 
 
 class _CardRedaction:
-    def __init__(self, body: str, sensitive: re.Pattern[str] | None, registered_fragments: set[str]) -> None:
+    def __init__(
+        self, body: str, sensitive: re.Pattern[str] | None, registered_fragments: set[str],
+        *, source_spans: Iterable[tuple[int, int]] = (),
+    ) -> None:
         self.body = body
         self.sensitive = re.compile(f"(?=({sensitive.pattern}))") if sensitive else None
         self.registered_fragments = registered_fragments
-        self.spans = self._matches(self.sensitive, body)
+        self.spans = (*self._matches(self.sensitive, body), *source_spans)
         self.fragments = None
         if self.spans:
             # 自由文本没有坐标。短而又出现在非敏感原文里的字面值无法仅凭字面归属。
