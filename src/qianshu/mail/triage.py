@@ -34,7 +34,7 @@ class MailItem:
     candidate: str | None
     attachments: int | None
     fields: dict = field(repr=False)
-    html_body_missed: bool = False
+    body_missed: bool = False
 
 
 class _StyledHTML(_HTMLText):

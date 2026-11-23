@@ -19,7 +19,9 @@ from test_trial_listener import service
 @pytest.mark.parametrize("plain,html,answer,body,verdict,missed", [
     ("\ufeff\u200b", "<p>CURRENT</p>", "是", "CURRENT", "是", True),
     ("\ufeff\u200b", "<p>CURRENT</p><p>From: previous</p>", "否", "", "拿不准", True),
-    ("PLAIN", "<p>CURRENT</p>", "是", "PLAIN", "是", False),
+    # mixed 里 plain 与 HTML 是两个独立正文；HTML 未进 Sonnet 即按 G437 转人工。
+    # 「全部可见正文都进 Sonnet 可记 done」的正例见 test_trial_body_coverage.py。
+    ("PLAIN", "<p>CURRENT</p>", "是", "PLAIN", "是", True),
 ])
 def test_body_selection_at_delivery(journey, baseline_modules, monkeypatch, plain, html, answer,
                                     body, verdict, missed):

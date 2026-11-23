@@ -6,7 +6,7 @@ from email.errors import MessageError
 
 from . import _fingerprint
 from .imap import MailError, _number
-from .message import body_parts, headers, message_id, request_text
+from .message import _plain_text, body_parts, headers, message_id, request_text
 from .triage import MailItem, has_body, triage_fields
 
 
@@ -105,6 +105,26 @@ def _related_root(children, params, read, prefix):
     return matches[0][0]
 
 
+def _request_body(chosen, groups):
+    """按旧入口的类型优先级取正文，并保留实际贡献正文的路径。"""
+    text = ""
+    source_kind = None
+    for kind in ("text/plain", "text/html"):
+        parts = tuple(part for part in chosen.values() if part[0] == kind)
+        text = request_text(parts)
+        if text:
+            source_kind = kind
+            break
+    required, covered = set(), set()
+    for path, group in groups.items():
+        kind, value = chosen[path]
+        if has_body(_plain_text(kind, value)):
+            required.add(group)
+            if kind == source_kind:
+                covered.add(group)
+    return text, not required.issubset(covered)
+
+
 def read_segmented(mailbox, uid, seen):
     read = _Read(mailbox, uid, seen)
     complete = False
@@ -124,13 +144,14 @@ def read_segmented(mailbox, uid, seen):
         _frame(digest, read.tree)
         unknown_count = False
         visible = set()
+        groups = {}
         selected_paths = {""} if chosen else set()
         for path in chosen:
             while path:
                 selected_paths.add(path)
                 path = path.rpartition(".")[0]
 
-        def visit(node, path="", resource=False):
+        def visit(node, path="", resource=False, alternative=None, attachment=False):
             nonlocal unknown_count
             section = path or "TEXT"
             mime = headers(read.section(uid, path + ".MIME")) if path else outer
@@ -158,6 +179,7 @@ def read_segmented(mailbox, uid, seen):
             named = _named(params, b"NAME") or mime.get_filename() is not None
             disposition = _attached(disp)
             attached = mime.get_content_disposition() not in (None, "inline") or disposition is True
+            attachment = attachment or attached
             uncertain = disposition is None and not (resource or named or attached) and (multi or section in chosen)
             unknown_count |= uncertain
             if (multi or section in chosen) and any(len(mime.get_all(name, [])) > 1 for name in
@@ -168,6 +190,8 @@ def read_segmented(mailbox, uid, seen):
                 prefix = path + "." if path else ""
                 if not opaque or path in selected_paths:
                     root = _related_root(children, params, read, prefix) if node[n].upper() == b"RELATED" else None
+                    if alternative is None and node[n].upper() == b"ALTERNATIVE":
+                        alternative = path
                     count = 0
                     for i, child in enumerate(children, 1):
                         child_path = f"{prefix}{i}"
@@ -176,13 +200,15 @@ def read_segmented(mailbox, uid, seen):
                             raise MailError("已读段与根绑定不符。")
                         # 不透明容器只复核旧函数实际读出的后代，整棵子树计一。
                         if not opaque or child_path in selected_paths:
-                            count += visit(child, child_path, opaque or nonroot)
+                            count += visit(child, child_path, opaque or nonroot, alternative, attachment)
                     if not opaque:
                         return count
             if section not in read.payloads:
                 read.payload(section)
             if not multi and str(octets) != read.payloads[section][0]:
                 raise MailError("邮件段长度与结构不符。")
+            if section in chosen and not attachment:
+                groups[section] = section if alternative is None else alternative
             if section in chosen and not opaque:
                 visible.add(section)
                 return 0
@@ -199,19 +225,15 @@ def read_segmented(mailbox, uid, seen):
             _frame(digest, (path, fact))
         for path, part in chosen.items():
             _frame(digest, (path, part))
-        text = request_text(parts)
+        text, body_missed = _request_body(chosen, groups)
         preferred = "text/plain" if any(k == "text/plain" and has_body(s) for k, s in parts) else "text/html"
         visible_parts = [part for path, part in chosen.items() if path in visible]
         fields = triage_fields(outer, visible_parts, preferred)
-        # G405 保留 request_text 的选段。引文过滤后为空也须披露选段差异。
-        html_body_missed = (preferred == "text/html"
-                            and any(kind == "text/html" for kind, _ in visible_parts)
-                            and any(kind == "text/plain" and value.strip() for kind, value in parts))
         candidate = "2:" + digest.hexdigest()
         _frame(digest, [(k.lower(), v) for k, v in outer.raw_items() if k.lower() == "message-id"])
         key = message_id(outer)
         item = MailItem(_fingerprint(key) if key else None, "2:" + digest.hexdigest(),
-                        candidate, attachments, fields, html_body_missed)
+                        candidate, attachments, fields, body_missed)
         complete = True
         return item, text
     except (AttributeError, IndexError, LookupError, MessageError, ValueError, TypeError, RecursionError, AssertionError):

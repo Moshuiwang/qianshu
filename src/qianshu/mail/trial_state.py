@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS registration(
 CREATE INDEX IF NOT EXISTS trial_identity ON registration(scope,msgkey);
 CREATE INDEX IF NOT EXISTS trial_candidate ON registration(scope,candidate);
 CREATE TABLE IF NOT EXISTS trial_target(id INTEGER PRIMARY KEY CHECK(id=1), fingerprint TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS missed_body(scope TEXT, digest TEXT, PRIMARY KEY(scope,digest));
 CREATE TABLE IF NOT EXISTS trial_folder(scope TEXT PRIMARY KEY, folder TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS card_intent(
  uuid TEXT PRIMARY KEY, registration INTEGER NOT NULL, version INTEGER NOT NULL, page INTEGER NOT NULL,
@@ -213,6 +214,23 @@ class Store:
             (digest IS NULL OR digest NOT LIKE '2:%' OR candidate IS NULL OR candidate NOT LIKE '2:%')
             LIMIT 1""", scope)
 
+    def record_coverage(self, scope, item):
+        if item.body_missed:
+            self.db.execute("INSERT OR IGNORE INTO missed_body VALUES(?,?)", (scope, item.digest))
+
+    def finish(self, reg, status, *, reason=None, warned=False):
+        """在调用方事务内完成登记，同步登记尚待发送的人工提示。冻结优先。"""
+        row = self.row("""SELECT r.scope, m.digest IS NOT NULL missed FROM registration r
+            LEFT JOIN missed_body m USING(scope,digest) WHERE r.id=? AND r.status!='frozen'""", reg)
+        if row is None:
+            return
+        if row["missed"]:
+            status = MANUAL_BODY_MISSED
+            if not warned:
+                self.notice(f"body:{reg}", row["scope"], reg, "body_missed")
+        self.db.execute("UPDATE registration SET status=?,reason=coalesce(?,reason) WHERE id=?",
+                        (status, reason, reg))
+
     def register(self, scope, generation, uid, item, *, seen=None):
         with self.write() as db:
             if not self.row("SELECT 1 FROM mailbox WHERE scope=? AND generation=? AND state='active'", scope, generation):
@@ -221,6 +239,7 @@ class Store:
             if not loc or loc["status"] != "pending":
                 raise Hold()
             key, digest, candidate = item.key, item.digest, item.candidate
+            self.record_coverage(scope, item)
             same = list(db.execute("SELECT * FROM registration WHERE scope=? AND msgkey=?", (scope, key)))
             related = list(db.execute("""SELECT * FROM registration WHERE scope=? AND candidate=?
                 AND msgkey IS NOT ?""", (scope, candidate, key)))
@@ -355,6 +374,7 @@ class Store:
                 JOIN mailbox m USING(scope) WHERE r.scope=? AND r.id=?""", scope, reg)
             if (not enabled() or not row or row["state"] != "active" or row["generation"] != generation
                     or row["status"] not in {"haiku": ("triage",), "sonnet": ("parse",), "correction": ("parsing",),
+                                             "body_missed": (MANUAL_BODY_MISSED,),
                                              "card": ("sending",), "received": ("parse",), "deferred": ("parse",)}[stage]
                     or not self.budget_open()):
                 raise Hold()
@@ -384,6 +404,7 @@ class Store:
             generation = box["generation"]
             observations = []
             for uid, item in entries:
+                self.record_coverage(scope, item)
                 matches = list(db.execute("""SELECT id,status FROM registration WHERE scope=?
                     AND msgkey=? AND digest=?""", (scope, item.key, item.digest)))
                 match = matches[0][0] if len(matches) == 1 and matches[0][1] != "frozen" else None
@@ -411,14 +432,18 @@ class Store:
                           (scope, generation, validity, cursor)).rowcount != 1:
                 raise Hold()
             # 本次水位以前未能证明的新信、旧待办和可能已发的工作均交人工。
-            db.execute("""UPDATE registration SET status='manual',reason='reconciliation',version=version+1
-                WHERE scope=? AND status NOT IN ('done','no','frozen','manual',?)""", (scope, MANUAL_BODY_MISSED))
+            pending = db.execute("""SELECT id FROM registration WHERE scope=?
+                AND status NOT IN ('done','no','frozen','manual',?)""", (scope, MANUAL_BODY_MISSED)).fetchall()
+            for reg, in pending:
+                db.execute("UPDATE registration SET version=version+1 WHERE id=?", (reg,))
+                self.finish(reg, "manual", reason="reconciliation")
             for row in list(db.execute("""SELECT * FROM reconciliation WHERE scope=? AND generation=?
                     AND matched IS NULL""", (scope, generation))):
                 reg = db.execute("""INSERT INTO registration(scope,msgkey,digest,candidate,attachments,status,
-                    reason,created) VALUES(?,?,?,?,?,'manual','reconciliation',?)""",
+                    reason,created) VALUES(?,?,?,?,?,'review','reconciliation',?)""",
                                  (scope, row["msgkey"], row["digest"], row["candidate"],
                                   row["attachments"], now())).lastrowid
+                self.finish(reg, "manual")
                 db.execute("UPDATE reconciliation SET matched=? WHERE scope=? AND generation=? AND uid=?",
                            (reg, scope, generation, row["uid"]))
             db.execute("DELETE FROM scan_range WHERE scope=?", (scope,))

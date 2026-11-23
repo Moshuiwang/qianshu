@@ -1,7 +1,9 @@
 """单租约的试运行轮询与交接。邮件正文仅在本轮内存中保留。"""
 
+import asyncio
 import json
 import logging
+import signal
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -16,9 +18,10 @@ from . import _fingerprint
 from .imap import MailError, trial_connect
 from .segmented import read_segmented
 from .triage import MailItem, classify, input_limit, trial_model
-from .trial_state import MANUAL_BODY_MISSED, Hold, Store
+from .trial_state import Hold, Store
 
 _LOG = logging.getLogger(__name__)
+_BODY_NOTICE = "HTML 正文未参与解析，请人工核对原邮件"
 _NOTICES = {
     "received": "收到，待核对 1 封。",
     "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
@@ -171,8 +174,12 @@ class Trial:
                     row["msgkey"], row["digest"], row["candidate"], row["attachments"]):
                 self.store.freeze(self.scope, "mapping")
                 break
+            if item.body_missed:
+                # 兼容升级前已经登记、这轮首次核实覆盖的邮件。
+                with self.store.write():
+                    self.store.record_coverage(self.scope, item)
             if card:
-                self.parse(row, gen, text, html_body_missed=item.html_body_missed)
+                self.parse(row, gen, text, body_missed=item.body_missed)
             else:
                 self.triage(row, gen, item)
         self.flush()
@@ -188,7 +195,10 @@ class Trial:
 
     def status(self, reg, status):
         with self.store.write() as db:
-            db.execute("UPDATE registration SET status=? WHERE id=? AND status!='frozen'", (status, reg))
+            if status in {"done", "no", "manual", "correction_pending"}:
+                self.store.finish(reg, status)
+            else:
+                db.execute("UPDATE registration SET status=? WHERE id=? AND status!='frozen'", (status, reg))
 
     def charge_limits(self, req, family):
         data = json.loads(req.content)
@@ -220,11 +230,15 @@ class Trial:
         self.store.settle(attempt, inputs, outputs)
         with self.store.write() as db:
             changed = db.execute("UPDATE registration SET verdict=?,failure=?,status=? WHERE id=? AND status='classifying'",
-                       (verdict, reason, "no" if verdict == "否" else "parse", reg))
-            if changed.rowcount and verdict != "否" and not self.enabled(True):
+                       (verdict, reason, "classifying" if verdict == "否" else "parse", reg))
+            if not changed.rowcount:
+                return
+            if verdict == "否":
+                self.store.finish(reg, "no")
+            elif not self.enabled(True):
                 self.store.notice(f"received:{reg}", self.scope, reg, "received")
 
-    def parse(self, row, gen, text, *, html_body_missed=False):
+    def parse(self, row, gen, text, *, body_missed=False):
         reg = row["id"]
         attempt = None
         refused = False
@@ -275,8 +289,8 @@ class Trial:
                               (reg, expected)).rowcount:
                 return
         notices = []
-        if html_body_missed:
-            notices.append(CardLine("正文", "HTML 正文未参与解析，请人工核对原邮件"))
+        if body_missed:
+            notices.append(CardLine("正文", _BODY_NOTICE))
         if row["attachments"] != 0:
             hint = f"含 {row['attachments']} 个附件未解析，请对照原件核对"
             if row["attachments"] is None:
@@ -299,7 +313,8 @@ class Trial:
         except Exception:
             unknown = True
         status = "manual" if unknown or attempt is None else "done"
-        self.status(reg, MANUAL_BODY_MISSED if html_body_missed else status)
+        with self.store.write():
+            self.store.finish(reg, status, warned=body_missed)
 
     def flush(self):
         rows = list(self.store.db.execute("""SELECT * FROM notice WHERE status='pending'
@@ -308,13 +323,13 @@ class Trial:
             if not self.enabled():
                 return
             kind = row["kind"]
-            card = kind == "deferred"
-            if card and not row["event"].endswith(self.clock().astimezone(UTC).date().isoformat()):
+            card = kind in {"deferred", "body_missed"}
+            if kind == "deferred" and not row["event"].endswith(self.clock().astimezone(UTC).date().isoformat()):
                 with self.store.write() as db:
                     db.execute("UPDATE notice SET status='expired' WHERE event=? AND status='pending'", (row["event"],))
                 continue
             gate = self.store.gate()
-            if kind in {"received", "deferred"}:
+            if kind in {"received", "deferred", "body_missed"}:
                 gate = self.store.dispatch(self.scope, row["generation"], row["registration"], kind,
                                            lambda: self.enabled(card))
             try:
@@ -324,7 +339,10 @@ class Trial:
                         if not db.execute("""UPDATE notice SET status='unknown' WHERE event=?
                             AND status='pending'""", (row["event"],)).rowcount:
                             continue
-                    self.send(_NOTICES[kind].format(n=row["quantity"]), row["uuid"], False,
+                    warning = kind == "body_missed"
+                    content = (result_card(detail_pages("试运行邮件", [CardLine("正文", _BODY_NOTICE)])[0])
+                               if warning else _NOTICES[kind].format(n=row["quantity"]))
+                    self.send(content, row["uuid"], warning,
                               lambda: self.require_enabled(card))
                     with self.store.write() as db:
                         db.execute("UPDATE notice SET status='sent' WHERE event=?", (row["event"],))
@@ -335,17 +353,21 @@ class Trial:
 
     def uncertain_notices(self):
         with self.store.write() as db:
-            db.execute("""UPDATE registration SET status='manual',reason='notice_unknown' WHERE scope=?
+            rows = db.execute("""SELECT id FROM registration WHERE scope=?
                 AND status='parse' AND id IN (SELECT registration FROM notice WHERE status='unknown'
-                AND kind IN ('received','deferred'))""", (self.scope,))
+                AND kind IN ('received','deferred'))""", (self.scope,)).fetchall()
+            for reg, in rows:
+                self.store.finish(reg, "manual", reason="notice_unknown")
 
     def run(self):
         while not self.stop.is_set():
             try:
                 self.uncertain_notices()
                 with self.store.write() as db:
-                    db.execute("""UPDATE registration SET status='manual',reason='unknown' WHERE scope=?
-                        AND status IN ('parsing','sending','classifying')""", (self.scope,))
+                    rows = db.execute("""SELECT id FROM registration WHERE scope=?
+                        AND status IN ('parsing','sending','classifying')""", (self.scope,)).fetchall()
+                    for reg, in rows:
+                        self.store.finish(reg, "manual", reason="unknown")
                 self.poll()
             except (Hold, ConfigError, MailError):
                 pass
@@ -404,7 +426,11 @@ def run_service(args, settings, path, switches):
             _LOG.error("试运行收信已停止，请核对私有登记。")
         finally:
             if store is not None:
-                store.db.close()
+                try:
+                    store.db.close()
+                except Exception:
+                    _LOG.critical("收信登记库关闭失败，监听锁保留，须人工停机核对。")
+                    return
             closed.set()
 
     class TrialLog(MentionLog):
@@ -426,21 +452,39 @@ def run_service(args, settings, path, switches):
     def send(content, request_id, card, check):
         _send_trial_message(service.transport, content, request_id, card, check)
 
-    with TrialLog.listening(path, settings) as log:
-        service = HandoffService(log)
-        thread = Thread(target=poll, name="trial-mail")
-        thread.start()
-        try:
-            service.run()
-        finally:
-            interrupted = False
-            while True:
-                try:
-                    stop.set()
-                    closed.wait()
-                    break
-                except KeyboardInterrupt:
-                    interrupted = True
-            thread.join()
-            if interrupted:
-                raise KeyboardInterrupt
+    interrupted = False
+
+    def record_interrupt(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+
+    class TrialHandoff(HandoffService):
+        async def _serve(self, client):
+            # 让长连接从事件循环正常退出；信号处理器自身只写标志。
+            serving = asyncio.create_task(super()._serve(client))
+            try:
+                while not interrupted:
+                    done, _ = await asyncio.wait((serving,), timeout=0.25)
+                    if done:
+                        return serving.result()
+            finally:
+                serving.cancel()
+                await asyncio.gather(serving, return_exceptions=True)
+
+    previous = signal.signal(signal.SIGINT, record_interrupt)
+    try:
+        with TrialLog.listening(path, settings) as log:
+            service = TrialHandoff(log)
+            thread = Thread(target=poll, name="trial-mail")
+            thread.start()
+            try:
+                if not interrupted:
+                    service.run()
+            finally:
+                stop.set()
+                closed.wait()
+                thread.join()
+    finally:
+        signal.signal(signal.SIGINT, previous)
+        if interrupted:
+            signal.raise_signal(signal.SIGINT)
