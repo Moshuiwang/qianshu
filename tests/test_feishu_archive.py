@@ -80,6 +80,12 @@ def setup(tmp_path, monkeypatch):
     def register(b=batch, **kwargs):
         args = dict(approved_country="区域甲", email_verified=True, owner_release="X8a",
                     expires=time.time()+60, sensitive_values=())
+        if "preview_fingerprint" not in kwargs:
+            try:
+                preview = a.preview_archive_batch(b, config=cfg, sensitive_values=kwargs.get("sensitive_values", ()))
+                args["preview_fingerprint"] = preview.fingerprint
+            except ValueError:
+                pass
         a.register_archive_batch(b, ledger_path=path, **(args | kwargs))
 
     def run(b=batch, **kwargs):
@@ -206,10 +212,10 @@ def test_sensitive_excerpt_never_leaves_transport(setup, mode):
         fields[key] = SourceExcerpt(start=body.rindex(text), text=text)
     batch = replace(batch, body=body, policies=(a.ArchivePolicy("定向政策", (fields,)),))
     register(batch, sensitive_values=(secret,))
-    assert isinstance(run(batch, sensitive_values=(secret,)), a.ArchiveSuccess)
+    # 必需明细被整段遮盖时不得交付链接（审核 P1-5）；敏感片段在任何情况下都不得出站。
+    assert isinstance(run(batch, sensitive_values=(secret,)), a.ArchiveFailed)
     payload = json.dumps(stub.writes, ensure_ascii=False)
     assert all(s not in payload for s in [header, secret, fragment, *parts])
-    assert "[已脱敏]" in payload and "标签原文" in payload
 
 
 def test_lost_local_receipt_freezes_without_replay(setup):
@@ -329,3 +335,142 @@ def test_unreadable_share_permission_remains_unknown(setup):
     assert isinstance(result, a.ArchiveUnknown) and not hasattr(result, "url")
     assert run() == result
     assert stub.pages["Public"] == stub.pages["Target"] == ["历史行"]
+
+
+def test_unavailable_grant_freezes_late_ack(setup):
+    _, path, _, stub, register, run = setup
+    register()
+    stub.pause = "Public"
+    with ThreadPoolExecutor(1) as pool:
+        owner = pool.submit(run)
+        assert stub.landed.wait(15)
+        try:
+            path.chmod(0o640)
+            assert isinstance(run(), a.ArchiveUnknown)
+        finally:
+            path.chmod(0o600)
+            stub.release.set()
+        assert isinstance(owner.result(), a.ArchiveUnknown)
+    writes = list(stub.writes)
+    assert isinstance(run(), a.ArchiveUnknown) and stub.writes == writes
+
+
+def test_journal_restore_in_place_stops(setup):
+    batch, _, _, stub, register, run = setup
+    register()
+    journal = a._journal(batch.registration)
+    backup = journal.with_suffix(".backup")
+    shutil.copyfile(journal, backup)
+    assert isinstance(run(), a.ArchiveSuccess)
+    writes = list(stub.writes)
+    shutil.copyfile(backup, journal)
+    assert isinstance(run(), a.ArchiveUnknown) and stub.writes == writes
+
+
+def excerpt_batch(batch, field, context, quote):
+    body = batch.body + "\n" + context
+    fields = dict(batch.policies[0].groups[0])
+    fields[field] = SourceExcerpt(start=body.rindex(quote), text=quote)
+    return replace(batch, body=body, policies=(a.ArchivePolicy("定向政策", (fields,)),))
+
+
+@pytest.mark.parametrize("label,quote,allowed", [
+    ("> From: synthetic\r\n> \t", "模拟续行", False),
+    ("Scenario: ", "仅面向现有用户", True),
+    ("> From: synthetic\r\n> Scenario: ", "仅面向现有用户", True),
+    (">From: synthetic\r\n> ", "模拟续行", False),
+    ("Subject: ", "模拟主题", False),
+])
+def test_required_scenario_visibility(setup, label, quote, allowed):
+    batch, _, _, stub, register, run = setup
+    batch = excerpt_batch(batch, "使用场景", label + quote, quote)
+    register(batch)
+    result = run(batch)
+    if allowed:
+        assert isinstance(result, a.ArchiveSuccess)
+        assert quote in json.dumps(stub.writes, ensure_ascii=False)
+    else:
+        assert isinstance(result, a.ArchiveFailed) and not stub.writes
+
+
+def test_sdk_project_log_hides_document_ids(setup, monkeypatch):
+    import io
+    import logging
+    import httpx
+    from lark_oapi.core.token import TokenManager
+    from qianshu.logs import setup_logging
+
+    _, _, cfg, stub, register, run = setup
+    monkeypatch.setattr(TokenManager.cache, "get", lambda key: "synthetic")
+    client = httpx.AsyncClient
+
+    def reply(req):
+        body = json.loads(req.content) if req.content else None
+        data = stub.request(req.method, req.url.path, query=dict(req.url.params), body=body)
+        return httpx.Response(200, json={"code": 0, "data": data})
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda: client(transport=httpx.MockTransport(reply)))
+    stream = io.StringIO()
+    root = logging.getLogger()
+    with monkeypatch.context() as patch:
+        patch.setattr(root, "handlers", [])
+        patch.setattr(root, "level", logging.INFO)
+        patch.setattr("sys.stderr", stream)
+        setup_logging(cfg)
+        register()
+        assert isinstance(run(transport=None), a.ArchiveSuccess)
+        logging.getLogger("httpx").info("ordinary request")
+    assert "archive_request " in stream.getvalue()
+    assert "ordinary request" in stream.getvalue()
+    assert all(s not in stream.getvalue() for s in ("Created", "Target", "/open-apis/"))
+
+
+@pytest.mark.parametrize("binding", ["missing", "old_preview", "matching"])
+def test_x8b_preview_binds_exact_published_blocks(setup, binding):
+    batch, _, cfg, stub, register, run = setup
+    batch = replace(batch, purpose="X8b")
+    original = a.preview_archive_batch(batch, config=cfg)
+    quote = "政策原文\n内部审批备注\n模拟终端账号"
+    batch = excerpt_batch(batch, "政策内容", quote, quote)
+    preview = a.preview_archive_batch(batch, config=cfg)
+    assert quote in preview.body and preview.fingerprint != original.fingerprint
+    digest = {"missing": None, "old_preview": original.fingerprint, "matching": preview.fingerprint}[binding]
+    register(batch, owner_release="X8b", preview_fingerprint=digest)
+    result = run(batch)
+    if binding == "matching":
+        assert isinstance(result, a.ArchiveSuccess)
+        paragraphs = [child["text"]["elements"][0]["text_run"]["content"] for child in stub.pages["Created"]]
+        assert tuple(paragraphs) == preview.blocks
+    else:
+        assert isinstance(result, a.ArchiveFailed) and stub.writes == []
+
+
+@pytest.mark.parametrize("parts", [
+    ("可公开说明\n> From: synthetic\r\n> \t模拟续行", "模拟续行"),
+    ("可公开说明材料禁止", "材料禁止"),
+])
+def test_partially_visible_required_excerpt(setup, parts):
+    batch, _, _, stub, register, run = setup
+    text, hidden = parts
+    batch = excerpt_batch(batch, "使用场景", text, text)
+    sensitive = ("组合密钥材料禁止披露",)
+    register(batch, sensitive_values=sensitive)
+    assert isinstance(run(batch, sensitive_values=sensitive), a.ArchiveSuccess)
+    payload = json.dumps(stub.writes, ensure_ascii=False)
+    assert "可公开说明" in payload and "[已脱敏]" in payload and hidden not in payload
+
+
+def test_split_secret_with_visible_detail_on_both_sides(setup):
+    batch, _, _, stub, register, run = setup
+    left, right = "活动说明材料", "禁止数量说明"
+    body = batch.body + "\n" + left + "\n" + right
+    fields = dict(batch.policies[0].groups[0])
+    for field, quote in zip(a._FIELDS[:2], (left, right), strict=True):
+        fields[field] = SourceExcerpt(start=body.index(quote), text=quote)
+    batch = replace(batch, body=body, policies=(a.ArchivePolicy("定向政策", (fields,)),))
+    sensitive = ("组合密钥材料禁止披露",)
+    register(batch, sensitive_values=sensitive)
+    assert isinstance(run(batch, sensitive_values=sensitive), a.ArchiveSuccess)
+    payload = json.dumps(stub.writes, ensure_ascii=False)
+    assert "活动说明[已脱敏]" in payload and "[已脱敏]数量说明" in payload
+    assert "材料" not in payload and "禁止" not in payload

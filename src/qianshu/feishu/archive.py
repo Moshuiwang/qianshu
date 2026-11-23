@@ -21,6 +21,7 @@ from uuid import NAMESPACE_URL, uuid5
 
 from qianshu.config import LOGGABLE_CONFIG_KEYS, Config
 from qianshu.draft import SourceExcerpt
+from qianshu.logs import archive_request_fingerprint
 from qianshu.pipeline import _CardRedaction
 
 from .handoff import _CREDENTIAL_PATTERN, _file
@@ -36,8 +37,12 @@ _JOURNALS = Path(__file__).resolve().parents[3] / ".private" / "archive-journals
 _WAIT = 0.5
 _PAGE = re.compile(r"https://(?:[a-z0-9-]+\.)?feishu\.cn/(wiki|docx)/([a-zA-Z0-9]+)")
 _HEADER = re.compile(
-    r"(?im)^[ \t>]*(?:[a-z][a-z0-9-]*|发件人|收件人|抄送|主题|发送时间)[ \t]*[:：]"
-    r"[^\r\n]*(?:\r?\n[ \t]+[^\r\n]*)*"
+    r"(?im)^(?P<header_prefix>[ \t>]*)(?:from|to|cc|bcc|subject|date|sender|reply-to|message-id|in-reply-to|references|"
+    r"received|return-path|delivered-to|mime-version|content-type|content-disposition|"
+    r"content-transfer-encoding|content-id|content-language|authentication-results|dkim-signature|"
+    r"resent-(?:from|to|cc|bcc|date|sender|message-id)|x-(?:mailer|original-to|forwarded-to)|"
+    r"发件人|收件人|抄送|主题|发送时间)[ \t]*[:：]"
+    r"[^\r\n]*(?:\r?\n(?:(?P=header_prefix)|(?:[ \t]*>[ ]?+)*)[ \t]+[^\r\n]*)*"
 )
 _ADDRESS = re.compile(r"(?i)https?://[^\s<>]+|[\w.+%-]+@[\w.-]+")
 _DOCS = "/open-apis/docx/v1/documents"
@@ -105,7 +110,12 @@ class _SDK:
         req = (BaseRequest.builder().http_method(HttpMethod[method]).uri(path)
                .token_types({AccessTokenType.TENANT}).queries(list(query.items())).body(body).build())
         # 异步 SDK 传输使用 httpx，默认禁止重定向、重试。
-        response = asyncio.run(self.client.arequest(req))
+        fingerprint = hashlib.sha256(json.dumps([method, path, query], sort_keys=True).encode()).hexdigest()
+        token = archive_request_fingerprint.set(fingerprint)
+        try:
+            response = asyncio.run(self.client.arequest(req))
+        finally:
+            archive_request_fingerprint.reset(token)
         raw = response.raw
         if raw.status_code in (401, 403):
             raise ArchiveRejected
@@ -157,12 +167,14 @@ def initialize_archive_ledger(path: Path):
     with _database(path) as db:
         db.execute("""CREATE TABLE grants (
             registration TEXT PRIMARY KEY, digest TEXT NOT NULL, country TEXT NOT NULL,
-            verified INTEGER NOT NULL, release TEXT NOT NULL, expires REAL NOT NULL, registry TEXT NOT NULL
+            verified INTEGER NOT NULL, release TEXT NOT NULL, expires REAL NOT NULL, registry TEXT NOT NULL,
+            preview TEXT, version INTEGER NOT NULL DEFAULT 0, halted INTEGER NOT NULL DEFAULT 0
         )""")
 
 
 def register_archive_batch(batch, *, ledger_path, approved_country, email_verified,
-                           owner_release, expires, sensitive_values: tuple[str, ...]):
+                           owner_release, expires, sensitive_values: tuple[str, ...],
+                           preview_fingerprint: str | None = None):
     """仅供私有登记入口使用。核验、建单国家及当次 X8 确认来自可信记录。"""
     _JOURNALS.mkdir(mode=0o700, exist_ok=True, parents=True)
     path = _journal(batch.registration)
@@ -170,20 +182,24 @@ def register_archive_batch(batch, *, ledger_path, approved_country, email_verifi
         grants.execute("BEGIN IMMEDIATE")
         if grants.execute("SELECT 1 FROM grants WHERE registration=?", (batch.registration,)).fetchone():
             raise ValueError("该批已有授权登记，须核对原执行记录。")
+        if "preview" not in {col["name"] for col in grants.execute("PRAGMA table_info(grants)")}:
+            grants.execute("ALTER TABLE grants ADD COLUMN preview TEXT")
+            grants.execute("ALTER TABLE grants ADD COLUMN version INTEGER NOT NULL DEFAULT 0")
+            grants.execute("ALTER TABLE grants ADD COLUMN halted INTEGER NOT NULL DEFAULT 0")
         _exclusive_file(path)
         _exclusive_file(path.with_suffix(".lock"))
         with _database(path) as journal:
             journal.execute("""CREATE TABLE run (
                 id INTEGER PRIMARY KEY CHECK(id=1), dev INTEGER, ino INTEGER,
                 digest TEXT, plan TEXT, state TEXT, step INTEGER, stage TEXT,
-                doc TEXT, reason TEXT)""")
+                doc TEXT, reason TEXT, version INTEGER NOT NULL, registration TEXT NOT NULL)""")
             journal.execute("CREATE TABLE receipts (step INTEGER PRIMARY KEY, reference TEXT)")
             identity = ledger_path.stat()
-            journal.execute("INSERT INTO run VALUES (1,?,?,?,'','ready',0,'prepare','','')",
-                            (identity.st_dev, identity.st_ino, batch.fingerprint()))
-        grants.execute("INSERT INTO grants VALUES (?,?,?,?,?,?,?)", (
+            journal.execute("INSERT INTO run VALUES (1,?,?,?,'','ready',0,'prepare','','',0,?)",
+                            (identity.st_dev, identity.st_ino, batch.fingerprint(), batch.registration))
+        grants.execute("INSERT INTO grants VALUES (?,?,?,?,?,?,?,?,0,0)", (
             batch.registration, batch.fingerprint(), approved_country, email_verified is True,
-            owner_release, expires, _registry_digest(sensitive_values),
+            owner_release, expires, _registry_digest(sensitive_values), preview_fingerprint,
         ))
 
 
@@ -226,6 +242,8 @@ def _material(batch, config, registered):
     # 保留坐标保护，并在全部摘录拼合后再查登记片段。来源为已知凭据的短引文也遮蔽。
     quotes = ["[已脱敏]" if any(q in s for s in literals) else q for q in quotes]
     safe = list(redact.free_texts(quotes))
+    if any(not value.replace("[已脱敏]", "").strip() for value in safe):
+        raise ValueError
     if (sensitive.search(batch.country) or any(f in batch.country for f in fragments)
             or any(batch.country in s for s in secrets)):
         raise ValueError
@@ -243,6 +261,27 @@ def _material(batch, config, registered):
         if sensitive.search(text) or any(text[i:i+4] in fragments for i in range(len(text)-3)):
             raise ValueError
     return title, blocks, summaries
+
+
+@dataclass(frozen=True, repr=False)
+class ArchivePreview:
+    title: str
+    blocks: tuple[str, ...]
+    summaries: tuple[tuple[str, str], ...]
+
+    @property
+    def body(self):
+        return "\n".join(self.blocks)
+
+    @property
+    def fingerprint(self):
+        return hashlib.sha256(json.dumps(asdict(self), ensure_ascii=False).encode()).hexdigest()
+
+
+def preview_archive_batch(batch, *, config, sensitive_values=()) -> ArchivePreview:
+    """生成待核对的正文段落和汇总行前缀。材料不完整时抛出 ValueError。"""
+    title, blocks, summaries = _material(batch, config, sensitive_values)
+    return ArchivePreview(title, tuple(blocks), tuple(summaries.items()))
 
 
 def _targets(config, request):
@@ -282,7 +321,15 @@ def _url(doc):
 
 
 def _row(db):
-    return db.execute("SELECT * FROM run WHERE id=1").fetchone()
+    row = db.execute("""SELECT run.*, grants.version AS expected, grants.halted
+                        FROM run JOIN witness.grants USING (registration) WHERE id=1""").fetchone()
+    if row is None or row["halted"]:
+        raise sqlite3.DatabaseError("授权记录无法核对")
+    # 仅恢复了较旧授权库时，完整的成功终态可回读；执行历史落后则一律冻结。
+    cached_success = row["state"] == "success" and row["version"] > row["expected"]
+    if row["version"] != row["expected"] and not cached_success:
+        raise sqlite3.DatabaseError("执行版本不一致")
+    return row
 
 
 def _freeze(db):
@@ -320,9 +367,10 @@ def _registry_digest(values):
     return hashlib.sha256(json.dumps(sorted(set(values))).encode()).hexdigest()
 
 
-def _authorized(grants, batch, digest, registry):
+def _authorized(grants, batch, digest, registry, preview=None):
     grant = grants.execute("SELECT * FROM grants WHERE registration=?", (batch.registration,)).fetchone()
     return (grant and grant["digest"] == digest and grant["registry"] == registry and grant["verified"] == 1
+            and not grant["halted"] and (preview is None or grant["preview"] == preview)
             and grant["country"] == batch.country and grant["release"] == batch.purpose
             and batch.purpose in ("X8a", "X8b") and math.isfinite(grant["expires"])
             and time.time() < grant["expires"])
@@ -334,17 +382,18 @@ def _execute(db, grants, batch, config, digest, material, transport, registry):
         return _freeze(db) if row["state"] == "sending" else _result(row)
     request = (transport if transport is not None else _SDK(config)).request
     pages = _targets(config, request)
-    title, blocks, summaries = material
+    title, blocks, summaries = material.title, material.blocks, dict(material.summaries)
     chunks = [blocks[i:i+40] for i in range(0, len(blocks), 40)]
     steps = [("create", None), *(("details", chunk) for chunk in chunks),
              ("share", None), ("verify", None), *(("summary", k) for k in pages if k in summaries)]
     plan = hashlib.sha256(json.dumps([pages, blocks, config["FEISHU_APP_ID"]]).encode()).hexdigest()
     if row["plan"] and row["plan"] != plan:
         return _freeze(db)
+    preview = material.fingerprint
     doc = row["doc"]
     for index in range(row["step"], len(steps)):
         stage, arg = steps[index]
-        if not _authorized(grants, batch, digest, registry):
+        if not _authorized(grants, batch, digest, registry, preview):
             db.execute("UPDATE run SET state='failed', reason='gate' WHERE state='ready'")
             return _result(_row(db))
         claim = db.execute("""UPDATE run SET state='sending', stage=?, plan=?
@@ -398,35 +447,61 @@ def archive_batch(batch: VerifiedArchiveBatch, *, config: Config, ledger_path: P
                   transport: ArchiveTransport | None = None, sensitive_values: tuple[str, ...] = ()
                   ) -> ArchiveSuccess | ArchiveFailed | ArchiveUnknown:
     """同步入口。额外的登记敏感值取自受信私有配置；结果只在成功时携带链接。"""
+    path = None
     try:
         batch = deepcopy(batch)
-        registry = _registry_digest(sensitive_values)
         path = _journal(batch.registration)
+        registry = _registry_digest(sensitive_values)
         with _database(ledger_path) as grants:
             if not path.exists():
                 registered = grants.execute("SELECT 1 FROM grants WHERE registration=?",
                                             (batch.registration,)).fetchone()
                 if registered:
-                    return ArchiveUnknown("ledger", "missing_history")
+                    raise sqlite3.DatabaseError("缺少执行记录")
                 return ArchiveFailed("prepare", "missing_registration")
             with _database(path) as db, os.fdopen(_file(path.with_suffix(".lock")), "rb") as lock:
-                return _archive_registered(db, lock, grants, ledger_path, batch, config,
+                identity = ledger_path.stat()
+                binding = db.execute("SELECT dev, ino FROM run WHERE id=1").fetchone()
+                if not binding or tuple(binding) != (identity.st_dev, identity.st_ino):
+                    db.execute("UPDATE run SET state='unknown' WHERE state IN ('ready','sending')")
+                    return ArchiveUnknown("ledger", "identity")
+                # 状态与独立版本号通过 SQLite 多库事务一同提交。
+                db.execute("ATTACH DATABASE ? AS witness", (ledger_path.absolute().as_uri() + "?mode=rw",))
+                db.execute("""CREATE TEMP TRIGGER advance AFTER UPDATE OF state ON main.run BEGIN
+                    SELECT CASE WHEN NOT EXISTS (
+                        SELECT 1 FROM grants WHERE registration=OLD.registration AND version=OLD.version AND halted=0
+                    ) THEN RAISE(ABORT, 'checkpoint') END;
+                    UPDATE grants SET version=version+1 WHERE registration=OLD.registration;
+                    UPDATE run SET version=version+1 WHERE id=NEW.id;
+                END""")
+                return _archive_registered(db, lock, grants, batch, config,
                                            transport, sensitive_values, registry)
     except (OSError, sqlite3.Error, ValueError, AttributeError, TypeError):
+        if path is not None:
+            # 两侧分别落冻结标记；任一文件暂时失联，另一侧仍能拦住迟到回执。
+            for database, statement, args in (
+                (path, "UPDATE run SET state='unknown', reason='unconfirmed' WHERE id=1", ()),
+                (ledger_path, "UPDATE grants SET halted=1 WHERE registration=?", (batch.registration,)),
+            ):
+                try:
+                    with _database(database) as available:
+                        available.execute(statement, args)
+                except (OSError, ValueError, sqlite3.Error):
+                    continue
         return ArchiveUnknown("ledger", "unavailable")
 
 
-def _archive_registered(db, lock, grants, ledger_path, batch, config, transport, sensitive_values, registry):
+def _archive_registered(db, lock, grants, batch, config, transport, sensitive_values, registry):
     row = _row(db)
-    identity = ledger_path.stat()
-    if (row["dev"], row["ino"]) != (identity.st_dev, identity.st_ino):
-        _freeze(db)
-        return ArchiveUnknown("ledger", "identity")
     digest = batch.fingerprint()
     if digest != row["digest"] or not _authorized(grants, batch, digest, registry):
         return _deny(db, "gate")
     try:
-        material = _material(batch, config, sensitive_values)
+        material = preview_archive_batch(batch, config=config, sensitive_values=sensitive_values)
+        grant = grants.execute("SELECT preview FROM grants WHERE registration=?",
+                               (batch.registration,)).fetchone()
+        if not grant or grant["preview"] != material.fingerprint:
+            return _deny(db, "preview")
     except (KeyError, TypeError, AttributeError, ValueError):
         return _deny(db, "material")
     try:
