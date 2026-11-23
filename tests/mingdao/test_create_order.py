@@ -1561,7 +1561,7 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
     order.exclusive(config_path, case.config)
     draft = {**deepcopy(case.values), **draft_inputs}
     if mode == "template_conflict":
-        set_mutex_template(case, platform, "否")
+        draft["maintain_mutual_exclusion_group"] = "否"
     if mode == "missing_user_scope":
         del draft["user_scope"]
     if mode == "duplicate_draft_package":
@@ -2655,3 +2655,12 @@ def test_benefit_declaration_uses_trusted_option(case, platform, business_cli, d
     control = case.control["benefit_type"]
     assert "优惠类型：赠送时长" in business_cli.summaries[0].splitlines()
     assert json.loads(platform.created_cells[control]) == [platform.template[control][0]["key"]]
+
+
+def test_template_conflict_reverse_direction(case, platform, business_cli):
+    assert case.values["maintain_mutual_exclusion_group"] == "是"
+    set_mutex_template(case, platform, "否")
+    code, error = business_cli.run()
+    assert code == 1 and "互斥组" in error
+    assert platform.create_count == 0
+    assert not business_cli.summaries and not business_cli.notices
