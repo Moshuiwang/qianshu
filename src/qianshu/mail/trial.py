@@ -2,7 +2,7 @@
 
 import json
 import logging
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from uuid import uuid4
@@ -354,7 +354,7 @@ class Trial:
 
 
 def run_service(args, settings, path, switches):
-    from threading import Event, Thread
+    from threading import Event, Thread, current_thread
 
     from dotenv import dotenv_values
     from qianshu.config import load_config
@@ -399,20 +399,30 @@ def run_service(args, settings, path, switches):
             store.db.close()
 
     class TrialLog(MentionLog):
+        _listener_thread = None
+
         @contextmanager
-        def listener(self):
-            with super().listener():
-                thread = Thread(target=poll, name="trial-mail")
-                thread.start()
+        def listener(self, *, create=False):
+            # 同一服务线程嵌套进入时，外层 listening 仍持有锁。
+            if self._listener_thread is current_thread():
+                yield
+                return
+            with super().listener(create=create):
+                self._listener_thread = current_thread()
                 try:
                     yield
                 finally:
-                    stop.set()
-                    thread.join()
+                    self._listener_thread = None
 
     def send(content, request_id, card, check):
         _send_trial_message(service.transport, content, request_id, card, check)
 
-    with closing(TrialLog(path, settings, create=True)) as log:
+    with TrialLog.listening(path, settings) as log:
         service = HandoffService(log)
-        service.run()
+        thread = Thread(target=poll, name="trial-mail")
+        thread.start()
+        try:
+            service.run()
+        finally:
+            stop.set()
+            thread.join()
