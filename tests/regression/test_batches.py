@@ -565,3 +565,230 @@ def test_capture_requests_accepts_v040_client_signature(monkeypatch):
     snapshot = {"documents": {"fixture": {"body": "合成正文"}}, "companies_text": ""}
     rules = Path(__file__).resolve().parents[2] / "rules"
     assert batches.capture_requests(snapshot, rules, False, {}) == {"fixture": '{"application": "合成正文"}'}
+
+
+def shape_retry_sdk(monkeypatch, *, repaired, lose_retry_response=False):
+    from test_regression import BATCH, _stream_reply_events, fixed_reply
+
+    submissions = {}
+    envelopes = []
+    instant = []
+
+    def payload_for(messages):
+        body = json.loads(messages[0]["content"])["application"]
+        payload = fixed_reply(body, [{}])
+        if body == BATCH and (len(messages) == 1 or not repaired):
+            del payload["policies"][0]["fields"]["country"]["evidence"]
+        return payload
+
+    def respond(request):
+        if request.url.path.endswith("/messages"):
+            instant.append(request.content.decode())
+            payload = payload_for(json.loads(request.content)["messages"])
+            return httpx.Response(200, headers={"content-type": "text/event-stream"},
+                                  content=b"".join(_stream_reply_events(json.dumps(payload))))
+        if request.method == "POST":
+            batch_id = f"batch-{len(submissions) + 1}"
+            envelopes.append(request.content.decode())
+            submissions[batch_id] = json.loads(request.content)["requests"]
+            if lose_retry_response and len(envelopes) == 2:
+                raise httpx.ReadError("synthetic")
+            return httpx.Response(200, json={"id": batch_id})
+        batch_id = request.url.path.split("/")[-1]
+        if batch_id != "results":
+            return httpx.Response(200, json={"id": batch_id, "processing_status": "ended",
+                                            "results_url": f"https://fixture.invalid/{batch_id}/results"})
+        rows = []
+        for item in submissions[request.url.path.split("/")[-2]]:
+            messages = item["params"]["messages"]
+            payload = payload_for(messages)
+            message = {"stop_reason": "tool_use", "usage": {"input_tokens": 3, "output_tokens": 2},
+                       "content": [{"type": "tool_use", "name": "submit_application_reply", "input": payload}]}
+            rows.append(json.dumps({"custom_id": item["custom_id"], "result": {"type": "succeeded", "message": message}}))
+        return httpx.Response(200, content="\n".join(rows).encode())
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(respond), **kw))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
+    return envelopes, instant
+
+
+def shape_args(frozen, mode):
+    return [*run_args(frozen, ".private/" + mode), "--live", "--mode", mode, "--run-id", mode,
+            "--estimate-usd", "1", "--release"]
+
+
+@pytest.mark.parametrize("repaired", [True, False])
+def test_batch_shape_retry_missing_evidence(repo, frozen, monkeypatch, repaired):
+    envelopes, _ = shape_retry_sdk(monkeypatch, repaired=repaired)
+    assert main(shape_args(frozen, "batch")) == 0
+    report = get_json(repo / "batch/public-report.json")
+    assert report["documents"]["first_shape_errors"] == 1
+    first, final = get_json(repo / "batch/document-00001.json")["attempts"]
+    assert first["first_shape_error"] == final["first_shape_error"] == "missing_evidence"
+    assert final["retry_result"] == ("succeeded" if repaired else "failed")
+    assert [len(json.loads(raw)["requests"]) for raw in envelopes] == [2, 1]
+    messages = json.loads(envelopes[1])["requests"][0]["params"]["messages"]
+    feedback = [json.loads(item["content"]) for item in messages[-1]["content"]]
+    assert feedback == [{"reason": "missing_evidence", "path": ["policies", 0, "fields", "country", "evidence"]}]
+    assert report["business"]["counts"]["reply_parse_failed"] == int(not repaired)
+    assert report["documents"]["parsed"] == 1 + int(repaired)
+    assert report["usage"]["attempts"] == 3
+    assert report["usage"]["input_tokens"]["total"] == 9
+    details = get_json(repo / "batch/mismatches.json")
+    document = next(doc for doc in details["documents"] if doc["token"] == "doc-batch")
+    assert len(document.get("drafts", [])) == int(repaired)
+
+
+def test_batch_shape_retry_matches_instant_bytes(repo, frozen, monkeypatch):
+    envelopes, instant = shape_retry_sdk(monkeypatch, repaired=True)
+    for mode in ("instant", "batch"):
+        assert main(shape_args(frozen, mode)) == 0
+    correction, = [raw for raw in instant if len(json.loads(raw)["messages"]) > 1]
+    _, retry = envelopes
+    item, = json.loads(retry)["requests"]
+    batches.verify_envelope(retry, {item["custom_id"]: batches.common_body(correction)})
+
+    recorded = [get_json(repo / mode / "document-00001.json")["attempts"] for mode in ("instant", "batch")]
+    for direct, batched in zip(*recorded, strict=True):
+        assert direct.keys() == batched.keys()
+    assert recorded[1][-1]["request"] == correction
+
+
+def test_batch_shape_retry_reconciles_lost_create(repo, frozen, monkeypatch):
+    envelopes, _ = shape_retry_sdk(monkeypatch, repaired=True, lose_retry_response=True)
+    args = shape_args(frozen, "batch")
+    assert main(args) == 1
+    ledger = repo / "regression-ledger.json"
+    assert get_json(ledger)["batch"]["active"]
+    assert main([*args, "--resume"]) == 1
+    assert main([*args, "--resume", "--reconcile-batch-id", "batch-2"]) == 0
+    report = get_json(repo / "batch/public-report.json")
+    row = get_json(ledger)["batch"]
+    assert not row["active"] and row["spent_usd"] == report["cost"]["known_usd"]
+    assert len(row["item_costs"]) == 3
+    assert len(envelopes) == 2
+
+
+def counterexample_sdk(monkeypatch, *, double_tool=False, lose_response=False, on_retry=None):
+    from test_regression import _stream_reply_events, fixed_reply
+
+    posts = []
+    tool = {"type": "tool_use", "name": "submit_application_reply"}
+
+    def respond(request):
+        if request.method == "POST":
+            body = json.loads(request.content)
+            if "requests" in body:
+                posts.append(body["requests"])
+                if len(posts) == 2 and on_retry:
+                    on_retry()
+                if len(posts) == 2 and lose_response:
+                    raise httpx.ReadError("synthetic")
+                return httpx.Response(200, json={"id": f"round-{len(posts)}"})
+            messages = body["messages"]
+            if len(messages) == 1:
+                first = list(_stream_reply_events('{"x":1e400}'))
+                second = [event.replace(b'"index": 0', b'"index": 1') for event in
+                          list(_stream_reply_events("{}"))[1:-2]]
+                events = first[:-2] + second + first[-2:]
+            else:
+                application = json.loads(messages[0]["content"])["application"]
+                events = _stream_reply_events(json.dumps(fixed_reply(application, [{}])))
+            return httpx.Response(200, content=b"".join(events), headers={"content-type": "text/event-stream"})
+        batch_id = request.url.path.split("/")[-1]
+        if batch_id != "results":
+            return httpx.Response(200, json={"id": batch_id, "processing_status": "ended",
+                                            "results_url": f"https://fixture.invalid/{batch_id}/results"})
+        index = int(request.url.path.split("/")[-2].split("-")[1]) - 1
+        item, = posts[index]
+        application = json.loads(item["params"]["messages"][0]["content"])["application"]
+        payload = fixed_reply(application, [{}])
+        if index == 0:
+            del payload["policies"][0]["fields"]["country"]["evidence"]
+        content = [{**tool, "input": payload}]
+        if double_tool and index == 0:
+            content = [{**tool, "input": {"x": "overflow"}}, {**tool, "input": {}}]
+        message = {"stop_reason": "tool_use", "content": content,
+                   "usage": {"input_tokens": 1 if index else 1300000, "output_tokens": 0}}
+        line = json.dumps({"custom_id": item["custom_id"], "result": {"type": "succeeded", "message": message}})
+        return httpx.Response(200, content=line.replace('"overflow"', '1e400').encode())
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(respond), **kw))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
+    return posts
+
+
+def test_overflow_double_tool_scores_match(repo, frozen, monkeypatch):
+    counterexample_sdk(monkeypatch, double_tool=True)
+    scores = []
+    for mode in ("instant", "batch"):
+        args = shape_args(frozen, mode)[:-1] + ["--trial", "1"]
+        assert main(args) == 0
+        report = get_json(repo / mode / "public-report.json")
+        scores.append(report["business"])
+        assert report["usage"]["attempts"] == 2
+        assert report["business"]["counts"]["reply_parse_failed"] == 0
+        doc, = get_json(repo / mode / "mismatches.json")["documents"]
+        assert len(doc["drafts"]) == 1
+    assert scores[0] == scores[1]
+
+
+@pytest.mark.parametrize("at_limit", [True, False])
+def test_correction_commitment_before_post(repo, frozen, monkeypatch, at_limit):
+    path = Path("regression-ledger.json")
+    observed = []
+
+    def observe_commitment():
+        observed.append(Decimal(get_json(repo / path)["batch"]["committed_usd"]))
+
+    posts = counterexample_sdk(monkeypatch, lose_response=True, on_retry=observe_commitment)
+    if at_limit:
+        with PrivateFiles(repo.parent).open() as files:
+            ledger = Ledger(files, path)
+            ledger.reserve("prior", "instant", "1", "prior")
+            ledger.settle("prior", Decimal("108.70"), False)
+    args = shape_args(frozen, "batch")[:-1] + ["--trial", "1"]
+    assert main(args) == 1
+    entry = get_json(repo / path)["batch"]
+    assert Decimal(entry["spent_usd"]) == Decimal("1.30")
+    assert len(posts) == (1 if at_limit else 2)
+    assert observed == ([] if at_limit else [Decimal("1.30")])
+    if at_limit:
+        assert main([*args, "--resume"]) == 1
+        assert len(posts) == 1 and not entry["active"]
+    else:
+        assert Decimal(entry["committed_usd"]) == Decimal("1.30")
+        assert main([*args, "--resume"]) == 1
+        assert get_json(repo / path)["batch"] == entry
+        assert main([*args, "--resume", "--reconcile-batch-id", "round-2"]) == 0
+        assert len(posts) == 2
+        settled = get_json(repo / path)["batch"]
+        assert Decimal(settled["spent_usd"]) == Decimal("1.300001")
+        assert Decimal(settled["committed_usd"]) == 0
+
+
+@pytest.mark.parametrize("drop_marker", [True, False])
+def test_recording_rechecks_raw_shape_and_reports_settled_cost(repo, frozen, monkeypatch, capsys, drop_marker):
+    from qianshu.regression.recording import Recording
+
+    counterexample_sdk(monkeypatch)
+    finish = Recording.finish
+
+    def truncate(self, *args, **kwargs):
+        first, _ = self.document["attempts"]
+        self.document["attempts"] = [first]
+        if drop_marker:
+            first.pop("first_shape_error")
+        return finish(self, *args, **kwargs)
+
+    monkeypatch.setattr(Recording, "finish", truncate)
+    args = shape_args(frozen, "batch")[:-1] + ["--trial", "1"]
+    assert main(args) == 1
+    assert "发布已停止，费用已登记" in capsys.readouterr().err
+    assert not (repo / "batch/recording.json").exists()
+    row = get_json(repo / "regression-ledger.json")["batch"]
+    assert Decimal(row["spent_usd"]) == Decimal("1.300001") and not row["active"]
