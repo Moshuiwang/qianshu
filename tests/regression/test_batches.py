@@ -669,3 +669,126 @@ def test_batch_shape_retry_reconciles_lost_create(repo, frozen, monkeypatch):
     assert not row["active"] and row["spent_usd"] == report["cost"]["known_usd"]
     assert len(row["item_costs"]) == 3
     assert len(envelopes) == 2
+
+
+def counterexample_sdk(monkeypatch, *, double_tool=False, lose_response=False, on_retry=None):
+    from test_regression import _stream_reply_events, fixed_reply
+
+    posts = []
+    tool = {"type": "tool_use", "name": "submit_application_reply"}
+
+    def respond(request):
+        if request.method == "POST":
+            body = json.loads(request.content)
+            if "requests" in body:
+                posts.append(body["requests"])
+                if len(posts) == 2 and on_retry:
+                    on_retry()
+                if len(posts) == 2 and lose_response:
+                    raise httpx.ReadError("synthetic")
+                return httpx.Response(200, json={"id": f"round-{len(posts)}"})
+            messages = body["messages"]
+            if len(messages) == 1:
+                first = list(_stream_reply_events('{"x":1e400}'))
+                second = [event.replace(b'"index": 0', b'"index": 1') for event in
+                          list(_stream_reply_events("{}"))[1:-2]]
+                events = first[:-2] + second + first[-2:]
+            else:
+                application = json.loads(messages[0]["content"])["application"]
+                events = _stream_reply_events(json.dumps(fixed_reply(application, [{}])))
+            return httpx.Response(200, content=b"".join(events), headers={"content-type": "text/event-stream"})
+        batch_id = request.url.path.split("/")[-1]
+        if batch_id != "results":
+            return httpx.Response(200, json={"id": batch_id, "processing_status": "ended",
+                                            "results_url": f"https://fixture.invalid/{batch_id}/results"})
+        index = int(request.url.path.split("/")[-2].split("-")[1]) - 1
+        item, = posts[index]
+        application = json.loads(item["params"]["messages"][0]["content"])["application"]
+        payload = fixed_reply(application, [{}])
+        if index == 0:
+            del payload["policies"][0]["fields"]["country"]["evidence"]
+        content = [{**tool, "input": payload}]
+        if double_tool and index == 0:
+            content = [{**tool, "input": {"x": "overflow"}}, {**tool, "input": {}}]
+        message = {"stop_reason": "tool_use", "content": content,
+                   "usage": {"input_tokens": 1 if index else 1300000, "output_tokens": 0}}
+        line = json.dumps({"custom_id": item["custom_id"], "result": {"type": "succeeded", "message": message}})
+        return httpx.Response(200, content=line.replace('"overflow"', '1e400').encode())
+
+    monkeypatch.setattr(anthropic, "DefaultHttpxClient", lambda *, transport=None, **kw: httpx.Client(
+        transport=httpx.MockTransport(respond), **kw))
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "synthetic")
+    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://fixture.invalid")
+    return posts
+
+
+def test_overflow_double_tool_scores_match(repo, frozen, monkeypatch):
+    counterexample_sdk(monkeypatch, double_tool=True)
+    scores = []
+    for mode in ("instant", "batch"):
+        args = shape_args(frozen, mode)[:-1] + ["--trial", "1"]
+        assert main(args) == 0
+        report = get_json(repo / mode / "public-report.json")
+        scores.append(report["business"])
+        assert report["usage"]["attempts"] == 2
+        assert report["business"]["counts"]["reply_parse_failed"] == 0
+        doc, = get_json(repo / mode / "mismatches.json")["documents"]
+        assert len(doc["drafts"]) == 1
+    assert scores[0] == scores[1]
+
+
+@pytest.mark.parametrize("at_limit", [True, False])
+def test_correction_commitment_before_post(repo, frozen, monkeypatch, at_limit):
+    path = Path("regression-ledger.json")
+    observed = []
+
+    def observe_commitment():
+        observed.append(Decimal(get_json(repo / path)["batch"]["committed_usd"]))
+
+    posts = counterexample_sdk(monkeypatch, lose_response=True, on_retry=observe_commitment)
+    if at_limit:
+        with PrivateFiles(repo.parent).open() as files:
+            ledger = Ledger(files, path)
+            ledger.reserve("prior", "instant", "1", "prior")
+            ledger.settle("prior", Decimal("108.70"), False)
+    args = shape_args(frozen, "batch")[:-1] + ["--trial", "1"]
+    assert main(args) == 1
+    entry = get_json(repo / path)["batch"]
+    assert Decimal(entry["spent_usd"]) == Decimal("1.30")
+    assert len(posts) == (1 if at_limit else 2)
+    assert observed == ([] if at_limit else [Decimal("1.30")])
+    if at_limit:
+        assert main([*args, "--resume"]) == 1
+        assert len(posts) == 1 and not entry["active"]
+    else:
+        assert Decimal(entry["committed_usd"]) == Decimal("1.30")
+        assert main([*args, "--resume"]) == 1
+        assert get_json(repo / path)["batch"] == entry
+        assert main([*args, "--resume", "--reconcile-batch-id", "round-2"]) == 0
+        assert len(posts) == 2
+        settled = get_json(repo / path)["batch"]
+        assert Decimal(settled["spent_usd"]) == Decimal("1.300001")
+        assert Decimal(settled["committed_usd"]) == 0
+
+
+@pytest.mark.parametrize("drop_marker", [True, False])
+def test_recording_rechecks_raw_shape_and_reports_settled_cost(repo, frozen, monkeypatch, capsys, drop_marker):
+    from qianshu.regression.recording import Recording
+
+    counterexample_sdk(monkeypatch)
+    finish = Recording.finish
+
+    def truncate(self, *args, **kwargs):
+        first, _ = self.document["attempts"]
+        self.document["attempts"] = [first]
+        if drop_marker:
+            first.pop("first_shape_error")
+        return finish(self, *args, **kwargs)
+
+    monkeypatch.setattr(Recording, "finish", truncate)
+    args = shape_args(frozen, "batch")[:-1] + ["--trial", "1"]
+    assert main(args) == 1
+    assert "发布已停止，费用已登记" in capsys.readouterr().err
+    assert not (repo / "batch/recording.json").exists()
+    row = get_json(repo / "regression-ledger.json")["batch"]
+    assert Decimal(row["spent_usd"]) == Decimal("1.300001") and not row["active"]

@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from qianshu.parse import parse_application
 from qianshu.parse.model import (
-    ModelError, _REPLY_TOOL, _missing_shape, configured_model, recorded_shape_error, validate_reply_json,
+    ModelError, _REPLY_TOOL, _missing_shape, configured_model, validate_reply_json,
 )
 from qianshu.parse.protocol import ApplicationReply
 
@@ -176,7 +176,7 @@ def batch_attempt(line, *, first_shape_error=None, effort=None):
         a["failure_stage"] = "reply_tool_missing"
     elif len(tools) > 1:
         a["failure_stage"] = "reply_tool_multiple"
-        if not first_shape_error and recorded_shape_error(a):
+        if not first_shape_error and [name for name, _ in tools] == [_REPLY_TOOL, _REPLY_TOOL]:
             a["first_shape_error"] = "reply_tool_multiple"
             a["structure_path"] = ("content",)
     elif tools[0][0] != _REPLY_TOOL:
@@ -228,7 +228,7 @@ def raw_lines(response):
 
 
 def _fetch_round(ledger, run_id, estimate, config, wires, settings, *, run_day, resume, reconcile_id, correction):
-    """两轮共享运行预占，分别登记批次受理与每篇原始结果。"""
+    """每轮提交前登记预占与提交意图，按篇取回原始结果。"""
     files = ledger.files
     prefix = [run_id, "shape_retry"] if correction else [run_id]
     keys = {token: digest(json_bytes([*prefix, token])) for token in wires}
@@ -268,6 +268,8 @@ def _fetch_round(ledger, run_id, estimate, config, wires, settings, *, run_day, 
             with transaction(files, ledger.path) as runs:
                 if runs.get(run_id, {}).get("identity") != identity:
                     raise RegressionError("续取与原提交配置不一致。")
+        if correction and not resume:
+            ledger.reserve_correction(run_id, identity)
         if not resume:
             with round_state() as state:
                 if state:
@@ -322,7 +324,8 @@ def _fetch_round(ledger, run_id, estimate, config, wires, settings, *, run_day, 
                         if not conflict:
                             checksum = digest(line.encode())
                             if key not in seen:
-                                ledger.record_batch_item(run_id, key, checksum, batch_cost([line], model_id))
+                                ledger.record_batch_item(run_id, key, checksum, batch_cost([line], model_id),
+                                                         correction=correction)
                                 seen[key] = line
                             item.update(raw=line, sha256=checksum)
                     if conflict:

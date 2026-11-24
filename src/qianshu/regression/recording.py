@@ -10,7 +10,7 @@ from re import fullmatch
 from uuid import uuid4
 
 from qianshu.parse.model import (
-    REPLY_FORMAT_ERRORS, CallResult, ModelError, ModelReplyError, ParseModel, validate_reply_json,
+    REPLY_FORMAT_ERRORS, CallResult, ModelError, ModelReplyError, ParseModel, _REPLY_TOOL, recorded_shape_error, validate_reply_json,
 )
 from qianshu.parse.protocol import LEGACY_REPLY_STRUCTURE, PROTOCOL_VERSION, REPLY_STRUCTURE
 
@@ -28,6 +28,13 @@ def _interrupted_with_text(attempt: dict) -> bool:
     return attempt["failure_stage"] == "reply_truncated" or (
         attempt["failure_stage"] == "model_incomplete" and attempt["stop_reason"] is None and bool(attempt["reply"])
     )
+
+
+def _batch_needs_correction(first: dict) -> bool:
+    if first["failure_stage"] == "reply_tool_multiple":
+        blocks = json.loads(first["reply"])
+        return [b["name"] for b in blocks if b["type"] == "tool_use"] == [_REPLY_TOOL, _REPLY_TOOL]
+    return bool(recorded_shape_error({**first, "first_shape_error": None}))
 
 
 def _retryable(attempt: dict) -> bool:
@@ -299,9 +306,9 @@ class Recording:
             self.request_hashes[digest(token.encode())] = self.document["request_sha256"]
         attempts = self.document["attempts"]
         if self.origin == "live" and self.mode == "batch" and len(attempts) != (
-            2 if attempts and attempts[0].get("first_shape_error") else 1
+            2 if attempts and _batch_needs_correction(attempts[0]) else 1
         ):
-            raise RegressionError("批量结果未逐篇录制，保留预占并停止结算。")
+            raise RegressionError("批量结果未逐篇录制，发布已停止，费用已登记。")
         for attempt in attempts:
             attempt.setdefault("batch_outcome", None)
         if status == "model_failed":

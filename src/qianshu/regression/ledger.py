@@ -147,7 +147,29 @@ class Ledger:
             runs[run_id] = {**context, "reserved_usd": str(amount), "spent_usd": "0", "committed_usd": str(amount),
                             "active": True, "mode": mode, "identity": identity}
 
-    def record_batch_item(self, run_id, key, checksum, cost):
+    def reserve_correction(self, run_id, identity):
+        with transaction(self.files, self.path) as runs:
+            row = runs[run_id]
+            if intent := row.get("shape_retry"):
+                if intent["identity"] != identity:
+                    raise RegressionError("纠错提交意图与原请求不符。")
+                return  # 预占已落盘，批次日志负责阻止重复 POST。
+            # 首轮已收齐，只保留未知用量的预占。纠错沿用原登记估算，
+            # 避免续取命令改变估算；两轮共用同一个运行名额。
+            amount = Decimal(row["reserved_usd"])
+            first_hold = amount if any(item.get("missing", True) for item in row["item_costs"].values()) else 0
+            used = sum(Decimal(r["spent_usd"]) + Decimal(r["committed_usd"]) for r in runs.values())
+            allowed = used - Decimal(row["committed_usd"]) + first_hold + amount <= 110
+            slots = sum(r["active"] and r["mode"] == "batch" for r in runs.values())
+            allowed = allowed and (row["active"] or slots < 3)
+            row.update(active=allowed, committed_usd=str(first_hold + amount if allowed else first_hold))
+            if allowed:
+                row["shape_retry"] = {"identity": identity, "reserved_usd": str(amount),
+                                      "first_spent_usd": row["spent_usd"], "first_hold_usd": str(first_hold)}
+        if not allowed:
+            raise RegressionError("纠错预算或并发名额不足。")
+
+    def record_batch_item(self, run_id, key, checksum, cost, *, correction=False):
         # 费用先于原始行落盘。中途退出后，续取同一行只补齐结果文件。
         with transaction(self.files, self.path) as runs:
             row = runs[run_id]
@@ -159,11 +181,19 @@ class Ledger:
                     return
             items[key] = {"sha256": checksum, "usd": cost["known_usd"] or "0",
                           "missing": cost["known_usd"] is None or bool(cost["missing_attempts"])}
+            if correction:
+                items[key]["correction"] = True
             total = sum(Decimal(item["usd"]) for item in items.values())
             # 旧版可能已登记整批费用，续取期间保留该已知金额。
             spent = max(total, Decimal(row["spent_usd"]))
             reserve = Decimal(row["reserved_usd"])
-            if not any(item.get("missing", True) for item in items.values()):
+            if retry := row.get("shape_retry"):
+                retry_spent = spent - Decimal(retry["first_spent_usd"])
+                remaining = Decimal(retry["reserved_usd"])
+                if not any(item["missing"] for item in items.values() if item.get("correction")):
+                    remaining = max(remaining - retry_spent, 0)
+                reserve = Decimal(retry["first_hold_usd"]) + remaining
+            elif not any(item.get("missing", True) for item in items.values()):
                 reserve = max(reserve - spent, 0)
             row.update(spent_usd=str(spent), committed_usd=str(reserve), active=True)
 
@@ -175,5 +205,11 @@ class Ledger:
         with transaction(self.files, self.path) as runs:
             row = runs[run_id]
             row["spent_usd"] = str(cost)
-            row["committed_usd"] = row["reserved_usd"] if missing else "0"
+            if retry := row.get("shape_retry"):
+                hold = Decimal(retry["first_hold_usd"])
+                if any(item["missing"] for item in row["item_costs"].values() if item.get("correction")):
+                    hold += Decimal(retry["reserved_usd"])
+                row["committed_usd"] = str(hold)
+            else:
+                row["committed_usd"] = row["reserved_usd"] if missing else "0"
             row["active"] = False
