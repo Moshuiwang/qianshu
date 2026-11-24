@@ -18,6 +18,7 @@ from . import _fingerprint
 from .imap import MailError, trial_connect
 from .segmented import read_segmented
 from .triage import MailItem, classify, input_limit, trial_model
+from .trial_diagnostics import CLOSE_FAILED, CLOSE_TIMEOUT, fault_writer, listener_logs
 from .trial_state import BODY_NOTICE, FormatHold, Hold, Store
 
 _LOG = logging.getLogger(__name__)
@@ -439,6 +440,16 @@ def run_service(args, settings, path, switches):
     clean_close = Event()
     dirty = state.with_suffix(".dirty")
 
+    close_fault = Event()
+
+    def report_fault(message):
+        diagnostics.post(message)
+        logs.post(message)
+
+    def report_close_failure():
+        close_fault.set()
+        report_fault(CLOSE_FAILED)
+
     def poll():
         store = None
         registered = False
@@ -450,7 +461,7 @@ def run_service(args, settings, path, switches):
                 needs_review = True
                 if not state.exists():
                     raise FormatHold("收信登记库缺失，请人工对账。")
-            store = Store(state, before_failed_close=closing.set)
+            store = Store(state, before_failed_close=closing.set, close_failed=report_close_failure)
             with store.write() as db:
                 target = _fingerprint(settings.app_id, settings.chat_id, settings.tenant_key or "")
                 db.execute("INSERT OR IGNORE INTO trial_target VALUES(1,?)", (target,))
@@ -475,7 +486,7 @@ def run_service(args, settings, path, switches):
                 try:
                     store.db.close()
                 except Exception:
-                    _LOG.critical("收信登记库关闭失败，保留脏标记，下次收信先对账。")
+                    report_close_failure()
                 else:
                     if registered:
                         clean_close.set()
@@ -487,7 +498,7 @@ def run_service(args, settings, path, switches):
             try:
                 super().close()
             except Exception:
-                _LOG.critical("转交库关闭失败，监听锁保留，须人工停机核对。")
+                report_fault("转交库关闭失败，监听锁保留，须人工停机核对。")
                 Event().wait()
 
         @contextmanager
@@ -525,9 +536,10 @@ def run_service(args, settings, path, switches):
                 serving.cancel()
                 await asyncio.gather(serving, return_exceptions=True)
 
+    diagnostics = fault_writer(state)
     previous = signal.signal(signal.SIGINT, record_interrupt)
     try:
-        with TrialLog.listening(path, settings) as log:
+        with listener_logs(_LOG) as logs, TrialLog.listening(path, settings) as log:
             service = TrialHandoff(log)
             thread = Thread(target=poll, name="trial-mail", daemon=True)
             thread.start()
@@ -540,10 +552,14 @@ def run_service(args, settings, path, switches):
                 closing.wait()
                 thread.join(_MAIL_CLOSE_TIMEOUT)
                 if thread.is_alive():
-                    _LOG.critical("收信登记库关闭超时，保留脏标记，下次收信先对账。")
+                    close_fault.set()
+                    report_fault(CLOSE_TIMEOUT)
                 elif clean_close.is_set():
                     dirty.unlink()
     finally:
+        diagnostics.finish()
         signal.signal(signal.SIGINT, previous)
-        if interrupted:
+        if interrupted and not close_fault.is_set() and not logs.thread.is_alive():
             signal.raise_signal(signal.SIGINT)
+    if close_fault.is_set() or logs.thread.is_alive():
+        return 130 if interrupted else 1

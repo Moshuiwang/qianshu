@@ -796,7 +796,12 @@ def main(argv: list[str] | None = None) -> int:
                 from .mail.trial import run_service
                 switches = trial_config(args.trial_switches)
                 if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
-                    run_service(args, settings, path, lambda: switches)
+                    fault_code = run_service(args, settings, path, lambda: switches)
+                    if fault_code:
+                        # 租约及转交库已释放。故障退出不能在 logging.shutdown 再次等处理器锁。
+                        if __name__ == "__main__":
+                            os._exit(fault_code)
+                        return fault_code
                     return 0
             with MentionLog.listening(path, settings) as store:
                 HandoffService(store).run()
