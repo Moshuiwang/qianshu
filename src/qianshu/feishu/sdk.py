@@ -2,13 +2,18 @@
 
 import asyncio
 import base64
+import fcntl
 import json
 import logging
 import math
 import re
+import socket
+import struct
+import termios
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from contextvars import ContextVar
 from http import HTTPStatus
 from pathlib import Path
@@ -38,6 +43,7 @@ from lark_oapi.event.callback.model.p2_card_action_trigger import (
 from lark_oapi.ws import client as ws
 from websockets.uri import parse_uri
 
+from .frame_budget import FrameBudget, MESSAGE, bounded_wire, current_app
 from .cards import Report, approval_card, decided_approval_card
 from .entrance import Application, Attachment, Entrance, Message
 from .settings import Settings, Window
@@ -526,6 +532,8 @@ class _Connection(ws.Client):
         self._dispatch = ContextVar("feishu_dispatch", default=(None, 0.0, 0.0))
         self.receiver = None
         self.frames = set()
+        self._budget = FrameBudget()
+        self.card_drops = self.ack_drops = self.pending_acks = 0
         self._generation = 0
         dispatcher = lark.EventDispatcherHandler.builder("", "").register_p2_im_message_receive_v1(
             self._receive,
@@ -549,6 +557,8 @@ class _Connection(ws.Client):
                 conn_id, service_id = query[ws.DEVICE_ID][0], query[ws.SERVICE_ID][0]
                 self.service.transport._require_window()
                 options = ws._ws_connect_kwargs()
+                if not self._approvals:
+                    options.update(max_size=MESSAGE, max_queue=8, write_limit=65536)
                 http_check = getattr(self.service, "http_check", None)
                 if http_check:
                     options["create_connection"] = checked_websocket_connection(conn_url, http_check)
@@ -560,6 +570,7 @@ class _Connection(ws.Client):
                     ws._parse_ws_conn_exception(error)
                 self._conn_url, self._conn_id, self._service_id = conn_url, conn_id, service_id
                 self.service.transport._require_window()
+                self._budget.groups.clear()
                 self._generation += 1
                 self.service._connected(self._conn)
                 self.receiver = asyncio.create_task(self._receive_message_loop())
@@ -598,6 +609,7 @@ class _Connection(ws.Client):
         return endpoint.data.URL
 
     async def _disconnect(self):
+        self._budget.groups.clear()
         try:
             self.service._disconnected()
         finally:
@@ -610,6 +622,11 @@ class _Connection(ws.Client):
                 origin = self._conn
                 msg = await origin.recv()
                 dispatch = self._frame_timing(origin)
+                if not self._approvals:
+                    # 同步检查/分发一帧，避免已缓冲的洪峰先创建无界 task。
+                    await self._handle_message(msg, dispatch)
+                    await asyncio.sleep(0)
+                    continue
                 task = asyncio.create_task(self._handle_message(msg, dispatch))
                 self.frames.add(task)
                 task.add_done_callback(self.frames.discard)
@@ -643,13 +660,31 @@ class _Connection(ws.Client):
         if dispatch is None:
             dispatch = self._frame_timing(self._conn)
         origin, _, _ = dispatch
-        if origin is None:
+        if origin is None or origin is not self._conn:
+            return
+        if not self._approvals and not bounded_wire(msg):
+            self._budget.reject()
             return
         task = asyncio.current_task()
         self.frames.add(task)
         token = self._dispatch.set(dispatch)
         try:
-            await super()._handle_message(msg)
+            if self._approvals:
+                await super()._handle_message(msg)
+            else:
+                try:
+                    frame = ws.Frame()
+                    frame.ParseFromString(msg)
+                    if not frame.IsInitialized():
+                        self._budget.reject()
+                    elif frame.method == ws.FrameType.DATA.value:
+                        await self._handle_data_frame(frame)
+                    elif frame.method == ws.FrameType.CONTROL.value:
+                        await self._handle_control_frame(frame)
+                    else:
+                        self._budget.reject()
+                except Exception:
+                    self._budget.reject()
         finally:
             self._dispatch.reset(token)
             self.frames.discard(task)
@@ -657,31 +692,43 @@ class _Connection(ws.Client):
     async def _handle_data_frame(self, frame):
         # 沿用 SDK 帧格式和分发器，在编码应答前等待审批回调。
         origin, started, deadline = self._dispatch.get()
-        headers = frame.headers
-        frame_type = ws._get_by_key(headers, ws.HEADER_TYPE)
-        if frame_type not in (ws.MessageType.EVENT.value, ws.MessageType.CARD.value):
+        if origin is not self._conn:
             return
-        payload = frame.payload
-        count = int(ws._get_by_key(headers, ws.HEADER_SUM))
-        if count > 1:
-            msg_id = ws._get_by_key(headers, ws.HEADER_MESSAGE_ID)
-            timing_key = f"handoff-timing:{self._generation}:{msg_id}"
-            if not self._approvals:
-                first = self._cache.get(timing_key)
-                if first is None or started < first[0]:
-                    first = (started, deadline)
-                self._cache.set(timing_key, first, 5)
-                started, deadline = first
-            payload = self._combine(
-                msg_id, count, int(ws._get_by_key(headers, ws.HEADER_SEQ)), payload,
-            )
-            if payload is None:
+        headers = frame.headers
+        if not self._approvals:
+            completed = self._budget.accept(frame, self.service.settings, started, deadline)
+            if completed is None:
                 return
+            frame_type, payload, started, deadline = completed
+        else:
+            frame_type = ws._get_by_key(headers, ws.HEADER_TYPE)
+            if frame_type not in (ws.MessageType.EVENT.value, ws.MessageType.CARD.value):
+                return
+            payload = frame.payload
+            count = int(ws._get_by_key(headers, ws.HEADER_SUM))
+            if count > 1:
+                payload = self._combine(ws._get_by_key(headers, ws.HEADER_MESSAGE_ID), count,
+                                        int(ws._get_by_key(headers, ws.HEADER_SEQ)), payload)
+                if payload is None:
+                    return
 
         _before_send(self.service, "callback_headers", [(h.key, h.value) for h in headers])
         response = ws.Response(code=HTTPStatus.OK)
         timing = self._dispatch.set((origin, started, deadline))
         try:
+            if not self._approvals:
+                self._budget.decoded += 1
+                envelope = json.loads(payload)
+                header = envelope.get("header") if isinstance(envelope, dict) else None
+                event_type = header.get("event_type") if isinstance(header, dict) else None
+                message_event = event_type == "im.message.receive_v1"
+                bound = origin is self.service._origin and current_app(header, self.service.settings)
+                if frame_type == "card" or not (bound and message_event):
+                    sidecar = self.service._sidecar
+                    if sidecar is not None and bound and event_type == "card.action.trigger":
+                        sidecar.offer(payload, started, deadline)
+                    self._card_reply(origin, frame, started, ignored_message=message_event)
+                    return
             if frame_type == ws.MessageType.CARD.value:
                 header = json.loads(payload).get("header")
                 if not isinstance(header, dict) or header.get("event_type") != "card.action.trigger":
@@ -692,6 +739,10 @@ class _Connection(ws.Client):
                 _before_send(self.service, "callback_content", encoded)
                 response.data = base64.b64encode(encoded)
         except Exception:
+            if not self._approvals:
+                self._budget.reject()
+                self._card_reply(origin, frame, started)
+                return
             _LOG.error("feishu_event_dispatch_failed")
             if frame_type == ws.MessageType.CARD.value:
                 warning = _approval_warning("卡片回调格式无效")
@@ -706,13 +757,83 @@ class _Connection(ws.Client):
         frame.payload = ws.JSON.marshal(response).encode()
         remaining = started + _CALLBACK_BUDGET - time.monotonic()
         if remaining <= 0:
+            if not self._approvals:
+                self.ack_drops += 1
             return
+        encoded = frame.SerializeToString()
+        if self._approvals:
+            await self._send_ack(origin, encoded, remaining)
+        elif self.pending_acks < 8 and len(encoded) <= 8192:
+            self.pending_acks += 1
+            task = asyncio.create_task(self._queued_ack(origin, encoded, started + _CALLBACK_BUDGET))
+            self.frames.add(task)
+            task.add_done_callback(self.frames.discard)
+        else:
+            self.ack_drops += 1
+
+    async def _send_ack(self, origin, encoded, remaining):
         async with asyncio.timeout(remaining):
             async with self._lock:
-                if origin is not None and origin is self._conn and origin.close_code is None:
-                    encoded = frame.SerializeToString()
+                if origin is self._conn and origin.close_code is None:
                     _before_send(self.service, "callback_response", encoded)
                     await origin.send(encoded)
+
+    async def _queued_ack(self, origin, encoded, deadline):
+        try:
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await self._send_ack(origin, encoded, remaining)
+            else:
+                self.ack_drops += 1
+        except Exception:
+            self.ack_drops += 1
+        finally:
+            self.pending_acks -= 1
+
+    def _drop_card(self):
+        self.card_drops += 1
+        if self.service._sidecar is not None:
+            self.service._sidecar.card_drops = self.card_drops
+
+    def _card_reply(self, origin, frame, started, *, ignored_message=False):
+        # 转交 CLI 从未注册卡片处理器，保留 main 的 CARD 警告和 EVENT 500。
+        now = time.monotonic()
+        transport = getattr(origin, "transport", None)
+        if (transport is None or origin is not self._conn or origin.close_code is not None
+                or self._lock.locked() or self.pending_acks
+                or now >= started + _CALLBACK_BUDGET or self._budget.pending_messages()):
+            self._drop_card()
+            return
+        kind = ws._get_by_key(frame.headers, ws.HEADER_TYPE)
+        response = ws.Response(code=HTTPStatus.OK if ignored_message else HTTPStatus.INTERNAL_SERVER_ERROR)
+        if kind == "card":
+            warning = _approval_warning("卡片回调格式无效")
+            response = ws.Response(code=HTTPStatus.OK)
+            response.data = base64.b64encode(ws.JSON.marshal(warning).encode())
+        header = frame.headers.add()
+        header.key, header.value = ws.HEADER_BIZ_RT, str(round((now - started) * 1000))
+        frame.payload = ws.JSON.marshal(response).encode()
+        encoded = frame.SerializeToString()
+        # asyncio 的 TLS 层和底层传输均须有完整余量。单循环中检查到
+        # write 之间无 await；Sans-I/O 同步接收整个帧，不进入 drain。
+        tls = getattr(transport, "_ssl_protocol", None)
+        raw = tls._transport if tls else transport
+        if (len(encoded) > 4096 or raw is None or any(
+                t.is_closing() or t.get_write_buffer_size() or t.get_write_buffer_limits()[1] < 16384
+                for t in (transport, raw))):
+            self._drop_card()
+            return
+        try:
+            sock = raw.get_extra_info("socket")
+            if (sock is None or sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2 < 16384
+                    or struct.unpack("i", fcntl.ioctl(sock, termios.TIOCOUTQ, bytes(4)))[0]):
+                self._drop_card()
+                return
+            _before_send(self.service, "callback_response", encoded)
+            origin.protocol.send_binary(encoded)
+            origin.send_data()
+        except Exception:
+            self._drop_card()
 
     def _combine(self, msg_id, count, sequence, data):
         # SDK 分片缓存跨重连保留，给每次连接独立的缓存键。
@@ -817,6 +938,7 @@ class FeishuService:
             Entrance(settings, window, self._state, self.transport, process, clock=clock)
             if process is not None else None
         )
+        self._machine_lease = ExitStack()
         self._client = _Connection(self)
 
     def _connected(self, origin) -> None:
@@ -1056,6 +1178,9 @@ class FeishuService:
         return self.window.end.timestamp() - self.clock()
 
     async def _serve(self) -> None:
+        from .handoff import machine_listener
+
+        self._machine_lease.enter_context(machine_listener())
         try:
             async with asyncio.timeout(self._remaining()):
                 delay = 0.25
@@ -1080,6 +1205,11 @@ class FeishuService:
                 raise
 
     async def _stop(self, *, finish_frames=False) -> None:
+        # 真实连接关闭前仍须排斥下一监听器（含收尾中的窗口服务）。
+        with self._machine_lease:
+            await self._stop_connection(finish_frames)
+
+    async def _stop_connection(self, finish_frames) -> None:
         if self._client.receiver is not None:
             self._client.receiver.cancel()
             await asyncio.gather(self._client.receiver, return_exceptions=True)

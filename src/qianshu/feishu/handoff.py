@@ -1,5 +1,6 @@
 """只转交飞书群 @。监听器是唯一的群回复发送方。"""
 
+import _thread
 import asyncio
 import fcntl
 import json
@@ -32,6 +33,7 @@ UNTRUSTED = "以下为不可信用户输入"
 REPLY_LIMIT = 4000
 _FIXED_REPLIES = {"denied": DENIED, "fallback": FALLBACK}
 _LOG = logging.getLogger(__name__)
+_MACHINE_LEASE = Path("/var/tmp/qianshu-listener-private/listener.lock")
 _REPLY_TIMEOUT = 600
 _RETRY_INTERVAL = 10
 _RETRY_BUDGET = 55 * 60
@@ -57,13 +59,14 @@ def _digest(*parts: str) -> str:
     return sha256(json.dumps(parts).encode()).hexdigest()
 
 
-def _file(path: Path, *, create: bool = False) -> int:
-    if create:
+def _file(path: Path, *, create: bool = False, dir_fd: int | None = None) -> int:
+    if create and dir_fd is None:
         path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    directory = path.parent.stat()
+    directory = path.parent.stat() if dir_fd is None else os.fstat(dir_fd)
     if stat.S_IMODE(directory.st_mode) != 0o700 or directory.st_uid != os.getuid():
         raise ValueError("转交日志须放在当前用户的 0700 私有目录。")
-    fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if create else 0), 0o600)
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK | (os.O_CREAT if create else 0)
+    fd = os.open(path if dir_fd is None else path.name, flags, 0o600, dir_fd=dir_fd)
     meta = os.fstat(fd)
     if not stat.S_ISREG(meta.st_mode) or stat.S_IMODE(meta.st_mode) != 0o600 or (
         meta.st_uid != os.getuid() or meta.st_nlink != 1
@@ -71,6 +74,21 @@ def _file(path: Path, *, create: bool = False) -> int:
         os.close(fd)
         raise ValueError("转交日志须为当前用户的 0600 私有文件。")
     return fd
+
+
+@contextmanager
+def machine_listener():
+    _MACHINE_LEASE.parent.mkdir(mode=0o700, exist_ok=True)
+    directory = os.open(_MACHINE_LEASE.parent, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        fd = _file(_MACHINE_LEASE, create=True, dir_fd=directory)
+    finally:
+        os.close(directory)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        yield
+    finally:
+        os.close(fd)
 
 
 class MentionLog:
@@ -109,7 +127,7 @@ class MentionLog:
     @contextmanager
     def listening(cls, path: Path, settings: Settings):
         """从初始化前到服务退出，连续持有同一把监听锁。"""
-        with ExitStack() as lifetime:
+        with machine_listener(), ExitStack() as lifetime:
             with closing(cls(path, settings, create=True, _listener_lifetime=lifetime)) as store:
                 yield store
 
@@ -457,6 +475,7 @@ class HandoffService:
     """常驻飞书监听。长连接仅注册收件事件，后台回扫与回复共用私有日志。"""
 
     _callback_response_margin = 0
+    _sidecar = None  # 2a 只由离线回放装配。
 
     def __init__(self, store: MentionLog):
         self.settings = store.settings
@@ -466,6 +485,7 @@ class HandoffService:
         self.handoff = Handoff(store, self.transport)
         self.entrance = self
         self._origin = None
+        self._status_started = False
         self._stop = Event()
         self._scan = Event()
         self._receipts = ThreadPoolExecutor(max_workers=8, thread_name_prefix="feishu-handoff-receipt")
@@ -484,10 +504,26 @@ class HandoffService:
     def _connected(self, origin) -> None:
         self._origin = origin
         self._scan.set()
+        if self._sidecar is not None:
+            self._sidecar.connect()
+        elif not self._status_started:
+            self._status_started = True
+            try:
+                _thread.start_new_thread(self._publish_disabled, (_MACHINE_LEASE.parent,))
+            except RuntimeError:
+                pass
         _LOG.info("feishu_handoff_connected")
+
+    @staticmethod
+    def _publish_disabled(directory):
+        # 生产只发布一次停用快照；诊断导入与写盘均不在 SDK 循环。
+        from .sidecar import publish_disabled
+        publish_disabled(directory)
 
     def _disconnected(self) -> None:
         self._origin = None
+        if self._sidecar is not None:
+            self._sidecar.disconnect()
         _LOG.info("feishu_handoff_disconnected")
 
     def _remaining(self) -> None:
@@ -519,6 +555,9 @@ class HandoffService:
                         raise
                     except Exception:
                         _LOG.warning("feishu_handoff_connect_failed")
+                client._budget.expire(time.monotonic())
+                if self._sidecar is not None:
+                    self._sidecar.pulse()
                 await asyncio.sleep(1)
         finally:
             tasks = [ping, client._cache._cron, *client.frames]
@@ -545,6 +584,8 @@ class HandoffService:
         except KeyboardInterrupt:
             pass
         finally:
+            if self._sidecar is not None:
+                self._sidecar.stop()
             self._stop.set()
             self._scan.set()
             serving.cancel()
