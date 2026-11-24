@@ -109,11 +109,19 @@ def _send_trial_message(transport, content, request_id, card, check):
             .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
             .uuid(request_id).build())
     request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-    token = asyncio.run(transport._tenant_token())
-    check()
-    response = transport.im.message.create(request, RequestOption.builder().tenant_access_token(token).build())
-    if not response.success() or not response.data or not response.data.message_id:
+    if not getattr(transport, "order_http", None) or not callable(getattr(transport, "before_send", None)):
+        raise RuntimeError("缺少试运行凭据出口检查器")
+    transport.before_send("message", {"receive_id": body.receive_id, "content": body.content, "uuid": request_id})
+
+    async def deliver():
+        token = await transport._tenant_token()
+        check()
+        return await transport.im.message.acreate(request, RequestOption.builder().tenant_access_token(token).build())
+    response = asyncio.run(deliver())
+    if (not response.success() or not response.data or not isinstance(response.data.message_id, str)
+            or not response.data.message_id.strip()):
         raise RuntimeError("试运行群消息回执不明。")
+    return response.data.message_id
 
 
 class _ReportProcessor:
@@ -783,10 +791,11 @@ def main(argv: list[str] | None = None) -> int:
                 from .mail.trial import run_service
                 switches = trial_config(args.trial_switches)
                 if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
-                    run_service(args, settings, path, lambda: switches)
+                    run_service(args, settings, path, lambda: trial_config(args.trial_switches))
                     return 0
             with MentionLog.listening(path, settings) as store:
-                HandoffService(store).run()
+                from .mail.trial import run_disabled
+                run_disabled(HandoffService(store), path.with_name("trial-050.sqlite3"), settings)
         except ConfigError as error:
             print(error, file=sys.stderr)
             return 1

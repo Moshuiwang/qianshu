@@ -523,6 +523,7 @@ class _Connection(ws.Client):
     def __init__(self, service, *, approvals: bool = True):
         self.service = service
         self._approvals = approvals
+        self._handoff = not approvals or getattr(service, "trial_callbacks", False) is True
         self._dispatch = ContextVar("feishu_dispatch", default=(None, 0.0, 0.0))
         self.receiver = None
         self.frames = set()
@@ -666,7 +667,7 @@ class _Connection(ws.Client):
         if count > 1:
             msg_id = ws._get_by_key(headers, ws.HEADER_MESSAGE_ID)
             timing_key = f"handoff-timing:{self._generation}:{msg_id}"
-            if not self._approvals:
+            if self._handoff:
                 first = self._cache.get(timing_key)
                 if first is None or started < first[0]:
                     first = (started, deadline)
@@ -748,7 +749,7 @@ class _Connection(ws.Client):
             )
         except (TypeError, ValueError):
             return
-        if self._approvals:
+        if not self._handoff:
             self.service.entrance.inject_message(incoming)
         else:
             _, _, deadline = self._dispatch.get()

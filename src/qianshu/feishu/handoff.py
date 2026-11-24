@@ -456,6 +456,7 @@ class Handoff:
 class HandoffService:
     """常驻飞书监听。长连接仅注册收件事件，后台回扫与回复共用私有日志。"""
 
+    trial_callbacks = False
     _callback_response_margin = 0
 
     def __init__(self, store: MentionLog):
@@ -531,7 +532,7 @@ class HandoffService:
                 await client._disconnect()
 
     def run(self) -> None:
-        client = _Connection(self, approvals=False)
+        client = _Connection(self, approvals=self.trial_callbacks)
         threads = (
             Thread(target=self._recover, name="feishu-handoff-history"),
             Thread(target=self._deliver, args=(False,), name="feishu-handoff-replies"),

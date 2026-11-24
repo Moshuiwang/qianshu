@@ -1,9 +1,11 @@
 """从指定的 .env 文件读取外部依赖配置。"""
 
+import re
 from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 from dotenv import dotenv_values
+from dotenv.parser import parse_stream
 
 CONFIG_KEYS = (
     "FEISHU_APP_ID",
@@ -99,7 +101,12 @@ def trial_config(path: Path) -> Config:
     """从显式私有文件读取试运行开关，业务配置只在收信开启后读取。"""
     try:
         with path.open(encoding="utf-8-sig") as stream:
-            values = dotenv_values(stream=stream, interpolate=False)
+            values = {}
+            for binding in parse_stream(stream):
+                if binding.error or (binding.key and binding.key.startswith("MAIL_TRIAL_") and binding.key in values):
+                    raise ConfigError("试运行开关文件有重复键或格式不明。")
+                if binding.key is not None:
+                    values[binding.key] = binding.value
     except (OSError, UnicodeError):
         raise ConfigError("无法读取试运行私有开关。") from None
     result = {}
@@ -111,6 +118,18 @@ def trial_config(path: Path) -> Config:
         result[key] = value
     if result["MAIL_TRIAL_CARD_ENABLED"] == "true" and result["MAIL_TRIAL_RECEIVE_ENABLED"] != "true":
         raise ConfigError("出卡须先开启收信。")
+    create = values.get("MAIL_TRIAL_CREATE_ENABLED", "false")
+    country = values.get("MAIL_TRIAL_CREATE_COUNTRY", "")
+    members = values.get("MAIL_TRIAL_APPROVER_OPEN_IDS", "")
+    if (create not in {"true", "false"} or country is None or members is None
+            or (country and (country != country.strip() or not re.fullmatch(r"\w[\w -]{0,79}", country)))
+            or (members and len(set(members.split(","))) != len(members.split(",")))
+            or (members and not re.fullmatch(r"ou_[A-Za-z0-9]+(?:,ou_[A-Za-z0-9]+)*", members))
+            or (create == "true" and (result["MAIL_TRIAL_CARD_ENABLED"] != "true" or not country or not members))):
+        raise ConfigError("试运行建单配置缺失或格式无效。")
+    for key in ("MAIL_TRIAL_CREATE_ENABLED", "MAIL_TRIAL_CREATE_COUNTRY", "MAIL_TRIAL_APPROVER_OPEN_IDS"):
+        if key in values:
+            result[key] = values[key]
     limit = values.get("MAIL_TRIAL_DAILY_PARSE_LIMIT", "15")
     if not limit or not limit.isascii() or not limit.isdecimal() or len(limit) > 9:
         raise ConfigError("试运行每日解析上限须为非负整数。")

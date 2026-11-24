@@ -12,6 +12,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from qianshu.feishu.handoff import _file
+from qianshu.feishu.trial_approval import SCHEMA as APPROVAL_SCHEMA
 
 from . import _fingerprint
 from .triage import BodyShape
@@ -108,6 +109,9 @@ class Store:
                         raise FormatHold(FORMAT_HOLD)
                     else:
                         self._ledger_valid()
+                    for statement in APPROVAL_SCHEMA.split(";"):
+                        if statement.strip():
+                            db.execute(statement)
             except BaseException:
                 self.db.close()
                 raise
