@@ -692,11 +692,15 @@ class _Connection(ws.Client):
         response = ws.Response(code=HTTPStatus.OK)
         timing = self._dispatch.set((origin, started, deadline))
         try:
+            lifecycle = getattr(self.service, "approvals", None)
+            header = json.loads(payload).get("header") if lifecycle or frame_type == ws.MessageType.CARD.value else None
             if frame_type == ws.MessageType.CARD.value:
-                header = json.loads(payload).get("header")
                 if not isinstance(header, dict) or header.get("event_type") != "card.action.trigger":
                     raise ValueError("卡片帧缺少卡片回调类型。")
-            result = self._event_handler._do_without_validation(payload)
+            if lifecycle and isinstance(header, dict) and header.get("event_type") == "card.action.trigger":
+                result = lifecycle.handle(payload)
+            else:
+                result = self._event_handler._do_without_validation(payload)
             if result is not None:
                 encoded = ws.JSON.marshal(await result).encode()
                 _before_send(self.service, "callback_content", encoded)

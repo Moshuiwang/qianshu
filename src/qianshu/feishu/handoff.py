@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
 import stat
 import time
@@ -458,6 +459,33 @@ class Handoff:
 class HandoffService:
     """常驻飞书监听。长连接仅注册收件事件，后台回扫与回复共用私有日志。"""
 
+    approvals = None
+    interrupted = False
+
+    @classmethod
+    @contextmanager
+    def listening(cls, path, settings):
+        """在工作线程和登记库全部关闭后交还中断。"""
+        interrupted = False
+        service = None
+
+        def interrupt(signum, frame):
+            nonlocal interrupted
+            interrupted = True
+            if service is not None:
+                service.interrupted = True
+
+        previous = signal.signal(signal.SIGINT, interrupt)
+        try:
+            with MentionLog.listening(path, settings) as log:
+                service = cls(log)
+                service.interrupted = interrupted
+                yield service
+        finally:
+            signal.signal(signal.SIGINT, previous)
+            if interrupted:
+                signal.raise_signal(signal.SIGINT)
+
     trial_callbacks = False
     _callback_response_margin = 0
 
@@ -514,7 +542,7 @@ class HandoffService:
     async def _serve(self, client: _Connection) -> None:
         ping = asyncio.create_task(client._ping_loop())
         try:
-            while True:
+            while not self.interrupted:
                 if self._origin is None and (client.receiver is None or client.receiver.done()):
                     try:
                         await client._connect()
@@ -522,6 +550,8 @@ class HandoffService:
                         raise
                     except Exception:
                         _LOG.warning("feishu_handoff_connect_failed")
+                if self.approvals is not None:
+                    self.approvals.try_enable(client)
                 retry = getattr(self, "retry_approval_start", None)
                 if retry is not None:
                     retry()
@@ -558,6 +588,8 @@ class HandoffService:
             self._receipts.shutdown(wait=True, cancel_futures=True)
             for thread in threads:
                 thread.join()
+            if self.approvals is not None:
+                self.approvals.disable()
 
 
 def _utc(ms: int) -> str:

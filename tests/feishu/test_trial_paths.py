@@ -12,6 +12,7 @@ import pytest
 
 from qianshu.feishu.settings import Settings
 from qianshu.mail.trial_state import Store
+from tests.feishu.startup_replay import observe
 
 
 def settings():
@@ -99,7 +100,6 @@ def test_mixed_combinations_bind_complete_preview(tmp_path):
 
 def test_single_connection_callback_then_disabled_cli_recovery(tmp_path, monkeypatch):
     from qianshu import __main__ as cli
-    from qianshu.feishu.handoff import HandoffService
     from qianshu.feishu.state import State
     from qianshu.feishu.trial_listener import Listener
     from qianshu.feishu.trial_approval import Journal
@@ -149,7 +149,7 @@ def test_single_connection_callback_then_disabled_cli_recovery(tmp_path, monkeyp
     switch_file.write_text("")
     monkeypatch.setattr(cli, "load_handoff_settings", lambda *a, **k: (settings(), tmp_path/"mention"))
     delivered = Event()
-    monkeypatch.setattr(HandoffService, "run", lambda self: delivered.wait(3))
+    observe(monkeypatch, delivered)
     deliveries = []
     def send(transport, content, uuid, card, claim):
         claim()

@@ -796,23 +796,21 @@ def main(argv: list[str] | None = None) -> int:
                 args.tag_dates, args.companies_file, args.legacy_companies, args.raw_output_dir)):
             parser.error("--handoff-only 只与 --env-file、--business-env-file、--mingdao-config 一起使用。")
         try:
-            from .feishu.handoff import HandoffService, MentionLog
+            from .feishu.handoff import HandoffService
 
-            settings, path = load_handoff_settings(
-                args.env_file, for_listener=True, business_env_file=args.business_env_file,
-                mingdao_config=args.mingdao_config,
-            )
+            def settings_for(*, include_trial):
+                return load_handoff_settings(
+                    args.env_file, for_listener=True, business_env_file=args.business_env_file,
+                    mingdao_config=args.mingdao_config, include_trial=include_trial,
+                )
+
+            settings, path = settings_for(include_trial=False)
             setup_logging({"FEISHU_APP_SECRET": settings.app_secret})
-            if args.trial_switches:
-                from .config import trial_config
-                from .mail.trial import run_service
-                switches = trial_config(args.trial_switches)
-                if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
-                    run_service(args, settings, path, lambda: trial_config(args.trial_switches))
-                    return 0
-            with MentionLog.listening(path, settings) as store:
-                from .mail.trial import run_disabled
-                run_disabled(HandoffService(store), path.with_name("trial-050.sqlite3"), settings)
+            from .feishu.trial_lifecycle import ApprovalLifecycle
+
+            with HandoffService.listening(path, settings) as service:
+                service.approvals = ApprovalLifecycle(args, path, lambda: settings_for(include_trial=True))
+                service.run()
         except ConfigError as error:
             print(error, file=sys.stderr)
             return 1

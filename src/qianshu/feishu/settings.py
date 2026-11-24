@@ -93,7 +93,7 @@ def _read_handoff_config(path: Path, *, allow_missing: bool = False) -> dict[str
     raise ConfigError("无法读取飞书转交所需的私有配置。")
 
 
-def _read_official_keys(path: Path, business: dict[str, str | None]):
+def _read_official_keys(path: Path, business: dict[str, str | None], *, include_trial: bool):
     try:
         with path.open(encoding="utf-8-sig") as stream:
             official = json.load(stream)["official"]
@@ -105,6 +105,8 @@ def _read_official_keys(path: Path, business: dict[str, str | None]):
     token = (business.get(token_key) or "").strip()
     if not token:
         raise ConfigError("业务私有配置缺少明道云官方接口令牌。")
+    if not include_trial:
+        return token, set(), True
     app_key = official.get("app_id_key")
     complete = (isinstance(app_key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", app_key)
                 and (business.get(app_key) or "").strip())
@@ -113,7 +115,7 @@ def _read_official_keys(path: Path, business: dict[str, str | None]):
 
 def load_handoff_settings(
     env_file: Path, *, for_listener: bool = False, business_env_file: Path | None = None,
-    mingdao_config: Path | None = None,
+    mingdao_config: Path | None = None, include_trial: bool = True,
 ) -> tuple[Settings, Path]:
     """读取飞书转交配置，监听器另读取业务配置的敏感值。"""
     values = _read_handoff_config(env_file)
@@ -147,13 +149,14 @@ def load_handoff_settings(
         official_keys = set()
         if mingdao_config is not None:
             try:
-                token, official_keys, complete = _read_official_keys(mingdao_config, business)
+                token, official_keys, complete = _read_official_keys(mingdao_config, business, include_trial=include_trial)
                 matches.append(token)
             except ConfigError:
                 handoff_complete = complete = False
-        credentials = tuple(dict.fromkeys(
-            pair for source in (values, business) for pair in registered_credentials(source, official_keys).items()
-        ))
+        if include_trial:
+            credentials = tuple(dict.fromkeys(
+                pair for source in (values, business) for pair in registered_credentials(source, official_keys).items()
+            ))
         sensitive_values = tuple(dict.fromkeys(matches))
     settings = Settings(
         app_id=(values.get("FEISHU_APP_ID") or "").strip(),

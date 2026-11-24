@@ -471,12 +471,12 @@ class Trial:
             self.stop.wait(30)
 
 
-def run_service(args, settings, path, switches):
-    from threading import Event, Lock, Thread, current_thread
+@contextmanager
+def mail_worker(args, settings, path, switches, *, cards, available, sender=None):
+    from threading import Event, Thread
 
     from dotenv import dotenv_values
     from qianshu.config import load_config
-    from qianshu.feishu.handoff import HandoffService, MentionLog
     from qianshu.parse._output import check_output_path
     from qianshu.parse.model import load_model_config
     from qianshu.__main__ import _send_trial_message
@@ -500,20 +500,12 @@ def run_service(args, settings, path, switches):
     stop = Event()
     closed = Event()
 
-    sender = None
-    sender_lock = Lock()
-
-    def get_sender():
-        nonlocal sender
-        with sender_lock:
-            if sender is None:
-                sender = checked_transport(settings, state.parent)
-            return sender
+    if sender is None:
+        sender = checked_transport(settings, state.parent)
 
     def poll():
         store = None
         try:
-            transport = get_sender()
             store = Store(state)
             with store.write() as db:
                 target = _fingerprint(settings.app_id, settings.chat_id, settings.tenant_key or "")
@@ -522,7 +514,7 @@ def run_service(args, settings, path, switches):
                     raise ConfigError("试运行登记与汇报群不匹配。")
             trial = Trial(store, config, switches, send, stop, legacy_path=legacy,
                           approval_setup=(lambda: approval_setup(getattr(args, "mingdao_config", None), switches))
-                          if service.trial_callbacks else None, sensitive=transport.sensitive_values)
+                          if cards else None, sensitive=sender.sensitive_values)
             trial.run()
         except FormatHold as exc:
             _LOG.error("%s", exc)
@@ -536,6 +528,28 @@ def run_service(args, settings, path, switches):
                     _LOG.critical("收信登记库关闭失败，监听锁保留，须人工停机核对。")
                     return
             closed.set()
+
+    def send(content, request_id, card, check):
+        def before_send():
+            if card and (not available() or switches().get("MAIL_TRIAL_CARD_ENABLED") != "true"):
+                raise Hold()
+            check()
+        return _send_trial_message(sender, content, request_id, card, before_send)
+
+    thread = Thread(target=poll, name="trial-mail")
+    try:
+        thread.start()
+        yield
+    finally:
+        stop.set()
+        if thread.ident is not None:
+            closed.wait()
+            thread.join()
+
+
+def run_service(args, settings, path, switches):
+    from threading import Event, current_thread
+    from qianshu.feishu.handoff import HandoffService, MentionLog
 
     class TrialLog(MentionLog):
         _listener_thread = None
@@ -559,13 +573,6 @@ def run_service(args, settings, path, switches):
                     yield
                 finally:
                     self._listener_thread = None
-
-    def send(content, request_id, card, check):
-        def before_send():
-            if service.trial_callbacks and card and switches().get("MAIL_TRIAL_CARD_ENABLED") != "true":
-                raise Hold()
-            check()
-        return _send_trial_message(sender, content, request_id, card, before_send)
 
     interrupted = False
 
@@ -608,22 +615,12 @@ def run_service(args, settings, path, switches):
         with TrialLog.listening(path, settings) as log:
             service = TrialHandoff(log)
             service.trial_callbacks = switches().get("MAIL_TRIAL_CARD_ENABLED") == "true"
-            approvals = ApprovalWorker(state, settings, switches, enabled=service.trial_callbacks,
-                                       get_transport=get_sender)
-            with approvals.running(service):
-                thread = Thread(target=poll, name="trial-mail")
-                try:
-                    thread.start()
-                except Exception:
-                    _LOG.error("试运行收信未启动，请核对私有登记。")
-                try:
-                    if not interrupted:
-                        service.run()
-                finally:
-                    stop.set()
-                    if thread.ident is not None:
-                        closed.wait()
-                        thread.join()
+            approvals = ApprovalWorker(path.with_name("trial-050.sqlite3"), settings, switches, enabled=service.trial_callbacks,
+                                       get_transport=None)
+            with approvals.running(service), mail_worker(args, settings, path, switches,
+                                                         cards=service.trial_callbacks, available=lambda: True):
+                if not interrupted:
+                    service.run()
     finally:
         signal.signal(signal.SIGINT, previous)
         if interrupted:
