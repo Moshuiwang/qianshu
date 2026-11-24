@@ -28,6 +28,7 @@ _NOTICES = {
     "duplicate": "疑似重复，{n} 封待人工核对。",
     "freeze": "邮箱水位已冻结，本账户已登记 {n} 封，待人工对账。",
     "ledger": "费用账本不完整，待人工对账。",
+    "interrupted": "解析中途停止，1 封待人工核对。",
     "gap": "收信水位区间有 {n} 个未知位置，待人工对账。",
     "fee15": "开发与试运行已花及已预占费用合计达到 15 美元报告线。",
     "parse8": "试运行解析已花及已预占费用合计超过 8 美元报告线。",
@@ -269,14 +270,18 @@ class Trial:
                 complete = self.store.settle(attempt, call.input_tokens, call.output_tokens,
                                              partial_inputs=call.partial_input_tokens,
                                              partial_outputs=call.partial_output_tokens)
-                unknown = bool(call.failure_stage) or not complete
+                # 多次调用（首轮 + 纠错）累加，任何一次失败或用量不完整都转人工（G448）。
+                unknown = unknown or bool(call.failure_stage) or not complete
 
         model = trial_model(self.config, reserve, result)
         pages = Pipeline(model=model, tag_dates={}, sensitive_values=self.sensitive,
                          companies_file=self.companies)(Application(None, text, ()))
         if refused or (text and attempt is None):
             if attempt is not None:
-                self.status(reg, "correction_pending")
+                # 纠错阶段未获派发（如停机）：经统一出口转人工并发固定群提示（G448）。
+                with self.store.write():
+                    self.store.finish(reg, "manual", reason="correction_interrupted")
+                    self.store.notice(f"interrupted:{reg}", self.scope, reg, "interrupted")
             return
         with self.store.write() as db:
             expected = "parsing" if attempt else "parse"

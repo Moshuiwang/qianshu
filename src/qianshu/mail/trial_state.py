@@ -26,7 +26,7 @@ MANUAL_BODY_MISSED = "转人工（正文未参与解析）"
 # 供日报的只读连接直接执行。顺序为待发、需人工核对。
 BODY_NOTICE_COUNTS_SQL = """
 SELECT count(*) FILTER (WHERE status='pending'), count(*) FILTER (WHERE status IN ('unknown','review'))
-FROM notice WHERE kind='body_missed'
+FROM notice WHERE kind IN ('body_missed','interrupted')
 """
 
 
@@ -222,14 +222,19 @@ class Store:
 
     def _freeze(self, scope, reason):
         box = self.row("SELECT state FROM mailbox WHERE scope=?", scope)
-        if box["state"] != "frozen":
+        fresh = box["state"] != "frozen"
+        if fresh:
             self.db.execute("UPDATE registration SET version=version+1 WHERE scope=?", (scope,))
         self.db.execute("UPDATE mailbox SET state='frozen',reason=? WHERE scope=?", (reason, scope))
         if reason == "generation":
             self.review_stale_notices(scope)
         generation = self.row("SELECT generation FROM mailbox WHERE scope=?", scope)[0]
         count = self.row("SELECT count(*) FROM registration WHERE scope=?", scope)[0]
-        self.notice(f"freeze:{scope}:{generation}", scope, None, "freeze", count)
+        event = f"freeze:{scope}:{generation}"
+        # 对账恢复后代次可能不变；新一次冻结须有新事件号，不得被同名去重吞掉（G448）。
+        if fresh and self.row("SELECT 1 FROM notice WHERE event=?", event):
+            event += f":{self.row('SELECT count(*) FROM notice WHERE scope=? AND kind=?', scope, 'freeze')[0]}"
+        self.notice(event, scope, None, "freeze", count)
 
     def freeze(self, scope, reason):
         with self.write():
