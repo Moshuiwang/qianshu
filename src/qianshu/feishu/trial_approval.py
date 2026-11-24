@@ -55,6 +55,12 @@ class Journal:
     def __init__(self, db):
         self.db = db
 
+    def initialize(self):
+        """在调用方事务内创建审批表，沿用现有收信登记。"""
+        for statement in SCHEMA.split(";"):
+            if statement.strip():
+                self.db.execute(statement)
+
     def session(self):
         row = self.db.execute("SELECT session FROM trial_session WHERE id=1").fetchone()
         return row[0] if row else ""
@@ -105,6 +111,7 @@ class Journal:
     def rotate(self, session, reason):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
+            self.initialize()
             for row in self.db.execute("SELECT * FROM trial_card WHERE status IN ('preparing','open','accepted','partial')"):
                 self.close(row, reason)
             self.db.execute("INSERT OR REPLACE INTO trial_session VALUES(1,?)", (session,))

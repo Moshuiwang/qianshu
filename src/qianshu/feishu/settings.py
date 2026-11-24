@@ -9,7 +9,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from qianshu.config import CONFIG_KEYS, LOGGABLE_CONFIG_KEYS, ConfigError, load_config, registered_credentials
+from qianshu.config import CONFIG_KEYS, LOGGABLE_CONFIG_KEYS, ConfigError, load_config
 
 _REQUIRED_EXTRA_KEYS = ("FEISHU_BOT_OPEN_ID", "FEISHU_ALLOWED_SENDER_IDS")
 _HANDOFF_SENSITIVE_KEYS = (
@@ -30,10 +30,6 @@ class Settings:
     handoff_sensitive_values: tuple[str, ...] = ()
     handoff_sensitive_urls: frozenset[str] = frozenset()
     handoff_member_open_ids: frozenset[str] = frozenset()
-    trial_credentials: tuple[tuple[str, str], ...] = ()
-    handoff_credentials_complete: bool = True
-    trial_credentials_complete: bool = True
-    trial_login_dir: Path | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -93,29 +89,23 @@ def _read_handoff_config(path: Path, *, allow_missing: bool = False) -> dict[str
     raise ConfigError("无法读取飞书转交所需的私有配置。")
 
 
-def _read_official_keys(path: Path, business: dict[str, str | None], *, include_trial: bool):
+def _read_official_token(path: Path, business: dict[str, str | None]) -> str:
     try:
         with path.open(encoding="utf-8-sig") as stream:
-            official = json.load(stream)["official"]
-            token_key = official["token_key"]
-    except (OSError, ValueError, KeyError, TypeError, RecursionError):
+            token_key = json.load(stream)["official"]["token_key"]
+    except (OSError, ValueError, KeyError, TypeError):
         raise ConfigError("无法读取明道云官方接口令牌键名。") from None
     if not isinstance(token_key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_key):
         raise ConfigError("明道云官方接口令牌键名无效。")
     token = (business.get(token_key) or "").strip()
     if not token:
         raise ConfigError("业务私有配置缺少明道云官方接口令牌。")
-    if not include_trial:
-        return token, set(), True
-    app_key = official.get("app_id_key")
-    complete = (isinstance(app_key, str) and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", app_key)
-                and (business.get(app_key) or "").strip())
-    return token, {token_key, app_key} if complete else {token_key}, bool(complete)
+    return token
 
 
 def load_handoff_settings(
     env_file: Path, *, for_listener: bool = False, business_env_file: Path | None = None,
-    mingdao_config: Path | None = None, include_trial: bool = True,
+    mingdao_config: Path | None = None,
 ) -> tuple[Settings, Path]:
     """读取飞书转交配置，监听器另读取业务配置的敏感值。"""
     values = _read_handoff_config(env_file)
@@ -132,9 +122,6 @@ def load_handoff_settings(
         raise ConfigError("FEISHU_MENTION_LOG 须指向私有目录中的日志文件。")
     sensitive_values = ()
     sensitive_urls = frozenset()
-    credentials = ()
-    handoff_complete = True
-    complete = True
     if for_listener:
         business_path = business_env_file or Path(".env")
         business = values if business_path == env_file else _read_handoff_config(
@@ -146,17 +133,8 @@ def load_handoff_settings(
         ]
         sensitive_urls = frozenset(value for key, value in sensitive if key.endswith("_URL"))
         matches = [value for key, value in sensitive if not key.endswith("_URL")]
-        official_keys = set()
         if mingdao_config is not None:
-            try:
-                token, official_keys, complete = _read_official_keys(mingdao_config, business, include_trial=include_trial)
-                matches.append(token)
-            except ConfigError:
-                handoff_complete = complete = False
-        if include_trial:
-            credentials = tuple(dict.fromkeys(
-                pair for source in (values, business) for pair in registered_credentials(source, official_keys).items()
-            ))
+            matches.append(_read_official_token(mingdao_config, business))
         sensitive_values = tuple(dict.fromkeys(matches))
     settings = Settings(
         app_id=(values.get("FEISHU_APP_ID") or "").strip(),
@@ -166,9 +144,6 @@ def load_handoff_settings(
         allowed_senders=frozenset({owner}),
         tenant_key=(values.get("FEISHU_TENANT_KEY") or "").strip() or None,
         handoff_member_open_ids=members,
-        handoff_credentials_complete=handoff_complete,
-        trial_credentials=credentials, trial_credentials_complete=complete,
-        trial_login_dir=mingdao_config.parent if mingdao_config is not None else None,
         handoff_sensitive_values=sensitive_values,
         handoff_sensitive_urls=sensitive_urls,
     )

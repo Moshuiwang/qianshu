@@ -1,9 +1,11 @@
-"""与群转交共享长连接，审批消息使用独立的凭据检查传输。"""
+"""试运行卡片回调、通知及凭据出口检查。"""
 
 import asyncio
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from copy import copy
+from dataclasses import dataclass
+from pathlib import Path
 from html import escape
 import json
 import logging
@@ -12,12 +14,16 @@ import time
 from threading import Lock
 from uuid import uuid4
 
+from lark_oapi import RequestOption
+from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+
 from qianshu.config import ConfigError
 from qianshu.mail import _fingerprint
-from qianshu.mingdao.create_order import CredentialConflict, Outlet, OutletConflict, OutletUnavailable, Stop, decode, private_bytes
+from qianshu.mingdao.create_order import CredentialConflict, Outlet, OutletConflict, Stop, decode, private_bytes
 
 from .cards import mention
 from .sdk import P2CardActionTriggerResponse, _Transport
+from .settings import Settings
 from .state import CALLBACK_RESPONSE_MARGIN
 from .trial_approval import CARD_FORMAT, journal_at
 
@@ -27,6 +33,52 @@ _LOG = logging.getLogger(__name__)
 
 class MessageNotSent(RuntimeError):
     """消息尚未交接给 HTTP 传输。"""
+
+
+@dataclass(frozen=True, repr=False, kw_only=True)
+class ApprovalSettings(Settings):
+    trial_credentials: tuple[tuple[str, str], ...]
+    trial_credentials_complete: bool
+    trial_login_dir: Path | None = None
+
+
+class OutletUnavailable(CredentialConflict):
+    """发送前无法核对已配置的凭据来源或检查器。"""
+
+
+def send_trial_message(transport, content, request_id, card, check):
+    if (not getattr(transport, "order_http", None) or not callable(getattr(transport, "before_send", None))
+            or not callable(getattr(transport, "trial_action", None))):
+        raise OutletUnavailable("缺少试运行凭据出口检查器")
+    handed_off = False
+
+    def claim():
+        nonlocal handed_off
+        check()
+        handed_off = True
+
+    async def deliver():
+        payload = content if card else {"text": content}
+        body = (CreateMessageRequestBody.builder().receive_id(transport.settings.chat_id)
+                .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
+                .uuid(request_id).build())
+        request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+        transport.before_send("message", {"receive_id": body.receive_id, "content": body.content, "uuid": request_id})
+        token = await transport._tenant_token()
+        return await transport.im.message.acreate(request, RequestOption.builder().tenant_access_token(token).build())
+    try:
+        with transport.trial_action(claim):
+            response = asyncio.run(deliver())
+    except CredentialConflict:
+        raise
+    except Exception as exc:
+        if not handed_off:
+            raise MessageNotSent("试运行群消息尚未交接") from exc
+        raise
+    if (not response.success() or not response.data or not isinstance(response.data.message_id, str)
+            or not response.data.message_id.strip()):
+        raise RuntimeError("试运行群消息回执不明。")
+    return response.data.message_id
 
 
 def checked_transport(settings, private_dir=None):
@@ -187,7 +239,6 @@ class Listener:
                                        USING(card) WHERE n.status='pending' ORDER BY n.rowid""").fetchall():
                 target = json.loads(row["snapshot"]).get("contact")
 
-                from qianshu.__main__ import _send_trial_message
                 def claim():
                     with j.db:
                         if not j.db.execute("""UPDATE trial_notification SET status='unknown'
@@ -195,7 +246,7 @@ class Listener:
                             raise ValueError
                 body = (mention(target, "配置负责人") + " " if target else "") + row["body"]
                 try:
-                    _send_trial_message(self.transport, body, row["uuid"], False, claim)
+                    send_trial_message(self.transport, body, row["uuid"], False, claim)
                 except CredentialConflict:
                     _LOG.error("E-TRIAL-MANUAL")
                     with j.db:

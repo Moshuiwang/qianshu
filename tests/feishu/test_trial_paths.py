@@ -1,22 +1,20 @@
 import asyncio
 import json
-import sqlite3
 import time
 from contextlib import closing
 from datetime import UTC, datetime
-from threading import Event
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from qianshu.feishu.settings import Settings
+from qianshu.feishu.trial_listener import ApprovalSettings, Listener, checked_transport, send_trial_message
 from qianshu.mail.trial_state import Store
-from tests.feishu.startup_replay import observe
 
 
 def settings():
-    return Settings("app", "private-app-key", "group", "bot", frozenset({"owner"}))
+    return ApprovalSettings("app", "private-app-key", "group", "bot", frozenset({"owner"}),
+                            trial_credentials=(), trial_credentials_complete=True)
 
 
 def switches():
@@ -98,11 +96,8 @@ def test_mixed_combinations_bind_complete_preview(tmp_path):
         assert [b["value"]["action"] for b in pages[-1]["elements"][-1]["elements"][-1]["actions"]] == ["verify", "approve", "reject"]
 
 
-def test_single_connection_callback_then_disabled_cli_recovery(tmp_path, monkeypatch):
-    from qianshu import __main__ as cli
-    from qianshu.feishu.state import State
-    from qianshu.feishu.trial_listener import Listener
-    from qianshu.feishu.trial_approval import Journal
+def test_bound_card_callback(tmp_path, monkeypatch):
+    from qianshu.feishu.trial_approval import recovery
     path = tmp_path / "trial-050.sqlite3"
     store, journal, card, pages = setup_card(path)
     now = [datetime(2030, 1, 1, 1, tzinfo=UTC).timestamp()]
@@ -142,33 +137,11 @@ def test_single_connection_callback_then_disabled_cli_recovery(tmp_path, monkeyp
     checked.is_member.side_effect = None
     assert "已核验" in trigger("verify")
     assert "执行器未就绪" in trigger("approve")
+    assert {r["kind"] for r in recovery(store.db)} >= {"trial_task", "trial_card"}
     store.db.close()
-    assert {r["kind"] for r in State.recovery_list(path)} >= {"trial_task", "trial_card"}
-
-    switch_file = tmp_path / "switches"
-    switch_file.write_text("")
-    monkeypatch.setattr(cli, "load_handoff_settings", lambda *a, **k: (settings(), tmp_path/"mention"))
-    delivered = Event()
-    observe(monkeypatch, delivered)
-    deliveries = []
-    def send(transport, content, uuid, card, claim):
-        claim()
-        deliveries.append(content)
-        delivered.set()
-        return "ok"
-    monkeypatch.setattr(cli, "_send_trial_message", send)
-    assert cli.main(["--handoff-only", "--trial-switches", str(switch_file)]) == 0
-    with closing(sqlite3.connect(path)) as db:
-        assert db.execute("SELECT status FROM trial_task").fetchone()[0] == "closed"
-        bodies = db.execute("SELECT body FROM trial_notification").fetchall()
-        assert bodies and all("未建单" in row[0] for row in bodies)
-    assert delivered.is_set() and deliveries
-    assert all('<at user_id="ou_config">' in message for message in deliveries)
 
 
 def test_trial_outlet_blocks_before_token_and_sdk(tmp_path):
-    from qianshu.__main__ import _send_trial_message
-    from qianshu.feishu.trial_listener import checked_transport
     login = tmp_path / "mingdao-state.json"
     login.write_text(json.dumps({"cookies": [{"value": "synthetic-session-fragment"}]}))
     login.chmod(0o600)
@@ -176,45 +149,9 @@ def test_trial_outlet_blocks_before_token_and_sdk(tmp_path):
     transport._tenant_token = AsyncMock(side_effect=AssertionError)
     transport.im.message.acreate = AsyncMock(side_effect=AssertionError)
     with pytest.raises(Exception):
-        _send_trial_message(transport, {"excerpt": "session-fragment"}, "fixed", True, Mock())
+        send_trial_message(transport, {"excerpt": "session-fragment"}, "fixed", True, Mock())
     transport._tenant_token.assert_not_awaited()
     transport.before_send = None
     with pytest.raises(RuntimeError, match="出口检查器"):
-        _send_trial_message(transport, "notice", "fixed", False, Mock())
+        send_trial_message(transport, "notice", "fixed", False, Mock())
     transport._tenant_token.assert_not_awaited()
-
-
-def test_one_socket_keeps_handoff_deadline_and_routes_card(monkeypatch):
-    from qianshu.feishu.sdk import P2CardActionTriggerResponse, _Connection, ws
-    from tests.feishu.test_sdk import FakeSocket, encoded_frame
-
-    async def exercise():
-        monkeypatch.setattr(ws, "loop", asyncio.get_running_loop())
-        origin = FakeSocket()
-        record = AsyncMock(return_value=P2CardActionTriggerResponse({"toast": {"type": "info", "content": "已记录"}}))
-        inject = Mock()
-        service = SimpleNamespace(settings=settings(), _origin=origin, _record_action=record,
-                                  trial_callbacks=True, _callback_response_margin=0,
-                                  entrance=SimpleNamespace(inject_message=inject))
-        connection = _Connection(service, approvals=True)
-        connection._conn = origin
-        timing = connection._frame_timing(origin)
-        header = {"app_id": "app", "event_id": "event", "event_type": "im.message.receive_v1"}
-        message = {"sender": {"sender_type": "user", "sender_id": {"open_id": "owner"}},
-                   "message": {"message_id": "m", "chat_id": "group", "chat_type": "group", "message_type": "text",
-                               "create_time": "1000", "content": "{}", "mentions": [{"key": "@1", "id": {"open_id": "bot"}}]}}
-        try:
-            await connection._handle_message(encoded_frame(dict(schema="2.0", header=header, event=message)), timing)
-            assert inject.call_args.kwargs == {"deadline": timing[-1]}
-            header["event_type"] = "card.action.trigger"
-            for app in ("other", "app"):
-                header["app_id"] = app
-                await connection._handle_message(encoded_frame(dict(schema="2.0", header=header, event={}),
-                                                               ws.MessageType.CARD), timing)
-            record.assert_awaited_once()
-            assert origin.responses == ["event_ack", "warning", "info"]
-        finally:
-            connection._cache._cron.cancel()
-            await asyncio.gather(connection._cache._cron, return_exceptions=True)
-
-    asyncio.run(exercise())

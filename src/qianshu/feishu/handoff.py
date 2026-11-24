@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import re
-import signal
 import sqlite3
 import stat
 import time
@@ -318,8 +317,6 @@ class MentionLog:
             """, (self.clock() - 3,)).fetchall()
 
     def _validate_reply_text(self, text: str) -> None:
-        if not self.settings.handoff_credentials_complete:
-            raise ValueError("转交回复凭据来源无法核对。")
         if not text.strip() or len(text) > REPLY_LIMIT or _AT_TAG.search(text):
             raise ValueError("守望者回复须提供不含 @ 标签的非空文本，最多 4000 字。")
         if self._redact(text) != text or _CREDENTIAL_PATTERN.search(text):
@@ -459,34 +456,6 @@ class Handoff:
 class HandoffService:
     """常驻飞书监听。长连接仅注册收件事件，后台回扫与回复共用私有日志。"""
 
-    approvals = None
-    interrupted = False
-
-    @classmethod
-    @contextmanager
-    def listening(cls, path, settings):
-        """在工作线程和登记库全部关闭后交还中断。"""
-        interrupted = False
-        service = None
-
-        def interrupt(signum, frame):
-            nonlocal interrupted
-            interrupted = True
-            if service is not None:
-                service.interrupted = True
-
-        previous = signal.signal(signal.SIGINT, interrupt)
-        try:
-            with MentionLog.listening(path, settings) as log:
-                service = cls(log)
-                service.interrupted = interrupted
-                yield service
-        finally:
-            signal.signal(signal.SIGINT, previous)
-            if interrupted:
-                signal.raise_signal(signal.SIGINT)
-
-    trial_callbacks = False
     _callback_response_margin = 0
 
     def __init__(self, store: MentionLog):
@@ -542,7 +511,7 @@ class HandoffService:
     async def _serve(self, client: _Connection) -> None:
         ping = asyncio.create_task(client._ping_loop())
         try:
-            while not self.interrupted:
+            while True:
                 if self._origin is None and (client.receiver is None or client.receiver.done()):
                     try:
                         await client._connect()
@@ -550,11 +519,6 @@ class HandoffService:
                         raise
                     except Exception:
                         _LOG.warning("feishu_handoff_connect_failed")
-                if self.approvals is not None:
-                    self.approvals.try_enable(client)
-                retry = getattr(self, "retry_approval_start", None)
-                if retry is not None:
-                    retry()
                 await asyncio.sleep(1)
         finally:
             tasks = [ping, client._cache._cron, *client.frames]
@@ -567,7 +531,7 @@ class HandoffService:
                 await client._disconnect()
 
     def run(self) -> None:
-        client = _Connection(self, approvals=self.trial_callbacks)
+        client = _Connection(self, approvals=False)
         threads = (
             Thread(target=self._recover, name="feishu-handoff-history"),
             Thread(target=self._deliver, args=(False,), name="feishu-handoff-replies"),
@@ -588,8 +552,6 @@ class HandoffService:
             self._receipts.shutdown(wait=True, cancel_futures=True)
             for thread in threads:
                 thread.join()
-            if self.approvals is not None:
-                self.approvals.disable()
 
 
 def _utc(ms: int) -> str:

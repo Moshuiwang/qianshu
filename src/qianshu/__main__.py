@@ -104,41 +104,16 @@ def _send_report_card(
 
 
 def _send_trial_message(transport, content, request_id, card, check):
-    if (not getattr(transport, "order_http", None) or not callable(getattr(transport, "before_send", None))
-            or not callable(getattr(transport, "trial_action", None))):
-        from .mingdao.create_order import OutletUnavailable
-        raise OutletUnavailable("缺少试运行凭据出口检查器")
-    from .feishu.trial_listener import MessageNotSent
-    from .mingdao.create_order import CredentialConflict
-    handed_off = False
-
-    def claim():
-        nonlocal handed_off
-        check()
-        handed_off = True
-
-    async def deliver():
-        payload = content if card else {"text": content}
-        body = (CreateMessageRequestBody.builder().receive_id(transport.settings.chat_id)
-                .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
-                .uuid(request_id).build())
-        request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-        transport.before_send("message", {"receive_id": body.receive_id, "content": body.content, "uuid": request_id})
-        token = await transport._tenant_token()
-        return await transport.im.message.acreate(request, RequestOption.builder().tenant_access_token(token).build())
-    try:
-        with transport.trial_action(claim):
-            response = asyncio.run(deliver())
-    except CredentialConflict:
-        raise
-    except Exception as exc:
-        if not handed_off:
-            raise MessageNotSent("试运行群消息尚未交接") from exc
-        raise
-    if (not response.success() or not response.data or not isinstance(response.data.message_id, str)
-            or not response.data.message_id.strip()):
+    payload = content if card else {"text": content}
+    body = (CreateMessageRequestBody.builder().receive_id(transport.settings.chat_id)
+            .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
+            .uuid(request_id).build())
+    request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+    token = asyncio.run(transport._tenant_token())
+    check()
+    response = transport.im.message.create(request, RequestOption.builder().tenant_access_token(token).build())
+    if not response.success() or not response.data or not response.data.message_id:
         raise RuntimeError("试运行群消息回执不明。")
-    return response.data.message_id
 
 
 class _ReportProcessor:
@@ -796,21 +771,22 @@ def main(argv: list[str] | None = None) -> int:
                 args.tag_dates, args.companies_file, args.legacy_companies, args.raw_output_dir)):
             parser.error("--handoff-only 只与 --env-file、--business-env-file、--mingdao-config 一起使用。")
         try:
-            from .feishu.handoff import HandoffService
+            from .feishu.handoff import HandoffService, MentionLog
 
-            def settings_for(*, include_trial):
-                return load_handoff_settings(
-                    args.env_file, for_listener=True, business_env_file=args.business_env_file,
-                    mingdao_config=args.mingdao_config, include_trial=include_trial,
-                )
-
-            settings, path = settings_for(include_trial=False)
+            settings, path = load_handoff_settings(
+                args.env_file, for_listener=True, business_env_file=args.business_env_file,
+                mingdao_config=args.mingdao_config,
+            )
             setup_logging({"FEISHU_APP_SECRET": settings.app_secret})
-            from .feishu.trial_lifecycle import ApprovalLifecycle
-
-            with HandoffService.listening(path, settings) as service:
-                service.approvals = ApprovalLifecycle(args, path, lambda: settings_for(include_trial=True))
-                service.run()
+            if args.trial_switches:
+                from .config import trial_config
+                from .mail.trial import run_service
+                switches = trial_config(args.trial_switches)
+                if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
+                    run_service(args, settings, path, lambda: switches)
+                    return 0
+            with MentionLog.listening(path, settings) as store:
+                HandoffService(store).run()
         except ConfigError as error:
             print(error, file=sys.stderr)
             return 1

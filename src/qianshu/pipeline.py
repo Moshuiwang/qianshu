@@ -450,9 +450,7 @@ class Pipeline:
         legacy_companies: bool = False,
         on_reply: Callable[[Application, str], None] | None = None,
         benefit_catalog: BenefitCatalog | None = None,
-        on_review=None,
     ) -> None:
-        self.on_review = on_review
         self.model = model
         self.tag_dates = tag_dates
         self.today = today
@@ -594,6 +592,4 @@ class Pipeline:
                 for number, excerpt in enumerate(policy.draft.approval_url.evidence, 1):
                     lines.append(_ModelLine(f"政策 {index} · 任务审批链接 · 原文出处 {number}", "",
                                             parts=(_ModelText(excerpt.text, "evidence", start=excerpt.start),)))
-        if self.on_review is not None:
-            self.on_review(drafts, policies, requires_full_review)
         return self._detail_pages(display_body, lines, redact)

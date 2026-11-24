@@ -73,6 +73,7 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
     reg, version = row["id"], row["version"]
     card = str(uuid4())
     journal = Journal(trial.store.db)
+    journal.initialize()
     session = journal.session()
     lines, eligible, missing = [], [], []
     items = list(range(1, len(policies) + 1))

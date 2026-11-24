@@ -29,7 +29,7 @@ import httpx
 from dotenv import dotenv_values
 from pydantic import TypeAdapter
 
-from qianshu.config import CONFIG_KEYS, registered_credentials
+from qianshu.config import CONFIG_KEYS, LOGGABLE_CONFIG_KEYS
 from qianshu.draft import DraftField, OfferPolicyDraft, PolicyDraft
 from qianshu.mingdao.offer_fields import WEB_TYPES, web_value
 from qianshu.parse import _normalized_value, _read_options
@@ -137,10 +137,6 @@ _UNKNOWN_STOP = "建单结果未知，需人工对账"
 _LOCAL_CONFLICT = "E-CRED-STOP"
 _MANUAL_NOTICE = "未建单（凭据冲突），转人工处理"
 _outlet = ContextVar("create_order_outlet", default=None)
-
-
-class OutletUnavailable(CredentialConflict):
-    """发送前无法核对已配置的凭据来源或检查器。"""
 
 
 class OutletConflict(CredentialConflict):
@@ -3112,7 +3108,10 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
         require(secret_safe(value), "官方接口鉴权配置无效")
         return value
 
-    credentials = registered_credentials(secrets, {official["token_key"], official["app_id_key"]})
+    display_settings = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
+    official_keys = {official["token_key"], official["app_id_key"]}
+    credentials = {key: value for key, value in secrets.items()
+                   if receipt(value) and (key not in display_settings or key in official_keys)}
     for index, cookie in enumerate(login["cookies"]):
         if receipt(cookie.get("value")):
             credentials[("cookie", index)] = cookie["value"]

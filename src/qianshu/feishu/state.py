@@ -201,9 +201,6 @@ class State:
             raise ValueError("须指定私有入口状态文件。")
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
-            if db.execute("SELECT 1 FROM sqlite_master WHERE name='trial_card'").fetchone():
-                from .trial_approval import recovery
-                return recovery(db)
             columns = {c[1] for c in db.execute("PRAGMA table_info(feishu_messages)")}
             if "digest" not in columns:
                 raise ValueError("入口状态表不存在。")

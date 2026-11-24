@@ -3,15 +3,6 @@ from contextlib import closing
 
 import pytest
 
-from qianshu.config import ConfigError, trial_config
-
-
-def test_invalid_create_switch_is_rejected(tmp_path):
-    path = tmp_path / "switches"
-    path.write_text("MAIL_TRIAL_CREATE_ENABLED=yes")
-    with pytest.raises(ConfigError):
-        trial_config(path)
-
 
 @pytest.fixture
 def journal(tmp_path):

@@ -523,7 +523,6 @@ class _Connection(ws.Client):
     def __init__(self, service, *, approvals: bool = True):
         self.service = service
         self._approvals = approvals
-        self._handoff = not approvals or getattr(service, "trial_callbacks", False) is True
         self._dispatch = ContextVar("feishu_dispatch", default=(None, 0.0, 0.0))
         self.receiver = None
         self.frames = set()
@@ -560,19 +559,10 @@ class _Connection(ws.Client):
                 except ws.InvalidHandshake as error:
                     ws._parse_ws_conn_exception(error)
                 self._conn_url, self._conn_id, self._service_id = conn_url, conn_id, service_id
-                try:
-                    self.service.transport._require_window()
-                    self._generation += 1
-                    self.service._connected(self._conn)
-                    self.receiver = asyncio.create_task(self._receive_message_loop())
-                except BaseException:
-                    conn, self._conn = self._conn, None
-                    self._conn_url = self._conn_id = self._service_id = ""
-                    try:
-                        self.service._disconnected()
-                    finally:
-                        await conn.close()
-                    raise
+                self.service.transport._require_window()
+                self._generation += 1
+                self.service._connected(self._conn)
+                self.receiver = asyncio.create_task(self._receive_message_loop())
 
     async def _discover_endpoint(self) -> str:
         # 固定版本的 SDK 在这里直接调用无超时的 requests.post。
@@ -676,7 +666,7 @@ class _Connection(ws.Client):
         if count > 1:
             msg_id = ws._get_by_key(headers, ws.HEADER_MESSAGE_ID)
             timing_key = f"handoff-timing:{self._generation}:{msg_id}"
-            if self._handoff:
+            if not self._approvals:
                 first = self._cache.get(timing_key)
                 if first is None or started < first[0]:
                     first = (started, deadline)
@@ -692,15 +682,11 @@ class _Connection(ws.Client):
         response = ws.Response(code=HTTPStatus.OK)
         timing = self._dispatch.set((origin, started, deadline))
         try:
-            lifecycle = getattr(self.service, "approvals", None)
-            header = json.loads(payload).get("header") if lifecycle or frame_type == ws.MessageType.CARD.value else None
             if frame_type == ws.MessageType.CARD.value:
+                header = json.loads(payload).get("header")
                 if not isinstance(header, dict) or header.get("event_type") != "card.action.trigger":
                     raise ValueError("卡片帧缺少卡片回调类型。")
-            if lifecycle and isinstance(header, dict) and header.get("event_type") == "card.action.trigger":
-                result = lifecycle.handle(payload)
-            else:
-                result = self._event_handler._do_without_validation(payload)
+            result = self._event_handler._do_without_validation(payload)
             if result is not None:
                 encoded = ws.JSON.marshal(await result).encode()
                 _before_send(self.service, "callback_content", encoded)
@@ -762,7 +748,7 @@ class _Connection(ws.Client):
             )
         except (TypeError, ValueError):
             return
-        if not self._handoff:
+        if self._approvals:
             self.service.entrance.inject_message(incoming)
         else:
             _, _, deadline = self._dispatch.get()
