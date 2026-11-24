@@ -298,7 +298,9 @@ class Recording:
         if self.document.get("request_sha256"):
             self.request_hashes[digest(token.encode())] = self.document["request_sha256"]
         attempts = self.document["attempts"]
-        if self.origin == "live" and self.mode == "batch" and len(attempts) != 1:
+        if self.origin == "live" and self.mode == "batch" and len(attempts) != (
+            2 if attempts and attempts[0].get("first_shape_error") else 1
+        ):
             raise RegressionError("批量结果未逐篇录制，保留预占并停止结算。")
         for attempt in attempts:
             attempt.setdefault("batch_outcome", None)

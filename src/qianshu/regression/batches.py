@@ -4,7 +4,7 @@ import json
 from io import BytesIO
 import time
 from collections import Counter
-from contextlib import closing
+from contextlib import closing, contextmanager
 from unittest.mock import patch
 
 import anthropic
@@ -12,7 +12,9 @@ import httpx
 from pydantic import ValidationError
 
 from qianshu.parse import parse_application
-from qianshu.parse.model import ModelError, _REPLY_TOOL, configured_model, validate_reply_json
+from qianshu.parse.model import (
+    ModelError, _REPLY_TOOL, _missing_shape, configured_model, recorded_shape_error, validate_reply_json,
+)
 from qianshu.parse.protocol import ApplicationReply
 
 from .ledger import transaction
@@ -131,7 +133,7 @@ def batch_cost(lines, model_id):
     return reference_cost(model_id, "batch", usage, missing, live=True)
 
 
-def batch_attempt(line):
+def batch_attempt(line, *, first_shape_error=None, effort=None):
     raw_result = parts(line)["result"]
     result = json.loads(raw_result)
     outcome = result["type"]
@@ -141,7 +143,9 @@ def batch_attempt(line):
     usage = message.get("usage") or result.get("usage") or {}
     a = dict(batch_outcome=outcome, elapsed_ms=None, model=message.get("model"), stop_reason=message.get("stop_reason"),
              input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
-             blocks=None, reply=None, failure_stage="model_call")
+             blocks=None, reply=None, failure_stage="model_call", effort=effort,
+             first_shape_error=first_shape_error, retry_result="failed" if first_shape_error else None,
+             partial_input_tokens=None, partial_output_tokens=None)
     if any(v is not None and (type(v) is not int or v < 0) for v in (a["input_tokens"], a["output_tokens"])):
         raise RegressionError("批量用量无效。")
     if outcome != "succeeded":
@@ -172,6 +176,9 @@ def batch_attempt(line):
         a["failure_stage"] = "reply_tool_missing"
     elif len(tools) > 1:
         a["failure_stage"] = "reply_tool_multiple"
+        if not first_shape_error and recorded_shape_error(a):
+            a["first_shape_error"] = "reply_tool_multiple"
+            a["structure_path"] = ("content",)
     elif tools[0][0] != _REPLY_TOOL:
         a["failure_stage"] = "reply_tool_unexpected"
     else:
@@ -180,10 +187,32 @@ def batch_attempt(line):
             validate_reply_json(a["reply"])
             ApplicationReply.model_validate_json(a["reply"])
         except ValidationError as error:
-            a.update(failure_stage="reply_schema", structure_path=error.errors(include_input=False)[0]["loc"])
+            a["failure_stage"] = "reply_schema"
+            if not first_shape_error and (missing := _missing_shape(error)):
+                a["first_shape_error"], a["structure_path"] = missing
+            else:
+                a["structure_path"] = error.errors(include_input=False)[0]["loc"]
         except ValueError:
             a["failure_stage"] = "tool_input_json"
+    if first_shape_error:
+        if a["failure_stage"] is None:
+            a["retry_result"] = "succeeded"
+        else:
+            a.setdefault("structure_path", ())
     return a
+
+
+def _correction_request(wire, attempt):
+    request = json.loads(wire)
+    reason = attempt["first_shape_error"]
+    feedback = json.dumps({"path": attempt["structure_path"], "reason": reason})
+    count = 2 if reason == "reply_tool_multiple" else 1
+    calls = [{"type": "tool_use", "id": f"toolu_retry_{i}", "name": _REPLY_TOOL, "input": {}}
+             for i in range(count)]
+    results = [{"type": "tool_result", "tool_use_id": call["id"], "content": feedback, "is_error": True}
+               for call in calls]
+    request["messages"].extend([{"role": "assistant", "content": calls}, {"role": "user", "content": results}])
+    return json.dumps(request, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
 
 def raw_lines(response):
@@ -198,13 +227,20 @@ def raw_lines(response):
         yield pending.getvalue().decode("utf-8")
 
 
-def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, resume=False, reconcile_id=None):
+def _fetch_round(ledger, run_id, estimate, config, wires, settings, *, run_day, resume, reconcile_id, correction):
+    """两轮共享运行预占，分别登记批次受理与每篇原始结果。"""
     files = ledger.files
-    keys = {token: digest(json_bytes([run_id, token])) for token in wires}
+    prefix = [run_id, "shape_retry"] if correction else [run_id]
+    keys = {token: digest(json_bytes([*prefix, token])) for token in wires}
     expected = {keys[token]: common_body(raw) for token, raw in wires.items()}
     requests = [{"custom_id": k, "params": json.loads(v)} for k, v in expected.items()]
     identity = digest(json_bytes([config, expected]))
     journal = ledger.journal(run_id)
+    @contextmanager
+    def round_state():
+        with transaction(files, journal) as run:
+            yield run.setdefault("shape_retry", {}) if correction else run
+
     def verify(request):
         if (request.url.scheme, request.url.host, request.url.port) != origin:
             raise RegressionError("批量接口返回了不同来源的地址。")
@@ -225,10 +261,15 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                              http_client=http, max_retries=0, timeout=60) as client:
         origin = (client.base_url.scheme, client.base_url.host, client.base_url.port)
         batches = client.messages.batches
+        if not correction:
+            if not resume:
+                ledger.reserve(run_id, "batch", estimate, identity, today=config["today"], run_day=run_day,
+                               config_sha256=digest(json_bytes(config)))
+            with transaction(files, ledger.path) as runs:
+                if runs.get(run_id, {}).get("identity") != identity:
+                    raise RegressionError("续取与原提交配置不一致。")
         if not resume:
-            ledger.reserve(run_id, "batch", estimate, identity, today=config["today"], run_day=run_day,
-                           config_sha256=digest(json_bytes(config)))
-            with transaction(files, journal) as state:
+            with round_state() as state:
                 if state:
                     raise RegressionError("批次已登记。")
                 state.update(identity=identity, run_id=run_id, freeze_sha256=config["freeze_sha256"],
@@ -242,12 +283,9 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                     raise ValueError
             except (anthropic.APIError, httpx.HTTPError, AttributeError, ValueError):
                 raise RegressionError("批量创建受理未知，保留预占，须按原运行号只读对账。") from None
-            with transaction(files, journal) as state:
+            with round_state() as state:
                 state["batch_id"] = batch_id
-        with transaction(files, ledger.path) as runs:
-            if runs.get(run_id, {}).get("identity") != identity:
-                raise RegressionError("续取与原提交配置不一致。")
-        with transaction(files, journal) as state:
+        with round_state() as state:
             if (state.get("identity") != identity or state.get("conflict") or state.get("instant") != wires
                 or state.get("batch_sha256") != digest(captured[0].encode()) or state.get("batch") != captured[0]):
                 raise RegressionError("批次登记与请求不符或有冲突，须人工对账。")
@@ -271,7 +309,7 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                     raise RegressionError("批次仍在途，可按原运行号续取。")
                 time.sleep(min(delay, max(0, deadline - time.time())))
                 delay = min(delay * 2, 60)
-            with transaction(files, journal) as state:
+            with round_state() as state:
                 state.setdefault("observed_seconds", time.time() - state["submitted"])
             seen = {}
             with closing(batches.results(batch_id)) as result:
@@ -288,13 +326,12 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
                                 seen[key] = line
                             item.update(raw=line, sha256=checksum)
                     if conflict:
-                        with transaction(files, journal) as state:
+                        with round_state() as state:
                             state["conflict"] = True
                         raise RegressionError("同一批量结果的字节冲突。")
             if seen.keys() != expected.keys():
                 raise RegressionError("取回结果缺篇，请从原批次续取。")
-            ledger.record_cost(run_id, batch_cost(seen.values(), model_id))
-            with transaction(files, journal) as state:
+            with round_state() as state:
                 if state.get("conflict"):
                     raise RegressionError("结果有冲突，须人工对账。")
                 state.update(complete=True, batch_id=batch_id)
@@ -304,18 +341,51 @@ def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, r
             if digest(item["raw"].encode()) != item["sha256"]:
                 raise RegressionError("逐篇原始结果指纹不符。")
             rows[key] = item["raw"]
-        if finished:
-            # 兼容旧日志：结果可能已齐，但旧版本尚未结算就退出。
-            ledger.record_cost(run_id, batch_cost(rows.values(), model_id))
+    return {token: rows[key] for token, key in keys.items()}, state["observed_seconds"]
+
+
+def fetch_batch(ledger, run_id, estimate, config, wires, settings, *, run_day, resume=False, reconcile_id=None):
+    journal = ledger.journal(run_id)
+    retry_registered = False
+    retry_reconcile = None
+    if resume:
+        with transaction(ledger.files, journal) as state:
+            retry_registered = "shape_retry" in state
+            if retry_registered and reconcile_id != state.get("batch_id"):
+                retry_reconcile, reconcile_id = reconcile_id, None
+
+    rows, seconds = _fetch_round(ledger, run_id, estimate, config, wires, settings, run_day=run_day,
+                                 resume=resume, reconcile_id=reconcile_id, correction=False)
+    effort = config.get("effort")
+    attempts = {token: [batch_attempt(line, effort=effort)] for token, line in rows.items()}
+    retry_wires = {token: _correction_request(wires[token], first)
+                   for token, (first,) in attempts.items() if first["first_shape_error"]}
+    lines = list(rows.values())
+    if retry_wires:
+        if reconcile_id and not retry_registered:
+            raise RegressionError("首轮已完成对账，请用原参数续取以执行形状纠错。")
+        retry_rows, retry_seconds = _fetch_round(
+            ledger, run_id, estimate, config, retry_wires, settings, run_day=run_day,
+            resume=retry_registered, reconcile_id=retry_reconcile, correction=True,
+        )
+        seconds += retry_seconds
+        lines.extend(retry_rows.values())
+        for token, line in retry_rows.items():
+            final = batch_attempt(line, first_shape_error=attempts[token][0]["first_shape_error"], effort=effort)
+            # 即时录制只给最终格式错误保留 structure_path，首轮位置已进入纠错请求。
+            del attempts[token][0]["structure_path"]
+            final["request"] = retry_wires[token]
+            attempts[token].append(final)
+    model_id = json.loads(next(iter(wires.values())))["model"]
+    ledger.record_cost(run_id, batch_cost(lines, model_id))
+
     def source(token, user_sha, system_sha):
         request = json.loads(wires[token])
         if (digest(request["system"].encode()) != system_sha
             or digest(request["messages"][0]["content"].encode()) != user_sha):
             raise RegressionError("批量录制与计分输入不同。")
-        attempt = batch_attempt(rows[keys[token]])
-        attempt["effort"] = config.get("effort")
-        return [attempt]
-    source.batch_seconds = state["observed_seconds"]
+        return attempts[token]
+    source.batch_seconds = seconds
     return source
 
 
