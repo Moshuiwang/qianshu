@@ -12,7 +12,7 @@ import ssl
 import sys
 import time
 import unicodedata
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, fields, replace
@@ -132,6 +132,8 @@ class CredentialConflict(Stop):
     """发卡前命中凭据门禁，须公告转人工。"""
 
 
+_UNKNOWN_NOTICE = "建单结果未知，已冻结清理，需人工核对官方回读和私有台账"
+_UNKNOWN_STOP = "建单结果未知，需人工对账"
 _LOCAL_CONFLICT = "E-CRED-STOP"
 _MANUAL_NOTICE = "未建单（凭据冲突），转人工处理"
 _outlet = ContextVar("create_order_outlet", default=None)
@@ -148,6 +150,8 @@ class Outlet:
         self.credentials = {}
         self.conflict = False
         self.configuration_checked = False
+        self.unknown_reentry = False
+        self.unknown_notice_attempted = False
         self.started = False
 
     def require_clear(self):
@@ -366,6 +370,58 @@ def exclusive(path, value):
     sync_directory(path.parent)
 
 
+_RECONCILED = {"create_reconciled_read", "create_reconciled_read_unconfirmed",
+               "readback_unconfirmed", "create_reconciled_candidate"}
+
+
+def valid_policy_name(name):
+    return receipt(name) and len(name) > len(_PREFIX) and not any(c in name for c in "\r\n<>")
+
+
+def creation_state(rows):
+    """在台账锁内按同号事件顺序判断。无法解释的组合一律冻结。"""
+    name = rows[0].get("name")
+    if not valid_policy_name(name) or not name.startswith(_PREFIX) or any(
+        row.get("name") != name or row.get("is_test") is not True for row in rows
+    ):
+        return "conflict"
+    before_write = {"create_reserved", "card_published", "create_attempt", "aborted_before_write", "approval_closed"}
+    if any(row.get("event") in before_write and row.get("record_id") is not None for row in rows):
+        return "conflict"
+    events = [row.get("event") for row in rows]
+    reserved = events[:1] == ["create_reserved"]
+    start = int(reserved)
+    if events[start:start + 1] == ["card_published"]:
+        start += 1
+    pending = events[start:]
+    if not pending:
+        return "reserved"
+    attempted = pending[:1] == ["create_attempt"]
+    if attempted:
+        pending = pending[1:]
+    if not pending:
+        return "attempt"
+    if reserved and pending in (["aborted_before_write"], ["aborted_before_write", "approval_closed"]):
+        writes = rows[start + int(attempted)].get("allowed_writes")
+        if type(writes) is int and writes == 0:
+            return "aborted"
+    if pending == ["create_unknown"]:
+        return "unknown"
+    if pending[:1] == ["create_unknown"] and len(pending) == 2 and pending[1] in _RECONCILED:
+        return "reconciled"
+    if attempted and pending[:1] == ["created"]:
+        if pending == ["created", "readback_compared"]:
+            return "compared"
+        if pending in (["created"], ["created", "readback_unconfirmed"]):
+            return "used"
+        if pending[:2] == ["created", "readback_compared"] and pending[2:] in (
+            ["delete_attempt"], ["delete_unconfirmed"], ["delete_attempt", "delete_unconfirmed"],
+            ["delete_attempt", "delete_verified"],
+        ):
+            return "used"
+    return "conflict"
+
+
 class Ledger:
     def __init__(self, stream, directory, registration, name):
         self.stream = stream
@@ -388,15 +444,14 @@ class Ledger:
     def check_available(self):
         rows = self.records()
         require(not any(row["registration"] == self.registration for row in rows), "登记编号已使用")
-        # 共用 t11 的资格锚点与台账，兼容已证明从未放行的旧预留。
-        occupied = {"create_unknown", "create_reconciled_candidate", "created", "delete_attempt", "delete_verified"}
-        aborted = {row["registration"] for row in rows if row["event"] == "aborted_before_write"
-                   and type(row.get("allowed_writes")) is int and row["allowed_writes"] == 0}
-        require(not any(row["event"] in occupied or
-                        (row["event"] == "create_attempt" and row["registration"] not in aborted)
-                        for row in rows), "本 Trace 建单资格已占用，须对账")
+        histories = defaultdict(list)
+        for row in rows:
+            histories[row["registration"]].append(row)
+        for history in histories.values():
+            state = creation_state(history)
+            require(state != "reserved", "本 Trace 可能存在未清理单据，须对账")
+            require(state == "aborted", "本 Trace 建单资格已占用，须对账")
         reserved = [row["registration"] for row in rows if row["event"] == "create_reserved"]
-        require(set(reserved) <= aborted, "本 Trace 可能存在未清理单据，须对账")
         anchor = self.directory / "trace-12-create.lock"
         if reserved:
             require(decode(private_bytes(anchor)) == {"registration": reserved[0]}, "资格锁与台账不符")
@@ -417,13 +472,11 @@ class Ledger:
         require(len(compared) == 1 and type(compared[0].get("total")) is int and compared[0]["total"] > 0
                 and compared[0].get("counts") == {"一致": compared[0]["total"]}
                 and not any(row["event"] == "readback_unconfirmed" for row in rows), "全项回读尚未确认")
-        require(sum(row["event"] == "create_attempt" for row in rows) == 1
+        require(creation_state(rows) == "compared"
                 and uuid_record(record_id) and self.name.startswith(_PREFIX) and len(created) == 1
                 and created[0]["is_test"] is True and created[0]["name"] == self.name
                 and uuid_record(created[0]["record_id"])
-                and created[0]["record_id"].lower() == record_id.lower()
-                and not any(row["event"] in {"create_unknown", "delete_attempt", "delete_verified"}
-                            for row in rows), "建单台账不符或已尝试清理")
+                and created[0]["record_id"].lower() == record_id.lower(), "建单台账不符或已尝试清理")
 
 
 @contextmanager
@@ -642,7 +695,7 @@ class Official:
             failed = True
         if failed:
             raise Stop("官方接口请求或响应未确认")
-        if guard and guard.started:
+        if guard and (guard.started or (action == "search" and self.reconciling)):
             guard.check(payload)
         if action == "read" and status == spec["missing_status"]:
             try:
@@ -1268,8 +1321,7 @@ def draft_values(draft, *, order_entry=False):
     require(all(key in values for key in (*common, "user_tags", "packages", "company")), "草稿缺少必填字段")
     require(receipt(values["user_scope"]), "草稿用户范围格式无效，需人工")
     name = values["policy_name"]
-    require(receipt(name) and len(name) > len(_PREFIX) and not any(c in name for c in "\r\n<>"),
-            "草稿政策名称格式无效")
+    require(valid_policy_name(name), "草稿政策名称格式无效")
     for key in ("start_date", "end_date"):
         calendar_date(values[key], "草稿日期格式无效")
     require(values["start_date"] <= values["end_date"], "草稿开始日期晚于结束日期")
@@ -2745,6 +2797,22 @@ class ReadbackResult:
         return self.conclusion == "一致" and self.cleanup_verified
 
 
+def reconcile_unknown(ledger, api, *, prior_conflict=False):
+    api.reconciling = True
+    try:
+        matches = api.find(ledger.name)
+        ledger.append("create_reconciled_read", matches[0] if len(matches) == 1 else None,
+                      candidates=len(matches))
+    except OutletConflict:
+        ledger.append("readback_unconfirmed")
+        raise
+    except (Exception, KeyboardInterrupt):
+        ledger.append("readback_unconfirmed" if prior_conflict
+                      else "create_reconciled_read_unconfirmed")
+    finally:
+        api.reconciling = False
+
+
 def run_order(ledger, api, create, feishu, window, payload, summary, controls, config, evidence,
               contact, login_check, stop, *, packages, company,
               clock=time.time, pause=time.sleep, monotonic=time.monotonic, check_start_date=None,
@@ -2811,23 +2879,11 @@ def run_order(ledger, api, create, feishu, window, payload, summary, controls, c
         interrupted = isinstance(error, KeyboardInterrupt)
         if create.started:
             ledger.append("create_unknown")
-            api.reconciling = True
-            try:
-                matches = api.find(ledger.name)
-                ledger.append("create_reconciled_read", matches[0] if len(matches) == 1 else None,
-                              candidates=len(matches))
-            except OutletConflict:
-                ledger.append("readback_unconfirmed")
-                raise
-            except (Exception, KeyboardInterrupt):
-                ledger.append("readback_unconfirmed" if isinstance(error, OutletConflict)
-                              else "create_reconciled_read_unconfirmed")
-            finally:
-                api.reconciling = False
+            reconcile_unknown(ledger, api, prior_conflict=isinstance(error, OutletConflict))
             if isinstance(error, OutletConflict):
                 raise
-            announce("建单结果未知，已冻结清理，需人工核对官方回读和私有台账")
-            raise Stop("建单结果未知，需人工对账") from None
+            announce(_UNKNOWN_NOTICE)
+            raise Stop(_UNKNOWN_STOP) from None
         if isinstance(error, OutletConflict):
             if approval_id is not None:
                 feishu.close_create_approval(approval_id, binding)
@@ -2989,6 +3045,49 @@ def _run(args, directory, clock, guard):
     return _run_registered(args, directory, clock, guard, config_data, authorizations)
 
 
+def check_search_binding(config, official):
+    worksheet = config["create"]["identifiers"]["worksheetId"]
+    require(receipt(worksheet) and official["search"]["path"] == f"/v3/app/worksheets/{worksheet}/rows/list",
+            "官方读写与建单目标表不一致")
+    require(config["fields"].get(official["search"]["name_control"], {}).get("draft") == "policy_name",
+            "同名查询字段与建单政策名称不一致")
+
+
+def resume_unknown(ledger, rows, guard, config, config_data, authorizations, official_token, official_app_id):
+    state = creation_state(rows)
+    require(state in {"attempt", "unknown", "conflict"}, "登记编号已使用")
+    guard.unknown_reentry = True
+    ledger.name = rows[0].get("name")
+    try:
+        require(state != "conflict", _UNKNOWN_STOP)
+        guard.check((ledger.registration, ledger.name))
+        sensitive = {form for value in guard.credentials.values() for form in (value, value.strip())}
+        require(re.fullmatch(r"[A-Za-z0-9_-]{1,200}", ledger.registration)
+                and not any(secret in ledger.registration or ledger.registration in secret
+                            or secret in ledger.name for secret in sensitive)
+                and not any(registered_windows(ledger.name, credential_fragments(sensitive))),
+                _UNKNOWN_STOP, CredentialConflict)
+        if state == "attempt":
+            ledger.append("create_unknown")
+        evidence = authorizations.get(ledger.registration, {})
+        require(evidence.get("is_test") is True and evidence.get("config_sha256") == digest(config_data),
+                _UNKNOWN_STOP)
+        official = config["official"]
+        check_search_binding(config, official)
+        timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
+        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+            api = Official(official, official_token, official_app_id, client)
+            CheckedHTTPTransport(client, api.check_wire_request)
+            reconcile_unknown(ledger, api)
+    except CredentialConflict:
+        raise
+    except (Exception, KeyboardInterrupt):
+        # 绑定或本地落盘失败时保留原资格，无论如何都须交人工。
+        pass
+    announce_unknown(guard)
+    raise Stop(_UNKNOWN_STOP)
+
+
 def _run_registered(args, directory, clock, guard, config_data, authorizations):
     config = decode(config_data)
     login_path = directory / "mingdao-state.json"
@@ -3030,8 +3129,13 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
     sensitive = {form for value in credentials.values() for form in (value, value.strip())}
     configurator = config["configurator"]
     guard.configuration_checked = True
+    if path_present(directory / "trial-orders.jsonl", "建单台账无法核实"):
+        with ledger_open(directory, args.registration, None) as ledger:
+            rows = [row for row in ledger.records() if row["registration"] == args.registration]
+            if rows:
+                resume_unknown(ledger, rows, guard, config, config_data, authorizations, official_token, official_app_id)
     if not re.fullmatch(r"[A-Za-z0-9_-]{1,200}", args.registration):
-        # 历史登记编号可能不符合新字符集，结果未知时仍须先对账。
+        # 新号仍须确认整个 Trace 可用，才能按建单前凭据冲突处理。
         with ledger_open(directory, args.registration, None) as ledger:
             ledger.check_available()
             raise CredentialConflict("展示字段与凭据冲突")
@@ -3089,11 +3193,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
         check_proof_window()
 
     create = CreateRequest(config["create"], evidence, token)
-    worksheet = config["create"]["identifiers"]["worksheetId"]
-    require(official["search"]["path"] == f"/v3/app/worksheets/{worksheet}/rows/list",
-            "官方读写与建单目标表不一致")
-    require(config["fields"].get(official["search"]["name_control"], {}).get("draft") == "policy_name",
-            "同名查询字段与建单政策名称不一致")
+    check_search_binding(config, official)
     with ledger_open(directory, args.registration, values["policy_name"]) as ledger:
         ledger.check_available()
         reason = "展示字段与凭据冲突"
@@ -3305,7 +3405,10 @@ def main(argv=None):
             if guard.configuration_checked:
                 notice = ("建单请求已发出（凭据冲突），已停止，转人工核对" if guard.started else _MANUAL_NOTICE)
                 try:
-                    announce_conflict(guard, notice)
+                    if guard.unknown_reentry:
+                        announce_unknown(guard)
+                    else:
+                        announce_conflict(guard, notice)
                 except Exception:
                     pass
             try:
@@ -3343,6 +3446,18 @@ def announce_conflict(guard, notice):
     transport.announce(notice)
 
 
+def announce_unknown(guard):
+    if guard.unknown_notice_attempted:
+        return
+    guard.unknown_notice_attempted = True
+    try:
+        announce_conflict(guard, _UNKNOWN_NOTICE)
+    except OutletConflict:
+        raise
+    except (Exception, KeyboardInterrupt):
+        raise Stop("建单结果未知，公告未获确认，需人工对账") from None
+
+
 def execute(args, guard):
     def output(message, stream):
         guard.check(message)
@@ -3359,7 +3474,10 @@ def execute(args, guard):
         raise
     except CredentialConflict as error:
         try:
-            announce_conflict(guard, _MANUAL_NOTICE)
+            if guard.unknown_reentry:
+                announce_unknown(guard)
+            else:
+                announce_conflict(guard, _MANUAL_NOTICE)
         except OutletConflict:
             raise
         except Exception:
