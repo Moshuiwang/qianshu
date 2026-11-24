@@ -104,22 +104,37 @@ def _send_report_card(
 
 
 def _send_trial_message(transport, content, request_id, card, check):
-    payload = content if card else {"text": content}
-    body = (CreateMessageRequestBody.builder().receive_id(transport.settings.chat_id)
-            .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
-            .uuid(request_id).build())
-    request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
     if (not getattr(transport, "order_http", None) or not callable(getattr(transport, "before_send", None))
             or not callable(getattr(transport, "trial_action", None))):
         from .mingdao.create_order import OutletUnavailable
         raise OutletUnavailable("缺少试运行凭据出口检查器")
-    async def deliver():
-        token = await transport._tenant_token()
+    from .feishu.trial_listener import MessageNotSent
+    from .mingdao.create_order import CredentialConflict
+    handed_off = False
+
+    def claim():
+        nonlocal handed_off
         check()
-        return await transport.im.message.acreate(request, RequestOption.builder().tenant_access_token(token).build())
-    with transport.trial_action():
+        handed_off = True
+
+    async def deliver():
+        payload = content if card else {"text": content}
+        body = (CreateMessageRequestBody.builder().receive_id(transport.settings.chat_id)
+                .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
+                .uuid(request_id).build())
+        request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
         transport.before_send("message", {"receive_id": body.receive_id, "content": body.content, "uuid": request_id})
-        response = asyncio.run(deliver())
+        token = await transport._tenant_token()
+        return await transport.im.message.acreate(request, RequestOption.builder().tenant_access_token(token).build())
+    try:
+        with transport.trial_action(claim):
+            response = asyncio.run(deliver())
+    except CredentialConflict:
+        raise
+    except Exception as exc:
+        if not handed_off:
+            raise MessageNotSent("试运行群消息尚未交接") from exc
+        raise
     if (not response.success() or not response.data or not isinstance(response.data.message_id, str)
             or not response.data.message_id.strip()):
         raise RuntimeError("试运行群消息回执不明。")

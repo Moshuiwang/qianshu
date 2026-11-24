@@ -522,6 +522,9 @@ class HandoffService:
                         raise
                     except Exception:
                         _LOG.warning("feishu_handoff_connect_failed")
+                retry = getattr(self, "retry_approval_start", None)
+                if retry is not None:
+                    retry()
                 await asyncio.sleep(1)
         finally:
             tasks = [ping, client._cache._cron, *client.frames]

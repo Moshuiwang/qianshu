@@ -98,7 +98,7 @@ def _read_official_keys(path: Path, business: dict[str, str | None]):
         with path.open(encoding="utf-8-sig") as stream:
             official = json.load(stream)["official"]
             token_key = official["token_key"]
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, ValueError, KeyError, TypeError, RecursionError):
         raise ConfigError("无法读取明道云官方接口令牌键名。") from None
     if not isinstance(token_key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_key):
         raise ConfigError("明道云官方接口令牌键名无效。")

@@ -6,6 +6,7 @@ from contextvars import ContextVar
 from copy import copy
 from html import escape
 import json
+import logging
 import re
 import time
 from threading import Lock
@@ -13,12 +14,19 @@ from uuid import uuid4
 
 from qianshu.config import ConfigError
 from qianshu.mail import _fingerprint
-from qianshu.mingdao.create_order import CredentialConflict, Outlet, OutletUnavailable, Stop, decode, private_bytes
+from qianshu.mingdao.create_order import CredentialConflict, Outlet, OutletConflict, OutletUnavailable, Stop, decode, private_bytes
 
 from .cards import mention
 from .sdk import P2CardActionTriggerResponse, _Transport
 from .state import CALLBACK_RESPONSE_MARGIN
 from .trial_approval import CARD_FORMAT, journal_at
+
+
+_LOG = logging.getLogger(__name__)
+
+
+class MessageNotSent(RuntimeError):
+    """消息尚未交接给 HTTP 传输。"""
 
 
 def checked_transport(settings, private_dir=None):
@@ -48,30 +56,61 @@ def checked_transport(settings, private_dir=None):
         except FileNotFoundError:
             if directory == settings.trial_login_dir:
                 complete = False
-        except (OSError, Stop, ValueError, KeyError, TypeError):
+        except (OSError, Stop, ValueError, KeyError, TypeError, RecursionError):
             complete = False
     guard.configure(credentials)
     lock = Lock()
     current = ContextVar("trial_outlet")
 
+    claim_message = ContextVar("trial_message_claim", default=None)
+
     @contextmanager
-    def action():
+    def action(claim=None):
+        claim_token = claim_message.set(claim)
         # 复制动作状态，共享只追加的凭据和片段登记表。
         token = current.set(copy(guard))
         try:
             yield
         finally:
             current.reset(token)
+            claim_message.reset(claim_token)
 
     def check(outlet, value):
         if not complete:
             raise OutletUnavailable("试运行凭据来源无法核对")
         with lock:
-            current.get().sdk(outlet, value)
+            checker = current.get()
+            checker.sdk(outlet, value)
+            if outlet == "message":
+                check_content(decode(value["content"]))
+            elif outlet == "http" and value[1] == "message":
+                check_content(decode(decode(value[0].content)["content"]))
+        if outlet == "http" and value[1] == "message":
+            claim = claim_message.get()
+            if claim is not None:
+                claim()
+
+    def check_content(value):
+        if isinstance(value, dict):
+            for item in value.values():
+                check_content(item)
+        elif isinstance(value, list):
+            for item in value:
+                check_content(item)
+        elif isinstance(value, str):
+            if any(secret and secret in value for raw in guard.credentials.values()
+                   for secret in (raw, raw.strip())):
+                raise OutletConflict()
+
+    def check_reason(reason):
+        with lock:
+            check_content(reason)
+            copy(guard).check(reason)
 
     transport = _Transport(settings, None, time.time, http_check=check)
     transport.trial_action = action
     transport.before_send = check
+    transport.check_reason = check_reason
     transport.sensitive_values = tuple(dict.fromkeys(
         form for value in credentials.values() for form in (value, value.strip())
     ))
@@ -93,13 +132,14 @@ def approval_setup(path, switches):
 
 
 class Listener:
-    def __init__(self, path, settings, switches, *, clock=time.time, defer_rotation=False):
+    def __init__(self, path, settings, switches, *, clock=time.time, defer_rotation=False, transport=None):
         self.path, self.settings, self.switches, self.clock = path, settings, switches, clock
         self.origin, self.session, self.connected_at = None, "", 0
         self._rotation_lock = Lock()
         self._pending = None
+        self.current_connection = lambda origin: True
         self._check_store = defer_rotation
-        self.transport = checked_transport(settings, path.parent)
+        self.transport = transport if transport is not None else checked_transport(settings, path.parent)
         self.request_rotation(None, "服务重启或关闭")
         if not defer_rotation:
             self._apply_rotation()
@@ -157,6 +197,7 @@ class Listener:
                 try:
                     _send_trial_message(self.transport, body, row["uuid"], False, claim)
                 except CredentialConflict:
+                    _LOG.error("E-TRIAL-MANUAL")
                     with j.db:
                         j.db.execute("UPDATE trial_notification SET status='blocked' WHERE uuid=?", (row["uuid"],))
                         if row["kind"] != "manual":
@@ -173,7 +214,7 @@ class Listener:
         session = self.session
         def current():
             return (origin is not None and self.origin is origin and origin.close_code is None
-                    and self.session == session and time.monotonic() < deadline)
+                    and self.current_connection(origin) and self.session == session and time.monotonic() < deadline)
         def response(message):
             return P2CardActionTriggerResponse({"toast": {"type": "info", "content": message}})
         if (not current() or header.event_type != "card.action.trigger" or not event or not event.context
@@ -227,6 +268,11 @@ class Listener:
             reason = form.get("reason", "")
             if not isinstance(reason, str) or len(reason) > 500:
                 return response("请核对驳回原因")
+            try:
+                self.transport.check_reason(reason)
+            except CredentialConflict:
+                _LOG.warning("E-CRED-STOP")
+                reason = "原因已拦截，请人工核对"
             reason = escape(reason.strip())
         def record():
             with journal_at(self.path) as j:
