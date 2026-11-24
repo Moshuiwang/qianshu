@@ -103,6 +103,19 @@ def _send_report_card(
         raise RuntimeError("飞书未确认汇报卡片发送成功。")
 
 
+def _send_trial_message(transport, content, request_id, card, check):
+    payload = content if card else {"text": content}
+    body = (CreateMessageRequestBody.builder().receive_id(transport.settings.chat_id)
+            .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
+            .uuid(request_id).build())
+    request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
+    token = asyncio.run(transport._tenant_token())
+    check()
+    response = transport.im.message.create(request, RequestOption.builder().tenant_access_token(token).build())
+    if not response.success() or not response.data or not response.data.message_id:
+        raise RuntimeError("试运行群消息回执不明。")
+
+
 class _ReportProcessor:
     def __init__(
         self,
@@ -713,7 +726,35 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--business-env-file", type=Path, help="仅转交监听器用于出站比对的业务私有配置。")
     parser.add_argument("--mingdao-config", type=Path, help="仅转交监听器用于定位官方接口令牌键名的明道云 JSON 配置。")
     parser.add_argument("--list-recovery", action="store_true", help="只读列出私有入口库未完成事项，供守望者上报。")
+    parser.add_argument("--trial-switches", type=Path, help="常驻转交服务的试运行私有开关文件")
+    parser.add_argument("--trial-import-spend", help="一次性登记已核定的开发期累计美元金额")
+    parser.add_argument("--trial-reconcile", nargs=4, metavar=("SCOPE", "GEN", "VALIDITY", "NEXT"),
+                        help="人工完成对账后，按已核准的代次与水位恢复派发")
     args = parser.parse_args(argv)
+    if args.trial_import_spend is not None or args.trial_reconcile:
+        if (args.state is None or args.state.name != "trial-050.sqlite3"
+                or any((args.mail, args.handoff_only, args.trial_switches, args.inject, args.list_recovery))
+                or (args.trial_import_spend is not None and args.trial_reconcile)):
+            parser.error("费用导入及人工对账须独立指定 --state 私有目录/trial-050.sqlite3。")
+        from .mail.trial_state import FormatHold, Store
+        try:
+            check_output_path(args.state)
+            store = Store(args.state)
+            with closing(store.db):
+                if args.trial_reconcile:
+                    scope, *numbers = args.trial_reconcile
+                    store.reconcile(scope, *map(int, numbers))
+                else:
+                    store.import_spend(args.trial_import_spend)
+        except FormatHold as exc:
+            print(exc, file=sys.stderr)
+            return 1
+        except Exception:
+            print("试运行私有登记失败，请核对金额、代次与已有登记。", file=sys.stderr)
+            return 1
+        return 0
+    if args.trial_switches and not args.handoff_only:
+        parser.error("--trial-switches 须与 --handoff-only 一起使用。")
     if args.list_recovery:
         if args.state is None or any((args.inject, args.handoff_only, args.mail)):
             parser.error("--list-recovery 需要 --state，并须独立于发送入口运行。")
@@ -737,6 +778,13 @@ def main(argv: list[str] | None = None) -> int:
                 mingdao_config=args.mingdao_config,
             )
             setup_logging({"FEISHU_APP_SECRET": settings.app_secret})
+            if args.trial_switches:
+                from .config import trial_config
+                from .mail.trial import run_service
+                switches = trial_config(args.trial_switches)
+                if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
+                    run_service(args, settings, path, lambda: switches)
+                    return 0
             with MentionLog.listening(path, settings) as store:
                 HandoffService(store).run()
         except ConfigError as error:
