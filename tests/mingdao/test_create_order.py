@@ -1204,7 +1204,9 @@ def test_readback_report_counts_and_modes(case, platform):
     platform.mismatch = True
     approvals = Approvals(platform)
     assert not run_case(case, platform, approvals)
-    assert events(case)[-1] == "delete_verified"
+    assert events(case)[-1] == "readback_compared"
+    assert "delete" not in platform.actions and case.ids["created"] in platform.rows
+    assert any("已保留记录，需人工核对" in text for text in approvals.notices)
     path, = case.private.glob("create-readback-*.json")
     report = json.loads(path.read_text())
     rows = report["字段比对"]
@@ -1299,7 +1301,10 @@ def test_created_record_readback_uses_relations(case, platform, mode, field, res
     platform.before_read = before_read
     approvals = Approvals(platform)
     assert run_case(case, platform, approvals) == (mode == "success")
-    assert events(case)[-1] == "delete_verified"
+    assert events(case)[-1] == ("delete_verified" if mode == "success" else "readback_compared")
+    assert platform.actions.count("delete") == int(mode == "success")
+    assert (case.ids["created"] in platform.rows) == (mode != "success")
+    assert any("已保留记录，需人工核对" in text for text in approvals.notices) == (mode != "success")
     assert platform.actions.count("created_relations:" + packages) == 1
     assert platform.actions.count("created_relations:" + case.control["user_tags"]) == 1
     assert platform.created_cells[case.control["user_scope"]] == case.values["user_scope"]
