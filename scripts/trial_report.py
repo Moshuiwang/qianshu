@@ -1,24 +1,52 @@
 """050 日报。stdout 只含固定指标；观察窗口为 UTC 半开区间。"""
 
 import argparse
+import fcntl
 import json
 import os
 import sqlite3
 from collections import Counter, defaultdict
 from contextlib import closing, contextmanager
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from enum import StrEnum
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 import httpx
 
 from qianshu.mail.trial_state import BODY_NOTICE_COUNTS_SQL, FORMAT_VERSION, ledger_matches
-from qianshu.mingdao.create_order import Official, Stop, no_log_continuation, private_bytes, utc
+from qianshu.mingdao.create_order import Official, Stop, creation_state, no_log_continuation, private_bytes, utc
 
 
 UNKNOWN = "未知"
+
+
+class Reason(StrEnum):
+    SCOPE = "覆盖范围无独立证据"
+    LEDGER = "台账缺失或格式不认识"
+    PENDING = "建单结果未确认"
+    TEST = "测试登记无法核实"
+    CONFLICT = "登记冲突"
+    MANIFEST = "字段清单无独立来源"
+    SNAPSHOT = "字段快照核对不完整"
+    APPROVAL = "建单同意证据不完整"
+    READ = "回读未完成"
+    COUNTRY = "建单国家归属无法核实"
+    CREATOR = "建单身份无法核实"
+    LINK = "申请关联核对不完整"
+    CARD = "卡片与单据无法唯一核对"
+    FIELD = "卡片字段核对不完整"
+    HISTORY = "已核历史证据本次未能重证"
+    SEAL = "用量账摘要不符"
+    USAGE = "调用用量不完整"
+    MODEL = "调用模型无法定价"
+    CHARGE = "用量归档冲突"
+    REJECTIONS = "审批清单无法核对完整"
+
+
 ERRORS = (OSError, ValueError, TypeError, KeyError, Stop)
 EVENTS = {
     "create_reserved", "card_published", "create_attempt", "aborted_before_write",
@@ -42,22 +70,38 @@ class Order:
     created: datetime
     countries: frozenset
     wrong: bool
-    uncertain: bool
+    reasons: frozenset
     card_uuid: str | None
     fields: dict | None
     written: dict | None
 
 
-def read_orders(path, start, end, required, cards):
+@dataclass
+class OrderLedger:
+    orders: dict = field(default_factory=dict)
+    tests: set = field(default_factory=set)
+    gaps: int = 0
+    inflight: bool = False
+    published: list = field(default_factory=list)
+    reasons: set = field(default_factory=set)
+    conflicts: dict = field(default_factory=dict)
+
+
+def read_orders(path, start, end):
     """归并原始事件。每条登记独立保留已确认差异，任何损坏都不能清空已读证据。"""
     context = defaultdict(dict)
+    records = {}
+    ids = defaultdict(set)
     owners = defaultdict(set)
+    result = OrderLedger()
+    wrong_readbacks = set()
+    test_events = defaultdict(list)
     pending = set()
     gaps = 0
     try:
         lines = private_bytes(path).splitlines()
     except ERRORS:
-        return {}, set(), 1
+        return OrderLedger(gaps=1, inflight=True, reasons={Reason.LEDGER})
 
     for line in lines:
         try:
@@ -76,21 +120,38 @@ def read_orders(path, start, end, required, cards):
             if (rid is not None and event in {"create_reserved", "create_attempt", "approval_closed",
                                               "card_published", "create_unknown", "aborted_before_write"}):
                 raise ValueError()
-            if event.startswith("delete_") and (not test or not rid or rid != info.get("rid")):
+            if event == "card_published" and not test:
+                result.published.append(row)
+            if test:
+                test_events[identity].append(row)
+            if event == "create_attempt":
+                info.pop("expected", None)
+                manifest = row.get("request_fields")
+                if isinstance(manifest, list) and manifest and all(isinstance(k, str) and k for k in manifest):
+                    info["expected"] = set(manifest)
+                if "attempt" in info:
+                    info["uncertain"] = True
+                info["attempt"] = True
+            if rid and event in {"readback_compared", "readback_unconfirmed"} and row.get("结论") == "写错":
+                wrong_readbacks.add(rid)
+            if rid:
+                if event == "created":
+                    if (identity, rid) in records:
+                        records[identity, rid]["uncertain"] = True
+                    else:
+                        records[identity, rid] = deepcopy(info)
+                    ids[reg].add(rid)
+                    owners[rid].add(identity)
+                    pending.discard(identity)
+                if (identity, rid) not in records:
+                    raise ValueError()
+                info = records[identity, rid]
+            if event.startswith("delete_") and (not test or not rid):
                 raise ValueError()
             if event == "created":
-                if not isinstance(rid, str) or not rid.strip():
+                if not rid:
                     raise ValueError()
-                if info.get("rid", rid) != rid:
-                    gaps += 1
-                    info["uncertain"] = True
-                    continue
-                owners[rid].add(identity)
-                if "created" in info:
-                    info["uncertain"] = True
                 info.setdefault("created", stamp)
-                info.setdefault("rid", rid)
-                pending.discard(identity)
             if event in {"create_attempt", "create_unknown", "create_reconciled_candidate",
                          "create_reconciled_read", "create_reconciled_read_unconfirmed"}:
                 pending.add(identity)
@@ -99,17 +160,19 @@ def read_orders(path, start, end, required, cards):
                     raise ValueError()
                 pending.discard(identity)
             if event in {"readback_compared", "readback_unconfirmed"}:
-                if not rid or info.get("rid") != rid:
+                if not rid:
                     raise ValueError()
                 verdict = row.get("结论")
+                if event == "readback_compared" and verdict in {"一致", "写错"}:
+                    info["compared"] = True
                 if verdict == "写错":
                     info["wrong"] = True
                 if event == "readback_unconfirmed" or verdict not in {"一致", "写错"}:
-                    info["uncertain"] = True
+                    info["compared"] = False
             if test:
                 continue
             for key in ("country", "approved", "written", "displayed", "card_uuid", "fields"):
-                if key not in row:
+                if key not in row or event == "create_attempt" and key in {"displayed", "written"}:
                     continue
                 if key == "country" and event not in {"created", "create_reserved", "create_attempt", "card_published"}:
                     continue
@@ -120,6 +183,8 @@ def read_orders(path, start, end, required, cards):
                 info.setdefault(key, row[key])
                 if key == "approved" and row[key] is False:
                     info["wrong"] = True
+            if event == "create_attempt":
+                continue
             written, displayed = row.get("written", info.get("written")), row.get("displayed", info.get("displayed"))
             if isinstance(written, dict) and isinstance(displayed, dict):
                 if any(not same(written[k], displayed[k]) for k in written.keys() & displayed.keys()):
@@ -127,36 +192,52 @@ def read_orders(path, start, end, required, cards):
         except ERRORS:
             gaps += 1
 
-    orders, tests = {}, set()
+    if gaps:
+        result.reasons.add(Reason.LEDGER)
+    if pending:
+        result.reasons.add(Reason.PENDING)
+    result.inflight = bool(pending or gaps)
+    result.conflicts = {reg: sorted(rids) for reg, rids in ids.items() if len(rids) > 1}
+    if result.conflicts:
+        result.reasons.add(Reason.CONFLICT)
     for rid, identities in owners.items():
-        formal = [context[i] for i in sorted(identities) if not i[1]]
+        formal = [records[i, rid] for i in sorted(identities) if not i[1]]
         if not formal:
-            tests.add(rid)
-            gaps += len(identities) > 1
+            identity = next(iter(identities))
+            events = test_events[identity]
+            if (len(identities) == 1 and events[0]["event"] == "create_reserved"
+                    and creation_state(events) in {"used", "compared"}):
+                result.tests.add(rid)
+            else:
+                result.reasons.add(Reason.TEST)
+                gaps += 1
             continue
         info = formal[0]
-        uncertain = len(identities) > 1 or any(r.get("uncertain") for r in formal)
+        uncertain = (len(identities) > 1 or any(reg in result.conflicts for reg, _ in identities)
+                     or any(r.get("uncertain") for r in formal))
+        reasons = {Reason.CONFLICT} if uncertain else set()
         card = info.get("card_uuid")
         if card is not None and not isinstance(card, str):
-            card, uncertain = None, True
-        expected = set()
-        for source in (required, cards.get(card, {}).get("fields"), info.get("fields")):
-            if source is None:
-                continue
-            if isinstance(source, (dict, list)) and all(isinstance(k, str) and k for k in source):
-                expected.update(source)
-            else:
-                uncertain = True
+            card = None
+            reasons.add(Reason.CONFLICT)
+        expected = info.get("expected")
+        if not info.get("compared"):
+            reasons.add(Reason.READ)
         snapshots = [info.get(k) for k in ("written", "displayed")]
-        if (not expected or not all(isinstance(v, dict) and expected <= v.keys() for v in snapshots)
-                or type(info.get("approved")) is not bool):
-            uncertain = True
-        if all(isinstance(v, dict) for v in snapshots) and snapshots[0].keys() != snapshots[1].keys():
-            uncertain = True
-        orders[rid] = Order(info["created"], frozenset().union(*(r.get("countries", ()) for r in formal)),
-                            any(r.get("wrong") for r in formal), bool(uncertain), card,
-                            info.get("fields"), info.get("written"))
-    return orders, tests, gaps + len(pending)
+        if not expected:
+            reasons.add(Reason.MANIFEST)
+        if (not all(isinstance(v, dict) for v in snapshots)
+                or snapshots[0].keys() != snapshots[1].keys()
+                or expected and expected != snapshots[0].keys()):
+            reasons.add(Reason.SNAPSHOT)
+        if type(info.get("approved")) is not bool:
+            reasons.add(Reason.APPROVAL)
+        result.orders[rid] = Order(
+            info["created"], frozenset().union(*(r.get("countries", ()) for r in formal)),
+            rid in wrong_readbacks or any(r.get("wrong") for r in formal), frozenset(reasons), card,
+            info.get("fields"), info.get("written"))
+    result.gaps = gaps + len(pending) + len(result.conflicts)
+    return result
 
 
 def same(left, right):
@@ -247,7 +328,7 @@ def linked_rows(api, spec, link):
 
 
 def scan_bot(api, scope, account, trial, end):
-    """私有配置明确登记覆盖整表的授权视图；逐页核对元数据与时段。"""
+    """先产出可见记录，分页完成后再与独立的整表匹配数核对。"""
     if (not isinstance(scope, dict) or scope.get("coverage") != "full_table"
             or scope.get("view") not in api.config["search"]["view_ids"]):
         raise ValueError()
@@ -256,11 +337,20 @@ def scan_bot(api, scope, account, trial, end):
                                       ("_createdAt", "lt", end.isoformat()))]
 
     snapshot = None
+    matched_count = None
+    observed = 0
 
     def fetch(page):
-        nonlocal snapshot
+        nonlocal snapshot, matched_count
         result = api._request("search", body={"viewId": scope["view"], "pageSize": api.page_size,
                               "pageIndex": page, "filter": dict(type="group", logic="AND", children=filters)})
+        result = dict(result)
+        # 仅接受服务端同一响应对同一过滤条件的整表计数，普通 total 只是视图计数。
+        table_count = result.pop("wholeTableMatchedCount", None)
+        if page == 1:
+            matched_count = table_count
+        elif table_count != matched_count:
+            matched_count = None
         if type(result.get("total")) is not int and type(result.get("hasMore")) is not bool:
             raise ValueError()
         if page == 1:
@@ -272,7 +362,10 @@ def scan_bot(api, scope, account, trial, end):
     for row in api.page_rows(fetch, api.page_size):
         if creator_id(row) != account or not trial <= utc(row["_createdAt"], platform=True) < end:
             raise ValueError()
+        observed += 1
         yield row["rowId"]
+    if type(matched_count) is not int or matched_count != observed:
+        raise ValueError()
 
 
 def creator_id(row):
@@ -282,20 +375,78 @@ def creator_id(row):
     return creator if isinstance(creator, str) and creator else None
 
 
-def previous_errors(directory, trial, start, end):
-    """旧窗口用于首次发现去重；窗口内已出过的日报用于保留确认结论。"""
-    earlier, confirmed, historical = set(), set(), set()
+DAY = timedelta(days=1)
+RATES = {"sonnet": (2000, 10000), "haiku": (100, 500)}
+
+
+def check_window(trial, start, end):
+    if (trial.time() != datetime.min.time() or not trial <= start < end <= trial + 14 * DAY
+            or (start - trial) % DAY or end - start != DAY and (start, end) != (trial, trial + 14 * DAY)):
+        raise ValueError("日报窗口无效")
+
+
+def locations(directory, start, whole):
+    slot = "summary" if whole else str(start.date())
+    name = "trial-summary.json" if whole else f"trial-report-{slot}.json"
+    return directory / name, directory / "reports" / slot / name
+
+
+@dataclass
+class Evidence:
+    rejected: set = field(default_factory=set)
+    charges: dict = field(default_factory=dict)
+
+    reasons: dict = field(default_factory=lambda: defaultdict(set))
+    disputed_models: set = field(default_factory=set)
+
+    def merge(self, rejected, charges, disputes):
+        if not isinstance(rejected, list) or not all(isinstance(x, str) and x for x in rejected):
+            raise ValueError("驳回归档无效")
+        self.rejected.update(rejected)
+        if not isinstance(disputes, list) or any(m not in RATES for m in disputes):
+            raise ValueError("费用归档无效")
+        self.disputed_models.update(disputes)
+        if not isinstance(charges, dict):
+            raise ValueError()
+        for call, amounts in charges.items():
+            if not isinstance(amounts, dict) or not amounts or amounts.keys() - RATES.keys():
+                raise ValueError()
+            saved = self.charges.setdefault(call, {})
+            if saved and saved != amounts:
+                self.disputed_models.update(saved.keys() | amounts.keys())
+            for model, amount in amounts.items():
+                if type(amount) is not int or amount < 0:
+                    raise ValueError()
+                saved[model] = max(saved.get(model, 0), amount)
+
+    def amounts(self):
+        def dollars(value):
+            return format(Decimal(value).scaleb(-9), "f")
+        totals = {m + "费用美元已核": dollars(sum(row.get(m, 0) for row in self.charges.values())) for m in RATES}
+        totals["总费用美元已核"] = dollars(sum(max(row.values()) for row in self.charges.values()))
+        return totals
+
+
+def archive_windows(directory, trial, end):
     day = trial
     while day < end:
-        path = directory / f"trial-report-{day.date()}.json"
+        for path in locations(directory, day, False):
+            yield day, day + DAY, path
+        day += DAY
+
+
+def previous_errors(directory, trial, start, end, evidence):
+    earlier, confirmed, historical = set(), set(), set()
+    windows = list(archive_windows(directory, trial, end))
+    if end - start == 14 * DAY:
+        windows.extend((start, end, p) for p in locations(directory, start, True))
+    for day, until, path in windows:
         try:
             previous = json.loads(private_bytes(path))
         except FileNotFoundError:
-            day += timedelta(days=1)
             continue
         if (not isinstance(previous, dict) or previous.get("试运行起点") != trial.isoformat()
-                or previous.get("窗口起点") != day.isoformat()
-                or previous.get("窗口终点") != (day + timedelta(days=1)).isoformat()):
+                or previous.get("窗口起点") != day.isoformat() or previous.get("窗口终点") != until.isoformat()):
             raise ValueError("历史日报窗口无法核对")
         ids, old = previous["写错"], previous["新发现的历史异常"]
         if (not all(isinstance(items, list) and all(isinstance(r, str) and r for r in items)
@@ -303,34 +454,80 @@ def previous_errors(directory, trial, start, end):
             raise ValueError("历史日报异常记录无法核对")
         if day < start:
             earlier.update(ids)
-        elif day + timedelta(days=1) <= end:
+        else:
             confirmed.update(ids)
-            if day == start:
-                historical.update(old)
-        day += timedelta(days=1)
+            historical.update(old)
+            evidence.merge(previous.get("已核驳回", []), previous.get("已核用量", {}), previous.get("费用证据冲突", []))
     return earlier, confirmed, historical
 
 
-def charge_counts(rows):
-    rates = {"sonnet": (2000, 10000), "haiku": (100, 500)}
-    result = {}
-    for model, (a, b) in rates.items():
-        total = missing = 0
-        for row in rows:
-            if row["model"] != model:
-                continue
-            i, o = row["inputs"], row["outputs"]
-            if all(type(n) is int and n >= 0 for n in (i, o)):
-                total += i * a + o * b
-            else:
-                missing += 1
-        result[model + "费用美元"] = UNKNOWN if missing else format(Decimal(total).scaleb(-9), "f")
-        result[model + "用量未知调用"] = missing
-    result["费用未知模型调用"] = sum(r["model"] not in rates for r in rows)
-    result["总费用美元"] = UNKNOWN
-    if not any(result[k] for k in ("费用未知模型调用", "sonnet用量未知调用", "haiku用量未知调用")):
-        result["总费用美元"] = format(sum(Decimal(result[m + "费用美元"]) for m in rates), "f")
+def charge_counts(rows, evidence=None):
+    evidence = evidence if evidence is not None else Evidence()
+    missing = Counter()
+    for index, row in enumerate(rows):
+        model = row["model"]
+        if model not in RATES:
+            missing["other"] += 1
+            continue
+        i, o = row["inputs"], row["outputs"]
+        if not all(type(n) is int and n >= 0 for n in (i, o)):
+            missing[model] += 1
+            continue
+        a, b = RATES[model]
+        key = str(row["id"]) if "id" in row.keys() else str(index)
+        evidence.charges[key] = {model: i * a + o * b}
+    amounts = evidence.amounts()
+    result = dict(amounts)
+    for model in RATES:
+        result[model + "费用美元"] = UNKNOWN if missing[model] else amounts[model + "费用美元已核"]
+        result[model + "用量未知调用"] = missing[model]
+    result["费用未知模型调用"] = missing["other"]
+    result["总费用美元"] = UNKNOWN if any(missing.values()) else amounts["总费用美元已核"]
+    for model in RATES:
+        if missing[model]:
+            evidence.reasons[model + "费用美元"].add(Reason.USAGE)
+            evidence.reasons["总费用美元"].add(Reason.USAGE)
+    if missing["other"]:
+        evidence.reasons["总费用美元"].add(Reason.MODEL)
     return result
+
+
+def rejection_counts(directory, config, cards, published, start, end, evidence, ledger_ok):
+    sent = {c["uuid"] for c in cards if c["status"] == "sent"}
+    complete = ledger_ok and all(c["status"] in {"sent", "pending"} for c in cards)
+    bindings = set()
+    matched = set()
+    try:
+        with reader(directory / config["entry_db"]) as db:
+            for event in published:
+                card = event.get("card_uuid")
+                approval = event.get("approval_id")
+                message = event.get("message_id")
+                if card not in sent or not all(isinstance(x, str) and x for x in (approval, message)):
+                    complete = False
+                    continue
+                rows = db.execute("SELECT status, decided_at FROM feishu_approvals "
+                                  "WHERE scope=? AND approval_id=? AND message_id=?",
+                                  (config["entry_scope"], approval, message)).fetchall()
+                if len(rows) != 1:
+                    complete = False
+                    continue
+                complete &= approval not in bindings and card not in matched
+                matched.add(card)
+                bindings.add(approval)
+                status, at = rows[0]
+                if status == "reject":
+                    if type(at) not in (int, float):
+                        complete = False
+                    elif start.timestamp() <= at < end.timestamp():
+                        evidence.rejected.add(approval)
+                elif status not in {"pending", "approve", "closed", "claimed", "used"}:
+                    complete = False
+        declared = config.get("approval_ids")
+        complete &= bool(bindings) and isinstance(declared, list) and set(declared) == bindings and matched == sent
+    except (sqlite3.Error, KeyError, TypeError, OSError):
+        complete = False
+    return len(evidence.rejected) if complete else UNKNOWN
 
 
 def recommendation(wrong, uncertain, applications, cards, slight, unscoped):
@@ -341,7 +538,8 @@ def recommendation(wrong, uncertain, applications, cards, slight, unscoped):
     return "维持"
 
 
-def local_counts(directory, config, trial, start, end):
+def local_counts(directory, config, trial, start, end, published, ledger_ok):
+    evidence = Evidence()
     def inside(value):
         return start <= utc(value) < end
 
@@ -358,10 +556,12 @@ def local_counts(directory, config, trial, start, end):
         notices = [r for r in notices if inside(r["at"])]
         waiting, review = db.execute(BODY_NOTICE_COUNTS_SQL).fetchone()
         if ledger_matches(db):
-            costs = charge_counts([r for r in db.execute("SELECT model,at,inputs,outputs FROM charge")
-                                   if inside(r["at"])])
+            costs = charge_counts([r for r in db.execute("SELECT id,model,at,inputs,outputs FROM charge")
+                                   if inside(r["at"])], evidence)
         else:
             costs = dict.fromkeys(charge_counts([]), UNKNOWN)
+            for key in costs:
+                evidence.reasons[key].add(Reason.SEAL)
     today = [r for r in registrations.values() if inside(r["created"])]
     apps = {n for n, r in registrations.items() if r["verdict"] in {"是", "拿不准"}}
     meta = config.get("registrations", {})
@@ -391,32 +591,24 @@ def local_counts(directory, config, trial, start, end):
     public["未解析附件批次"] = sum(r["attachments"] != 0 for r in today if r["id"] in apps)
     for status, label in (("pending", "待发"), ("sent", "已发"), ("unknown", "结果未知")):
         public["冻结通知" + label] = sum(r["kind"] == "freeze" and r["status"] == status for r in notices)
-    try:
-        with reader(directory / config["entry_db"]) as db:
-            public["卡片驳回"] = db.execute("""
-                SELECT count(*) FROM feishu_approvals WHERE scope=? AND status='reject'
-                AND decided_at>=? AND decided_at<? AND approval_id IN (SELECT value FROM json_each(?))
-            """, (config["entry_scope"], start.timestamp(), end.timestamp(),
-                  json.dumps(config["approval_ids"]))).fetchone()[0]
-    except (sqlite3.Error, KeyError):
-        public["卡片驳回"] = UNKNOWN
-
-    return public, apps, cards, daily
+    public["卡片驳回"] = rejection_counts(directory, config, cards, published, start, end, evidence, ledger_ok)
+    if public["卡片驳回"] == UNKNOWN:
+        evidence.reasons["卡片驳回"].add(Reason.REJECTIONS)
+    return public, apps, cards, daily, evidence
 
 
 def report(directory, config, api, start, end):
     trial = utc(config["trial_start"])
-    if not trial <= start < end <= trial + timedelta(days=14):
-        raise ValueError("窗口超出试运行")
-    public, apps, cards, daily = local_counts(directory, config, trial, start, end)
+    check_window(trial, start, end)
+    ledger = read_orders(directory / "trial-orders.jsonl", trial, end)
+    public, apps, cards, daily, evidence = local_counts(
+        directory, config, trial, start, end, ledger.published, ledger.gaps == 0)
     meta = config.get("registrations", {})
     build = config["build_country"]
 
     def country(reg):
         return meta.get(str(reg), {}).get("country")
 
-    orders, test_ids, pending = read_orders(directory / "trial-orders.jsonl", trial, end,
-                                          config.get("required_fields"), config.get("cards", {}))
     if not isinstance(config["bot_account"], str) or not config["bot_account"]:
         raise ValueError("机器人账号未登记")
     spec = config["controls"]
@@ -427,7 +619,7 @@ def report(directory, config, api, start, end):
     record_links = defaultdict(set)
     build_links = {meta.get(str(n), {}).get("link") for n in apps if country(n) in (None, "", build)}
     build_gaps = sum(not meta.get(str(n), {}).get("link") for n in apps if country(n) in (None, "", build))
-    records = set(orders)
+    records = set(ledger.orders)
     scanned = set()
     scan_gap = 0
     try:
@@ -435,7 +627,24 @@ def report(directory, config, api, start, end):
     except ERRORS:
         scan_gap = 1
     records.update(scanned)
-    seen, archived, historical = previous_errors(directory, trial, start, end)
+    reasons = evidence.reasons
+    reasons["卡片驳回"].update(ledger.reasons)
+    current_rejected = evidence.rejected.copy()
+    current_amounts = evidence.amounts()
+    seen, archived, historical = previous_errors(directory, trial, start, end, evidence)
+    public["卡片驳回已核"] = len(evidence.rejected)
+    if current_rejected != evidence.rejected:
+        public["卡片驳回"] = UNKNOWN
+        reasons["卡片驳回"].add(Reason.HISTORY)
+    amounts = evidence.amounts()
+    public.update(amounts)
+    for label in (*RATES, "总"):
+        if current_amounts[label + "费用美元已核"] != amounts[label + "费用美元已核"]:
+            reasons[label + "费用美元"].add(Reason.HISTORY)
+            public[label + "费用美元"] = UNKNOWN
+        if label in evidence.disputed_models or label == "总" and evidence.disputed_models:
+            reasons[label + "费用美元"].add(Reason.CHARGE)
+            public[label + "费用美元"] = UNKNOWN
     wrong = set()
     for link in filter(None, links):
         try:
@@ -448,11 +657,19 @@ def report(directory, config, api, start, end):
             gaps += 1
     differences = {}
     missed, created = set(), set()
-    unknown_writes = build_gaps + pending + scan_gap
-    unknown_creates = build_gaps + pending + scan_gap
+    create_reasons = set(ledger.reasons)
+    if build_gaps:
+        create_reasons.add(Reason.LINK)
+    if scan_gap:
+        create_reasons.add(Reason.SCOPE)
+    write_reasons = create_reasons.copy()
+    miss_reasons = {Reason.LINK} if gaps else set()
+    card_reasons = set()
+    unknown_writes = build_gaps + ledger.gaps + scan_gap
+    unknown_creates = build_gaps + ledger.gaps + scan_gap
     unknown_misses = gaps
     observations, announcements = defaultdict(list), []
-    unknown_returns = build_gaps + pending + scan_gap
+    unknown_returns = build_gaps + ledger.gaps + scan_gap
     policy_cards = defaultdict(list)
     incomplete_links = set()
     for c in cards:
@@ -463,8 +680,8 @@ def report(directory, config, api, start, end):
         elif c["status"] != "pending":
             incomplete_links.add(link)
     for rid in sorted(records):
-        order = orders.get(rid)
-        if rid in test_ids:
+        order = ledger.orders.get(rid)
+        if rid in ledger.tests:
             continue
         row = {}
         try:
@@ -481,8 +698,11 @@ def report(directory, config, api, start, end):
             failed_links.update(record_links[rid])
             if order is None:
                 unknown_misses += 1
+                miss_reasons.add(Reason.READ)
                 if rid in scanned or record_links[rid] & build_links:
                     unknown_writes += 1
+                    create_reasons.add(Reason.READ)
+                    write_reasons.add(Reason.READ)
                     unknown_creates += 1
                     unknown_returns += 1
                 continue
@@ -493,11 +713,16 @@ def report(directory, config, api, start, end):
             where = build if build in order.countries else next(iter(order.countries), None)
             stamp = order.created
             issues = []
-            if order.uncertain:
+            if order.reasons:
+                write_reasons.update(order.reasons)
                 issues.append("台账身份或字段证据待核对")
             if len(order.countries) != 1 or current != where:
+                write_reasons.add(Reason.COUNTRY)
+                if not row:
+                    write_reasons.add(Reason.READ)
                 issues.append("国家归属待核对")
             if row and creator_id(row) != config["bot_account"]:
+                write_reasons.add(Reason.CREATOR)
                 issues.append("建单身份待核对")
             if issues:
                 differences[rid] = issues
@@ -516,21 +741,25 @@ def report(directory, config, api, start, end):
                 differences[rid] = ["台账外记录缺少创建时国家证据"]
         if bot and rid not in scanned and not scan_gap:
             scan_gap = 1
+            create_reasons.add(Reason.SCOPE)
+            write_reasons.add(Reason.SCOPE)
             unknown_writes += 1
             unknown_creates += 1
             unknown_returns += 1
         if in_period and (not where or where == build and not creator and order is None):
+            create_reasons.add(Reason.COUNTRY if not where else Reason.CREATOR)
             unknown_creates += 1
         if where == build and (order is not None or bot):
             if in_period:
                 created.add(rid)
-            if order is None and pending:
+            if order is None and ledger.inflight:
                 unknown_writes += 1
             elif (order is None or order.wrong) and (in_period or rid not in seen):
                 wrong.add(rid)
                 if not in_period:
                     historical.add(rid)
         elif order is None and (not where or where == build and not creator):
+            write_reasons.add(Reason.COUNTRY if not where else Reason.CREATOR)
             unknown_writes += 1
         if not row:
             unknown_returns += int(order is not None and where in (None, build))
@@ -540,6 +769,10 @@ def report(directory, config, api, start, end):
             key = (None, None)
         if order is None and not bot and in_period:
             if not creator or not all(key) or key[0] in incomplete_links and not policy_cards[key]:
+                if not creator:
+                    miss_reasons.add(Reason.CREATOR)
+                if not all(key) or key[0] in incomplete_links and not policy_cards[key]:
+                    miss_reasons.add(Reason.CARD)
                 unknown_misses += 1
             elif not policy_cards[key]:
                 missed.add(rid)
@@ -555,13 +788,18 @@ def report(directory, config, api, start, end):
             unknown_returns += int(where in (None, build) and (order is not None or bot))
         observations[key].append((order, final, where, creator, bot, in_period))
     for rid in archived - wrong:
+        write_reasons.add(Reason.HISTORY)
         differences.setdefault(rid, []).append("已确认写错，本次未能重证")
         unknown_writes += 1
     wrong.update(archived)
     for key, matches in observations.items():
         if policy_cards[key] and len(matches) > 1:
-            unknown_misses += sum(order is None and not bot and bool(creator) and in_period
+            ambiguous = sum(order is None and not bot and bool(creator) and in_period
                                   for order, _, _, creator, bot, in_period in matches)
+
+            if ambiguous:
+                unknown_misses += ambiguous
+                miss_reasons.add(Reason.CARD)
 
     totals = Counter()
     details = []
@@ -580,6 +818,18 @@ def report(directory, config, api, start, end):
             if where == country(c["registration"]) and (
                     order is not None or (where and where != build and creator and not bot)):
                 counts = field_counts(fields, baseline, final)
+                if counts is None:
+                    if final is None:
+                        card_reasons.add(Reason.READ)
+                    if final is not None or not fields or not baseline:
+                        card_reasons.add(Reason.FIELD)
+            else:
+                card_reasons.add(Reason.CARD)
+        else:
+            if not key[0] or key[0] in failed_links:
+                card_reasons.add(Reason.LINK)
+            if not all(key) or key[0] in incomplete_links or len(rows) != 1 or len(policy_cards[key]) != 1:
+                card_reasons.add(Reason.CARD)
         details.append(dict(card=c["uuid"], counts=counts))
         if counts is None:
             totals["未知"] += 1
@@ -591,6 +841,7 @@ def report(directory, config, api, start, end):
             if country(c["registration"]) == build and counts[0] <= 2:
                 totals["建单国家至多两处"] += 1
     for k in ("人工改动项", "错判确定", "多问", "无需修改", "至多两处"):
+        reasons[k].update(card_reasons)
         public[k + "已核"] = totals[k]
         public[k] = UNKNOWN if totals["未知"] else totals[k]
     public.update({"卡片核对未知": totals["未知"], "漏条已核": len(missed), "漏条未知": unknown_misses,
@@ -601,42 +852,107 @@ def report(directory, config, api, start, end):
                    "明道云写错": UNKNOWN if unknown_writes else len(wrong),
                    "建单": UNKNOWN if unknown_creates else len(created),
                    "退回公告条目": len(announcements), "退回核对未知": unknown_returns})
+    reasons["建单"].update(create_reasons)
+    reasons["明道云写错"].update(write_reasons)
+    reasons["新发现的历史异常"].update(write_reasons)
+    reasons["漏条"].update(miss_reasons)
+
+    period_orders = [order for order in ledger.orders.values() if start <= order.created < end]
+    coverage = {}
+    for prefix in ("", "建单国家"):
+        eligible = [o for o in period_orders if not prefix or o.countries == {build}]
+        for label, verified in (("已回读核对单数", True), ("机器人建单台账总单数", False)):
+            key = prefix + label
+            if Reason.LEDGER in ledger.reasons:
+                reasons[key].add(Reason.LEDGER)
+            if Reason.TEST in ledger.reasons:
+                reasons[key].add(Reason.TEST)
+            if prefix and any((not o.countries or build in o.countries and len(o.countries) > 1)
+                              and (not verified or not o.reasons) for o in period_orders):
+                reasons[key].add(Reason.COUNTRY)
+            coverage[key] = UNKNOWN if reasons[key] else sum(not verified or not o.reasons for o in eligible)
+    public.update(coverage)
+    private_metrics = dict(coverage)
+    for key, value in list(public.items()):
+        if value == UNKNOWN:
+            phrases = sorted(reasons[key])
+            public[key + "原因"] = phrases
+            private_metrics.update({key: value, key + "原因": phrases})
     advice = recommendation(wrong, unknown_writes or unknown_creates, public["建单国家申请"],
                             public["建单国家卡片"], totals["建单国家至多两处"],
                             public["卡片国家未知"] + public["卡片送达未知"])
-    return public, {"建议": advice, "未知卡片数": totals["未知"], "卡片样本数": len(daily), "卡片": details, "退回公告": announcements,
+    return public, {"指标": private_metrics, "建议": advice, "未知卡片数": totals["未知"], "卡片样本数": len(daily), "卡片": details, "退回公告": announcements,
                     "试运行起点": trial.isoformat(), "窗口起点": start.isoformat(),
-                    "窗口终点": end.isoformat(), "写入差异核对": differences,
+                    "窗口终点": end.isoformat(), "写入差异核对": differences, "登记冲突": ledger.conflicts,
+                    "已核用量": evidence.charges, "费用证据冲突": sorted(evidence.disputed_models),
+                    "已核驳回": sorted(evidence.rejected),
                     "新发现的历史异常": sorted(historical), "漏条": sorted(missed), "写错": sorted(wrong)}
+
+
+def isolated_target(directory, config, trial, start, whole):
+    _, target = locations(directory, start, whole)
+    dest = target.parent
+    if dest.resolve() != dest or target.is_symlink():
+        raise ValueError("私有输出路径冲突")
+    for folder in (dest.parent, dest):
+        if folder.exists() and (not folder.is_dir() or folder.stat().st_mode & 0o077):
+            raise ValueError("输出目录须独立且私有")
+    if dest.exists() and any(child != target for child in dest.iterdir()):
+        raise ValueError("窗口目录含有其他文件")
+    sources = [directory / name for name in ("trial-report.json", "trial-orders.jsonl")]
+    for database in (directory / config["entry_db"], directory / "trial-050.sqlite3"):
+        for base in {database, database.resolve()}:
+            sources.extend(Path(str(base) + suffix) for suffix in ("", "-wal", "-shm", "-journal"))
+
+    def collision(left, right):
+        return (left.resolve() == right.resolve()
+                or left.exists() and right.exists() and left.samefile(right))
+
+    archives = [p for _, _, p in archive_windows(directory, trial, trial + 14 * DAY)]
+    archives.extend(locations(directory, start, True))
+    for path in archives:
+        if path.is_symlink() or any(collision(path, source) for source in sources):
+            raise ValueError("归档路径与输入冲突")
+    for source in sources + [p for p in archives if p != target]:
+        if (source.resolve().is_relative_to(dest) or collision(target, source)
+                or source == dest or dest in source.parents):
+            raise ValueError("输出目录与输入冲突")
+    return target
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--private-dir", type=Path, required=True)
+    parser.add_argument("--start", help="UTC 窗口起点")
     parser.add_argument("--end", help="UTC 窗口终点（默认最近已结束的试运行日）")
     parser.add_argument("--whole-trial", action="store_true", help="按完整两周重算")
     args = parser.parse_args()
     directory = args.private_dir.resolve()
     if directory.stat().st_mode & 0o077:
         raise ValueError("须使用私有目录")
+    fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        generate(directory, args)
+    finally:
+        os.close(fd)
+
+
+def generate(directory, args):
     config = json.loads(private_bytes(directory / "trial-report.json"))
     trial = utc(config["trial_start"])
     limit = trial + timedelta(days=14)
     now = datetime.now(UTC)
     end = utc(args.end) if args.end else min(trial + timedelta(days=(now - trial).days), limit)
     start = trial if args.whole_trial else max(trial, end - timedelta(days=1))
+    if args.start is not None:
+        start = utc(args.start)
+    check_window(trial, start, end)
+    if not args.whole_trial and end - start != DAY:
+        raise ValueError("日报须为一个完整日")
     if end > now or args.whole_trial and end != limit:
         raise ValueError("观察窗口尚未结束")
-    target = directory / ("trial-summary.json" if args.whole_trial else f"trial-report-{start.date()}.json")
-    # 用量账与摘要均位于收信登记库；SQLite 副文件同样属于输入。
-    databases = (directory / config["entry_db"], directory / "trial-050.sqlite3")
-    inputs = [directory / name for name in ("trial-report.json", "trial-orders.jsonl")]
-    inputs.extend(Path(str(db) + suffix) for db in databases for suffix in ("", "-wal", "-shm", "-journal"))
-    inputs.extend(directory / f"trial-report-{(trial + timedelta(days=i)).date()}.json"
-                  for i in range((end - trial).days) if args.whole_trial or i < (start - trial).days)
-    if target.is_symlink() or any(target.resolve() == source.resolve()
-            or target.exists() and source.exists() and target.samefile(source) for source in inputs):
-        raise ValueError("私有输出路径与输入冲突")
+    target = isolated_target(directory, config, trial, start, args.whole_trial)
     requests = 0
     def count(_request):
         nonlocal requests
@@ -646,9 +962,15 @@ def main():
         api = Official(spec, os.environ[spec["token_key"]], os.environ[spec["app_id_key"]], client)
         public, private = report(directory, config, api, start, end)
     public["明道云只读请求数"] = requests
-    with NamedTemporaryFile(dir=directory, mode="w", encoding="utf8", delete=False) as stream:
-        json.dump(private, stream, ensure_ascii=False)
-    os.replace(stream.name, target)
+    target.parent.parent.mkdir(mode=0o700, exist_ok=True)
+    target.parent.mkdir(mode=0o700, exist_ok=True)
+    with NamedTemporaryFile(dir=target.parent, mode="w", encoding="utf8", delete=False) as stream:
+        try:
+            json.dump(private, stream, ensure_ascii=False)
+            stream.flush()
+            os.replace(stream.name, target)
+        finally:
+            Path(stream.name).unlink(missing_ok=True)
     print(json.dumps(public, ensure_ascii=False))
 
 
