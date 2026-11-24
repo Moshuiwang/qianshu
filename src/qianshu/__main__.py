@@ -109,15 +109,17 @@ def _send_trial_message(transport, content, request_id, card, check):
             .msg_type("interactive" if card else "text").content(json.dumps(payload, ensure_ascii=False))
             .uuid(request_id).build())
     request = CreateMessageRequest.builder().receive_id_type("chat_id").request_body(body).build()
-    if not getattr(transport, "order_http", None) or not callable(getattr(transport, "before_send", None)):
-        raise RuntimeError("缺少试运行凭据出口检查器")
-    transport.before_send("message", {"receive_id": body.receive_id, "content": body.content, "uuid": request_id})
-
+    if (not getattr(transport, "order_http", None) or not callable(getattr(transport, "before_send", None))
+            or not callable(getattr(transport, "trial_action", None))):
+        from .mingdao.create_order import OutletUnavailable
+        raise OutletUnavailable("缺少试运行凭据出口检查器")
     async def deliver():
         token = await transport._tenant_token()
         check()
         return await transport.im.message.acreate(request, RequestOption.builder().tenant_access_token(token).build())
-    response = asyncio.run(deliver())
+    with transport.trial_action():
+        transport.before_send("message", {"receive_id": body.receive_id, "content": body.content, "uuid": request_id})
+        response = asyncio.run(deliver())
     if (not response.success() or not response.data or not isinstance(response.data.message_id, str)
             or not response.data.message_id.strip()):
         raise RuntimeError("试运行群消息回执不明。")

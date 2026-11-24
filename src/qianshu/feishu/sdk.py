@@ -560,10 +560,19 @@ class _Connection(ws.Client):
                 except ws.InvalidHandshake as error:
                     ws._parse_ws_conn_exception(error)
                 self._conn_url, self._conn_id, self._service_id = conn_url, conn_id, service_id
-                self.service.transport._require_window()
-                self._generation += 1
-                self.service._connected(self._conn)
-                self.receiver = asyncio.create_task(self._receive_message_loop())
+                try:
+                    self.service.transport._require_window()
+                    self._generation += 1
+                    self.service._connected(self._conn)
+                    self.receiver = asyncio.create_task(self._receive_message_loop())
+                except BaseException:
+                    conn, self._conn = self._conn, None
+                    self._conn_url = self._conn_id = self._service_id = ""
+                    try:
+                        self.service._disconnected()
+                    finally:
+                        await conn.close()
+                    raise
 
     async def _discover_endpoint(self) -> str:
         # 固定版本的 SDK 在这里直接调用无超时的 requests.post。

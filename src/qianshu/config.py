@@ -49,6 +49,13 @@ LOGGABLE_CONFIG_KEYS = frozenset({
 REDACTED = "[已脱敏]"
 
 
+def registered_credentials(values, official_keys=()):
+    """#57 展示与出口共同登记所有非空私有配置，官方鉴权键始终纳入。"""
+    display = LOGGABLE_CONFIG_KEYS | {"FEISHU_CALLBACK_MAX_AGE_SECONDS"}
+    return {key: value for key, value in values.items()
+            if isinstance(value, str) and value.strip() and (key not in display or key in official_keys)}
+
+
 class ConfigError(ValueError):
     """配置文件不可读，或调用方所需的配置缺失。"""
 

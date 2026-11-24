@@ -39,15 +39,15 @@ def recovery(db):
     rows = []
     for table, condition in (("trial_card", "status IN ('preparing','open','accepted','partial')"),
                              ("trial_task", "status!='closed'"),
-                             ("trial_notification", "status IN ('pending','unknown')")):
+                             ("trial_notification", "status IN ('pending','unknown','blocked')")):
         rows.extend(dict(row) for row in db.execute(
             f"SELECT '{table}' AS kind, card, status FROM {table} WHERE {condition}"))
     rows.extend(dict(row) for row in db.execute("""
         SELECT 'card_intent' AS kind, registration, version, page, status FROM card_intent
-        WHERE status IN ('pending','unknown')"""))
+        WHERE status IN ('pending','unknown','blocked')"""))
     rows.extend(dict(row) for row in db.execute("""
         SELECT 'mail_notice' AS kind, registration, kind AS notice, status FROM notice
-        WHERE status IN ('pending','review','unknown')"""))
+        WHERE status IN ('pending','review','unknown','blocked')"""))
     return rows
 
 
@@ -120,7 +120,8 @@ class Journal:
                 elif now >= row["expires"]:
                     self.close(row, "审批到期")
                 elif now >= row["expires"] - 86400 and not self.db.execute(
-                    "SELECT 1 FROM trial_receipt WHERE card=?", (row["card"],)).fetchone():
+                    "SELECT 1 FROM trial_receipt WHERE card=? AND recorded<=?",
+                    (row["card"], row["expires"] - 86400)).fetchone():
                     self.notify(row, "remind", "尚无有效点击，请核对本批审批")
 
     def claim_event(self, event):

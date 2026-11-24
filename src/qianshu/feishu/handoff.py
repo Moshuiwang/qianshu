@@ -317,6 +317,8 @@ class MentionLog:
             """, (self.clock() - 3,)).fetchall()
 
     def _validate_reply_text(self, text: str) -> None:
+        if not self.settings.handoff_credentials_complete:
+            raise ValueError("转交回复凭据来源无法核对。")
         if not text.strip() or len(text) > REPLY_LIMIT or _AT_TAG.search(text):
             raise ValueError("守望者回复须提供不含 @ 标签的非空文本，最多 4000 字。")
         if self._redact(text) != text or _CREDENTIAL_PATTERN.search(text):

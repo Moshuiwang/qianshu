@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import signal
+import sqlite3
 from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -13,6 +14,7 @@ from qianshu.config import ConfigError
 from qianshu.feishu.cards import CardLine, detail_pages, result_card
 from qianshu.feishu.entrance import Application
 from qianshu.pipeline import Pipeline
+from qianshu.mingdao.create_order import CredentialConflict
 from qianshu.feishu.trial_approval import Journal
 from qianshu.feishu.trial_listener import Listener, approval_setup, checked_transport
 
@@ -24,6 +26,7 @@ from .trial_state import BODY_NOTICE, FormatHold, Hold, Store
 
 _LOG = logging.getLogger(__name__)
 _NOTICES = {
+    "blocked": "登记 {registration} 的试运行消息在本地被拦截，未建单，转人工核对私有登记。",
     "received": "收到，待核对 1 封。",
     "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
     "conflict": "身份冲突，已冻结 {n} 封，待人工核对。",
@@ -337,11 +340,6 @@ class Trial:
 
                     def before_send():
                         self.require_enabled(True)
-                        if approval and index == len(cards):
-                            sent = self.clock().timestamp()
-                            with self.store.write() as db:
-                                db.execute("UPDATE trial_card SET sent=?,expires=? WHERE card=?",
-                                           (sent, (int(sent) // 86400 + 2) * 86400, approval))
                         if warning_page:
                             with self.store.write() as db:
                                 self.claim_body_notice(f"body:{reg}")
@@ -351,9 +349,24 @@ class Trial:
                     with self.store.write() as db:
                         if approval or receipt is not None:
                             Journal(db).received(request_id, receipt)
+                        if approval and index == len(cards):
+                            sent = self.clock().timestamp()
+                            db.execute("UPDATE trial_card SET sent=?,expires=? WHERE card=?",
+                                       (sent, (int(sent) // 86400 + 2) * 86400, approval))
                         db.execute("UPDATE card_intent SET status='sent' WHERE uuid=?", (request_id,))
                         if warning_page:
                             db.execute("UPDATE notice SET status='sent' WHERE event=?", (f"body:{reg}",))
+        except CredentialConflict:
+            with self.store.write() as db:
+                db.execute("UPDATE card_intent SET status='blocked' WHERE uuid=?", (request_id,))
+                if warning_page:
+                    db.execute("UPDATE notice SET status='blocked' WHERE event=?", (f"body:{reg}",))
+                self.blocked_handoff(reg)
+                if approval:
+                    journal = Journal(db)
+                    journal.close(db.execute("SELECT * FROM trial_card WHERE card=?", (approval,)).fetchone(),
+                                  "卡片在本地被拦截")
+            return
         except Exception:
             unknown = True
         status = "manual" if unknown or attempt is None else "done"
@@ -366,6 +379,10 @@ class Trial:
                 if unknown:
                     self.store.db.execute("UPDATE trial_card SET status='partial' WHERE card=? AND status!='closed'", (approval,))
                 journal.bind(approval, self.clock().timestamp())
+
+    def blocked_handoff(self, reg):
+        self.store.finish(reg, "manual", reason="outlet_blocked")
+        self.store.notice(f"blocked:{reg}", self.scope, reg, "blocked")
 
     def claim_body_notice(self, event):
         if not self.store.db.execute("""UPDATE notice SET status='unknown'
@@ -399,7 +416,7 @@ class Trial:
                             AND status='pending'""", (row["event"],)).rowcount:
                             continue
                     content = (result_card(detail_pages("试运行邮件", [CardLine("正文", BODY_NOTICE)])[0])
-                               if warning else _NOTICES[kind].format(n=row["quantity"]))
+                               if warning else _NOTICES[kind].format(n=row["quantity"], registration=row["registration"]))
                     def before_send():
                         self.require_enabled(card)
                         if warning:
@@ -411,6 +428,11 @@ class Trial:
                         db.execute("UPDATE notice SET status='sent' WHERE event=?", (row["event"],))
             except Hold:
                 continue
+            except CredentialConflict:
+                with self.store.write() as db:
+                    db.execute("UPDATE notice SET status='blocked' WHERE event=?", (row["event"],))
+                    if row["registration"] is not None and kind != "blocked":
+                        self.blocked_handoff(row["registration"])
             except Exception:
                 self.uncertain_notices()
 
@@ -483,9 +505,7 @@ def run_service(args, settings, path, switches):
                     raise ConfigError("试运行登记与汇报群不匹配。")
             trial = Trial(store, config, switches, send, stop, legacy_path=legacy,
                           approval_setup=(lambda: approval_setup(getattr(args, "mingdao_config", None), switches))
-                          if service.trial_callbacks else None, sensitive=(
-                *settings.handoff_sensitive_values, *settings.handoff_sensitive_urls,
-            ))
+                          if service.trial_callbacks else None, sensitive=sender.sensitive_values)
             trial.run()
         except FormatHold as exc:
             _LOG.error("%s", exc)
@@ -538,14 +558,14 @@ def run_service(args, settings, path, switches):
 
     class TrialHandoff(HandoffService):
         def _connected(self, origin):
-            if listener:
-                listener.rotate(origin, "连接代次变更")
             super()._connected(origin)
+            if listener:
+                listener.request_rotation(origin, "连接代次变更")
 
         def _disconnected(self):
-            if listener:
-                listener.rotate(None, "审批连接断开")
             super()._disconnected()
+            if listener:
+                listener.request_rotation(None, "审批连接断开")
 
         async def _record_action(self, data, origin, deadline):
             return await listener.record(data, origin, deadline)
@@ -572,8 +592,7 @@ def run_service(args, settings, path, switches):
             service.trial_callbacks = switches().get("MAIL_TRIAL_CARD_ENABLED") == "true"
             listener = None
             if service.trial_callbacks or has_approval_history(state):
-                Store(state).db.close()
-                listener = Listener(state, settings, switches)
+                listener = Listener(state, settings, switches, defer_rotation=True)
             sender = listener.transport if listener else checked_transport(settings, state.parent)
             thread = Thread(target=poll, name="trial-mail")
             maintenance = None
@@ -590,7 +609,10 @@ def run_service(args, settings, path, switches):
                 thread.join()
                 if maintenance:
                     maintenance.join()
-                    listener.rotate(None, "服务关闭")
+                    try:
+                        listener.rotate(None, "服务关闭")
+                    except sqlite3.OperationalError:
+                        _LOG.warning("审批关闭待恢复，请核对私有登记。")
     finally:
         signal.signal(signal.SIGINT, previous)
         if interrupted:
@@ -607,24 +629,32 @@ def maintain_approvals(listener, stop):
 
 
 def has_approval_history(path):
-    import sqlite3
     from contextlib import closing
     if not path.exists():
         return False
     if path.is_symlink() or path.stat().st_mode & 0o077:
         raise ConfigError("试运行审批库须为私有文件")
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-        return bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='trial_card'").fetchone()
+    try:
+        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.25)) as db:
+            return bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='trial_card'").fetchone()
                     and db.execute("""SELECT 1 FROM trial_card WHERE status IN ('preparing','open','accepted','partial')
-                        UNION ALL SELECT 1 FROM trial_notification WHERE status IN ('pending','unknown') LIMIT 1""").fetchone())
+                        UNION ALL SELECT 1 FROM trial_notification WHERE status IN ('pending','unknown','blocked') LIMIT 1""").fetchone())
+    except sqlite3.OperationalError:
+        # 无法证明没有历史待办。恢复线程重试，群转交继续接收。
+        return True
 
 
 def run_disabled(service, path, settings):
     from threading import Event, Thread
-    if not has_approval_history(path):
+    # 审批恢复的任何错误都不得拖累群 @ 转交：判定或装配失败只记日志，转交照常运行（G452 补充）。
+    try:
+        listener = Listener(path, settings, lambda: {}, defer_rotation=True) if has_approval_history(path) else None
+    except Exception:
+        _LOG.warning("审批恢复未启动，请查私有恢复清单；群转交照常运行。")
+        listener = None
+    if listener is None:
         service.run()
         return
-    listener = Listener(path, settings, lambda: {})
     stop = Event()
     worker = Thread(target=maintain_approvals, args=(listener, stop), name="trial-approval-recovery")
     worker.start()

@@ -1,15 +1,19 @@
 """与群转交共享长连接，审批消息使用独立的凭据检查传输。"""
 
 import asyncio
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from copy import copy
 from html import escape
 import json
 import re
 import time
+from threading import Lock
 from uuid import uuid4
 
 from qianshu.config import ConfigError
 from qianshu.mail import _fingerprint
-from qianshu.mingdao.create_order import Outlet, Stop, decode, private_bytes
+from qianshu.mingdao.create_order import CredentialConflict, Outlet, OutletUnavailable, Stop, decode, private_bytes
 
 from .cards import mention
 from .sdk import P2CardActionTriggerResponse, _Transport
@@ -24,25 +28,53 @@ def checked_transport(settings, private_dir=None):
     for i, value in enumerate((*settings.handoff_sensitive_values, *settings.handoff_sensitive_urls)):
         if value not in credentials.values():
             credentials[str(i)] = value
-    if private_dir is not None:
-        login = private_dir / "mingdao-state.json"
+    for index, (key, value) in enumerate(settings.trial_credentials):
+        if credentials.get(key) != value:
+            credentials[("setting", index)] = value
+    complete = settings.trial_credentials_complete
+    for directory in dict.fromkeys((private_dir, settings.trial_login_dir)):
+        if directory is None:
+            continue
         try:
-            data = private_bytes(login)
-        except FileNotFoundError:
-            pass
-        else:
-            cookies = decode(data)["cookies"]
+            cookies = decode(private_bytes(directory / "mingdao-state.json"))["cookies"]
             if not isinstance(cookies, list):
-                raise ConfigError("无法核对已登记登录会话的凭据出口")
+                raise ValueError
             for index, cookie in enumerate(cookies):
                 value = cookie["value"]
                 if not isinstance(value, str):
-                    raise ConfigError("无法核对已登记登录会话的凭据出口")
-                if value:
-                    credentials[("cookie", index)] = value
+                    raise ValueError
+                if value.strip():
+                    credentials[("cookie", directory, index)] = value
+        except FileNotFoundError:
+            if directory == settings.trial_login_dir:
+                complete = False
+        except (OSError, Stop, ValueError, KeyError, TypeError):
+            complete = False
     guard.configure(credentials)
-    transport = _Transport(settings, None, time.time, http_check=guard.sdk)
-    transport.before_send = guard.sdk
+    lock = Lock()
+    current = ContextVar("trial_outlet")
+
+    @contextmanager
+    def action():
+        # 复制动作状态，共享只追加的凭据和片段登记表。
+        token = current.set(copy(guard))
+        try:
+            yield
+        finally:
+            current.reset(token)
+
+    def check(outlet, value):
+        if not complete:
+            raise OutletUnavailable("试运行凭据来源无法核对")
+        with lock:
+            current.get().sdk(outlet, value)
+
+    transport = _Transport(settings, None, time.time, http_check=check)
+    transport.trial_action = action
+    transport.before_send = check
+    transport.sensitive_values = tuple(dict.fromkeys(
+        form for value in credentials.values() for form in (value, value.strip())
+    ))
     return transport
 
 
@@ -61,27 +93,50 @@ def approval_setup(path, switches):
 
 
 class Listener:
-    def __init__(self, path, settings, switches, *, clock=time.time):
+    def __init__(self, path, settings, switches, *, clock=time.time, defer_rotation=False):
         self.path, self.settings, self.switches, self.clock = path, settings, switches, clock
         self.origin, self.session, self.connected_at = None, "", 0
-        with journal_at(path) as journal:
-            expected = _fingerprint(settings.app_id, settings.chat_id, settings.tenant_key or "")
+        self._rotation_lock = Lock()
+        self._pending = None
+        self._check_store = defer_rotation
+        self.transport = checked_transport(settings, path.parent)
+        self.request_rotation(None, "服务重启或关闭")
+        if not defer_rotation:
+            self._apply_rotation()
+
+    def request_rotation(self, origin, reason):
+        with self._rotation_lock:
+            self.origin = None
+            self._pending = (origin, reason, str(uuid4()) if origin is not None else "")
+
+    def rotate(self, origin, reason):
+        self.request_rotation(origin, reason)
+        self._apply_rotation()
+
+    def _apply_rotation(self):
+        with self._rotation_lock:
+            pending = self._pending
+        if pending is None:
+            return
+        if self._check_store:
+            from qianshu.mail.trial_state import Store
+            Store(self.path).db.close()
+            self._check_store = False
+        origin, reason, session = pending
+        with journal_at(self.path) as journal:
+            expected = _fingerprint(self.settings.app_id, self.settings.chat_id, self.settings.tenant_key or "")
             with journal.db:
                 journal.db.execute("INSERT OR IGNORE INTO trial_target VALUES(1,?)", (expected,))
                 if journal.db.execute("SELECT fingerprint FROM trial_target").fetchone()[0] != expected:
                     raise ConfigError("试运行审批登记与汇报群不匹配")
-        self.rotate(None, "服务重启或关闭")
-        self.transport = checked_transport(settings, path.parent)
-
-    def rotate(self, origin, reason):
-        self.origin = None
-        self.session = str(uuid4()) if origin is not None else ""
-        with journal_at(self.path) as j:
-            j.rotate(self.session, reason)
-        self.connected_at = self.clock()
-        self.origin = origin
+            journal.rotate(session, reason)
+        with self._rotation_lock:
+            if self._pending is pending:
+                self.session, self.connected_at, self.origin = session, self.clock(), origin
+                self._pending = None
 
     def maintain(self):
+        self._apply_rotation()
         with journal_at(self.path) as j:
             if self.switches().get("MAIL_TRIAL_CARD_ENABLED") != "true":
                 if j.session():
@@ -91,16 +146,24 @@ class Listener:
             for row in j.db.execute("""SELECT n.*, c.snapshot FROM trial_notification n JOIN trial_card c
                                        USING(card) WHERE n.status='pending' ORDER BY n.rowid""").fetchall():
                 target = json.loads(row["snapshot"]).get("contact")
-                if not target:
-                    continue
+
                 from qianshu.__main__ import _send_trial_message
                 def claim():
                     with j.db:
                         if not j.db.execute("""UPDATE trial_notification SET status='unknown'
                             WHERE uuid=? AND status='pending'""", (row["uuid"],)).rowcount:
                             raise ValueError
-                _send_trial_message(self.transport, mention(target, "配置负责人") + " " + row["body"],
-                                    row["uuid"], False, claim)
+                body = (mention(target, "配置负责人") + " " if target else "") + row["body"]
+                try:
+                    _send_trial_message(self.transport, body, row["uuid"], False, claim)
+                except CredentialConflict:
+                    with j.db:
+                        j.db.execute("UPDATE trial_notification SET status='blocked' WHERE uuid=?", (row["uuid"],))
+                        if row["kind"] != "manual":
+                            j.db.execute("""INSERT OR IGNORE INTO trial_notification VALUES(
+                                ?, 'manual', ?, '本批群通知被拦截，未建单，转人工核对私有登记。', 'pending')""",
+                                         (row["card"], str(uuid4())))
+                    continue
                 with j.db:
                     j.db.execute("UPDATE trial_notification SET status='sent' WHERE uuid=?", (row["uuid"],))
 
@@ -154,7 +217,8 @@ class Listener:
             return latest
         try:
             async with asyncio.timeout(max(0, deadline-time.monotonic())):
-                member = await self.transport.is_member(actor)
+                with getattr(self.transport, "trial_action", nullcontext)():
+                    member = await self.transport.is_member(actor)
         except Exception:
             return response("未能确认点击人是汇报群成员")
         reason = ""
