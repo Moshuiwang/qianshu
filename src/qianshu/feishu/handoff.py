@@ -555,8 +555,8 @@ class HandoffService:
                         raise
                     except Exception:
                         _LOG.warning("feishu_handoff_connect_failed")
-                client._budget.expire(time.monotonic())
                 if self._sidecar is not None:
+                    client._budget.expire(time.monotonic())
                     self._sidecar.pulse()
                 await asyncio.sleep(1)
         finally:
@@ -569,8 +569,14 @@ class HandoffService:
             if client._conn is not None:
                 await client._disconnect()
 
+    def _connection(self):
+        if self._sidecar is not None:
+            from .injected_connection import InjectedConnection
+            return InjectedConnection(self)
+        return _Connection(self, approvals=False)
+
     def run(self) -> None:
-        client = _Connection(self, approvals=False)
+        client = self._connection()
         threads = (
             Thread(target=self._recover, name="feishu-handoff-history"),
             Thread(target=self._deliver, args=(False,), name="feishu-handoff-replies"),

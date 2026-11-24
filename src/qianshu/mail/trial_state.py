@@ -88,7 +88,7 @@ CREATE TABLE ledger_check(id INTEGER PRIMARY KEY CHECK(id=1), digest TEXT NOT NU
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, before_failed_close=None):
         self.path = path
         self._locked = False
         with self.gate():
@@ -109,6 +109,8 @@ class Store:
                     else:
                         self._ledger_valid()
             except BaseException:
+                if before_failed_close is not None:
+                    before_failed_close()
                 self.db.close()
                 raise
 

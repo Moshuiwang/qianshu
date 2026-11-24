@@ -281,6 +281,7 @@ def read_status(directory):
     if state["snapshot_age"] is not None:
         state["snapshot_age"] += max(0, elapsed)
     if elapsed < 0 or elapsed >= FRESH or (state["snapshot_age"] or 0) >= FRESH:
+        state["alive"] = None
         if state["state"] == "ready":
             state["state"] = "stale"
     return state

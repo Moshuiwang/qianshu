@@ -288,8 +288,13 @@ def install():
         if flood:
             # 消费者在首次取得数据包时卡住，后续投递填满真实内核队列。
             (case / "fault").write_text("consumer")
+    if fault in {"wire", "unwritable"}:
+        from qianshu.feishu.sidecar import Sidecar
+        handoff.HandoffService._sidecar = Sidecar(case / "approval")
     if flood or fault in {"wire", "unwritable"}:
-        original_frame = sdk._Connection._handle_message
+        from qianshu.feishu.injected_connection import InjectedConnection
+        # 此后只在注入类上安装度量探针。
+        original_frame = InjectedConnection._handle_message
 
         async def observe(self, *args):
             await original_frame(self, *args)
@@ -304,15 +309,15 @@ def install():
                 record("budget", [self._budget.rejected, self._budget.peak_groups,
                                   self._budget.peak_bytes, self.card_drops, sidecar.rejected])
 
-        sdk._Connection._handle_message = observe
+        InjectedConnection._handle_message = observe
         if fault == "unwritable":
-            queued = sdk._Connection._queued_ack
+            queued = InjectedConnection._queued_ack
 
             async def measured(self, *args):
                 await queued(self, *args)
                 record("expired", self.ack_drops)
 
-            sdk._Connection._queued_ack = measured
+            InjectedConnection._queued_ack = measured
     if (case / "switches").exists():
         from qianshu.mail import imap
 

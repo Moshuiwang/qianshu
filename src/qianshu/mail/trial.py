@@ -21,6 +21,7 @@ from .triage import MailItem, classify, input_limit, trial_model
 from .trial_state import BODY_NOTICE, FormatHold, Hold, Store
 
 _LOG = logging.getLogger(__name__)
+_MAIL_CLOSE_TIMEOUT = 2
 _NOTICES = {
     "received": "收到，待核对 1 封。",
     "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
@@ -434,17 +435,32 @@ def run_service(args, settings, path, switches):
     check_output_path(state)
     legacy = _private_dir(config) / "mail-poll.sqlite3"
     stop = Event()
-    closed = Event()
+    closing = Event()
+    clean_close = Event()
+    dirty = state.with_suffix(".dirty")
 
     def poll():
         store = None
+        registered = False
         try:
-            store = Store(state)
+            try:
+                dirty.touch(mode=0o600, exist_ok=False)
+                needs_review = False
+            except FileExistsError:
+                needs_review = True
+                if not state.exists():
+                    raise FormatHold("收信登记库缺失，请人工对账。")
+            store = Store(state, before_failed_close=closing.set)
             with store.write() as db:
                 target = _fingerprint(settings.app_id, settings.chat_id, settings.tenant_key or "")
                 db.execute("INSERT OR IGNORE INTO trial_target VALUES(1,?)", (target,))
                 if store.row("SELECT fingerprint FROM trial_target")[0] != target:
                     raise ConfigError("试运行登记与汇报群不匹配。")
+                if needs_review:
+                    # 在同一事务内冻结仍可派发的邮箱；已冻结的保留原对账原因。
+                    for row in db.execute("SELECT scope FROM mailbox WHERE state!='frozen'").fetchall():
+                        store._freeze(row["scope"], "unclean_close")
+            registered = True
             trial = Trial(store, config, switches, send, stop, legacy_path=legacy, sensitive=(
                 *settings.handoff_sensitive_values, *settings.handoff_sensitive_urls,
             ))
@@ -454,13 +470,15 @@ def run_service(args, settings, path, switches):
         except Exception:
             _LOG.error("试运行收信已停止，请核对私有登记。")
         finally:
+            closing.set()
             if store is not None:
                 try:
                     store.db.close()
                 except Exception:
-                    _LOG.critical("收信登记库关闭失败，监听锁保留，须人工停机核对。")
-                    return
-            closed.set()
+                    _LOG.critical("收信登记库关闭失败，保留脏标记，下次收信先对账。")
+                else:
+                    if registered:
+                        clean_close.set()
 
     class TrialLog(MentionLog):
         _listener_thread = None
@@ -511,15 +529,20 @@ def run_service(args, settings, path, switches):
     try:
         with TrialLog.listening(path, settings) as log:
             service = TrialHandoff(log)
-            thread = Thread(target=poll, name="trial-mail")
+            thread = Thread(target=poll, name="trial-mail", daemon=True)
             thread.start()
             try:
                 if not interrupted:
                     service.run()
             finally:
                 stop.set()
-                closed.wait()
-                thread.join()
+                # 仍须等本次收信操作停下；只有关闭数据库这一步有等待上限。
+                closing.wait()
+                thread.join(_MAIL_CLOSE_TIMEOUT)
+                if thread.is_alive():
+                    _LOG.critical("收信登记库关闭超时，保留脏标记，下次收信先对账。")
+                elif clean_close.is_set():
+                    dirty.unlink()
     finally:
         signal.signal(signal.SIGINT, previous)
         if interrupted:
