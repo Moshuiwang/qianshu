@@ -6,6 +6,7 @@ import os
 import sqlite3
 from collections import Counter, defaultdict
 from contextlib import closing, contextmanager
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -13,7 +14,7 @@ from tempfile import NamedTemporaryFile
 
 import httpx
 
-from qianshu.mail.trial_state import BODY_NOTICE_COUNTS_SQL, FORMAT_VERSION
+from qianshu.mail.trial_state import BODY_NOTICE_COUNTS_SQL, FORMAT_VERSION, ledger_matches
 from qianshu.mingdao.create_order import Official, Stop, no_log_continuation, private_bytes, utc
 
 
@@ -36,52 +37,126 @@ def reader(path):
         yield db
 
 
-def read_orders(path, start, end):
-    """#154 唯一适配处。每行 event/utc/registration/is_test；created 带 record_id，
-    readback_compared/unconfirmed 带结论。可选 country、written（实际写入字段）、
-    approved（有效同意）、displayed（同意展示字段）、card_uuid/fields（卡片字段与候选值）取同一登记号的事件。
-    返回正式创建记录及未决请求数。缺失/未知版本不能证明台账外写入。
-    """
-    orders, pending, context = {}, set(), defaultdict(dict)
+@dataclass(frozen=True)
+class Order:
+    created: datetime
+    countries: frozenset
+    wrong: bool
+    uncertain: bool
+    card_uuid: str | None
+    fields: dict | None
+    written: dict | None
+
+
+def read_orders(path, start, end, required, cards):
+    """归并原始事件。每条登记独立保留已确认差异，任何损坏都不能清空已读证据。"""
+    context = defaultdict(dict)
+    owners = defaultdict(set)
+    pending = set()
+    gaps = 0
     try:
-        for line in private_bytes(path).splitlines():
+        lines = private_bytes(path).splitlines()
+    except ERRORS:
+        return {}, set(), 1
+
+    for line in lines:
+        try:
             row = json.loads(line)
             stamp = utc(row["utc"])
             if not start <= stamp < end:
                 continue
-            event, reg = row["event"], row["registration"]
-            if event not in EVENTS or type(row["is_test"]) is not bool or not reg:
-                return None, None
-            if row["is_test"]:
-                if event == "created":
-                    orders[row["record_id"]] = {"test": True, "created": stamp}
-                continue
-            info = context[reg]
-            for k in ("country", "written", "approved", "displayed", "card_uuid", "fields"):
-                if k in row:
-                    if k in info and info[k] != row[k]:
-                        return None, None
-                    info[k] = row[k]
-            if event in {"create_attempt", "create_unknown"}:
-                pending.add(reg)
-            if event == "aborted_before_write" and row.get("allowed_writes") == 0:
-                pending.discard(reg)
+            event, reg, test = row["event"], row["registration"], row["is_test"]
+            if event not in EVENTS or not isinstance(reg, str) or not reg.strip() or type(test) is not bool:
+                raise ValueError()
+            identity = (reg, test)
+            info = context[identity]
+            rid = row.get("record_id")
+            if rid is not None and (not isinstance(rid, str) or not rid.strip()):
+                raise ValueError()
+            if (rid is not None and event in {"create_reserved", "create_attempt", "approval_closed",
+                                              "card_published", "create_unknown", "aborted_before_write"}):
+                raise ValueError()
+            if event.startswith("delete_") and (not test or not rid or rid != info.get("rid")):
+                raise ValueError()
             if event == "created":
-                rid = row["record_id"]
-                if not isinstance(rid, str) or not rid or rid in orders or "created" in info:
-                    return None, None
-                info["created"] = stamp
-                orders[rid] = info
-                pending.discard(reg)
-            if event in {"readback_compared", "readback_unconfirmed"} and row.get("record_id"):
-                if orders.get(row["record_id"]) is not info:
-                    return None, None
-                if info.get("comparison") != "写错":
-                    info["comparison"] = row.get("结论")
-                    info["compared_at"] = stamp
-        return orders, len(pending)
-    except ERRORS:
-        return None, None
+                if not isinstance(rid, str) or not rid.strip():
+                    raise ValueError()
+                if info.get("rid", rid) != rid:
+                    gaps += 1
+                    info["uncertain"] = True
+                    continue
+                owners[rid].add(identity)
+                if "created" in info:
+                    info["uncertain"] = True
+                info.setdefault("created", stamp)
+                info.setdefault("rid", rid)
+                pending.discard(identity)
+            if event in {"create_attempt", "create_unknown", "create_reconciled_candidate",
+                         "create_reconciled_read", "create_reconciled_read_unconfirmed"}:
+                pending.add(identity)
+            if event == "aborted_before_write":
+                if type(row.get("allowed_writes")) is not int or row["allowed_writes"] != 0:
+                    raise ValueError()
+                pending.discard(identity)
+            if event in {"readback_compared", "readback_unconfirmed"}:
+                if not rid or info.get("rid") != rid:
+                    raise ValueError()
+                verdict = row.get("结论")
+                if verdict == "写错":
+                    info["wrong"] = True
+                if event == "readback_unconfirmed" or verdict not in {"一致", "写错"}:
+                    info["uncertain"] = True
+            if test:
+                continue
+            for key in ("country", "approved", "written", "displayed", "card_uuid", "fields"):
+                if key not in row:
+                    continue
+                if key == "country" and event not in {"created", "create_reserved", "create_attempt", "card_published"}:
+                    continue
+                if key == "country" and isinstance(row[key], str) and row[key].strip():
+                    info.setdefault("countries", set()).add(row[key])
+                if key in info and not same(info[key], row[key]):
+                    info["uncertain"] = True
+                info.setdefault(key, row[key])
+                if key == "approved" and row[key] is False:
+                    info["wrong"] = True
+            written, displayed = row.get("written", info.get("written")), row.get("displayed", info.get("displayed"))
+            if isinstance(written, dict) and isinstance(displayed, dict):
+                if any(not same(written[k], displayed[k]) for k in written.keys() & displayed.keys()):
+                    info["wrong"] = True
+        except ERRORS:
+            gaps += 1
+
+    orders, tests = {}, set()
+    for rid, identities in owners.items():
+        formal = [context[i] for i in sorted(identities) if not i[1]]
+        if not formal:
+            tests.add(rid)
+            gaps += len(identities) > 1
+            continue
+        info = formal[0]
+        uncertain = len(identities) > 1 or any(r.get("uncertain") for r in formal)
+        card = info.get("card_uuid")
+        if card is not None and not isinstance(card, str):
+            card, uncertain = None, True
+        expected = set()
+        for source in (required, cards.get(card, {}).get("fields"), info.get("fields")):
+            if source is None:
+                continue
+            if isinstance(source, (dict, list)) and all(isinstance(k, str) and k for k in source):
+                expected.update(source)
+            else:
+                uncertain = True
+        snapshots = [info.get(k) for k in ("written", "displayed")]
+        if (not expected or not all(isinstance(v, dict) and expected <= v.keys() for v in snapshots)
+                or type(info.get("approved")) is not bool):
+            uncertain = True
+        if all(isinstance(v, dict) for v in snapshots) and snapshots[0].keys() != snapshots[1].keys():
+            uncertain = True
+        orders[rid] = Order(info["created"], frozenset().union(*(r.get("countries", ()) for r in formal)),
+                            any(r.get("wrong") for r in formal), bool(uncertain), card,
+                            info.get("fields"), info.get("written"))
+    return orders, tests, gaps + len(pending)
 
 
 def same(left, right):
@@ -171,6 +246,71 @@ def linked_rows(api, spec, link):
     return found
 
 
+def scan_bot(api, scope, account, trial, end):
+    """私有配置明确登记覆盖整表的授权视图；逐页核对元数据与时段。"""
+    if (not isinstance(scope, dict) or scope.get("coverage") != "full_table"
+            or scope.get("view") not in api.config["search"]["view_ids"]):
+        raise ValueError()
+    filters = [dict(type="condition", field=key, operator=op, value=value)
+               for key, op, value in (("_createdBy", "eq", account), ("_createdAt", "gte", trial.isoformat()),
+                                      ("_createdAt", "lt", end.isoformat()))]
+
+    snapshot = None
+
+    def fetch(page):
+        nonlocal snapshot
+        result = api._request("search", body={"viewId": scope["view"], "pageSize": api.page_size,
+                              "pageIndex": page, "filter": dict(type="group", logic="AND", children=filters)})
+        if type(result.get("total")) is not int and type(result.get("hasMore")) is not bool:
+            raise ValueError()
+        if page == 1:
+            snapshot = result.get("snapshotVersion")
+        elif not snapshot or result.get("snapshotVersion") != snapshot:
+            raise ValueError()
+        return result
+
+    for row in api.page_rows(fetch, api.page_size):
+        if creator_id(row) != account or not trial <= utc(row["_createdAt"], platform=True) < end:
+            raise ValueError()
+        yield row["rowId"]
+
+
+def creator_id(row):
+    creator = row.get("_createdBy")
+    if isinstance(creator, dict):
+        creator = creator.get("accountId")
+    return creator if isinstance(creator, str) and creator else None
+
+
+def previous_errors(directory, trial, start, end):
+    """旧窗口用于首次发现去重；窗口内已出过的日报用于保留确认结论。"""
+    earlier, confirmed, historical = set(), set(), set()
+    day = trial
+    while day < end:
+        path = directory / f"trial-report-{day.date()}.json"
+        try:
+            previous = json.loads(private_bytes(path))
+        except FileNotFoundError:
+            day += timedelta(days=1)
+            continue
+        if (not isinstance(previous, dict) or previous.get("试运行起点") != trial.isoformat()
+                or previous.get("窗口起点") != day.isoformat()
+                or previous.get("窗口终点") != (day + timedelta(days=1)).isoformat()):
+            raise ValueError("历史日报窗口无法核对")
+        ids, old = previous["写错"], previous["新发现的历史异常"]
+        if (not all(isinstance(items, list) and all(isinstance(r, str) and r for r in items)
+                    for items in (ids, old)) or not set(old) <= set(ids)):
+            raise ValueError("历史日报异常记录无法核对")
+        if day < start:
+            earlier.update(ids)
+        elif day + timedelta(days=1) <= end:
+            confirmed.update(ids)
+            if day == start:
+                historical.update(old)
+        day += timedelta(days=1)
+    return earlier, confirmed, historical
+
+
 def charge_counts(rows):
     rates = {"sonnet": (2000, 10000), "haiku": (100, 500)}
     result = {}
@@ -217,7 +357,11 @@ def local_counts(directory, config, trial, start, end):
         interruptions = {r["registration"]: r["at"] for r in notices if r["kind"] == "interrupted"}
         notices = [r for r in notices if inside(r["at"])]
         waiting, review = db.execute(BODY_NOTICE_COUNTS_SQL).fetchone()
-        costs = charge_counts([r for r in db.execute("SELECT model,at,inputs,outputs FROM charge") if inside(r["at"])])
+        if ledger_matches(db):
+            costs = charge_counts([r for r in db.execute("SELECT model,at,inputs,outputs FROM charge")
+                                   if inside(r["at"])])
+        else:
+            costs = dict.fromkeys(charge_counts([]), UNKNOWN)
     today = [r for r in registrations.values() if inside(r["created"])]
     apps = {n for n, r in registrations.items() if r["verdict"] in {"是", "拿不准"}}
     meta = config.get("registrations", {})
@@ -271,7 +415,8 @@ def report(directory, config, api, start, end):
     def country(reg):
         return meta.get(str(reg), {}).get("country")
 
-    orders, pending = read_orders(directory / "trial-orders.jsonl", trial, end)
+    orders, test_ids, pending = read_orders(directory / "trial-orders.jsonl", trial, end,
+                                          config.get("required_fields"), config.get("cards", {}))
     if not isinstance(config["bot_account"], str) or not config["bot_account"]:
         raise ValueError("机器人账号未登记")
     spec = config["controls"]
@@ -282,7 +427,16 @@ def report(directory, config, api, start, end):
     record_links = defaultdict(set)
     build_links = {meta.get(str(n), {}).get("link") for n in apps if country(n) in (None, "", build)}
     build_gaps = sum(not meta.get(str(n), {}).get("link") for n in apps if country(n) in (None, "", build))
-    records = {rid for rid, order in (orders or {}).items() if not order.get("test")}
+    records = set(orders)
+    scanned = set()
+    scan_gap = 0
+    try:
+        scanned.update(scan_bot(api, config.get("bot_scan"), config["bot_account"], trial, end))
+    except ERRORS:
+        scan_gap = 1
+    records.update(scanned)
+    seen, archived, historical = previous_errors(directory, trial, start, end)
+    wrong = set()
     for link in filter(None, links):
         try:
             for rid in linked_rows(api, spec, link):
@@ -292,13 +446,13 @@ def report(directory, config, api, start, end):
             failed_links.add(link)
             build_gaps += link in build_links
             gaps += 1
-    known = orders or {}
-    wrong, missed, created = set(), set(), set()
-    unknown_writes = build_gaps + (pending or 0) + int(orders is None)
-    unknown_creates = build_gaps + (pending or 0) + int(orders is None)
+    differences = {}
+    missed, created = set(), set()
+    unknown_writes = build_gaps + pending + scan_gap
+    unknown_creates = build_gaps + pending + scan_gap
     unknown_misses = gaps
     observations, announcements = defaultdict(list), []
-    unknown_returns = build_gaps + (pending or 0) + int(orders is None)
+    unknown_returns = build_gaps + pending + scan_gap
     policy_cards = defaultdict(list)
     incomplete_links = set()
     for c in cards:
@@ -309,15 +463,17 @@ def report(directory, config, api, start, end):
         elif c["status"] != "pending":
             incomplete_links.add(link)
     for rid in sorted(records):
-        order = known.get(rid)
-        if order and order.get("test"):
+        order = orders.get(rid)
+        if rid in test_ids:
             continue
         row = {}
         try:
             row = api.detail(api.read(rid), rid)
             stamp = utc(row["_createdAt"], platform=True)
             if order is None:
-                if row.get(spec["link"]) not in record_links[rid]:
+                if rid in scanned and (creator_id(row) != config["bot_account"] or not trial <= stamp < end):
+                    raise ValueError()
+                if rid not in scanned and row.get(spec["link"]) not in record_links[rid]:
                     raise ValueError()
                 if not trial <= stamp < end:
                     continue
@@ -325,44 +481,56 @@ def report(directory, config, api, start, end):
             failed_links.update(record_links[rid])
             if order is None:
                 unknown_misses += 1
-                if record_links[rid] & build_links:
+                if rid in scanned or record_links[rid] & build_links:
                     unknown_writes += 1
                     unknown_creates += 1
                     unknown_returns += 1
                 continue
             row = {}
-        where = row.get(spec["country"])
-        if not isinstance(where, str) or not where:
-            where = (order or {}).get("country")
+        current = row.get(spec["country"])
+        where = current if isinstance(current, str) and current else None
         if order is not None:
-            stamp = order["created"]
-        in_period = (order is not None or bool(row)) and start <= stamp < end
-        compared_today = order is not None and start <= order.get("compared_at", stamp) < end
-        creator = row.get("_createdBy")
-        if isinstance(creator, dict):
-            creator = creator.get("accountId")
-        creator = creator if isinstance(creator, str) and creator else None
-        bot = creator is not None and creator == config["bot_account"]
-        if in_period and (not where or (where == build and not creator and order is None)):
+            where = build if build in order.countries else next(iter(order.countries), None)
+            stamp = order.created
+            issues = []
+            if order.uncertain:
+                issues.append("台账身份或字段证据待核对")
+            if len(order.countries) != 1 or current != where:
+                issues.append("国家归属待核对")
+            if row and creator_id(row) != config["bot_account"]:
+                issues.append("建单身份待核对")
+            if issues:
+                differences[rid] = issues
+                unknown_writes += 1
+        in_period = start <= stamp < end
+        creator = creator_id(row)
+        bot = creator == config["bot_account"]
+        if order is None and bot:
+            # 台账外记录只有在详情仍为创建时版本时才能从详情证明最初归属。
+            try:
+                creation_version = utc(row["_updatedAt"], platform=True) == stamp
+            except ERRORS:
+                creation_version = False
+            if not creation_version:
+                where = None
+                differences[rid] = ["台账外记录缺少创建时国家证据"]
+        if bot and rid not in scanned and not scan_gap:
+            scan_gap = 1
+            unknown_writes += 1
             unknown_creates += 1
-        if where == build and order is not None and in_period:
-            created.add(rid)
-        if (in_period or compared_today) and where == build and (bot or order is not None):
-            if order is None:
+            unknown_returns += 1
+        if in_period and (not where or where == build and not creator and order is None):
+            unknown_creates += 1
+        if where == build and (order is not None or bot):
+            if in_period:
                 created.add(rid)
-                if orders is None or pending:
-                    unknown_writes += 1
-                else:
-                    wrong.add(rid)
-            else:
-                compared = order.get("comparison")
-                written, display = order.get("written"), order.get("displayed")
-                comparable = isinstance(written, dict) and written and isinstance(display, dict) and display
-                if order.get("approved") is False or compared == "写错" or comparable and not same(written, display):
-                    wrong.add(rid)
-                elif not (order.get("approved") is True and (comparable or compared == "一致")):
-                    unknown_writes += 1
-        elif in_period and (not where or where == build and not creator):
+            if order is None and pending:
+                unknown_writes += 1
+            elif (order is None or order.wrong) and (in_period or rid not in seen):
+                wrong.add(rid)
+                if not in_period:
+                    historical.add(rid)
+        elif order is None and (not where or where == build and not creator):
             unknown_writes += 1
         if not row:
             unknown_returns += int(order is not None and where in (None, build))
@@ -386,6 +554,10 @@ def report(directory, config, api, start, end):
             final = None
             unknown_returns += int(where in (None, build) and (order is not None or bot))
         observations[key].append((order, final, where, creator, bot, in_period))
+    for rid in archived - wrong:
+        differences.setdefault(rid, []).append("已确认写错，本次未能重证")
+        unknown_writes += 1
+    wrong.update(archived)
     for key, matches in observations.items():
         if policy_cards[key] and len(matches) > 1:
             unknown_misses += sum(order is None and not bot and bool(creator) and in_period
@@ -402,9 +574,9 @@ def report(directory, config, api, start, end):
                 and len(rows) == len(policy_cards[key]) == 1):
             order, final, where, creator, bot, _ = rows[0]
             fields = proof.get("fields")
-            if order is not None and order.get("card_uuid") is not None:
-                fields = order.get("fields", fields) if order["card_uuid"] == c["uuid"] else None
-            baseline = order.get("written") if order is not None else proof.get("draft")
+            if order is not None and order.card_uuid is not None:
+                fields = (order.fields or fields) if order.card_uuid == c["uuid"] else None
+            baseline = order.written if order is not None else proof.get("draft")
             if where == country(c["registration"]) and (
                     order is not None or (where and where != build and creator and not bot)):
                 counts = field_counts(fields, baseline, final)
@@ -423,7 +595,9 @@ def report(directory, config, api, start, end):
         public[k] = UNKNOWN if totals["未知"] else totals[k]
     public.update({"卡片核对未知": totals["未知"], "漏条已核": len(missed), "漏条未知": unknown_misses,
                    "漏条": UNKNOWN if unknown_misses else len(missed),
-                   "建单已核": len(created), "明道云写错已核": len(wrong), "写入核对未知": unknown_writes,
+                   "建单已核": len(created), "新发现的历史异常已核": len(historical),
+                   "新发现的历史异常": UNKNOWN if unknown_writes else len(historical),
+                   "明道云写错已核": len(wrong), "写入核对未知": unknown_writes,
                    "明道云写错": UNKNOWN if unknown_writes else len(wrong),
                    "建单": UNKNOWN if unknown_creates else len(created),
                    "退回公告条目": len(announcements), "退回核对未知": unknown_returns})
@@ -431,7 +605,9 @@ def report(directory, config, api, start, end):
                             public["建单国家卡片"], totals["建单国家至多两处"],
                             public["卡片国家未知"] + public["卡片送达未知"])
     return public, {"建议": advice, "未知卡片数": totals["未知"], "卡片样本数": len(daily), "卡片": details, "退回公告": announcements,
-                    "漏条": sorted(missed), "写错": sorted(wrong)}
+                    "试运行起点": trial.isoformat(), "窗口起点": start.isoformat(),
+                    "窗口终点": end.isoformat(), "写入差异核对": differences,
+                    "新发现的历史异常": sorted(historical), "漏条": sorted(missed), "写错": sorted(wrong)}
 
 
 def main():
@@ -451,6 +627,16 @@ def main():
     start = trial if args.whole_trial else max(trial, end - timedelta(days=1))
     if end > now or args.whole_trial and end != limit:
         raise ValueError("观察窗口尚未结束")
+    target = directory / ("trial-summary.json" if args.whole_trial else f"trial-report-{start.date()}.json")
+    # 用量账与摘要均位于收信登记库；SQLite 副文件同样属于输入。
+    databases = (directory / config["entry_db"], directory / "trial-050.sqlite3")
+    inputs = [directory / name for name in ("trial-report.json", "trial-orders.jsonl")]
+    inputs.extend(Path(str(db) + suffix) for db in databases for suffix in ("", "-wal", "-shm", "-journal"))
+    inputs.extend(directory / f"trial-report-{(trial + timedelta(days=i)).date()}.json"
+                  for i in range((end - trial).days) if args.whole_trial or i < (start - trial).days)
+    if target.is_symlink() or any(target.resolve() == source.resolve()
+            or target.exists() and source.exists() and target.samefile(source) for source in inputs):
+        raise ValueError("私有输出路径与输入冲突")
     requests = 0
     def count(_request):
         nonlocal requests
@@ -460,7 +646,6 @@ def main():
         api = Official(spec, os.environ[spec["token_key"]], os.environ[spec["app_id_key"]], client)
         public, private = report(directory, config, api, start, end)
     public["明道云只读请求数"] = requests
-    target = directory / ("trial-summary.json" if args.whole_trial else f"trial-report-{start.date()}.json")
     with NamedTemporaryFile(dir=directory, mode="w", encoding="utf8", delete=False) as stream:
         json.dump(private, stream, ensure_ascii=False)
     os.replace(stream.name, target)

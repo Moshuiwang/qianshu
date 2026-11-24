@@ -64,7 +64,7 @@ class Reads:
 
 
 @pytest.fixture
-def dataset(tmp_path):
+def dataset(tmp_path, monkeypatch):
     config = dict(trial_start=START.isoformat(), build_country="A", bot_account="robot",
                   controls=dict(link="link", policy="policy", country="area", node_key="node",
                                 return_nodes=["returned"], reason_key="reason"),
@@ -86,8 +86,11 @@ def dataset(tmp_path):
                                             ("body_missed", "review"), ("interrupted", "pending")]):
             db.execute("INSERT INTO notice(event,kind,status,at,quantity) VALUES(?,?,?,?,42)", (i, kind, status, AT))
         db.execute("INSERT INTO notice(event,kind,status,at) VALUES('old','freeze','sent',?)", (END.isoformat(),))
-        db.execute("INSERT INTO charge(model,at,inputs,outputs) VALUES('sonnet',?,100,20)", (AT,))
-        db.execute("INSERT INTO charge(model,at,inputs,outputs) VALUES('haiku',?,100,20)", (AT,))
+    monkeypatch.setattr("qianshu.mail.trial_state.now", lambda: AT)
+    store.import_spend("0")
+    for model in ("sonnet", "haiku"):
+        attempt = store.reserve(model, maximum=20, input_bound=100, reg=1)
+        assert store.settle(attempt, inputs=100, outputs=20)
     store.db.close()
     with sqlite3.connect(tmp_path / "entry.sqlite") as db:
         db.execute("CREATE TABLE feishu_approvals(scope,approval_id,status,decided_at)")
@@ -99,8 +102,8 @@ def dataset(tmp_path):
     return tmp_path, config, api
 
 
-def test_all_countries_fields_and_unknown_not_clean(dataset):
-    public, private = tr.report(*dataset, START, END)
+def test_all_countries_fields_and_unknown_not_clean(scoped):
+    public, private = tr.report(*scoped, START, END)
     assert [public[k] for k in ("收到申请", "出卡", "建单国家申请", "建单国家卡片", "建单")] == [3, 3, 1, 1, 1]
     assert [public[k + "已核"] for k in ("人工改动项", "错判确定", "多问", "无需修改")] == [2, 2, 2, 0]
     assert public["卡片核对未知"] == 1 and public["人工改动项"] == tr.UNKNOWN
@@ -116,29 +119,30 @@ def test_field_positive_negative_and_missing():
     assert tr.field_counts({}, {}, {}) is None
 
 
-def test_returns_items_and_unregistered_writes_and_misses(dataset):
-    path, config, api = dataset
+def test_returns_items_and_unregistered_writes_and_misses(scoped):
+    path, config, api = scoped
     api.add("1", "1", "p", "A", "robot", returned=True)
     api.add("4", "1", "q", "A", "robot")
     api.add("5", "2", "q", "B", "robot")
     api.add("6", "2", "r", "B", "human")
     api.add("7", "outside", "s", "A", "robot")
-    public, private = tr.report(*dataset, START, END)
-    assert public["漏条"] == public["明道云写错"] == public["退回公告条目"] == 1
-    assert public["建单"] == 2 and private["写错"] == ["4"] and private["漏条"] == ["6"]
+    public, private = tr.report(*scoped, START, END)
+    assert public["漏条"] == public["退回公告条目"] == 1
+    assert public["明道云写错"] == public["明道云写错已核"] == 2
+    assert public["建单"] == 3 and private["写错"] == ["4", "7"] and private["漏条"] == ["6"]
     assert private["建议"] == "回退"
     notice, = private["退回公告"]
     assert notice["record_id"] == "1" and notice["notify"] == "配置负责人"
     assert notice["reason"] == "原因未读到，请到明道云查看"
     api.logs["1"][-1]["content"]["reason"] = "private-reason"
-    assert tr.report(*dataset, START, END)[1]["退回公告"][0]["reason"] == "private-reason"
+    assert tr.report(*scoped, START, END)[1]["退回公告"][0]["reason"] == "private-reason"
     api.logs["1"][-1]["content"]["node"] = "withdrawn"
-    assert tr.report(*dataset, START, END)[0]["退回公告条目"] == 0
+    assert tr.report(*scoped, START, END)[0]["退回公告条目"] == 0
 
 
-@pytest.mark.parametrize("mutation", [{"displayed": {"x": 9}}, {"approved": False}, {"comparison": "写错"}])
-def test_unapproved_or_mismatched_write(dataset, mutation):
-    ledger = dataset[0] / "trial-orders.jsonl"
+@pytest.mark.parametrize("mutation", [{"displayed": {"x": 9, "y": 1}}, {"approved": False}, {"comparison": "写错"}])
+def test_unapproved_or_mismatched_write(scoped, mutation):
+    ledger = scoped[0] / "trial-orders.jsonl"
     row = json.loads(ledger.read_text())
     if "comparison" in mutation:
         row = dict(row, event="readback_unconfirmed", 结论="写错")
@@ -146,8 +150,9 @@ def test_unapproved_or_mismatched_write(dataset, mutation):
             f.write(json.dumps(row))
     else:
         ledger.write_text(json.dumps(row | mutation))
-    public, private = tr.report(*dataset, START, END)
-    assert public["明道云写错"] == 1 and private["建议"] == "回退"
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错已核"] == 1 and private["建议"] == "回退"
+    assert public["明道云写错"] == (tr.UNKNOWN if "comparison" in mutation else 1)
 
 
 @pytest.mark.parametrize("contents", [None, "{}", "{", '{"event":"future"}'])
@@ -200,8 +205,8 @@ def test_cli_private_public_and_read_only(dataset, monkeypatch, capsys):
     assert before == [p.read_bytes() for p in inputs]
 
 
-def test_failed_detail_and_missing_link_stay_unknown(dataset, monkeypatch):
-    _, config, api = dataset
+def test_failed_detail_and_missing_link_stay_unknown(scoped, monkeypatch):
+    _, config, api = scoped
     api.add("extra", "1", "q", "A", "robot")
     read = api.read
 
@@ -211,20 +216,20 @@ def test_failed_detail_and_missing_link_stay_unknown(dataset, monkeypatch):
         return read(rid)
 
     monkeypatch.setattr(api, "read", fail_one)
-    public, _ = tr.report(*dataset, START, END)
+    public, _ = tr.report(*scoped, START, END)
     assert public["漏条"] == public["明道云写错"] == tr.UNKNOWN
     assert public["写入核对未知"] == 1 and public["卡片核对未知"] == 2
     del api.rows["extra"]
     del config["registrations"]["2"]["link"]
-    public, _ = tr.report(*dataset, START, END)
+    public, _ = tr.report(*scoped, START, END)
     assert public["漏条"] == tr.UNKNOWN and public["明道云写错"] == 0
 
 
-def test_prior_order_monitored_and_new_period_counts(dataset):
-    _, _, api = dataset
+def test_prior_order_monitored_and_new_period_counts(scoped):
+    _, _, api = scoped
     api.add("1", "1", "p", "A", "robot", returned=True)
     api.logs["1"][-1]["content"]["_createdAt"] = END.isoformat()
-    public, _ = tr.report(*dataset, END, END + timedelta(days=1))
+    public, _ = tr.report(*scoped, END, END + timedelta(days=1))
     assert public["收到申请"] == public["出卡"] == public["建单"] == 0
     assert public["退回公告条目"] == 1 and public["冻结通知已发"] == 1
 
@@ -250,3 +255,164 @@ def test_real_ledger_event_shape_with_test_and_inflight(dataset):
     public, _ = tr.report(*dataset, START, END)
     assert public["建单已核"] == 1 and public["明道云写错已核"] == 0
     assert public["建单"] == public["明道云写错"] == tr.UNKNOWN
+
+
+@pytest.fixture
+def scoped(dataset, monkeypatch):
+    path, config, api = dataset
+    config.update(bot_scan={"view": "v", "coverage": "full_table"}, required_fields=["x", "y"])
+    original = api._request
+
+    def search(action, rid=None, *, body=None, params=None):
+        if action == "search" and body["filter"]["children"][0]["field"] == "_createdBy":
+            who, since, until = body["filter"]["children"]
+            assert who == dict(type="condition", field="_createdBy", operator="eq", value="robot")
+            assert (since["field"], since["operator"], until["field"], until["operator"]) == (
+                "_createdAt", "gte", "_createdAt", "lt")
+            rows = [r for r in api.rows.values() if r["_createdBy"] == who["value"]
+                    and tr.utc(since["value"]) <= tr.utc(r["_createdAt"]) < tr.utc(until["value"])]
+            return {"rows": rows, "total": len(rows)}
+        return original(action, rid, body=body, params=params)
+
+    monkeypatch.setattr(api, "_request", search)
+    return dataset
+
+
+def test_scan_unregistered_link(scoped):
+    scoped[2].add("extra", "outside", "q", "A", "robot")
+    public, _ = tr.report(*scoped, START, END)
+    assert public["明道云写错已核"] == 1
+
+
+def test_first_discovery_after_creation_day(scoped):
+    scoped[2].add("extra", "1", "q", "A", "robot")
+    next_end = END + timedelta(days=1)
+    public, private = tr.report(*scoped, END, next_end)
+    assert public["明道云写错已核"] == public["新发现的历史异常"] == 1
+    previous = scoped[0] / f"trial-report-{END.date()}.json"
+    previous.touch(mode=0o600)
+    previous.write_text(json.dumps(private))
+    public, _ = tr.report(*scoped, next_end, next_end + timedelta(days=1))
+    assert public["新发现的历史异常"] == 0
+
+
+def test_missing_scan_scope_unknown(scoped):
+    del scoped[1]["bot_scan"]
+    assert tr.report(*scoped, START, END)[0]["明道云写错"] == tr.UNKNOWN
+
+
+def add_event(path, **changes):
+    ledger = path / "trial-orders.jsonl"
+    row = json.loads(ledger.read_text().splitlines()[0])
+    with ledger.open("a") as stream:
+        stream.write(json.dumps(row | changes) + "\n")
+
+
+@pytest.mark.parametrize("conflict", ["country", "test", "malformed"])
+def test_confirmed_error_survives_conflict(scoped, conflict):
+    path, _, api = scoped
+    add_event(path, event="readback_compared", 结论="写错")
+    if conflict == "country":
+        api.rows["1"]["area"] = "B"
+    elif conflict == "test":
+        add_event(path, registration="other", is_test=True)
+    else:
+        add_event(path, event="invalid")
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错已核"] == 1 and private["建议"] == "回退"
+    assert public["写入核对未知"] > 0
+
+
+@pytest.mark.parametrize("unconfirmed", [False, True])
+def test_partial_equal_snapshots(scoped, unconfirmed):
+    path, _, _ = scoped
+    ledger = path / "trial-orders.jsonl"
+    row = json.loads(ledger.read_text()) | dict(written={"x": 0}, displayed={"x": 0})
+    ledger.write_text(json.dumps(row) + "\n")
+    if unconfirmed:
+        add_event(path, event="readback_unconfirmed", 结论="未确认")
+    assert tr.report(*scoped, START, END)[0]["明道云写错"] == tr.UNKNOWN
+
+
+@pytest.mark.parametrize("damage", ["delete_charge", "delete_seal"])
+def test_charge_seal_damage(scoped, damage):
+    path, _, _ = scoped
+    with sqlite3.connect(path / "trial-050.sqlite3") as db:
+        db.execute("DELETE FROM charge WHERE model='haiku'")
+        store = Store.__new__(Store)
+        store.db = db
+        store._seal_ledger()
+        db.commit()
+        assert tr.report(*scoped, START, END)[0]["总费用美元"] == "0.000400000"
+        db.execute("DELETE FROM " + ("charge" if damage == "delete_charge" else "ledger_check"))
+    assert tr.report(*scoped, START, END)[0]["总费用美元"] == tr.UNKNOWN
+
+
+@pytest.mark.parametrize("alias", ["direct", "hardlink", "symlink"])
+def test_output_alias_rejected_before_report(scoped, monkeypatch, alias):
+    import os
+    path, config, api = scoped
+    target = path / "trial-report-2026-01-01.json"
+    entry = path / config["entry_db"]
+    if alias == "direct":
+        entry.rename(target)
+        config["entry_db"] = target.name
+    elif alias == "symlink":
+        target.symlink_to(entry)
+    else:
+        os.link(entry, target)
+    config["official"] = dict(token_key="SYNTH", app_id_key="SYNTH")
+    cfg = path / "trial-report.json"
+    cfg.touch(mode=0o600)
+    cfg.write_text(json.dumps(config))
+    monkeypatch.setenv("SYNTH", "fixture")
+    monkeypatch.setattr(tr, "Official", lambda *_: api)
+    monkeypatch.setattr(tr, "report", lambda *_: pytest.fail("已进入取数阶段"))
+    monkeypatch.setattr(sys, "argv", ["report", "--private-dir", str(path), "--end", END.isoformat()])
+    with pytest.raises(ValueError):
+        tr.main()
+
+
+def test_verified_empty_scan_and_intact_snapshots(scoped):
+    public, _ = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == public["写入核对未知"] == 0
+
+
+def test_unconfirmed_with_complete_snapshots(scoped):
+    add_event(scoped[0], event="readback_unconfirmed", 结论="未确认")
+    public, _ = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN and public["明道云写错已核"] == 0
+
+
+def test_late_scan_failure_keeps_confirmed_rows(scoped, monkeypatch):
+    api = scoped[2]
+    api.add("extra", "outside", "q", "A", "robot")
+    original = api.page_rows
+
+    def pages(fetch, size):
+        yield from original(fetch, size)
+        raise tr.Stop()
+
+    monkeypatch.setattr(api, "page_rows", pages)
+    public, _ = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN and public["明道云写错已核"] == 1
+
+
+def test_rerun_preserves_previously_confirmed_external_error(scoped):
+    path, _, api = scoped
+    api.add("extra", "outside", "q", "A", "robot")
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错已核"] == 1
+    previous = path / f"trial-report-{START.date()}.json"
+    previous.touch(mode=0o600)
+    previous.write_text(json.dumps(private))
+    api.rows["extra"]["area"] = "B"
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错已核"] == 1 and private["建议"] == "回退"
+
+
+def test_external_updated_detail_lacks_creation_country(scoped):
+    scoped[2].add("extra", "outside", "q", "B", "robot", late=True)
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == public["新发现的历史异常"] == tr.UNKNOWN
+    assert "extra" in private["写入差异核对"]
