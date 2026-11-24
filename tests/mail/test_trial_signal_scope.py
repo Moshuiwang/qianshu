@@ -13,7 +13,7 @@ from test_trial_listener import service
 
 
 @pytest.mark.parametrize("phase", ["start", "wait", "twice", "exit", "normal", "close_error"])
-def test_signal_scope(service, monkeypatch, phase):
+def test_signal_scope(service, monkeypatch, phase, fork_process):
     path, settings, run = service
     ctx = multiprocessing.get_context("fork")
     ready, resume, closed, closing, exit_log, caught, failed = (ctx.Event() for _ in range(7))
@@ -60,8 +60,7 @@ def test_signal_scope(service, monkeypatch, phase):
     monkeypatch.setattr(HandoffService, "run", lambda self: None)
     monkeypatch.setattr(MentionLog, "close", close_log)
     monkeypatch.setattr(trial._LOG, "critical", lambda *args: failed.set())
-    process = ctx.Process(target=serve)
-    process.start()
+    process = fork_process(serve)
     try:
         assert closing.wait(5)
         with path.open("rb") as contender:
@@ -88,7 +87,7 @@ def test_signal_scope(service, monkeypatch, phase):
         process.join()
 
 
-def test_handoff_close_failure_keeps_listener(service, monkeypatch):
+def test_handoff_close_failure_keeps_listener(service, monkeypatch, fork_process):
     path, settings, run = service
     ctx = multiprocessing.get_context("fork")
     closing, resume, failed = (ctx.Event() for _ in range(3))
@@ -103,8 +102,7 @@ def test_handoff_close_failure_keeps_listener(service, monkeypatch):
     monkeypatch.setattr(HandoffService, "run", lambda self: None)
     monkeypatch.setattr(MentionLog, "close", fail)
     monkeypatch.setattr(trial._LOG, "critical", lambda *args: failed.set())
-    process = ctx.Process(target=run, args=(settings,))
-    process.start()
+    process = fork_process(run, settings)
     try:
         assert closing.wait(5)
         with path.open("rb") as contender, pytest.raises(BlockingIOError):

@@ -28,7 +28,7 @@ def service(tmp_path, monkeypatch):
     return path, settings, start
 
 
-def test_contending_trial_process_opens_neither_database(service, monkeypatch):
+def test_contending_trial_process_opens_neither_database(service, monkeypatch, fork_process):
     path, settings, start = service
     processes = multiprocessing.get_context("fork")
     ready, finish = processes.Event(), processes.Event()
@@ -38,8 +38,7 @@ def test_contending_trial_process_opens_neither_database(service, monkeypatch):
 
     monkeypatch.setattr(HandoffService, "run", listen)
     monkeypatch.setattr(trial.Trial, "run", lambda self: ready.set())
-    holder = processes.Process(target=start, args=(settings,))
-    holder.start()
+    holder = fork_process(start, settings)
     try:
         assert ready.wait(15)
         assert path.exists() and path.with_name("trial-050.sqlite3").exists()

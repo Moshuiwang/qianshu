@@ -648,6 +648,8 @@ def test_run_polling_delivers_after_timeout_while_judge_is_still_running(config)
 
     def wait(seconds):
         nonlocal now
+        # #174：每轮都失败时 on_result 不触发、stop 永不置位，替身等待又立即返回，会死循环；限轮数。
+        assert now < 60 * 10, "收信循环超过 10 轮仍未结束"
         now += seconds
         return False
 

@@ -66,7 +66,7 @@ def test_body_selection_at_delivery(journey, baseline_modules, monkeypatch, plai
 
 
 @pytest.mark.parametrize("interrupt", [False, True])
-def test_lock_held_through_mail_db_close(service, monkeypatch, interrupt):
+def test_lock_held_through_mail_db_close(service, monkeypatch, interrupt, fork_process):
     path, settings, start = service
     ctx = multiprocessing.get_context("fork")
     closing, resume, closed, returned = (ctx.Event() for _ in range(4))
@@ -102,8 +102,7 @@ def test_lock_held_through_mail_db_close(service, monkeypatch, interrupt):
     monkeypatch.setattr(trial.Trial, "run", mail_run)
     monkeypatch.setattr(HandoffService, "run", lambda self: None)
     monkeypatch.setattr(MentionLog, "close", handoff_close)
-    process = ctx.Process(target=serve)
-    process.start()
+    process = fork_process(serve)
     try:
         assert closing.wait(10)
         with path.open("rb") as contender:
