@@ -4,6 +4,8 @@ import argparse
 import fcntl
 import json
 import os
+import re
+import secrets
 import sqlite3
 from collections import Counter, defaultdict
 from contextlib import closing, contextmanager
@@ -13,7 +15,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from uuid import UUID
 
 import httpx
 
@@ -25,6 +27,8 @@ UNKNOWN = "未知"
 
 
 class Reason(StrEnum):
+    ID = "标识格式无法核实"
+    RANGE = "回读字段范围无法核实"
     SCOPE = "覆盖范围无独立证据"
     LEDGER = "台账缺失或格式不认识"
     PENDING = "建单结果未确认"
@@ -65,6 +69,54 @@ def reader(path):
         yield db
 
 
+def normalized_id(raw, kind):
+    if kind == "registration" and type(raw) is int and raw > 0:
+        raw = str(raw)
+    if not isinstance(raw, str):
+        raise ValueError(Reason.ID)
+    value = raw.strip()
+    try:
+        canonical = str(UUID(value))
+        if canonical == value.lower():
+            return canonical
+    except ValueError:
+        pass
+    formats = {"registration": r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}",
+               "approval": r"[A-Za-z0-9_-]{43}", "message": r"om_[0-9a-fA-F]{32}",
+               "business": r"create:[0-9a-f]{64}"}
+    if kind in formats and re.fullmatch(formats[kind], value):
+        return value
+    raise ValueError(Reason.ID)
+
+
+def optional_id(raw, kind):
+    try:
+        return normalized_id(raw, kind)
+    except ValueError:
+        return None
+
+
+def indexed_metadata(mapping, kind):
+    result = {}
+    for raw, value in mapping.items():
+        key = optional_id(raw, kind)
+        if key is not None:
+            result[key] = {} if key in result else value
+    return result
+
+
+def readback_complete(row, expected):
+    items = row.get("逐项核对")
+    if (not expected or type(row.get("total")) is not int or row["total"] != len(expected)
+            or not isinstance(items, list) or len(items) != len(expected)
+            or not all(isinstance(item, dict) and isinstance(item.get("字段名"), str)
+                       and item.get("结果") in ("一致", "不一致") for item in items)):
+        return False
+    counts = Counter(item["结果"] for item in items)
+    return ({item["字段名"] for item in items} == expected and same(row.get("counts"), counts)
+            and row.get("结论") == ("写错" if counts["不一致"] else "一致"))
+
+
 @dataclass(frozen=True)
 class Order:
     created: datetime
@@ -72,6 +124,7 @@ class Order:
     wrong: bool
     reasons: frozenset
     card_uuid: str | None
+    covered: bool
     fields: dict | None
     written: dict | None
 
@@ -81,10 +134,19 @@ class OrderLedger:
     orders: dict = field(default_factory=dict)
     tests: set = field(default_factory=set)
     gaps: int = 0
-    inflight: bool = False
+    unreadable: bool = False
+    pending: list = field(default_factory=list)
+
     published: list = field(default_factory=list)
     reasons: set = field(default_factory=set)
     conflicts: dict = field(default_factory=dict)
+
+    def possible_attempt(self, rid, stamp, registration):
+        reg = optional_id(registration, "registration")
+        return self.unreadable or any(
+            (begin is None or begin <= stamp) and (target is None or target == rid)
+            and (reg is None or reg == owner) for owner, begin, target in self.pending
+        )
 
 
 def read_orders(path, start, end):
@@ -96,12 +158,12 @@ def read_orders(path, start, end):
     result = OrderLedger()
     wrong_readbacks = set()
     test_events = defaultdict(list)
-    pending = set()
+    pending = defaultdict(list)
     gaps = 0
     try:
         lines = private_bytes(path).splitlines()
     except ERRORS:
-        return OrderLedger(gaps=1, inflight=True, reasons={Reason.LEDGER})
+        return OrderLedger(gaps=1, unreadable=True, reasons={Reason.LEDGER})
 
     for line in lines:
         try:
@@ -112,6 +174,10 @@ def read_orders(path, start, end):
             event, reg, test = row["event"], row["registration"], row["is_test"]
             if event not in EVENTS or not isinstance(reg, str) or not reg.strip() or type(test) is not bool:
                 raise ValueError()
+            reg = row["registration"] = normalized_id(reg, "registration")
+            for key, kind in (("record_id", "record"), ("card_uuid", "card")):
+                if row.get(key) is not None:
+                    row[key] = normalized_id(row[key], kind)
             identity = (reg, test)
             info = context[identity]
             rid = row.get("record_id")
@@ -127,11 +193,12 @@ def read_orders(path, start, end):
             if event == "create_attempt":
                 info.pop("expected", None)
                 manifest = row.get("request_fields")
-                if isinstance(manifest, list) and manifest and all(isinstance(k, str) and k for k in manifest):
+                if (isinstance(manifest, list) and manifest and all(isinstance(k, str) and k for k in manifest)
+                        and len(set(manifest)) == len(manifest)):
                     info["expected"] = set(manifest)
                 if "attempt" in info:
                     info["uncertain"] = True
-                info["attempt"] = True
+                info["attempt"] = stamp
             if rid and event in {"readback_compared", "readback_unconfirmed"} and row.get("结论") == "写错":
                 wrong_readbacks.add(rid)
             if rid:
@@ -142,7 +209,7 @@ def read_orders(path, start, end):
                         records[identity, rid] = deepcopy(info)
                     ids[reg].add(rid)
                     owners[rid].add(identity)
-                    pending.discard(identity)
+                    pending.pop(identity, None)
                 if (identity, rid) not in records:
                     raise ValueError()
                 info = records[identity, rid]
@@ -154,21 +221,23 @@ def read_orders(path, start, end):
                 info.setdefault("created", stamp)
             if event in {"create_attempt", "create_unknown", "create_reconciled_candidate",
                          "create_reconciled_read", "create_reconciled_read_unconfirmed"}:
-                pending.add(identity)
+                if event == "create_attempt" or identity not in pending:
+                    pending[identity].append((reg, info.get("attempt"), optional_id(row.get("target_id"), "record")))
             if event == "aborted_before_write":
                 if type(row.get("allowed_writes")) is not int or row["allowed_writes"] != 0:
                     raise ValueError()
-                pending.discard(identity)
+                pending.pop(identity, None)
             if event in {"readback_compared", "readback_unconfirmed"}:
                 if not rid:
                     raise ValueError()
                 verdict = row.get("结论")
-                if event == "readback_compared" and verdict in {"一致", "写错"}:
-                    info["compared"] = True
+                complete = event == "readback_compared" and readback_complete(row, info.get("expected"))
+                info["compared"] = complete
+                if complete:
+                    info["covered"] = True
                 if verdict == "写错":
                     info["wrong"] = True
-                if event == "readback_unconfirmed" or verdict not in {"一致", "写错"}:
-                    info["compared"] = False
+                info["range_gap"] = event == "readback_compared" and not complete
             if test:
                 continue
             for key in ("country", "approved", "written", "displayed", "card_uuid", "fields"):
@@ -196,7 +265,8 @@ def read_orders(path, start, end):
         result.reasons.add(Reason.LEDGER)
     if pending:
         result.reasons.add(Reason.PENDING)
-    result.inflight = bool(pending or gaps)
+    result.unreadable = bool(gaps)
+    result.pending = [attempt for attempts in pending.values() for attempt in attempts]
     result.conflicts = {reg: sorted(rids) for reg, rids in ids.items() if len(rids) > 1}
     if result.conflicts:
         result.reasons.add(Reason.CONFLICT)
@@ -217,12 +287,9 @@ def read_orders(path, start, end):
                      or any(r.get("uncertain") for r in formal))
         reasons = {Reason.CONFLICT} if uncertain else set()
         card = info.get("card_uuid")
-        if card is not None and not isinstance(card, str):
-            card = None
-            reasons.add(Reason.CONFLICT)
         expected = info.get("expected")
         if not info.get("compared"):
-            reasons.add(Reason.READ)
+            reasons.add(Reason.RANGE if info.get("range_gap") else Reason.READ)
         snapshots = [info.get(k) for k in ("written", "displayed")]
         if not expected:
             reasons.add(Reason.MANIFEST)
@@ -235,6 +302,7 @@ def read_orders(path, start, end):
         result.orders[rid] = Order(
             info["created"], frozenset().union(*(r.get("countries", ()) for r in formal)),
             rid in wrong_readbacks or any(r.get("wrong") for r in formal), frozenset(reasons), card,
+            bool(info.get("covered")) and not reasons - {Reason.READ, Reason.RANGE},
             info.get("fields"), info.get("written"))
     result.gaps = gaps + len(pending) + len(result.conflicts)
     return result
@@ -307,6 +375,11 @@ def history(api, row, spec, end):
     return final, returns
 
 
+def normalized_page(result):
+    return result | {"rows": [row | {"rowId": normalized_id(row["rowId"], "record")}
+                              for row in result["rows"]]}
+
+
 def linked_rows(api, spec, link):
     """仅检索已登记的精确任务链接，再逐条校验返回的关联。"""
     condition = {"type": "condition", "field": spec["link"], "operator": "eq", "value": link}
@@ -319,7 +392,7 @@ def linked_rows(api, spec, link):
             })
             if "total" not in result and type(result.get("hasMore")) is not bool:
                 raise ValueError()
-            return result
+            return normalized_page(result)
         for row in api.page_rows(fetch, api.page_size):
             if row.get(spec["link"]) != link:
                 raise ValueError()
@@ -357,7 +430,7 @@ def scan_bot(api, scope, account, trial, end):
             snapshot = result.get("snapshotVersion")
         elif not snapshot or result.get("snapshotVersion") != snapshot:
             raise ValueError()
-        return result
+        return normalized_page(result)
 
     for row in api.page_rows(fetch, api.page_size):
         if creator_id(row) != account or not trial <= utc(row["_createdAt"], platform=True) < end:
@@ -400,9 +473,13 @@ class Evidence:
     disputed_models: set = field(default_factory=set)
 
     def merge(self, rejected, charges, disputes):
-        if not isinstance(rejected, list) or not all(isinstance(x, str) and x for x in rejected):
+        if not isinstance(rejected, list):
             raise ValueError("驳回归档无效")
-        self.rejected.update(rejected)
+        for raw in rejected:
+            try:
+                self.rejected.add(normalized_id(raw, "approval"))
+            except ValueError:
+                self.reasons["卡片驳回"].add(Reason.ID)
         if not isinstance(disputes, list) or any(m not in RATES for m in disputes):
             raise ValueError("费用归档无效")
         self.disputed_models.update(disputes)
@@ -449,8 +526,19 @@ def previous_errors(directory, trial, start, end, evidence):
                 or previous.get("窗口起点") != day.isoformat() or previous.get("窗口终点") != until.isoformat()):
             raise ValueError("历史日报窗口无法核对")
         ids, old = previous["写错"], previous["新发现的历史异常"]
-        if (not all(isinstance(items, list) and all(isinstance(r, str) and r for r in items)
-                    for items in (ids, old)) or not set(old) <= set(ids)):
+        if not all(isinstance(items, list) for items in (ids, old)):
+            raise ValueError("历史日报异常记录无法核对")
+        normalized = []
+        for items in (ids, old):
+            known = set()
+            for raw in items:
+                try:
+                    known.add(normalized_id(raw, "record"))
+                except ValueError:
+                    evidence.reasons["明道云写错"].add(Reason.ID)
+            normalized.append(known)
+        ids, old = normalized
+        if not old <= ids:
             raise ValueError("历史日报异常记录无法核对")
         if day < start:
             earlier.update(ids)
@@ -479,7 +567,7 @@ def charge_counts(rows, evidence=None):
     amounts = evidence.amounts()
     result = dict(amounts)
     for model in RATES:
-        result[model + "费用美元"] = UNKNOWN if missing[model] else amounts[model + "费用美元已核"]
+        result[model + "费用美元"] = UNKNOWN if missing[model] or missing["other"] else amounts[model + "费用美元已核"]
         result[model + "用量未知调用"] = missing[model]
     result["费用未知模型调用"] = missing["other"]
     result["总费用美元"] = UNKNOWN if any(missing.values()) else amounts["总费用美元已核"]
@@ -488,34 +576,54 @@ def charge_counts(rows, evidence=None):
             evidence.reasons[model + "费用美元"].add(Reason.USAGE)
             evidence.reasons["总费用美元"].add(Reason.USAGE)
     if missing["other"]:
-        evidence.reasons["总费用美元"].add(Reason.MODEL)
+        for label in (*RATES, "总"):
+            evidence.reasons[label + "费用美元"].add(Reason.MODEL)
     return result
 
 
 def rejection_counts(directory, config, cards, published, start, end, evidence, ledger_ok):
     sent = {c["uuid"] for c in cards if c["status"] == "sent"}
-    complete = ledger_ok and all(c["status"] in {"sent", "pending"} for c in cards)
+    complete = (ledger_ok and all(c["status"] in {"sent", "pending"} and c["uuid"] is not None for c in cards)
+                and len({c["uuid"] for c in cards}) == len(cards))
     bindings = set()
+    businesses = set()
     matched = set()
     try:
         with reader(directory / config["entry_db"]) as db:
+            by_approval = defaultdict(list)
+            by_message = defaultdict(list)
+            for row in db.execute("SELECT approval_id,message_id,record_id,status,decided_at "
+                                  "FROM feishu_approvals WHERE scope=?", (config["entry_scope"],)):
+                try:
+                    approval = normalized_id(row["approval_id"], "approval")
+                    message = normalized_id(row["message_id"], "message")
+                    business = normalized_id(row["record_id"], "business")
+                except ValueError:
+                    complete = False
+                    continue
+                by_approval[approval].append((message, business, row["status"], row["decided_at"]))
+                by_message[message].append(approval)
             for event in published:
-                card = event.get("card_uuid")
-                approval = event.get("approval_id")
-                message = event.get("message_id")
-                if card not in sent or not all(isinstance(x, str) and x for x in (approval, message)):
+                try:
+                    card = normalized_id(event.get("card_uuid"), "card")
+                    approval = normalized_id(event.get("approval_id"), "approval")
+                    message = normalized_id(event.get("message_id"), "message")
+                    business = normalized_id(event.get("business_id"), "business")
+                except ValueError:
                     complete = False
                     continue
-                rows = db.execute("SELECT status, decided_at FROM feishu_approvals "
-                                  "WHERE scope=? AND approval_id=? AND message_id=?",
-                                  (config["entry_scope"], approval, message)).fetchall()
-                if len(rows) != 1:
+                proof = config.get("cards", {}).get(card, {})
+                expected_business = optional_id(proof.get("business_id", card), "business")
+                rows = by_approval[approval]
+                if (card not in sent or len(rows) != 1 or by_message[message] != [approval]
+                        or business != expected_business or rows[0][:2] != (message, business)):
                     complete = False
                     continue
-                complete &= approval not in bindings and card not in matched
+                complete &= approval not in bindings and card not in matched and business not in businesses
+                businesses.add(business)
                 matched.add(card)
                 bindings.add(approval)
-                status, at = rows[0]
+                _, _, status, at = rows[0]
                 if status == "reject":
                     if type(at) not in (int, float):
                         complete = False
@@ -524,8 +632,9 @@ def rejection_counts(directory, config, cards, published, start, end, evidence, 
                 elif status not in {"pending", "approve", "closed", "claimed", "used"}:
                     complete = False
         declared = config.get("approval_ids")
-        complete &= bool(bindings) and isinstance(declared, list) and set(declared) == bindings and matched == sent
-    except (sqlite3.Error, KeyError, TypeError, OSError):
+        complete &= (bool(bindings) and isinstance(declared, list) and len(declared) == len(bindings)
+                     and {normalized_id(v, "approval") for v in declared} == bindings and matched == sent)
+    except (sqlite3.Error, KeyError, TypeError, OSError, ValueError):
         complete = False
     return len(evidence.rejected) if complete else UNKNOWN
 
@@ -549,10 +658,17 @@ def local_counts(directory, config, trial, start, end, published, ledger_ok):
     with reader(directory / "trial-050.sqlite3") as db:
         if db.execute("PRAGMA user_version").fetchone()[0] != FORMAT_VERSION:
             raise ValueError("登记库版本未知")
-        registrations = {r["id"]: r for r in db.execute("SELECT * FROM registration") if observed(r["created"])}
-        cards = [r for r in db.execute("SELECT * FROM card_intent") if observed(r["at"])]
+        registrations = {}
+        for row in db.execute("SELECT * FROM registration"):
+            if observed(row["created"]):
+                reg = normalized_id(row["id"], "registration")
+                registrations[reg] = dict(row, id=reg)
+        cards = [dict(row, uuid=optional_id(row["uuid"], "card"),
+                      registration=optional_id(row["registration"], "registration"))
+                 for row in db.execute("SELECT * FROM card_intent") if observed(row["at"])]
         notices = list(db.execute("SELECT kind,status,at,registration FROM notice"))
-        interruptions = {r["registration"]: r["at"] for r in notices if r["kind"] == "interrupted"}
+        interruptions = {normalized_id(r["registration"], "registration"): r["at"] for r in notices
+                         if r["kind"] == "interrupted" and optional_id(r["registration"], "registration") is not None}
         notices = [r for r in notices if inside(r["at"])]
         waiting, review = db.execute(BODY_NOTICE_COUNTS_SQL).fetchone()
         if ledger_matches(db):
@@ -569,7 +685,7 @@ def local_counts(directory, config, trial, start, end, published, ledger_ok):
     if not isinstance(build, str) or not build:
         raise ValueError()
     def country(reg):
-        return meta.get(str(reg), {}).get("country")
+        return meta.get(reg, {}).get("country")
 
     scope = {r["id"] for r in today if r["id"] in apps}
     sent = [c for c in cards if c["status"] == "sent"]
@@ -598,6 +714,8 @@ def local_counts(directory, config, trial, start, end, published, ledger_ok):
 
 
 def report(directory, config, api, start, end):
+    config = config | {"registrations": indexed_metadata(config.get("registrations", {}), "registration"),
+                       "cards": indexed_metadata(config.get("cards", {}), "card")}
     trial = utc(config["trial_start"])
     check_window(trial, start, end)
     ledger = read_orders(directory / "trial-orders.jsonl", trial, end)
@@ -607,18 +725,18 @@ def report(directory, config, api, start, end):
     build = config["build_country"]
 
     def country(reg):
-        return meta.get(str(reg), {}).get("country")
+        return meta.get(reg, {}).get("country")
 
     if not isinstance(config["bot_account"], str) or not config["bot_account"]:
         raise ValueError("机器人账号未登记")
     spec = config["controls"]
     proofs = config.get("cards", {})
-    links = {meta.get(str(n), {}).get("link") for n in apps}
+    links = {meta.get(n, {}).get("link") for n in apps}
     failed_links = {link for link in links if not link}
-    gaps = sum(not meta.get(str(n), {}).get("link") for n in apps)
+    gaps = sum(not meta.get(n, {}).get("link") for n in apps)
     record_links = defaultdict(set)
-    build_links = {meta.get(str(n), {}).get("link") for n in apps if country(n) in (None, "", build)}
-    build_gaps = sum(not meta.get(str(n), {}).get("link") for n in apps if country(n) in (None, "", build))
+    build_links = {meta.get(n, {}).get("link") for n in apps if country(n) in (None, "", build)}
+    build_gaps = sum(not meta.get(n, {}).get("link") for n in apps if country(n) in (None, "", build))
     records = set(ledger.orders)
     scanned = set()
     scan_gap = 0
@@ -633,6 +751,8 @@ def report(directory, config, api, start, end):
     current_amounts = evidence.amounts()
     seen, archived, historical = previous_errors(directory, trial, start, end, evidence)
     public["卡片驳回已核"] = len(evidence.rejected)
+    if Reason.ID in reasons["卡片驳回"]:
+        public["卡片驳回"] = UNKNOWN
     if current_rejected != evidence.rejected:
         public["卡片驳回"] = UNKNOWN
         reasons["卡片驳回"].add(Reason.HISTORY)
@@ -666,6 +786,9 @@ def report(directory, config, api, start, end):
     miss_reasons = {Reason.LINK} if gaps else set()
     card_reasons = set()
     unknown_writes = build_gaps + ledger.gaps + scan_gap
+    if Reason.ID in reasons["明道云写错"]:
+        unknown_writes += 1
+        write_reasons.add(Reason.ID)
     unknown_creates = build_gaps + ledger.gaps + scan_gap
     unknown_misses = gaps
     observations, announcements = defaultdict(list), []
@@ -673,7 +796,7 @@ def report(directory, config, api, start, end):
     policy_cards = defaultdict(list)
     incomplete_links = set()
     for c in cards:
-        link = meta.get(str(c["registration"]), {}).get("link")
+        link = meta.get(c["registration"], {}).get("link")
         policy = proofs.get(c["uuid"], {}).get("policy")
         if c["status"] == "sent" and policy:
             policy_cards[link, policy].append(c["uuid"])
@@ -685,7 +808,8 @@ def report(directory, config, api, start, end):
             continue
         row = {}
         try:
-            row = api.detail(api.read(rid), rid)
+            raw = api.read(rid)
+            row = api.detail(raw | {"rowId": normalized_id(raw["rowId"], "record")}, rid)
             stamp = utc(row["_createdAt"], platform=True)
             if order is None:
                 if rid in scanned and (creator_id(row) != config["bot_account"] or not trial <= stamp < end):
@@ -752,7 +876,7 @@ def report(directory, config, api, start, end):
         if where == build and (order is not None or bot):
             if in_period:
                 created.add(rid)
-            if order is None and ledger.inflight:
+            if order is None and ledger.possible_attempt(rid, stamp, row.get("registration")):
                 unknown_writes += 1
             elif (order is None or order.wrong) and (in_period or rid not in seen):
                 wrong.add(rid)
@@ -805,7 +929,7 @@ def report(directory, config, api, start, end):
     details = []
     for c in daily:
         proof = proofs.get(c["uuid"], {})
-        key = (meta.get(str(c["registration"]), {}).get("link"), proof.get("policy"))
+        key = (meta.get(c["registration"], {}).get("link"), proof.get("policy"))
         rows = observations.get(key, [])
         counts = None
         if (all(key) and key[0] not in failed_links and key[0] not in incomplete_links
@@ -868,9 +992,9 @@ def report(directory, config, api, start, end):
             if Reason.TEST in ledger.reasons:
                 reasons[key].add(Reason.TEST)
             if prefix and any((not o.countries or build in o.countries and len(o.countries) > 1)
-                              and (not verified or not o.reasons) for o in period_orders):
+                              and (not verified or o.covered) for o in period_orders):
                 reasons[key].add(Reason.COUNTRY)
-            coverage[key] = UNKNOWN if reasons[key] else sum(not verified or not o.reasons for o in eligible)
+            coverage[key] = UNKNOWN if reasons[key] else sum(not verified or o.covered for o in eligible)
     public.update(coverage)
     private_metrics = dict(coverage)
     for key, value in list(public.items()):
@@ -889,7 +1013,7 @@ def report(directory, config, api, start, end):
                     "新发现的历史异常": sorted(historical), "漏条": sorted(missed), "写错": sorted(wrong)}
 
 
-def isolated_target(directory, config, trial, start, whole):
+def isolated_target(directory, config, trial, start, whole, temporary=None):
     _, target = locations(directory, start, whole)
     dest = target.parent
     if dest.resolve() != dest or target.is_symlink():
@@ -897,7 +1021,7 @@ def isolated_target(directory, config, trial, start, whole):
     for folder in (dest.parent, dest):
         if folder.exists() and (not folder.is_dir() or folder.stat().st_mode & 0o077):
             raise ValueError("输出目录须独立且私有")
-    if dest.exists() and any(child != target for child in dest.iterdir()):
+    if dest.exists() and any(child not in (target, temporary) for child in dest.iterdir()):
         raise ValueError("窗口目录含有其他文件")
     sources = [directory / name for name in ("trial-report.json", "trial-orders.jsonl")]
     for database in (directory / config["entry_db"], directory / "trial-050.sqlite3"):
@@ -917,7 +1041,62 @@ def isolated_target(directory, config, trial, start, whole):
         if (source.resolve().is_relative_to(dest) or collision(target, source)
                 or source == dest or dest in source.parents):
             raise ValueError("输出目录与输入冲突")
-    return target
+    return target, {path: file_identity(path) for path in set(sources + archives)}
+
+
+def file_identity(path, **kwargs):
+    try:
+        stat = os.stat(path, **kwargs)
+    except FileNotFoundError:
+        return None
+    return stat.st_dev, stat.st_ino
+
+
+@contextmanager
+def output_transaction(directory, config, trial, start, whole):
+    args = directory, config, trial, start, whole
+    target, inputs = isolated_target(*args)
+    dest = target.parent
+    original_dirs = {d: file_identity(d) for d in (directory, dest.parent, dest)}
+    dest.parent.mkdir(mode=0o700, exist_ok=True)
+    dest.mkdir(mode=0o700, exist_ok=True)
+    fd = os.open(dest, os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        stat = os.fstat(fd)
+        pinned = stat.st_dev, stat.st_ino
+        dirs = {d: file_identity(d) for d in original_dirs}
+        if any(before is not None and before != dirs[d] for d, before in original_dirs.items()):
+            raise ValueError("私有输出身份变化")
+
+        def verify(temporary=None):
+            _, current = isolated_target(*args, temporary=temporary)
+            if (any(file_identity(d) != identity for d, identity in dirs.items()) or dirs[dest] != pinned
+                    or current != inputs or pinned in inputs.values()
+                    or file_identity(target.name, dir_fd=fd, follow_symlinks=False) != inputs[target]):
+                raise ValueError("私有输出身份变化")
+
+        def publish(private):
+            verify()
+            name = ".report-" + secrets.token_hex(16)
+            out = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=fd)
+            try:
+                with os.fdopen(out, "w", encoding="utf8") as stream:
+                    json.dump(private, stream, ensure_ascii=False)
+                    stream.flush()
+                    verify(dest / name)
+                    if not os.path.samestat(os.fstat(stream.fileno()), os.stat(name, dir_fd=fd, follow_symlinks=False)):
+                        raise ValueError("私有输出身份变化")
+                    os.replace(name, target.name, src_dir_fd=fd, dst_dir_fd=fd)
+            finally:
+                try:
+                    os.unlink(name, dir_fd=fd)
+                except FileNotFoundError:
+                    pass
+
+        verify()
+        yield publish
+    finally:
+        os.close(fd)
 
 
 def main():
@@ -952,25 +1131,17 @@ def generate(directory, args):
         raise ValueError("日报须为一个完整日")
     if end > now or args.whole_trial and end != limit:
         raise ValueError("观察窗口尚未结束")
-    target = isolated_target(directory, config, trial, start, args.whole_trial)
-    requests = 0
-    def count(_request):
-        nonlocal requests
-        requests += 1
-    spec = config["official"]
-    with httpx.Client(timeout=10, event_hooks={"request": [count]}) as client:
-        api = Official(spec, os.environ[spec["token_key"]], os.environ[spec["app_id_key"]], client)
-        public, private = report(directory, config, api, start, end)
-    public["明道云只读请求数"] = requests
-    target.parent.parent.mkdir(mode=0o700, exist_ok=True)
-    target.parent.mkdir(mode=0o700, exist_ok=True)
-    with NamedTemporaryFile(dir=target.parent, mode="w", encoding="utf8", delete=False) as stream:
-        try:
-            json.dump(private, stream, ensure_ascii=False)
-            stream.flush()
-            os.replace(stream.name, target)
-        finally:
-            Path(stream.name).unlink(missing_ok=True)
+    with output_transaction(directory, config, trial, start, args.whole_trial) as publish:
+        requests = 0
+        def count(_request):
+            nonlocal requests
+            requests += 1
+        spec = config["official"]
+        with httpx.Client(timeout=10, event_hooks={"request": [count]}) as client:
+            api = Official(spec, os.environ[spec["token_key"]], os.environ[spec["app_id_key"]], client)
+            public, private = report(directory, config, api, start, end)
+        public["明道云只读请求数"] = requests
+        publish(private)
     print(json.dumps(public, ensure_ascii=False))
 
 
