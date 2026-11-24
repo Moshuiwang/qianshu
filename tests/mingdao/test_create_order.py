@@ -3431,3 +3431,184 @@ def test_response_cookie_checked_across_header_separator(case):
         with pytest.raises(order.OutletConflict):
             client.get(url)
     assert len(sent) == 1
+
+
+_UNKNOWN_NOTICE = "建单结果未知，已冻结清理，需人工核对官方回读和私有台账"
+
+
+@pytest.fixture
+def reentry(runtime_case, platform, business_cli, monkeypatch, capsys):
+    case = runtime_case
+    calls = []
+    find = order.Official.find
+
+    def lookup(api, name):
+        calls.append((api, name, api.reconciling))
+        return find(api, name)
+
+    monkeypatch.setattr(order.Official, "find", lookup)
+
+    def ledger(registration=None):
+        return order.ledger_open(case.private, registration or case.ids["registration"], case.values["policy_name"])
+
+    def seed(*history):
+        with ledger() as book:
+            book.reserve()
+            for event in history:
+                if event == "aborted_before_write":
+                    book.append(event, allowed_writes=0)
+                else:
+                    book.append(event)
+
+    def again():
+        directory = case.private
+        code = order.main(["--config", str(directory / "config.json"), "--registration", case.ids["registration"],
+                           "--env-file", str(directory / "synthetic-settings"), str(directory / "draft.json")])
+        return code, capsys.readouterr().err
+
+    def frozen():
+        with ledger() as book:
+            with pytest.raises(order.Stop):
+                book.registered(case.ids["created"])
+            with pytest.raises(order.Stop):
+                book.reserve()
+        with ledger("next-registration") as book:
+            with pytest.raises(order.Stop):
+                book.reserve()
+        anchor = case.private / "trace-12-create.lock"
+        assert json.loads(anchor.read_bytes()) == {"registration": case.ids["registration"]}
+        assert not business_cli.summaries and platform.create_count == 0
+
+    return SimpleNamespace(seed=seed, calls=calls, again=again, frozen=frozen, ledger=ledger)
+
+
+def test_reentry_direct_reserve_after_later_attempt(reentry):
+    reentry.seed("aborted_before_write", "create_attempt")
+    with reentry.ledger("next-registration") as book:
+        with pytest.raises(order.Stop):
+            book.reserve()
+
+
+@pytest.mark.parametrize("conflict", ["aborted_before_write", "create_unknown", "create_reconciled_read",
+                                      "create_reconciled_candidate", "create_reconciled_read_unconfirmed"])
+def test_reentry_conflicting_cleanup(reentry, case, conflict):
+    reentry.seed("create_attempt", conflict)
+    record = case.ids["created"]
+    with reentry.ledger() as book:
+        book.append("created", record)
+        book.append("readback_compared", record, counts={"一致": 1}, total=1)
+        with pytest.raises(order.Stop):
+            book.registered(record)
+
+
+@pytest.mark.parametrize("mode", ["unique", "multiple", "empty", "attempt_only", "timeout", "incomplete",
+                                  "header", "response", "candidate", "notice_failure", "notice_conflict"])
+def test_unknown_reentry_result(reentry, case, platform, business_cli, monkeypatch, mode):
+    history = ["create_attempt"]
+    if mode != "attempt_only":
+        history.append("create_unknown")
+    reentry.seed(*history)
+    business_cli.now[0] = case.window.end.timestamp() + 1
+    ids = [str(uuid4()) for _ in range({"multiple": 2, "unique": 1, "incomplete": 1, "response": 1,
+                                         "candidate": 1}.get(mode, 0))]
+    for record in ids:
+        platform.rows[record] = platform.record(record, 1, {})
+    if mode == "incomplete":
+        case.config["official"].update(page_size=1, page_limit=1)
+    if mode == "timeout":
+        def timeout():
+            raise httpx.ReadTimeout("synthetic")
+        platform.before_search = timeout
+    if mode == "response":
+        platform.rows[ids[0]]["extra"] = case.session_token[2:10]
+    if mode == "header":
+        wire = order.Official.check_wire_request
+        def header(api, request):
+            request.headers["extra"] = case.session_token[2:10]
+            wire(api, request)
+        monkeypatch.setattr(order.Official, "check_wire_request", header)
+    if mode == "candidate":
+        append = order.Ledger.append
+        def conflict(book, event, record_id=None, **data):
+            if event == "create_reconciled_read":
+                assert record_id == ids[0]
+                order.check_outlet(case.session_token)
+            append(book, event, record_id, **data)
+        monkeypatch.setattr(order.Ledger, "append", conflict)
+    if mode in {"notice_failure", "notice_conflict"}:
+        def fail(_):
+            if mode == "notice_conflict":
+                order.check_outlet(case.session_token)
+            raise OSError("synthetic")
+        monkeypatch.setattr(order, "_Transport", lambda *args: SimpleNamespace(announce=fail))
+
+    code, error = business_cli.run()
+    assert len(reentry.calls) == 1
+    api, name, reconciling = reentry.calls[0]
+    assert (name, reconciling, api.reconciling) == (case.values["policy_name"], True, False)
+    assert platform.actions == ([] if mode == "header" else ["search"])
+    assert code == 1 and ("人工" in error or error == "E-CRED-STOP\n")
+    assert business_cli.notices == ([] if mode.startswith("notice_") else [_UNKNOWN_NOTICE])
+    with reentry.ledger() as book:
+        rows = book.records()
+    assert [r["event"] for r in rows[:-1]] == ["create_reserved", "create_attempt", "create_unknown"]
+    result = rows[-1]
+    if mode in {"timeout", "incomplete", "header", "response", "candidate"}:
+        assert result["event"] == ("readback_unconfirmed" if mode in {"header", "response", "candidate"}
+                                   else "create_reconciled_read_unconfirmed")
+        assert result["record_id"] is None and "candidates" not in result
+    else:
+        assert result["event"] == "create_reconciled_read" and result["candidates"] == len(ids)
+        assert result["record_id"] == (ids[0] if len(ids) == 1 else None)
+    reentry.frozen()
+    before = list(business_cli.notices)
+    assert "登记编号已使用" in reentry.again()[1]
+    assert len(reentry.calls) == 1 and business_cli.notices == before and events(case) == [r["event"] for r in rows]
+
+
+@pytest.mark.parametrize("result", ["create_reconciled_read", "create_reconciled_read_unconfirmed",
+                                    "readback_unconfirmed", "create_reconciled_candidate"])
+def test_reentry_already_read(reentry, case, business_cli, platform, result):
+    reentry.seed("create_attempt", "create_unknown", result)
+    business_cli.now[0] = case.window.end.timestamp() + 1
+    assert "登记编号已使用" in business_cli.run()[1]
+    assert not reentry.calls and not platform.actions and not business_cli.notices
+    assert events(case)[-1] == result
+    reentry.frozen()
+
+
+@pytest.mark.parametrize("mode", ["missing_binding", "wrong_digest", "worksheet", "name_control", "disabled",
+                                  "invalid_registration", "invalid_login", "proven_abort", "conflicting_abort"])
+def test_reentry_gates(reentry, case, business_cli, platform, monkeypatch, mode):
+    if mode == "invalid_registration":
+        case.ids["registration"] = "old.registration"
+    if mode == "invalid_login":
+        case.session_token = "invalid cookie"
+    if mode == "worksheet":
+        case.config["create"]["identifiers"]["worksheetId"] = str(uuid4())
+    if mode == "name_control":
+        case.config["official"]["search"]["name_control"] = case.control["company"]
+    if mode == "disabled":
+        order.exclusive(case.private / "trial-config.json", {})
+    history = (["aborted_before_write", "create_attempt"] if mode == "conflicting_abort" else
+               ["create_attempt", "aborted_before_write" if mode == "proven_abort" else "create_unknown"])
+    reentry.seed(*history)
+    if mode == "missing_binding":
+        write = order.exclusive
+        def omit(path, material):
+            write(path, {} if path.name == "create-authorizations.json" else material)
+        monkeypatch.setattr(order, "exclusive", omit)
+    code, error = business_cli.run(tamper="config" if mode == "wrong_digest" else None)
+    expected = {"disabled": "050", "invalid_login": "登录会话无法核实",
+                "proven_abort": "登记编号已使用"}.get(mode, "人工")
+    assert code == 1 and expected in error
+    assert not reentry.calls and not platform.actions and events(case) == ["create_reserved", *history]
+    if mode in {"disabled", "invalid_login", "proven_abort"}:
+        assert not business_cli.notices
+    else:
+        assert business_cli.notices == [_UNKNOWN_NOTICE]
+    if mode == "proven_abort":
+        with reentry.ledger("next-registration") as book:
+            book.reserve()
+    else:
+        reentry.frozen()
