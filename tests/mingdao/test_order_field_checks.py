@@ -732,6 +732,23 @@ def test_billing_uses_platform_plan(case, platform, business_cli, web_order, reg
         assert registered in business_cli.summaries[0]
 
 
+def test_billing_plan_relation_must_hold_one_plan(case, platform, business_cli, web_order):
+    # G447：价格计划关联多于一条时停单，不得只取第一条（恢复 76bedd4 的单值检查）。
+    control = case.control["packages"]
+    price = case.child["price"]
+    plan, other = case.ids["template"], case.ids["tag"]
+    both = order.compact([{"sid": plan}, {"sid": other}])
+    field = {"type": 29, "business_names": {order.compact([{"sid": plan}]): "月计划", both: "月计划"}}
+    case.config["fields"][control]["children"][price] = field
+    platform.relations[control][0][price] = [{"sid": plan, "name": "月计划"}, {"sid": other, "name": "年计划"}]
+    rate, = case.config["order_snapshot"]["tariffs"]
+    rate.update(cycle=0, price_plan="月计划", price_plan_id=plan, unit="月")
+    case.rate_rows[0].update(cycle=0, price_plan="月计划", price_plan_id=plan, unit="月")
+    code, out = business_cli.run()
+    assert code == 1 and platform.create_count == 0
+    assert "所选平台行与登记或模板不一致" in out
+
+
 @pytest.mark.parametrize("moment", ["login", "handoff", "handoff_new_version"])
 def test_tag_rename_at_transport(case, platform, business_cli, web_order, monkeypatch, moment):
     _, rows, _ = web_order

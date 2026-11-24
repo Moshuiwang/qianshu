@@ -1790,8 +1790,11 @@ def verified_order_rows(api, config, evidence, values, cells, relations, catalog
         encoded = encode_cell(linked[price], price_field)
         name = price_plan_name(encoded, spec)
         if price_field["type"] == 29:
+            # G447：恢复 76bedd4 的单值检查，价格计划关联只能有一条，不得只取第一条。
+            items = unpack_array(linked[price])
+            require(len(items) == 1 and isinstance(items[0], dict), reason)
             plan_id = decode(encoded)[0]["sid"]
-            require(unpack_array(linked[price])[0]["name"] == name, reason)
+            require(uuid_record(plan_id) and items[0].get("name") == name, reason)
         else:
             column = spec["price_plan_id_column"]
             require(receipt(column) and column not in spec["children"] and column not in _OFFICIAL_METADATA, reason)
