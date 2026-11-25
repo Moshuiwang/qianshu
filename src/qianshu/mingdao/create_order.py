@@ -1501,9 +1501,25 @@ def select_tag_ids(rows, name_keys, tags):
     return selected
 
 
+def relation_list_matches(cell, rows):
+    if len(cell) != len(rows):
+        return False
+    if not all(isinstance(item, dict) and item.keys() <= {"sid", "name"}
+               and receipt(item.get("sid")) for item in cell):
+        return False
+    if not all(isinstance(row, dict) and receipt(row.get("rowId")) for row in rows):
+        return False
+    sids = {item["sid"].casefold() for item in cell}
+    return len(sids) == len(cell) and sids == {row["rowId"].casefold() for row in rows}
+
+
 def template_relation_rows(cells, control, read_relations, label):
     count = cells[control]
     error = f"模板{label}字段计数与关联行总数不一致，需人工"
+    if isinstance(count, list):
+        rows = read_relations(control)
+        require(relation_list_matches(count, rows), error)
+        return rows
     require(type(count) is int and 0 <= count, error)
     rows = read_relations(control)
     require(count == len(rows), error)
@@ -2148,6 +2164,14 @@ def approved_names(controls, config, values, web, plan_names, template):
     return names
 
 
+def subtable_relation_list(actual, field):
+    # 完整子表行含子控件，或以控件数组表示，仍按原路径逐项核对。
+    return isinstance(actual, list) and (not actual or not all(
+        isinstance(row, list) or (isinstance(row, dict) and field["children"].keys() & row.keys())
+        for row in actual
+    ))
+
+
 def compare_approved(cell, actual, field, names, read_relations, tag_names, *, name_path=None):
     """确认写入键和值，并独立确认卡上对应的业务名称。"""
     key, expected = cell["controlId"], cell["value"]
@@ -2166,6 +2190,9 @@ def compare_approved(cell, actual, field, names, read_relations, tag_names, *, n
         return "缺失"
     if draft in ("company", "user_tags") and kind == 29:
         rows = read_relations(key)
+        if isinstance(actual, list):
+            require(relation_list_matches(actual, rows), "关联计数未确认")
+            actual = len(actual)
         require(type(actual) is int and actual == len(rows), "关联计数未确认")
         ids = [item["sid"].lower() for item in decode(expected)]
         if sorted(ids) != sorted(row["rowId"].lower() for row in rows):
@@ -2175,6 +2202,10 @@ def compare_approved(cell, actual, field, names, read_relations, tag_names, *, n
         labels = [row.get(field["display_name_key"]) for row in rows]
         require(all(receipt(label) for label in labels), "公司名称未确认")
         return "一致" if names == labels else "不一致"
+    if kind == 34 and subtable_relation_list(actual, field):
+        rows = read_relations(key)
+        require(relation_list_matches(actual, rows), "子表计数未确认")
+        actual = rows
     if kind == 34 and type(actual) is int:
         rows = read_relations(key)
         require(actual == len(rows), "子表计数未确认")
@@ -2225,6 +2256,11 @@ def compare_approved(cell, actual, field, names, read_relations, tag_names, *, n
 def compare_company(control, actual, field, read_relations, display_name):
     if field["type"] != 29:
         return "一致" if actual == control["value"] else "不确定"
+    if isinstance(actual, list):
+        selected = decode(control["value"])[0]["sid"]
+        if not relation_list_matches(actual, [{"rowId": selected}]):
+            return "不确定"
+        actual = len(actual)
     if type(actual) is not int or actual != 1:
         return "不确定"
     try:
@@ -2246,6 +2282,10 @@ def compare_relation(control, count, field, read_relations, packages, tag_names)
         raise
     except Stop:
         return "无法核对"
+    if isinstance(count, list):
+        if not relation_list_matches(count, rows):
+            return "不一致"
+        count = len(count)
     if type(count) is not int or count != len(rows):
         return "不一致"
     if field.get("draft") == "user_tags":
@@ -2294,7 +2334,8 @@ def compare(expected, raw_cells, config, *, read_relations, packages, company=No
             result = compare_company(control, actual, field, read_relations, company)
         elif (field.get("draft") == "user_tags" and "tag_search" in config["official"] and tag_names is None):
             result = "无法核对"
-        elif field.get("draft") in ("user_tags", "packages") or (field["type"] == 34 and type(actual) is int):
+        elif field.get("draft") in ("user_tags", "packages") or (
+                field["type"] == 34 and (type(actual) is int or subtable_relation_list(actual, field))):
             result = compare_relation(control, actual, field, read_relations, packages, tag_names)
         elif actual is _NO_CELL:
             result = "缺失"
