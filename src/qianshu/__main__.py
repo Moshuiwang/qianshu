@@ -13,15 +13,28 @@ if __name__ == "__main__" and __spec__ is None:
 
     raise SystemExit(run())
 
+import os
+import sys
+
+
+def _guardian_environment_blocked():
+    credentials = {"MAIL_USER", "MAIL_PASSWORD", "MINGDAO_ACCOUNT", "MINGDAO_PASSWORD",
+                   "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AI_BACKUP_API_KEY", "OPENAI_API_KEY"}
+    return not credentials.isdisjoint(os.environ)
+
+
+_GUARDIAN_HELP = "守望者命令检测到业务凭据，请使用 scripts/guardian-trial.sh。"
+if (__name__ == "__main__" and {"--trial-reconcile", "--list-recovery"}.intersection(sys.argv[1:])
+        and _guardian_environment_blocked()):
+    sys.exit(_GUARDIAN_HELP)
+
 import argparse
 import asyncio
 import json
 import logging
-import os
 import re
 import sqlite3
 import stat
-import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
@@ -745,6 +758,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="按已核准的代次与水位登记确认请求，由常驻收信服务复核")
     parser.add_argument("--retry-of", type=int, help="重新确认时指定上一条 Hold 请求编号")
     args = parser.parse_args(argv)
+    if (args.trial_reconcile or args.list_recovery) and _guardian_environment_blocked():
+        parser.error(_GUARDIAN_HELP)
     if args.retry_of is not None and (not args.trial_reconcile or args.retry_of < 1):
         parser.error("--retry-of 需要确认命令及正整数编号。")
     if args.trial_import_spend is not None or args.trial_reconcile:
@@ -778,16 +793,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.state is None or any((args.inject, args.handoff_only, args.mail)):
             parser.error("--list-recovery 需要 --state，并须独立于发送入口运行。")
         try:
-            if args.state.name == "trial-050.sqlite3":
-                from .mail.trial_state import Store
-                rows = Store.confirmation_list(args.state)
-            else:
-                rows = State.recovery_list(args.state)
+            with State.recovery_connection(args.state) as db:
+                tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                if "feishu_messages" in tables:
+                    rows = State.unfinished_records(db)
+                    label = "未完成记录数"
+                elif {"mailbox", "registration"} <= tables:
+                    from .mail.trial_state import Store
+                    rows = Store.confirmation_list(args.state, db)
+                    label = "确认请求数"
+                else:
+                    raise ValueError("无法识别登记库。")
         except (OSError, ValueError, sqlite3.Error):
             print("恢复清单读取失败，请核对私有入口库。", file=sys.stderr)
             return 1
         print(json.dumps(rows, ensure_ascii=False))
-        label = "确认请求数" if args.state.name == "trial-050.sqlite3" else "未完成记录数"
         print(f"{label} {len(rows)}", file=sys.stderr)
         return 0
     if args.handoff_only:

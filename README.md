@@ -35,3 +35,14 @@ python -m qianshu.feishu.watch_mentions --env-file .private/feishu-handoff.conf 
 ## Python 版本
 
 本机、CI 和后续生产环境统一使用 `.python-version` 固定的 uv 托管 Python 3.12.13，本机快检也使用该版本。补丁版本升级按「换版本先评估」处理，因为运行环境变化可能改变标准库行为。安装与快检命令见[验证与门禁](docs/验证与门禁.md#python-版本与本机快检)。
+
+### 守望者部署与冻结恢复
+
+在部署目录安装项目到 `.venv`，保留可执行的 `scripts/guardian-trial.sh`。将守望者的确认和查询命令配置为以下入口。两条命令只需访问私有状态库。入口清空继承环境，以固定的 PATH 和 LANG 启动解释器。
+
+```sh
+scripts/guardian-trial.sh --state "$state_db" --trial-reconcile "$scope" "$generation" "$validity" "$next_uid"
+scripts/guardian-trial.sh --state "$state_db" --list-recovery
+```
+
+确认命令返回请求编号。常驻收信服务在下轮只读复核并登记结果。查询出现 Hold 后，人工核对再用当前快照参数确认；重试同一快照时在确认命令末尾加 `--retry-of "$request_id"`。

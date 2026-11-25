@@ -50,6 +50,18 @@ class Recovery:
         self.scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"])
         self.folder = config.get("MAIL_FOLDER", "INBOX")
 
+    @contextmanager
+    def covered_snapshot(self, mailbox, snapshot):
+        # EXISTS 是整箱计数。legacy 也搜索整箱，只在持久化时应用自己的水位。
+        last = snapshot[1] - 1
+        present = mailbox.interval(1, last)
+        if len(present) != snapshot[2]:
+            raise Hold()
+        yield present
+        if (not self.enabled() or mailbox.interval(1, last) != present
+                or mailbox.snapshot(self.folder) != snapshot):
+            raise Hold()
+
     def verify_request(self, store, request):
         scope = request["scope"]
         binding = store.row("SELECT folder FROM trial_folder WHERE scope=?", scope)
@@ -66,16 +78,11 @@ class Recovery:
             if not store.same_epoch(box, *snapshot[:2]):
                 raise Hold()
             next_uid = snapshot[1]
-            first = cursor if action == "settle_legacy" else 1
-            present = mailbox.interval(first, next_uid - 1)
-            if (not self.enabled() or mailbox.interval(first, next_uid - 1) != present
-                    or mailbox.snapshot(self.folder) != snapshot):
-                raise Hold()
+            with self.covered_snapshot(mailbox, snapshot) as present:
+                pass  # 确认只读元数据。
         if action == "settle_legacy":
             store.check_legacy(scope, validity, next_uid, present)
             return
-        if len(present) != snapshot[2]:
-            raise Hold()
         with store.write():
             store.recovery_gaps(box, validity, next_uid, present)
         expected = tuple(row[0] for row in store.db.execute("""SELECT uid FROM reconciliation
@@ -88,28 +95,22 @@ class Recovery:
         scope = self.scope
         if action not in {"rebuild", "check_legacy"}:
             raise Hold()
-        box = store.row("SELECT cursor FROM mailbox WHERE scope=?", scope)
-        first = box["cursor"] if action == "check_legacy" else 1
-        uids = mailbox.interval(first, next_uid - 1)
-        entries = []
-        seen_flags = {}
-        if action == "rebuild":
-            for uid in uids:
-                if not self.enabled():
-                    raise Hold()
-                try:
-                    seen = mailbox.read_seen(uid)
-                    seen_flags[uid] = seen
-                    item, _ = read_segmented(mailbox, uid, seen)
-                except MailError:
-                    item = MailItem(None, None, None, None, {})
-                entries.append((uid, replace(item, fields={})))
-        for uid, seen in seen_flags.items():
-            mailbox.check_seen(uid, seen)
-        # EXAMINE 的 UIDNEXT 在删除后可能不变；还须核对最后一次 SEARCH。
-        if (not self.enabled() or mailbox.interval(first, next_uid - 1) != uids
-                or mailbox.snapshot(self.folder) != snapshot):
-            raise Hold()
+        with self.covered_snapshot(mailbox, snapshot) as uids:
+            entries = []
+            seen_flags = {}
+            if action == "rebuild":
+                for uid in uids:
+                    if not self.enabled():
+                        raise Hold()
+                    try:
+                        seen = mailbox.read_seen(uid)
+                        seen_flags[uid] = seen
+                        item, _ = read_segmented(mailbox, uid, seen)
+                    except MailError:
+                        item = MailItem(None, None, None, None, {})
+                    entries.append((uid, replace(item, fields={})))
+            for uid, seen in seen_flags.items():
+                mailbox.check_seen(uid, seen)
         if action == "check_legacy":
             store.check_legacy(scope, validity, next_uid, uids)
         else:

@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import stat
+from bisect import bisect_left
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -561,6 +562,27 @@ class Store:
             box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
             return transition(box, "scan", uncovered=self.uncovered(scope))
 
+    def recovery_ranges(self, scope, validity, first, high):
+        # 水位以下只核对本 UIDVALIDITY 的快照实际包含过的位置。将相邻 UID
+        # 合为半开区间，避免把两个历史 UID 之间从未观察的位置误报为缺口。
+        previous = None
+        for (uid,) in self.db.execute("""SELECT DISTINCT r.uid FROM reconciliation r
+                JOIN snapshot s USING(scope,generation)
+                WHERE r.scope=? AND s.validity=? AND r.uid<? ORDER BY r.uid""",
+                                      (scope, validity, first)):
+            if previous is None or uid != previous + 1:
+                if previous is not None:
+                    yield start, previous + 1
+                start = uid
+            previous = uid
+        if previous is not None:
+            if previous + 1 == first:
+                first = start
+            else:
+                yield start, previous + 1
+        if first < high:
+            yield first, high
+
     def recovery_gaps(self, box, validity, next_uid, uids):
         scope, generation = box["scope"], box["generation"]
         window = self.row("SELECT * FROM recovery_window WHERE scope=?", scope)
@@ -586,7 +608,9 @@ class Store:
         high = max(next_uid, high or 0, observed[0] if observed else 0)
         self.db.execute("INSERT OR REPLACE INTO recovery_window VALUES(?,?,?,?)",
                         (scope, validity, first, high))
-        self._record_gaps(scope, generation, first, high, uids)
+        for low, end in self.recovery_ranges(scope, validity, first, high):
+            covered = uids[bisect_left(uids, low):bisect_left(uids, end)]
+            self._record_gaps(scope, generation, low, end, covered)
 
     def check_legacy(self, scope, validity, next_uid, uids):
         with self.write() as db:
@@ -644,19 +668,18 @@ class Store:
             yield store
 
     @staticmethod
-    def confirmation_list(path):
+    def confirmation_list(path, db):
         meta = path.lstat()
         if (not stat.S_ISREG(meta.st_mode) or stat.S_IMODE(meta.st_mode) != 0o600
                 or meta.st_uid != os.getuid() or meta.st_nlink != 1
                 or stat.S_IMODE(path.parent.stat().st_mode) != 0o700):
             raise ValueError("须指定私有登记库。")
-        with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
-            if db.execute("PRAGMA user_version").fetchone()[0] != FORMAT_VERSION:
-                raise ValueError("登记库格式版本不符。")
-            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='recovery_request'").fetchone():
-                return []
-            db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute("SELECT * FROM recovery_request ORDER BY id")]
+        if db.execute("PRAGMA user_version").fetchone()[0] != FORMAT_VERSION:
+            raise ValueError("登记库格式版本不符。")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='recovery_request'").fetchone():
+            return []
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute("SELECT * FROM recovery_request ORDER BY id")]
 
     def request_confirmation(self, scope, generation, validity, cursor, retry_of=0):
         with self.write() as db:
@@ -691,10 +714,14 @@ class Store:
             count = None
             kind = "recovery_" + (reason or "restored")
             if reason is None:
-                count = self.row("""SELECT coalesce(sum(min(u.last,w.high-1)-max(u.first,w.first)+1),0)
-                    FROM unknown_range u JOIN snapshot s USING(scope,generation)
-                    JOIN recovery_window w ON w.scope=u.scope AND w.validity=s.validity
-                    WHERE u.scope=? AND u.last>=w.first AND u.first<w.high""", scope)[0]
+                window = self.row("SELECT * FROM recovery_window WHERE scope=?", scope)
+                count = 0
+                if window:
+                    for low, end in self.recovery_ranges(scope, window["validity"], window["first"], window["high"]):
+                        count += self.row("""SELECT coalesce(sum(min(u.last,?)-max(u.first,?)+1),0)
+                            FROM unknown_range u JOIN snapshot s USING(scope,generation)
+                            WHERE u.scope=? AND s.validity=? AND u.last>=? AND u.first<?""",
+                                          end - 1, low, scope, window["validity"], low, end)[0]
                 self._settle(db, scope, request["generation"], request["validity"], request["cursor"])
             db.execute("""UPDATE recovery_request SET status=?,reason=?,completed=?,gaps=? WHERE id=?""",
                        ("hold" if reason else "restored", reason, now(), count, request["id"]))
