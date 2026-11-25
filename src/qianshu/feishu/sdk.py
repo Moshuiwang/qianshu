@@ -522,6 +522,7 @@ class _Connection(ws.Client):
     """绑定 SDK 帧与当前连接。SDK 升级时需复核这些私有生命周期方法。"""
 
     _injected_options = None
+    _trial_cards = False
 
     def __init__(self, service, *, approvals: bool = True):
         self.service = service
@@ -684,6 +685,8 @@ class _Connection(ws.Client):
             payload = self._combine(
                 msg_id, count, int(ws._get_by_key(headers, ws.HEADER_SEQ)), payload,
             )
+            if self._trial_cards and frame_type == ws.MessageType.EVENT.value:
+                self._reserve_fragment_reply(timing_key, deadline, incomplete=payload is None)
             if payload is None:
                 return
 
@@ -701,6 +704,8 @@ class _Connection(ws.Client):
                 _before_send(self.service, "callback_content", encoded)
                 response.data = base64.b64encode(encoded)
         except Exception:
+            if self._trial_cards and self._trial_reply(frame, frame_type, payload, origin, started, deadline):
+                return
             _LOG.error("feishu_event_dispatch_failed")
             if frame_type == ws.MessageType.CARD.value:
                 warning = _approval_warning("卡片回调格式无效")

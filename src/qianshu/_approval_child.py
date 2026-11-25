@@ -1,4 +1,6 @@
-"""私有继承端点的合成消费者。此入口不加载 SDK 或任何业务依赖。"""
+"""验证私有继承端点，在审批租约内装配消费者。"""
+
+from contextlib import ExitStack
 
 import fcntl
 import logging
@@ -11,12 +13,15 @@ import sys
 import time
 from pathlib import Path
 
-from ._approval_protocol import ENVELOPE, PACKET_LIMIT, SNAPSHOT
+from ._approval_protocol import ENVELOPE, PACKET_LIMIT, SERVICE_STATUS, SNAPSHOT
 
 
-def snapshot(channel, read, done):
+def snapshot(channel, read, done, consumer=None):
     try:
-        channel.send(SNAPSHOT.pack(time.monotonic(), read, done))
+        packet = SNAPSHOT.pack(time.monotonic(), read, done)
+        if consumer is not None:
+            packet += SERVICE_STATUS.pack(consumer.create_enabled, consumer.manual_checks, consumer.pending_notices)
+        channel.send(packet)
     except BlockingIOError:
         pass
 
@@ -33,7 +38,8 @@ def run():
     os.umask(0o077)
     signal.signal(signal.SIGALRM, signal.SIG_DFL)
     signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGALRM})
-    signal.alarm(5)
+    production = hook[:1] == ["--service"]
+    signal.alarm(60 if production else 5)
     directory = Path(folder)
     directory.mkdir(mode=0o700, exist_ok=True)
     if directory.stat().st_mode & 0o077 or directory.stat().st_uid != uid:
@@ -42,10 +48,21 @@ def run():
     logger.propagate = False
     logger.addHandler(logging.FileHandler(directory / "consumer.log"))
     try:
-        with (directory / "consumer.lock").open("a") as lock, channel:
+        with (directory / "consumer.lock").open("a") as lock, channel, ExitStack() as stack:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             barrier = None
-            if hook:
+            consumer = None
+            if production:
+                # -I -S 不处理 .pth 或用户 site，只加载同一虚拟环境的依赖。
+                venv = Path(sys.executable).absolute().parents[1]
+                sys.path.append(str(venv / "lib" / f"python{sys.version_info.major}.{sys.version_info.minor}"
+                                    / "site-packages"))
+                from .feishu.trial_consumer import running
+                life = select.poll()
+                life.register(channel, select.POLLHUP | select.POLLERR | select.POLLRDHUP)
+                consumer = stack.enter_context(running(hook[1:], lambda: not life.poll(0)))
+                signal.alarm(5)
+            elif hook:
                 import runpy
                 barrier = runpy.run_path(hook[0])["barrier"]
                 barrier("start")
@@ -72,15 +89,19 @@ def run():
                             if binding != (epoch, serial) or not started <= time.monotonic() < deadline:
                                 raise ValueError
                             read += 1
-                            snapshot(channel, read, done)
+                            snapshot(channel, read, done, consumer)
                             if barrier:
                                 barrier("consume")
+                            if consumer:
+                                consumer.consume(packet[1 + ENVELOPE.size:], deadline)
                             done += 1
                         else:
                             break
+                    if consumer:
+                        consumer.tick()
                     if barrier:
                         barrier("tick")
-                    snapshot(channel, read, done)
+                    snapshot(channel, read, done, consumer)
             finally:
                 signal.alarm(2)
                 if barrier:

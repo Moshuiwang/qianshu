@@ -1,8 +1,10 @@
 """单租约的试运行轮询与交接。邮件正文仅在本轮内存中保留。"""
 
 import asyncio
+import fcntl
 import json
 import logging
+import os
 import signal
 from contextlib import contextmanager
 from dataclasses import replace
@@ -13,6 +15,9 @@ from qianshu.config import ConfigError
 from qianshu.feishu.cards import CardLine, detail_pages, result_card
 from qianshu.feishu.entrance import Application
 from qianshu.pipeline import Pipeline
+from qianshu.mingdao.create_order import CredentialConflict
+from qianshu.feishu.trial_approval import Journal
+from qianshu.feishu.trial_listener import MessageNotSent, approval_setup
 
 from . import _fingerprint
 from .imap import MailError, trial_connect
@@ -24,6 +29,7 @@ from .trial_state import BODY_NOTICE, FormatHold, Hold, Store
 _LOG = logging.getLogger(__name__)
 _MAIL_CLOSE_TIMEOUT = 2
 _NOTICES = {
+    "blocked": "登记 {registration} 的试运行消息在本地被拦截，未建单，转人工核对私有登记。",
     "received": "收到，待核对 1 封。",
     "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
     "conflict": "身份冲突，已冻结 {n} 封，待人工核对。",
@@ -41,17 +47,19 @@ _NOTICES = {
 class Trial:
     def __init__(self, store, config, switches, send, stop, *, connector=trial_connect,
                  clock=lambda: datetime.now(UTC),
-                 companies=None, sensitive=(), legacy_path=None):
+                 companies=None, sensitive=(), legacy_path=None, approval_setup=None):
         self.store, self.config, self.switches, self.send = store, config, dict(switches()), send
+        self.read_switches = switches
         self.stop, self.connector, self.clock = stop, connector, clock
         self.companies, self.sensitive = companies, sensitive
         self.scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"])
+        self.approval_setup = approval_setup
         self.legacy_path = legacy_path
         self.input_limits = {}
         self.folder = config.get("MAIL_FOLDER", "INBOX")
 
     def enabled(self, card=False):
-        settings = self.switches
+        settings = self.read_switches() if self.approval_setup else self.switches
         return (not self.stop.is_set() and settings["MAIL_TRIAL_RECEIVE_ENABLED"] == "true"
                 and (not card or settings["MAIL_TRIAL_CARD_ENABLED"] == "true"))
 
@@ -177,6 +185,8 @@ class Trial:
                 self.store.freeze(self.scope, "mapping")
                 break
             if card:
+                if self.approval_setup and not Journal(self.store.db).session():
+                    continue
                 self.parse(row, gen, text, body_missed=item.body_missed)
             else:
                 self.triage(row, gen, item)
@@ -276,8 +286,18 @@ class Trial:
                 unknown = unknown or bool(call.failure_stage) or not complete
 
         model = trial_model(self.config, reserve, result)
-        pages = Pipeline(model=model, tag_dates={}, sensitive_values=self.sensitive,
-                         companies_file=self.companies)(Application(None, text, ()))
+        setup = self.approval_setup() if self.approval_setup else None
+        tag_dates = {}
+        if setup:
+            from .trial_cards import confirmed_tag_dates
+            tag_dates = confirmed_tag_dates(setup[1])
+        review = []
+
+        def capture(drafts, policies, full_review):
+            review.extend((drafts, policies, full_review))
+
+        pages = Pipeline(model=model, tag_dates=tag_dates, sensitive_values=self.sensitive,
+                         companies_file=self.companies, **({"on_review": capture} if self.approval_setup else {}))(Application(None, text, ()))
         if refused or (text and attempt is None):
             if attempt is not None:
                 # 纠错阶段未获派发（如停机）：经统一出口转人工并发固定群提示（G448）。
@@ -299,41 +319,91 @@ class Trial:
             hint = f"含 {row['attachments']} 个附件未解析，请对照原件核对"
             if row["attachments"] is None:
                 hint = "附件数量未知，请对照原件核对"
-            notices.append(CardLine("附件", hint))
+            notices.append(CardLine("附件", hint + "，整批转人工，未建单"))
         if notices:
             pages = (*detail_pages("收信", notices), *pages)
         heading = detail_pages("试运行邮件", [])[0].elements
+        cards = [result_card(replace(p, elements=(*heading, *p.elements[1:]), number=i, total=len(pages)))
+                 for i, p in enumerate(pages, 1)]
+        def register_request(page, warning):
+            with self.store.write() as db:
+                key = (self.store.row("SELECT uuid FROM notice WHERE event=?", f"body:{reg}")[0]
+                       if warning else str(uuid4()))
+                db.execute("INSERT INTO card_intent VALUES(?,?,?,?,?,?)",
+                           (key, reg, row["version"], page, "pending", self.clock().isoformat()))
+            return key
+
+        approval = request_id = None
+        warning_page = delivery_failed = False
         try:
-            for index, page in enumerate(pages, 1):
-                page = replace(page, elements=(*heading, *page.elements[1:]), number=index, total=len(pages))
+            if self.approval_setup:
+                from .trial_cards import decision_pages
+                approval = decision_pages(self, row, text, cards, *(review or ([], [], True)),
+                                          setup, unknown or body_missed or attempt is None
+                                          or row["attachments"] != 0)
+            for index, card in enumerate(cards, 1):
+                warning_page = body_missed and index == 1
+                request_id = None
+                if approval:
+                    request_id = register_request(index, warning_page)
                 with self.store.dispatch(self.scope, gen, reg, "card", lambda: self.enabled(True)):
-                    warning_page = body_missed and index == 1
-                    request_id = (self.store.row("SELECT uuid FROM notice WHERE event=?", f"body:{reg}")[0]
-                                  if warning_page else str(uuid4()))
-                    with self.store.write() as db:
-                        db.execute("INSERT INTO card_intent VALUES(?,?,?,?,?,?)",
-                                   (request_id, reg, row["version"], index,
-                                    "pending" if warning_page else "unknown", self.clock().isoformat()))
+                    if request_id is None:
+                        request_id = register_request(index, warning_page)
 
                     def before_send():
+                        nonlocal sent
                         self.require_enabled(True)
-                        if warning_page:
-                            with self.store.write() as db:
-                                self.claim_body_notice(f"body:{reg}")
-                                db.execute("UPDATE card_intent SET status='unknown' WHERE uuid=?", (request_id,))
+                        with self.store.write() as db:
+                            if warning_page:
+                                self.claim_notice(f"body:{reg}")
+                            db.execute("UPDATE card_intent SET status='unknown' WHERE uuid=?", (request_id,))
+                        sent = self.clock().timestamp()
 
-                    self.send(result_card(page), request_id, True, before_send)
+                    sent = self.clock().timestamp()
+                    receipt = self.send(card, request_id, True, before_send)
                     with self.store.write() as db:
+                        if approval:
+                            Journal(db).received(request_id, receipt)
+                        if approval and index == len(cards):
+                            db.execute("UPDATE trial_card SET sent=?,expires=? WHERE card=?",
+                                       (sent, (int(sent) // 86400 + 2) * 86400, approval))
                         db.execute("UPDATE card_intent SET status='sent' WHERE uuid=?", (request_id,))
                         if warning_page:
                             db.execute("UPDATE notice SET status='sent' WHERE event=?", (f"body:{reg}",))
+        except CredentialConflict:
+            _LOG.error("E-TRIAL-MANUAL")
+            with self.store.write() as db:
+                db.execute("UPDATE card_intent SET status='blocked' WHERE uuid=?", (request_id,))
+                if warning_page:
+                    db.execute("UPDATE notice SET status='blocked' WHERE event=?", (f"body:{reg}",))
+                self.blocked_handoff(reg)
+                if approval:
+                    journal = Journal(db)
+                    if request_id is not None:
+                        journal.manual(approval, request_id)
+                    journal.close(db.execute("SELECT * FROM trial_card WHERE card=?", (approval,)).fetchone(),
+                                  "卡片在本地被拦截")
+            return
         except Exception:
-            unknown = True
+            delivery_failed = unknown = True
         status = "manual" if unknown or attempt is None else "done"
         with self.store.write():
             self.store.finish(reg, status)
+            if unknown and setup and not approval:
+                self.store.notice(f"interrupted:{reg}", self.scope, reg, "interrupted")
+            if approval:
+                journal = Journal(self.store.db)
+                if delivery_failed:
+                    if request_id is not None:
+                        journal.manual(approval, request_id)
+                    self.store.db.execute("UPDATE trial_card SET status='partial' WHERE card=? AND status!='closed'", (approval,))
+                journal.bind(approval, self.clock().timestamp())
 
-    def claim_body_notice(self, event):
+    def blocked_handoff(self, reg):
+        self.store.finish(reg, "manual", reason="outlet_blocked")
+        self.store.notice(f"blocked:{reg}", self.scope, reg, "blocked")
+
+    def claim_notice(self, event):
         if not self.store.db.execute("""UPDATE notice SET status='unknown'
                 WHERE event=? AND status='pending'""", (event,)).rowcount:
             raise Hold()
@@ -360,24 +430,32 @@ class Trial:
                 with gate:
                     self.require_enabled(card)
                     warning = kind == "body_missed"
-                    with self.store.write() as db:
-                        if not warning and not db.execute("""UPDATE notice SET status='unknown' WHERE event=?
-                            AND status='pending'""", (row["event"],)).rowcount:
-                            continue
+                    if self.store.row("SELECT status FROM notice WHERE event=?", row["event"])[0] != "pending":
+                        continue
                     content = (result_card(detail_pages("试运行邮件", [CardLine("正文", BODY_NOTICE)])[0])
-                               if warning else _NOTICES[kind].format(n=row["quantity"]))
+                               if warning else _NOTICES[kind].format(n=row["quantity"], registration=row["registration"]))
                     def before_send():
                         self.require_enabled(card)
-                        if warning:
-                            with self.store.write():
-                                self.claim_body_notice(row["event"])
+                        with self.store.write():
+                            self.claim_notice(row["event"])
 
                     self.send(content, row["uuid"], warning, before_send)
                     with self.store.write() as db:
                         db.execute("UPDATE notice SET status='sent' WHERE event=?", (row["event"],))
-            except Hold:
+            except (Hold, MessageNotSent):
                 continue
+            except CredentialConflict:
+                _LOG.error("E-TRIAL-MANUAL")
+                with self.store.write() as db:
+                    db.execute("UPDATE notice SET status='blocked' WHERE event=?", (row["event"],))
+                    if row["registration"] is not None and kind != "blocked":
+                        self.blocked_handoff(row["registration"])
             except Exception:
+                # 旧发送适配器可能在未调用 claim 的情况下已经交接。
+                if kind != "body_missed":
+                    with self.store.write() as db:
+                        db.execute("UPDATE notice SET status='unknown' WHERE event=? AND status='pending'",
+                                   (row["event"],))
                 self.uncertain_notices()
 
     def uncertain_notices(self):
@@ -409,15 +487,14 @@ class Trial:
             self.stop.wait(30)
 
 
-def run_service(args, settings, path, switches):
-    from threading import Event, Thread, current_thread
+@contextmanager
+def _polling_worker(args, settings, path, switches, send, sensitive, report, *, setup=None):
+    from threading import Event, Thread
 
     from dotenv import dotenv_values
     from qianshu.config import load_config
-    from qianshu.feishu.handoff import HandoffService, MentionLog
     from qianshu.parse._output import check_output_path
     from qianshu.parse.model import load_model_config
-    from qianshu.__main__ import _send_trial_message
     from . import _private_dir
 
     business = args.business_env_file
@@ -438,13 +515,14 @@ def run_service(args, settings, path, switches):
     stop = Event()
     closing = Event()
     clean_close = Event()
+    initialized = Event()
+    recovering = Event()
     dirty = state.with_suffix(".dirty")
 
     close_fault = Event()
 
     def report_fault(message):
-        diagnostics.post(message)
-        logs.post(message)
+        report(message)
 
     def report_close_failure():
         close_fault.set()
@@ -453,7 +531,30 @@ def run_service(args, settings, path, switches):
     def poll():
         store = None
         registered = False
+        lease = None
         try:
+            if setup is None:
+                # 旧收信档也可能接管开卡档。只有获取审批租约后才能碰旧台账。
+                from qianshu.feishu import handoff
+                lease_path = handoff._MACHINE_LEASE.with_name("consumer.lock")
+                history = False
+                if state.exists():
+                    recovering.set()
+                    from qianshu.feishu.trial_approval import has_approval_history
+                    history = has_approval_history(state)
+                if lease_path.exists() or history:
+                    recovering.set()
+                    from qianshu.feishu.trial_supervisor import recover_disabled
+                    lease = handoff._file(lease_path, create=True)
+                    while True:
+                        try:
+                            fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            break
+                        except BlockingIOError:
+                            if stop.wait(.1):
+                                return
+                    recover_disabled(args, path)
+                recovering.clear()
             try:
                 dirty.touch(mode=0o600, exist_ok=False)
                 needs_review = False
@@ -472,9 +573,9 @@ def run_service(args, settings, path, switches):
                     for row in db.execute("SELECT scope FROM mailbox WHERE state!='frozen'").fetchall():
                         store._freeze(row["scope"], "unclean_close")
             registered = True
-            trial = Trial(store, config, switches, send, stop, legacy_path=legacy, sensitive=(
-                *settings.handoff_sensitive_values, *settings.handoff_sensitive_urls,
-            ))
+            trial = Trial(store, config, switches, send, stop, legacy_path=legacy, sensitive=sensitive,
+                          approval_setup=setup)
+            initialized.set()
             trial.run()
         except FormatHold as exc:
             _LOG.error("%s", exc)
@@ -482,6 +583,7 @@ def run_service(args, settings, path, switches):
             _LOG.error("试运行收信已停止，请核对私有登记。")
         finally:
             closing.set()
+            initialized.set()
             if store is not None:
                 try:
                     store.db.close()
@@ -490,6 +592,82 @@ def run_service(args, settings, path, switches):
                 else:
                     if registered:
                         clean_close.set()
+            if lease is not None:
+                os.close(lease)
+
+    thread = Thread(target=poll, name="trial-mail", daemon=True)
+    thread.start()
+    try:
+        if setup:
+            initialized.wait()
+            if closing.is_set():
+                raise RuntimeError("E-TRIAL-DISABLED")
+        yield closing, close_fault
+    finally:
+        stop.set()
+        if setup is None:
+            # 收信中等当前操作退出；历史恢复可能稍后才取得或开始等待旧租约。
+            while not recovering.is_set() and not closing.wait(.1):
+                pass
+        thread.join(1 if setup else _MAIL_CLOSE_TIMEOUT)
+        if thread.is_alive():
+            close_fault.set()
+            report_fault(CLOSE_TIMEOUT)
+        elif clean_close.is_set():
+            dirty.unlink()
+
+
+@contextmanager
+def mail_worker(args, settings, path, switches, sender, available):
+    from qianshu.feishu.trial_listener import send_trial_message
+
+    def send(content, request_id, card, check):
+        def before_send():
+            if not available() or switches().get("MAIL_TRIAL_CARD_ENABLED") != "true":
+                raise Hold()
+            check()
+        return send_trial_message(sender, content, request_id, card, before_send)
+
+    def setup():
+        return approval_setup(args.mingdao_config, switches)
+
+    def fault(_):
+        logging.getLogger("approval").critical("CRITICAL E-TRIAL-DISABLED 1")
+
+    with _polling_worker(args, settings, path, switches, send, sender.sensitive_values, fault, setup=setup) as state:
+        ended, failed = state
+        yield ended
+    if failed.is_set():
+        raise RuntimeError("E-TRIAL-DISABLED")
+
+
+@contextmanager
+def receive_worker(args, settings, path, switches, service, logs, diagnostics=None):
+    from qianshu.__main__ import _send_trial_message
+
+    def send(content, request_id, card, check):
+        return _send_trial_message(service.transport, content, request_id, card, check)
+
+    def report(message):
+        diagnostics.post(message)
+        logs.post(message)
+
+    owns_diagnostics = diagnostics is None
+    if owns_diagnostics:
+        diagnostics = fault_writer(path.with_name("trial-050.sqlite3"))
+    sensitive = (*settings.handoff_sensitive_values, *settings.handoff_sensitive_urls)
+    try:
+        with _polling_worker(args, settings, path, switches, send, sensitive, report) as (_, failed):
+            yield failed
+    finally:
+        if owns_diagnostics:
+            diagnostics.finish()
+
+
+def run_service(args, settings, path, switches):
+    """已有收信服务的兼容入口。"""
+    from threading import Event, current_thread
+    from qianshu.feishu.handoff import HandoffService, MentionLog
 
     class TrialLog(MentionLog):
         _listener_thread = None
@@ -498,7 +676,9 @@ def run_service(args, settings, path, switches):
             try:
                 super().close()
             except Exception:
-                report_fault("转交库关闭失败，监听锁保留，须人工停机核对。")
+                message = "转交库关闭失败，监听锁保留，须人工停机核对。"
+                diagnostics.post(message)
+                logs.post(message)
                 Event().wait()
 
         @contextmanager
@@ -514,19 +694,15 @@ def run_service(args, settings, path, switches):
                 finally:
                     self._listener_thread = None
 
-    def send(content, request_id, card, check):
-        _send_trial_message(service.transport, content, request_id, card, check)
-
-    listener_error = None
     interrupted = False
+    listener_error = None
 
-    def record_interrupt(signum, frame):
+    def interrupt(signum, frame):
         nonlocal interrupted
         interrupted = True
 
     class TrialHandoff(HandoffService):
         async def _serve(self, client):
-            # 让长连接从事件循环正常退出；信号处理器自身只写标志。
             serving = asyncio.create_task(super()._serve(client))
             try:
                 while not interrupted:
@@ -537,34 +713,23 @@ def run_service(args, settings, path, switches):
                 serving.cancel()
                 await asyncio.gather(serving, return_exceptions=True)
 
-    diagnostics = fault_writer(state)
-    previous = signal.signal(signal.SIGINT, record_interrupt)
+    diagnostics = fault_writer(path.with_name("trial-050.sqlite3"))
+    previous = signal.signal(signal.SIGINT, interrupt)
     try:
         with listener_logs(_LOG) as logs, TrialLog.listening(path, settings) as log:
             service = TrialHandoff(log)
-            thread = Thread(target=poll, name="trial-mail", daemon=True)
-            thread.start()
-            try:
-                if not interrupted:
-                    service.run()
-            except Exception as exc:
-                listener_error = exc
-            finally:
-                stop.set()
-                # 仍须等本次收信操作停下；只有关闭数据库这一步有等待上限。
-                closing.wait()
-                thread.join(_MAIL_CLOSE_TIMEOUT)
-                if thread.is_alive():
-                    close_fault.set()
-                    report_fault(CLOSE_TIMEOUT)
-                elif clean_close.is_set():
-                    dirty.unlink()
+            with receive_worker(args, settings, path, switches, service, logs, diagnostics) as close_fault:
+                try:
+                    if not interrupted:
+                        service.run()
+                except Exception as exc:
+                    listener_error = exc
     finally:
         diagnostics.finish()
         signal.signal(signal.SIGINT, previous)
-        if interrupted and not close_fault.is_set() and not logs.thread.is_alive():
-            signal.raise_signal(signal.SIGINT)
     if close_fault.is_set() or logs.thread.is_alive():
         return 130 if interrupted else 1
+    if interrupted:
+        signal.raise_signal(signal.SIGINT)
     if listener_error is not None:
         raise listener_error

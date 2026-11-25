@@ -1,4 +1,4 @@
-"""转交侧监督。仅合成回放构造，生产无装配入口。"""
+"""转交侧监督。拨号与停机不等待审批解释器。"""
 
 import _thread
 import json
@@ -13,13 +13,13 @@ from pathlib import Path
 from tempfile import mkstemp
 from threading import Event, Lock
 
-from .._approval_protocol import ENVELOPE, PACKET_LIMIT, SNAPSHOT
+from .._approval_protocol import ENVELOPE, PACKET_LIMIT, SERVICE_STATUS, SNAPSHOT
 
 FRESH = 2.0
 POLL = 0.05
 
 
-def child_memory_limit():
+def child_memory_limit(ceiling_bytes=128 << 20):
     """在启动线程测当时的可用量，给转交保留至少四分之三。"""
     with Path("/proc/meminfo").open() as stream:
         available = next((int(line.split()[1]) * 1024 for line in stream
@@ -42,10 +42,19 @@ def child_memory_limit():
         if current == root:
             break
         current = current.parent
-    limit = min(128 << 20, available // 4)
+    limit = min(ceiling_bytes, available // 4)
     if limit < 32 << 20:
         raise ValueError("E-TRIAL-DISABLED")
     return limit
+
+
+def process_birth(pid):
+    # /proc/<pid>/stat 的 comm 可含空格与括号。22 栏为创建时钟刻度。
+    try:
+        fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        return None if fields[0] in {"Z", "X"} else int(fields[19])
+    except (FileNotFoundError, ProcessLookupError):
+        return None
 
 
 class Generation:
@@ -59,17 +68,20 @@ class Generation:
 
 
 class Sidecar:
-    def __init__(self, directory: Path, *, fault_hook: Path | None = None):
+    def __init__(self, directory: Path, *, fault_hook: Path | None = None, service_args=()):
         self.directory = directory
         self.fault_hook = fault_hook
+        self.service_args = service_args
         self.epoch = self.active = self.serial = 0
         self.beat = 0.0
         self.current = None
         self.stopping = Event()
         self.rejected = self.failures = self.unconfirmed = self.card_drops = 0
         self.alive = False
+        self.process_identity = None
         self.last_snapshot = 0.0
         self.io_errors = 0
+        self.manual_checks = self.pending_notices = 0
         self.started = False
 
     def connect(self):
@@ -90,6 +102,12 @@ class Sidecar:
 
     def disconnect(self):
         self.active = 0
+        gen = self.current
+        if self.service_args and gen:
+            try:
+                gen.channel.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def stop(self):
         self.disconnect()
@@ -119,16 +137,18 @@ class Sidecar:
     def _launch(self, endpoint):
         # setpriv 在进入解释器前设置 PDEATHSIG。检查注册前父死亡的竞态，
         # 再由 prlimit 在 exec Python 前限制整个地址空间。
-        limit = child_memory_limit()
+        limit = child_memory_limit(512 << 20) if self.service_args else child_memory_limit()
         boot = Path(__file__).parents[1] / "__main__.py"
         args = ["/usr/bin/setpriv", "--pdeathsig", "KILL", "/bin/sh", "-c",
                 '[ "$PPID" = "$1" ] || exit 125; shift; exec "$@"', "approval",
                 str(os.getpid()), "/usr/bin/prlimit", f"--as={limit}:{limit}", "--",
                 sys.executable, "-I", "-S", "-B", str(boot), str(endpoint.fileno()),
                 str(os.getpid()), str(self.directory)]
-        if self.fault_hook:
+        if self.service_args:
+            args.extend(("--service", *self.service_args))
+        elif self.fault_hook:
             args.append(str(self.fault_hook))
-        return subprocess.Popen(args, pass_fds=(endpoint.fileno(),), env={},
+        return subprocess.Popen(args, pass_fds=(endpoint.fileno(),), env={"MALLOC_ARENA_MAX": "2"},
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL)
 
@@ -136,9 +156,18 @@ class Sidecar:
         # 快消费者可在一个采样周期内完成多次，按原采样时间排空反向快照。
         for _ in range(128):
             try:
-                packet = gen.channel.recv(SNAPSHOT.size + 1)
+                packet = gen.channel.recv(SNAPSHOT.size + SERVICE_STATUS.size + 1)
             except BlockingIOError:
                 return True
+            if self.service_args:
+                if len(packet) != SNAPSHOT.size + SERVICE_STATUS.size:
+                    return False
+                enabled, manual, pending = SERVICE_STATUS.unpack_from(packet, SNAPSHOT.size)
+                if enabled not in (0, 1):
+                    return False
+                self.create_enabled = bool(enabled)
+                self.manual_checks, self.pending_notices = manual, pending
+                packet = packet[:SNAPSHOT.size]
             if len(packet) != SNAPSHOT.size:
                 return False
             sampled, read, done = SNAPSHOT.unpack(packet)
@@ -165,16 +194,25 @@ class Sidecar:
             self.current = gen
             self.alive = True
             try:
+                if self.service_args:
+                    try:
+                        birth = process_birth(child_pid.pid)
+                    except (OSError, ValueError, IndexError):
+                        self.io_errors += 1
+                        birth = None
+                    self.process_identity = child_pid.pid, birth
                 while child_pid.poll() is None:  # waitpid(WNOHANG)
                     now = time.monotonic()
                     if self.active != epoch or self.stopping.is_set():
                         break
                     if gen.waiting and now >= gen.waiting[0][2]:
                         break
-                    if now - (gen.snapshot or started) > 5 or now - self.beat > FRESH:
+                    timeout = 60 if self.service_args and not gen.snapshot else 5
+                    if now - (gen.snapshot or started) > timeout or now - self.beat > FRESH:
                         break
                     try:
-                        parent.send(b"H" + struct.pack("!d", self.beat))
+                        if not self.service_args or gen.snapshot:
+                            parent.send(b"H" + struct.pack("!d", self.beat))
                     except BlockingIOError:
                         pass
                     if not self._snapshots(gen):
@@ -208,7 +246,7 @@ class Sidecar:
                 continue
             try:
                 stable = self._generation(epoch)
-            except (OSError, ValueError, subprocess.SubprocessError):
+            except Exception:
                 stable = False
             if epoch == self.active:
                 self.failures += 1
@@ -235,7 +273,9 @@ class Sidecar:
                     unconfirmed += gen.sent - gen.done
         return dict(state=state, alive=self.alive, snapshot_age=age, sampled=now, oldest_wait=oldest,
                     backlog=backlog, unconfirmed=unconfirmed, rejected=self.rejected,
-                    card_drops=self.card_drops, failures=self.failures, io_errors=self.io_errors)
+                    card_drops=self.card_drops, failures=self.failures, io_errors=self.io_errors,
+                    process_identity=self.process_identity, manual_checks=self.manual_checks,
+                    pending_notices=self.pending_notices)
 
     def _publish(self):
         recorded = 0
@@ -276,12 +316,21 @@ def read_status(directory):
         state = json.loads((directory / "status.json").read_text())
     except FileNotFoundError:
         return dict(state="disabled", alive=False, snapshot_age=None, sampled=time.monotonic(),
-                    backlog=0, oldest_wait=0, unconfirmed=0, rejected=0, card_drops=0, failures=0, io_errors=0)
+                    backlog=0, oldest_wait=0, unconfirmed=0, rejected=0, card_drops=0, failures=0, io_errors=0,
+                    manual_checks=0, pending_notices=0)
     elapsed = time.monotonic() - state["sampled"]
     if state["snapshot_age"] is not None:
         state["snapshot_age"] += max(0, elapsed)
     if elapsed < 0 or elapsed >= FRESH or (state["snapshot_age"] or 0) >= FRESH:
         state["alive"] = None
         if state["state"] == "ready":
+            state["state"] = "stale"
+    identity = state.pop("process_identity", None)
+    if identity is not None and identity[1] is not None:
+        try:
+            state["alive"] = process_birth(identity[0]) == identity[1]
+        except (OSError, ValueError, IndexError):
+            state["alive"] = None
+        if state["alive"] is not True and state["state"] == "ready":
             state["state"] = "stale"
     return state
