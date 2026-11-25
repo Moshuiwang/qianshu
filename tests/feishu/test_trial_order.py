@@ -863,15 +863,18 @@ def test_worker_runs_archive_then_orders_in_one_thread(order):
     import sqlite3
 
     def status():
-        # 轮询读与工作线程的提交竞争登记库锁（忙等 0.25 秒）：读不到就下一轮再读，不当作失败。
+        # 轮询读与工作线程的提交竞争登记库锁（忙等 0.25 秒）：只有「database is locked」下一轮再读，其他错误照常抛出。
         try:
             return query(order.path, "SELECT status FROM trial_card")
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as error:
+            if "database is locked" not in str(error):
+                raise
             return None
     with archive_worker(order.runner(), interval=0.01, join=5, orders=orders):
         end = time.monotonic() + 10
         while time.monotonic() < end and status() != [("done",)]:
             time.sleep(0.02)
+    assert query(order.path, "SELECT status FROM trial_card") == [("done",)]  # 循环后断言终态
     assert order.mingdao.sent == [1, 2] and set(seen) == {"trial-archive"}
 
 
