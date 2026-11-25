@@ -2425,20 +2425,22 @@ class CreateRequest:
         self.endpoint, self.spec, self._token = endpoint.copy(), spec, token
         self.connect = connect
         self.started = False
-        # 正式单（#154）：建单请求体的 appId 与官方应用 ID 同值时，按该凭据的自有位置放行（字段级豁免）。
+        # 正式单（#154）：建单请求体的 appId 与官方应用 ID 同值时，按该凭据的自有位置放行（字段级豁免）；不同值不豁免、照常检查。
         self.app_owner = app_owner
 
     def _app_fields(self, guard, body):
-        """app_owner 登记时：顶层 appId 须与该凭据逐字相等且凭据不短于 8 字符，否则按凭据冲突即停。"""
+        """app_owner 登记时：凭据短于 8 字符即按凭据冲突停；顶层 appId 与该凭据逐字相等才豁免这一个字段，
+        不相等则不给豁免（返回 None），照常按凭据检查整个请求体——含应用 ID 或令牌的 8 字符片段照停。"""
         if self.app_owner is None:
             return None
         app_id = guard.credentials.get(self.app_owner)
-        parsed = decode(body)
-        if not (isinstance(app_id, str) and len(app_id) >= 8 and len(app_id.strip()) >= 8
-                and isinstance(parsed, dict) and type(parsed.get("appId")) is str and parsed["appId"] == app_id):
+        if not (isinstance(app_id, str) and len(app_id) >= 8 and len(app_id.strip()) >= 8):
             guard.conflict = True
             raise OutletConflict()
-        return {"appId": self.app_owner}
+        parsed = decode(body)
+        if isinstance(parsed, dict) and type(parsed.get("appId")) is str and parsed["appId"] == app_id:
+            return {"appId": self.app_owner}
+        return None
 
     def check_body(self, body):
         """建单请求体的出口检查（规划与预建连共用）。豁免只给顶层 appId 一个字段，其余位置照常按凭据拦截。"""

@@ -348,10 +348,11 @@ def test_same_app_id_formal_order_sends_once_and_feishu_outlets_still_block(case
     assert stream.getvalue() and app_id not in stream.getvalue()
 
 
-@pytest.mark.parametrize("change", ["other_field", "partial", "token", "superset", "different"])
+@pytest.mark.parametrize("change", ["other_field", "partial", "token", "superset", "different_app_fragment",
+                                    "different_token_fragment"])
 def test_app_id_exemption_bounds_stop_before_sending(case, platform, business_cli, web_order, change):
-    """必停四种：同值进请求体其他字段；部分包含；官方令牌（PAT）进请求体；豁免字段不与应用 ID 逐字相等（超集或另一个值，
-    不是「不豁免但放行」）→ 规划阶段即按凭据冲突停，0 发。"""
+    """必停：同值进请求体其他字段；部分包含；官方令牌（PAT）进请求体；appId 与应用 ID 不逐字相等时不给豁免、照常按凭据
+    检查（守望者 16:4xZ 口径更正）——超集、含应用 ID 或令牌 8 字符片段的另一个值照停 → 规划阶段即按凭据冲突停，0 发。"""
     app_id, identifiers = case.ids["official_app"], case.config["create"]["identifiers"]
     if change == "other_field":
         identifiers["projectId"] = app_id
@@ -361,12 +362,33 @@ def test_app_id_exemption_bounds_stop_before_sending(case, platform, business_cl
         identifiers["projectId"] = case.official_token
     elif change == "superset":
         identifiers["appId"] = app_id + "0"
+    elif change == "different_app_fragment":
+        identifiers["appId"] = "x-" + app_id[:12]
     else:
-        identifiers["appId"] = str(uuid4())
+        identifiers["appId"] = "x-" + case.official_token[:12]
     assert identifiers["appId"] != app_id or change in ("other_field", "partial", "token")
     with pytest.raises(order.OutletConflict):
         backend(case).plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
     assert platform.create_count == 0
+
+
+def test_different_app_id_is_not_exempt_but_checked_and_sends(case, platform, business_cli, web_order):
+    """原「另一个值 → 停」改为放行（守望者 16:4xZ 口径更正）：appId 与官方应用 ID 完全不同、且不含任何凭据 8 字符片段
+    → 不给豁免、照常检查整个请求体，无凭据即放行；发 1 次、逐字段回读一致。"""
+    app_id = case.ids["official_app"]
+    other = str(uuid4())
+    assert not any(other[i:i + 8] in app_id or other[i:i + 8] in case.official_token for i in range(len(other) - 7))
+    case.ids["appId"] = other
+    case.config["create"]["identifiers"]["appId"] = other
+    mingdao = backend(case)
+    plan = mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    assert json.loads(plan.payload)["appId"] == other and app_id not in plan.payload.decode()
+    arm(case, platform)
+    handed = []
+    record_id = mingdao.send(plan, lambda: handed.append(1))
+    assert handed == [1] and platform.create_count == 1 and record_id == case.ids["created"]
+    verdict, checks = mingdao.readback(plan, record_id, 30)
+    assert verdict == "一致" and all(c["结果"] == "一致" for c in checks)
 
 
 def test_short_credential_stops_before_any_request(case, platform, business_cli, web_order):
