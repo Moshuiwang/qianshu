@@ -1544,3 +1544,106 @@ def test_same_name_twice_in_one_card_builds_first_only(order, monkeypatch, names
     assert order.mingdao.sent == [1]
     assert query(order.path, "SELECT registration,version,item,name_key,reason,cleared FROM trial_handoff") == [
         (1, 1, 2, "", READONLY_CHECK, None)]
+
+
+# ---------------------------------------------------------------- 同卡同名在整卡收口与晚投时共用分组（守望者 G508）
+
+PAIR = ("合成政策（A）", "合成政策(A)")
+
+
+def same_pair_card(env, monkeypatch, *, approve=True):
+    """真实出卡（decision_pages → Journal.prepare）：两条同为已验证组合，政策名仅全半角不同。approve 为假时只核验、
+    不同意（卡片保持 open，供驳回用）。返回卡片 ID。"""
+    import qianshu.mail.trial_cards as cards
+    from test_trial_paths import setup_card
+    real = cards.decision_pages
+
+    def same_policy_twice(trial, row, text, details, parsed, policies, full_review, setup, blocked):
+        for policy, name in zip(policies, PAIR):
+            policy.draft.policy_name.value = name
+            policy.draft.benefit_type.value = "组合0"
+        return real(trial, row, text, details, parsed, policies, full_review, setup, blocked)
+    monkeypatch.setattr(cards, "decision_pages", same_policy_twice)
+    if approve:
+        return accept(env.path)[0]
+    store, _, card, pages = setup_card(env.path)
+    store.db.close()
+    with journal_at(env.path) as j:
+        for n in range(1, len(pages) + 1):
+            j.db.execute("INSERT INTO card_intent VALUES(?,1,1,?,'sent','')", (f"r{n}", n))
+            j.received(f"r{n}", "message" if n == len(pages) else f"page{n}")
+        j.bind(card, NOW + 1)
+        j.db.commit()
+        assert "已核验" in j.action("session", card, 1, 1, "message", "verify", "e1", "ou_actor", NOW + 2,
+                                    lambda: NOW + 2, lambda: True, True, SW, archive=True)
+        j.db.commit()
+    return card
+
+
+@pytest.mark.parametrize("ending", ["expired", "rejected", "disconnected"])
+def test_same_name_pair_card_close_hands_off_first_only(order, monkeypatch, ending):
+    """G508（复核 rv-2dG P1-1）：同卡「合成政策（A）」与「合成政策(A)」出卡后到截止、驳回、断线关卡 → 机器人 0 发；公告
+    第 1 条按原文案「未建单，转人工」，第 2 条写「与本卡第 1 条同名，只读核对」；恢复清单只有第 1 条是可补建项，第 2 条
+    仍是只读核对；守望者销清第 1 条后第 2 条不会变成可执行项。"""
+    from qianshu.feishu.trial_order import READONLY_CHECK, SAME_CARD, release_handoff
+    card = same_pair_card(order, monkeypatch, approve=ending != "rejected")
+    assert json.loads(query(order.path, "SELECT snapshot FROM trial_card")[0][0])["same_card"] == [[2, 1]]
+    with journal_at(order.path) as j:
+        if ending == "expired":
+            j.scan(query(order.path, "SELECT expires FROM trial_card")[0][0])
+            reason = "审批到期"
+        elif ending == "rejected":
+            assert j.action("session", card, 1, 1, "message", "reject", "e2", "ou_actor", NOW + 3, lambda: NOW + 3,
+                            lambda: True, True, SW, reason="合成驳回原因") == "已驳回"
+            j.db.commit()
+            reason = "驳回：合成驳回原因"
+        else:
+            j.rotate("session2", "连接断开")
+            reason = "连接断开"
+    assert query(order.path, "SELECT status FROM trial_card") == [("closed",)]
+    listener, transport = deliver(order)
+    listener.maintain()
+    text, = [json.loads(t)["text"] for t in sent(transport)]
+    assert f"登记 1 · 条目 1 · {reason}，未建单，转人工。" in text
+    assert "\n条目 2 · " + SAME_CARD.format(1) + "。" in text and "条目 1、2" not in text
+    assert text.count("未建单") == 1
+    assert order.orders().run_once() is False and order.mingdao.sent == []
+    assert query(order.path, "SELECT * FROM trial_order") == []
+    key = name_key(PAIR[0])
+    assert query(order.path, "SELECT item,name_key,reason FROM trial_handoff WHERE cleared IS NULL ORDER BY item") == [
+        (1, key, None), (2, "", READONLY_CHECK)]
+    assert recovery_kinds(order) == {"order_handoff": [(1, 1)], "order_readonly_check": [(1, 2)]}
+    with journal_at(order.path) as j, j.db:
+        release_handoff(j.db, 1, 1, 1, name_fingerprint(key), "合成：人工已核", NOW + 5)
+    listener.maintain()
+    assert len(sent(transport)) == 1
+    assert recovery_kinds(order) == {"order_handoff": [], "order_readonly_check": [(1, 2)]}
+    assert order.orders().run_once() is False and order.mingdao.sent == []
+
+
+def test_mixed_card_same_name_follows_first_handed_off_item(order):
+    """G508 混合卡：第 1 条未拟建（出卡即转人工），第 2 条与之同名、本可拟建 → 第 2 条沿用第 1 条的归属：出卡写「与本卡第 1 条
+    同名，只读核对」、不进拟建、只读核对类移交；第 3 条（异名）照常拟建。断线关卡后公告第 1、3 条未建单、第 2 条只读核对，
+    恢复清单可补建项只有第 1、3 条，第 2 条不另给可执行移交。"""
+    from qianshu.feishu.trial_order import READONLY_CHECK, SAME_CARD
+    from qianshu.mail.trial_state import Store
+    Store(order.path).db.close()
+    with journal_at(order.path) as j, j.db:
+        j.initialize()
+        j.rotate("session", "启动")
+    reissue(order, 1, eligible=(2, 3), names=(*PAIR, NAMES[1]))
+    snapshot = json.loads(query(order.path, "SELECT snapshot FROM trial_card")[0][0])
+    assert snapshot["eligible"] == [3] and snapshot["same_card"] == [[2, 1]]
+    assert query(order.path, "SELECT readonly FROM trial_card") == [(0,)]
+    lines, face = face_lines(order, 1)
+    assert lines[1].endswith("已转人工") and lines[2] == SAME_CARD.format(1) and lines[3] == "本次拟建"
+    assert query(order.path, "SELECT item,name_key,reason FROM trial_handoff ORDER BY item") == [
+        (1, name_key(PAIR[0]), None), (2, "", READONLY_CHECK)]
+    with journal_at(order.path) as j:
+        j.rotate("session2", "连接断开")
+    listener, transport = deliver(order)
+    listener.maintain()
+    text, = [json.loads(t)["text"] for t in sent(transport)]
+    assert "条目 1、3 · 连接断开，未建单，转人工。" in text and "\n条目 2 · " + SAME_CARD.format(1) + "。" in text
+    assert recovery_kinds(order) == {"order_handoff": [(1, 1), (1, 3)], "order_readonly_check": [(1, 2)]}
+    assert order.orders().run_once() is False and order.mingdao.sent == []

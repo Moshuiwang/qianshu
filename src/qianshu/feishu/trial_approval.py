@@ -311,11 +311,19 @@ class Journal:
                         (card,))
         self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
                         AND kind='remind' AND status='pending'""", (card,))
+        # 同卡同名后条（快照 same_card，G508）：沿用同组首条的归属，公告写「与本卡第 N 条同名，只读核对」，
+        # 不作为「未建单，转人工」列出；整批公告里由投递端逐条补写（unbuilt_notice），同样不登记可执行移交。
+        from .trial_order import SAME_CARD, same_card_owner
+        snapshot = json.loads(row["snapshot"])
+        owner = same_card_owner(snapshot)
         if not known and not uncertain and not done and (not legacy or legacy[0] in safe):
-            self.notify(row, "closed", reason + "，未建单，转人工")
+            self.notify(row, "closed", reason + "，未建单，转人工",
+                        items=[n for n in snapshot["items"] if n not in owner] if owner else None)
             return
-        for item in sorted(set(json.loads(row["snapshot"])["items"]) | known | uncertain):
-            if item in done:
+        for item in sorted(set(snapshot["items"]) | known | uncertain):
+            if item in owner and item not in done and item not in known and item not in uncertain:
+                detail = SAME_CARD.format(owner[item])
+            elif item in done:
                 detail = "已建单并回读一致"
             elif item in known:
                 detail = "已有记录待回读，请按私有登记只读核对"

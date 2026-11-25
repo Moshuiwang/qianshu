@@ -129,17 +129,15 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         else:
             lines.extend([CardLine("存档标题", preview.title), CardLine("存档预览", preview.body),
                           *(CardLine(kind + "汇总行", summary) for kind, summary in preview.summaries)])
-    readonly = not (preview and eligible and session and contact and settings.get("MAIL_TRIAL_APPROVER_OPEN_IDS"))
-    if readonly:
-        eligible = []
-    if readonly:
-        lines = [CardLine(line.label, "转人工") if line.text == "本次拟建" else line for line in lines]
-    # 同卡内同名去重（G507）：正文与附件可能把同一条政策各列一次。拟建条目按同一归一函数 name_key 去重，第二条起
-    # 改为只读核对、不进 eligible，卡面写「与本卡第 N 条同名，只读核对」；移交在 Journal.prepare 同一事务里登记为
-    # 只读核对类（card_handoffs 对这些条目留空名键、不占用政策名，免得把第 N 条自己拦下）。
+    # 同卡内同名去重（G507、G508）：正文与附件可能把同一条政策各列一次。全部条目按同一归一函数 name_key 分组，同组
+    # 只有首条按自身情况处理（拟建或转人工，可执行移交只给首条）；第二条起一律只读核对、不进 eligible，卡面写
+    # 「与本卡第 N 条同名，只读核对」；移交在 Journal.prepare 同一事务里登记为只读核对类（card_handoffs 对这些条目
+    # 留空名键、不占用政策名，免得把第 N 条自己拦下）。首条已转人工的混合卡，同名后条沿用首条的移交，不另给可执行移交。
+    # 快照 same_card 即整卡收口（Journal.close）与晚投登记（unbuilt_notice）共用的分组。去重放在只读判定之前：
+    # 拟建条目全被去重时卡片按只读出。
     from qianshu.feishu.trial_order import SAME_CARD, name_key
     same, first = {}, {}
-    for n in eligible:
+    for n in items:
         key = name_key(policies[n - 1].draft.policy_name.value)
         if key and key in first:
             same[n] = first[key]
@@ -149,6 +147,11 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         eligible = [n for n in eligible if n not in same]
         lines = [CardLine(line.label, SAME_CARD.format(same[int(line.label[3:])]))
                  if line.label.startswith("条目 ") and int(line.label[3:]) in same else line for line in lines]
+    readonly = not (preview and eligible and session and contact and settings.get("MAIL_TRIAL_APPROVER_OPEN_IDS"))
+    if readonly:
+        eligible = []
+    if readonly:
+        lines = [CardLine(line.label, "转人工") if line.text == "本次拟建" else line for line in lines]
     # 未列为拟建的条目出卡即登记人工移交（Journal.prepare 同一事务），卡面逐条写明「已转人工」；同名政策已有机器人
     # 建单记录的（held，由 prepare 在登记移交的同一写事务里裁决）改写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
     # 同卡同名条目卡面已写定，不再套「已转人工」或「只读核对，请勿重复建单」。

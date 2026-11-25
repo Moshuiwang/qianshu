@@ -146,9 +146,17 @@ def card_handoffs(snapshot):
             for item in snapshot.get("items") or [] if item not in eligible]
 
 
+def same_card_owner(snapshot):
+    """出卡时按归一政策名判为与本卡先出现条目同名的条目（G507、G508）：{后条: 同组首条}，读自卡片快照 `same_card`。
+
+    出卡登记（card_handoffs）、整卡收口（Journal.close）与晚投登记（unbuilt_notice）共用这一分组：同组只有首条给
+    可执行移交，后条保持只读核对。"""
+    return {int(n): int(owner) for n, owner in snapshot.get("same_card") or []}
+
+
 def same_card_items(snapshot):
-    """出卡时按归一政策名判为与本卡前一拟建条目同名的条目（G507）。"""
-    return {pair[0] for pair in snapshot.get("same_card") or []}
+    """出卡时按归一政策名判为与本卡先出现条目同名的条目（G507）。"""
+    return set(same_card_owner(snapshot))
 
 
 # 出卡登记移交时同名政策已有机器人记录（复核 rv-2d4 P1）：卡面不给可执行的人工建单信号，移交照登、保持同名占位。
@@ -187,6 +195,7 @@ def unbuilt_notice(db, row):
 
     调用方须在投递前、与建单领槽互斥的同一写事务里调用并登记移交（record_handoff）。条目逐条按目标表 + 归一政策名核对：
     已被新卡接管或已建单的条目标「已过时」、不登记移交；其余条目保留原文案并各自登记移交。全部过时才整条改为过时文案。
+    同卡同名后条（快照 `same_card`，G508）不登记移交、沿用同组首条的归属，整批公告逐条写「与本卡第 N 条同名，只读核对」。
     """
     body = row["body"]
     if row["kind"].startswith("order_unknown:") or row["kind"] == "order_mismatch":
@@ -197,8 +206,13 @@ def unbuilt_notice(db, row):
     if not any(word in body for word in HANDOFF_WORDS):
         return body, []
     snapshot = json.loads(row["snapshot"])
-    keep, taken, unnamed = [], [], []
+    keep, taken, unnamed, same = [], [], [], []
+    owner = same_card_owner(snapshot)
     for item in notice_items(row["kind"], snapshot):
+        if item in owner:
+            # 同卡同名后条（G508）：沿用同组首条的归属，保持出卡时登记的只读核对类移交，不另登记带名键的可执行移交。
+            same.append(item)
+            continue
         key = name_key(_reviewed_name(snapshot, item))
         if not key:
             unnamed.append(item)
@@ -215,6 +229,9 @@ def unbuilt_notice(db, row):
         rest = sorted([item for item, _ in keep] + unnamed)
         text += f"\n条目 {'、'.join(map(str, taken))} · {SUPERSEDED}"
         text += f"\n条目 {'、'.join(map(str, rest))} · {UNBUILT_ITEMS}"
+    if not row["kind"].startswith(("closed_", "order_cancel:")):
+        # 整批公告逐条写明同卡同名后条（单条公告由 Journal.close 按条写定）。
+        text += "".join(f"\n条目 {n} · {SAME_CARD.format(owner[n])}。" for n in same)
     return text + (HANDOFF_NOTE if keep else ""), keep
 
 
