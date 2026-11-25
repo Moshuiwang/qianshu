@@ -64,6 +64,15 @@ def archive_policy(parsed, body):
     return ArchivePolicy(parsed.policy_type.value, tuple(groups))
 
 
+def handed_text(reason):
+    """未拟建条目的卡面文案：原因后只写转人工固定文案（G510），不给可执行的建单指示。同名政策已有机器人建单记录的
+    条目同样只写固定文案，已有记录只在恢复清单的 robot_record 里标出，由守望者判定。"""
+    from qianshu.feishu.trial_order import MANUAL
+    if reason in ("本次拟建", "转人工"):
+        return MANUAL
+    return reason.removesuffix("，转人工") + "，" + MANUAL
+
+
 def decision_pages(trial, row, text, details, parsed, policies, full_review, setup, blocked):
     settings, snapshot, contact = setup
     countries = [d.field_results.get("country") for d in parsed]
@@ -118,28 +127,50 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         else:
             lines.extend([CardLine("存档标题", preview.title), CardLine("存档预览", preview.body),
                           *(CardLine(kind + "汇总行", summary) for kind, summary in preview.summaries)])
+    # 同卡同名合组（守望者 G509）：正文与附件可能把同一条政策各列一次，也可能同名而内容不同。全部条目（含只读卡）按
+    # 唯一归一函数 name_key 分组（same_name_groups，与出卡登记、整卡收口、晚投登记、建单执行、恢复清单、组销清共用），
+    # 组有 2 条及以上时整组机器人 0 发：组内条目都不进 eligible，卡面逐条写「本卡第 M、N 条同名，合为一项。」加转人工
+    # 固定文案（G510）；Journal.prepare 同一事务里合为一项组移交（record_handoff）。分组放在只读判定之前：
+    # 拟建条目全在组内时卡片按只读出。
+    from qianshu.feishu.trial_order import MANUAL, group_of, group_text
+    grouped = group_of({"items": items, "reviewed": [{"policy_name": {"value": p.draft.policy_name.value}}
+                                                     for p in policies]})
+    if grouped:
+        eligible = [n for n in eligible if n not in grouped]
+        lines = [CardLine(line.label, group_text(grouped[int(line.label[3:])]) + "。" + MANUAL)
+                 if line.label.startswith("条目 ") and int(line.label[3:]) in grouped else line for line in lines]
     readonly = not (preview and eligible and session and contact and settings.get("MAIL_TRIAL_APPROVER_OPEN_IDS"))
     if readonly:
         eligible = []
     if readonly:
         lines = [CardLine(line.label, "转人工") if line.text == "本次拟建" else line for line in lines]
-    details.extend(result_card(page) for page in detail_pages("试运行邮件", lines))
-    final = result_card(detail_pages("试运行邮件", [CardLine("本批处理",
-        "整批转人工" if readonly else "请在已发送中核对关联申请及本次无条件同意回复，再核验并决定。")])[0])
-    if not readonly:
-        binding = dict(card=card, registration=reg, version=version, format=CARD_FORMAT)
-        buttons = [{"tag": "button", "name": action, "action_type": "form_submit",
-                    "text": {"tag": "plain_text", "content": label}, "value": dict(binding, action=action)}
-                   for action, label in (("verify", "邮件审批已核验"), ("approve", "同意"), ("reject", "驳回"))]
-        final["elements"].append({"tag": "form", "name": "trial_review", "elements": [
-            {"tag": "input", "name": "reason", "placeholder": {"tag": "plain_text", "content": "驳回原因或待补内容"}},
-            {"tag": "action", "actions": buttons}]})
-    details.append(final)
-    for i, page in enumerate(details, 1):
-        page["header"]["title"]["content"] = f"试运行邮件 · 第 {i} / {len(details)} 张"
+    # 未列为拟建的条目出卡即登记人工移交（Journal.prepare 同一事务），卡面逐条只写转人工固定文案（G510）；同名政策
+    # 已有机器人建单记录的（held，由 prepare 在登记移交的同一写事务里裁决）卡面同样只写固定文案，移交标「只读核对」类。
+    # 同卡同名组的条目卡面已写定。
+    handed = {f"条目 {n}": n for n in items if n not in eligible and n not in grouped}
+
+    def render(held):
+        # held 只决定移交类别（prepare 登记「只读核对」类），不改卡面：卡面与公告只说「已转人工」（G510）。
+        shown = [CardLine(line.label, handed_text(line.text)) if line.label in handed else line for line in lines]
+        details.extend(result_card(page) for page in detail_pages("试运行邮件", shown))
+        final = result_card(detail_pages("试运行邮件", [CardLine("本批处理",
+            "整批转人工。" + MANUAL if readonly else "请在已发送中核对关联申请及本次无条件同意回复，再核验并决定。")])[0])
+        if not readonly:
+            binding = dict(card=card, registration=reg, version=version, format=CARD_FORMAT)
+            buttons = [{"tag": "button", "name": action, "action_type": "form_submit",
+                        "text": {"tag": "plain_text", "content": label}, "value": dict(binding, action=action)}
+                       for action, label in (("verify", "邮件审批已核验"), ("approve", "同意"), ("reject", "驳回"))]
+            final["elements"].append({"tag": "form", "name": "trial_review", "elements": [
+                {"tag": "input", "name": "reason", "placeholder": {"tag": "plain_text", "content": "驳回原因或待补内容"}},
+                {"tag": "action", "actions": buttons}]})
+        details.append(final)
+        for i, page in enumerate(details, 1):
+            page["header"]["title"]["content"] = f"试运行邮件 · 第 {i} / {len(details)} 张"
+        return details
+
     journal.prepare(card, reg, version, session, country, {
         "items": items, "eligible": eligible, "missing": missing, "contact": contact,
-        "pages": details, "preview": preview.fingerprint if preview else None,
+        "preview": preview.fingerprint if preview else None,
         "order_snapshot_sha256": sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
         "material": material, "drafts": [d.to_dict() for d in parsed],
         "sources": [{"id": "body", "source_id": "body", "start": 0, "text": text}],
@@ -148,5 +179,5 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
                               "span": i.span.model_dump(mode="json") if i.span else None}
                              for i in getattr(parsed, "structure_issues", ())],
         "reviewed": [asdict(p.draft) for p in policies],
-    }, readonly, trial.clock().timestamp())
+    }, readonly, trial.clock().timestamp(), render=render)
     return card

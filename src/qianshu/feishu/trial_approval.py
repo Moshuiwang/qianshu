@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS trial_archive(
  card_update TEXT NOT NULL DEFAULT 'none', PRIMARY KEY(registration,version));
 CREATE TABLE IF NOT EXISTS trial_archive_page(
  registration INTEGER, version INTEGER, kind TEXT, page TEXT, summary TEXT, PRIMARY KEY(registration,version,kind));
+CREATE TABLE IF NOT EXISTS trial_order(
+ registration INTEGER, version INTEGER, item INTEGER, card TEXT NOT NULL, status TEXT NOT NULL, name_key TEXT,
+ target TEXT, record_id TEXT, reason TEXT, sent REAL, finished REAL, disconnect INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(registration,version,item));
+CREATE TABLE IF NOT EXISTS trial_order_slot(id INTEGER PRIMARY KEY CHECK(id=1), registration INTEGER NOT NULL,
+ version INTEGER NOT NULL, item INTEGER NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS trial_handoff(name_key TEXT NOT NULL, target TEXT, registration INTEGER, version INTEGER,
+ item INTEGER, opened REAL NOT NULL, cleared REAL, reason TEXT);
+CREATE TABLE IF NOT EXISTS trial_guardian_log(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
 """
 
 # 存档阶段的条目任务状态：archive_pending 尚无外写（关卡时可安全关闭）；archive_running 已发起存档；
@@ -102,7 +111,7 @@ def recovery(db):
         SELECT 'trial_card' AS kind, registration, version, status FROM trial_card
         WHERE status IN ('preparing','open','accepted','partial')
         UNION ALL SELECT 'trial_task', c.registration, c.version, t.status
-        FROM trial_task t JOIN trial_card c USING(card) WHERE t.status!='closed'
+        FROM trial_task t JOIN trial_card c USING(card) WHERE t.status NOT IN ('closed','order_done')
         UNION ALL SELECT 'trial_notification', c.registration, c.version, n.status
         FROM trial_notification n JOIN trial_card c USING(card)
         WHERE n.status IN ('pending','unknown','blocked','missing_contact')
@@ -118,7 +127,7 @@ def recovery(db):
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_item_task'").fetchone():
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'item_task' AS kind, registration, version, item, status FROM trial_item_task
-            WHERE status!='closed'"""))
+            WHERE status NOT IN ('closed','order_done')"""))
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_feedback'").fetchone():
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'update' AS kind, registration, version, u.status FROM trial_update u JOIN trial_card c
@@ -129,6 +138,42 @@ def recovery(db):
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'manual_check' AS kind, registration, version, n.status
             FROM trial_notification n JOIN trial_card c USING(card) WHERE n.kind='result_manual' OR n.kind LIKE 'first_manual:%'"""))
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_order'").fetchone():
+        from .trial_order import (READONLY_CHECK, display_fingerprint, group_diff, group_of, name_fingerprint,
+                                  name_key, robot_held)
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'order' AS kind, registration, version, item, status FROM trial_order
+            WHERE status IN ('sending','created','unknown','mismatch')"""))
+        # 「只读核对」类移交（同名已有机器人建单记录，G497）不作为可补建项列出，单列可查。
+        # 每项移交（单条、只读核对、组）都带 robot_record（G510）：同一归一政策名在他卡、或本卡该条 / 组内成员有机器人在途、
+        # 已建、写错或结果未知记录（robot_held）。群里只说「已转人工」，是否补建由守望者据此加官方只读查重与本地台账判定。
+        # 同卡同名组（G509）：同一登记版本里属于同一同名组的未销清移交（含旧版逐条登记的）合为一项 order_group_handoff，
+        # 列出全部成员（条目号、展示名指纹）与差异摘要（只写字段名与「相同 / 不同」），须守望者按组销清。
+        groups = {}
+        for r in db.execute("""SELECT h.registration, h.version, h.item, h.name_key, h.reason, c.card, c.snapshot
+                FROM trial_handoff h LEFT JOIN trial_card c ON c.registration=h.registration AND c.version=h.version
+                WHERE h.cleared IS NULL ORDER BY h.rowid"""):
+            snapshot = json.loads(r[6]) if r[6] else {}
+            group = group_of(snapshot).get(r[2])
+            if group:
+                if (r[0], r[1], group[0]) not in groups:
+                    groups[r[0], r[1], group[0]] = True
+                    key = name_key(snapshot["reviewed"][group[0] - 1]["policy_name"]["value"])
+                    rows.append({"kind": "order_group_handoff", "registration": r[0], "version": r[1],
+                                 "item": group[0], "name_fp": name_fingerprint(key), "status": "open",
+                                 "members": [{"item": n, "display": f"条目 {n}",
+                                              "display_fp": display_fingerprint(snapshot, n)} for n in group],
+                                 "diff": group_diff(snapshot, group),
+                                 "robot_record": robot_held(db, key, r[5], members=group)})
+                continue
+            rows.append({"kind": "order_readonly_check" if r[4] == READONLY_CHECK else "order_handoff",
+                         "registration": r[0], "version": r[1], "item": r[2], "name_fp": name_fingerprint(r[3]),
+                         "status": "readonly_check" if r[4] == READONLY_CHECK else "open",
+                         "robot_record": robot_held(db, r[3], r[5], members=(r[2],))})
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'order_slot' AS kind, registration, version, item, 'held' AS status FROM trial_order_slot"""))
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'write_halt' AS kind, reason AS status FROM trial_halt"""))
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_known_record'").fetchone():
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'known_record' AS kind, registration, version, r.item, 'readback_pending' AS status
@@ -158,6 +203,20 @@ class Journal:
         with self.db:
             self.db.execute("DELETE FROM trial_halt WHERE id=1")
 
+    def disconnect_orders(self):
+        """断线期间照发的建单数（G464），供日报单列。"""
+        return self.db.execute("SELECT count(*) FROM trial_order WHERE disconnect=1").fetchone()[0]
+
+    def halt_state(self):
+        """停写位当前值与最后一次变更（守望者读回）。"""
+        halt = self.db.execute("SELECT reason, at FROM trial_halt WHERE id=1").fetchone()
+        last = self.db.execute("""SELECT at, action, reason FROM trial_guardian_log
+                               WHERE action IN ('halt_set','halt_clear','request_create_off')
+                               ORDER BY rowid DESC LIMIT 1""").fetchone()
+        return {"halted": halt is not None, "halt_reason": halt[0] if halt else None,
+                "halt_at": halt[1] if halt else None,
+                "last_change": dict(zip(("at", "action", "reason"), last)) if last else None}
+
     def disconnect_archive_writes(self):
         """断线期间发出的存档写步骤总数，供日报单列。"""
         return self.db.execute("SELECT coalesce(sum(disconnect_writes),0) FROM trial_archive").fetchone()[0]
@@ -165,7 +224,7 @@ class Journal:
     def notice_counts(self):
         return self.db.execute("""SELECT
             (SELECT count(*) FROM trial_notification WHERE kind='result_manual' OR kind GLOB 'first_manual:*'
-             OR kind GLOB 'archive_*'),
+             OR kind GLOB 'archive_*' OR kind GLOB 'order_unknown:*' OR kind='order_mismatch'),
             (SELECT count(*) FROM trial_notification WHERE status NOT IN ('sent','cancelled')) +
             (SELECT count(*) FROM trial_feedback WHERE status!='sent')""").fetchone()
 
@@ -183,13 +242,34 @@ class Journal:
                JOIN trial_interval i USING(session) WHERE g.session=? AND e.enabled=1 AND e.closed IS NULL
                AND i.closed IS NULL AND max(i.opened,e.opened)<=?""", (session, created)).fetchone() is not None
 
-    def prepare(self, card, reg, version, session, country, snapshot, readonly, sent):
-        packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    def prepare(self, card, reg, version, session, country, snapshot, readonly, sent, *, render=None):
+        """卡片快照落盘；同一事务里给未列为拟建的条目逐条登记人工移交（特批第 3 轮第 1 条）。
+
+        收口不再靠公告组合给这些条目补移交；投递端逐条裁决照旧用于拟建条目，同一条目已有未销清移交时按现有去重
+        不重复登记。
+
+        render(held) 给出卡面（快照 `pages`）：held 为要移交、但同名政策已有机器人建单记录的条目（与公告投递同一裁决
+        robot_held），在登记移交的同一写事务里裁决后再渲染；held 只决定移交记为「只读核对」类，卡面与其他转人工条目
+        一样只写固定文案（G510）。
+        """
+        from .trial_order import card_handoffs, group_of, record_handoff, robot_held
+        handoffs = card_handoffs(snapshot)
+        # 同卡同名组（G509）的成员由 record_handoff 合为一项组移交，不按单条只读核对裁决。
+        grouped = group_of(snapshot)
+        held = set()
         with self.db:
+            if render is not None:
+                if not self.db.in_transaction:
+                    self.db.execute("BEGIN IMMEDIATE")
+                held = {item for item, key in handoffs if item not in grouped and robot_held(self.db, key, card)}
+                snapshot = dict(snapshot, pages=render(held))
+            packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
             self.db.execute("""INSERT INTO trial_card VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (card, reg, version, CARD_FORMAT, session, country, packed,
                              sha256(packed.encode()).hexdigest(), int(readonly), sent,
                              (int(sent) // 86400 + 2) * 86400, "preparing"))
+            if handoffs:
+                record_handoff(self.db, card, handoffs, sent, held=held)
 
     def bind(self, card, now):
         row = self.db.execute("SELECT * FROM trial_card WHERE card=?", (card,)).fetchone()
@@ -215,7 +295,8 @@ class Journal:
         snapshot = json.loads(row["snapshot"])
         items = "、".join(str(i) for i in (snapshot["items"] if items is None else items))
         missing = "、".join(snapshot["missing"]) or "无"
-        body = f"登记 {row['registration']} · 条目 {items} · {reason}。待补项：{missing}。"
+        # 条目为空（整卡都在同卡同名组里，G509）时不写「条目」段，组内条目号由组文案给出。
+        body = f"登记 {row['registration']} · {'条目 ' + items + ' · ' if items else ''}{reason}。待补项：{missing}。"
         self.db.execute("INSERT OR IGNORE INTO trial_notification VALUES(?,?,?,?,'pending')",
                         (row["card"], kind, str(uuid4()), body))
 
@@ -237,7 +318,8 @@ class Journal:
         tasks = dict(self.db.execute("SELECT item,status FROM trial_item_task WHERE card=?", (card,)))
         known = {r[0] for r in self.db.execute("""SELECT item FROM trial_known_record
                          WHERE card=? AND length(trim(record_id))>0""", (card,))}
-        uncertain = {item for item, status in tasks.items() if status not in safe}
+        done = {item for item, status in tasks.items() if status == "order_done"}
+        uncertain = {item for item, status in tasks.items() if status not in safe and item not in done}
         self.db.execute("UPDATE trial_card SET status='closed' WHERE card=?", (card,))
         marks = ",".join("?" * len(ARCHIVE_SAFE))
         self.db.execute(f"""UPDATE trial_item_task SET status='closed' WHERE card=? AND status IN ({marks})
@@ -254,18 +336,39 @@ class Journal:
                         (card,))
         self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
                         AND kind='remind' AND status='pending'""", (card,))
-        if not known and not uncertain and (not legacy or legacy[0] in safe):
-            self.notify(row, "closed", reason + "，未建单，转人工")
+        # 同卡同名组（G509，按快照可信政策名重算）：同组合为一项交人工，公告写组文案；组移交在投递时登记（unbuilt_notice）。
+        # 转人工只写固定文案 MANUAL（G510），不给可执行的建单指示；notify 在原因后补「。」，故去掉固定文案句末「。」。
+        from .trial_order import MANUAL, group_of, group_text, same_name_groups
+        manual = MANUAL.removesuffix("。")
+        snapshot = json.loads(row["snapshot"])
+        grouped = group_of(snapshot)
+        if not known and not uncertain and not done and (not legacy or legacy[0] in safe):
+            if not grouped:
+                self.notify(row, "closed", reason + "，未建单。" + manual)
+                return
+            plain = [n for n in snapshot["items"] if n not in grouped]
+            tail = "".join(group_text(group) + "。" for group in same_name_groups(snapshot))
+            self.notify(row, "closed", (reason + "，未建单。" if plain else reason + "。") + tail + manual, items=plain)
             return
-        for item in sorted(set(json.loads(row["snapshot"])["items"]) | known | uncertain):
-            if item in known:
+        settled = done | known | uncertain
+        for item in sorted(set(snapshot["items"]) | known | uncertain):
+            if item in grouped and item not in settled:
+                # 同卡同名组（G509）：组内未进入建单的成员合为一条公告、一项组移交（投递时登记），不逐条给可执行移交。
+                pending = [n for n in grouped[item] if n not in settled]
+                if item == pending[0]:
+                    self.notify(row, f"closed_{item}", reason + "，" + group_text(grouped[item]) + "。" + manual,
+                                items=grouped[item])
+                continue
+            if item in done:
+                detail = "已建单并回读一致"
+            elif item in known:
                 detail = "已有记录待回读，请按私有登记只读核对"
             elif tasks.get(item, "").startswith("archive_"):
                 detail = "存档结果未知，请核对存档文档与汇总页"
             elif item in uncertain or (legacy and legacy[0] not in safe):
                 detail = "结果未知，请人工到明道云核对"
             else:
-                detail = "未建单，转人工"
+                detail = "未建单。" + manual
             self.notify(row, f"closed_{item}", reason + "，" + detail, items=[item])
 
     def rotate(self, session, reason, *, instant=None):
@@ -289,8 +392,10 @@ class Journal:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             # 存档进行中的批次由存档执行器收口，扫描不抢先关闭（开始存档前的授权只核一次）。
+            # 建单在途（已登记发送、待回读）的批次同样由建单执行器收口。
             for row in self.db.execute("""SELECT * FROM trial_card WHERE status IN ('open','accepted')
-                    AND card NOT IN (SELECT card FROM trial_archive WHERE status='running')""").fetchall():
+                    AND card NOT IN (SELECT card FROM trial_archive WHERE status='running')
+                    AND card NOT IN (SELECT card FROM trial_order WHERE status IN ('sending','created'))""").fetchall():
                 if not create_enabled and row["status"] == "accepted":
                     self.close(row, "建单开关关闭")
                 elif trial_batch(self.db, row["registration"], row["version"])[3]:

@@ -219,7 +219,10 @@ class Outlet:
             lines.append(line)
             offset += len(line)
         self.check_text("".join(lines) + "\r\n", spans)
-        body = request.content.decode("utf-8", "surrogateescape")
+        self.check_body(request.content.decode("utf-8", "surrogateescape"), fields)
+
+    def check_body(self, body, fields=None):
+        """检查请求正文。fields 把顶层字段名映射到凭据位置；豁免区间只绑定该字段且值与凭据相同。"""
         if not fields or not body:
             self.check_text(body)
             return
@@ -800,7 +803,11 @@ class Official:
         require(status is not None, error)
         return Record(record_id, name, status, utc(raw["_updatedAt"], platform=True), state)
 
-    def find(self, name):
+    def find(self, name, fold=None):
+        """官方同名查询：明道云端按原串精确查询。fold 为归一函数时（#154 正式单传入 `name_key`），查询前按它算出
+        本条的归一名，返回后候选行名称按同一函数归一、与本条相同即算同名命中；未传时按原串逐字相等（X5 不变）。"""
+        same = fold or (lambda value: value)
+        wanted = same(name)
         spec = self.config["search"]
         control = spec["name_control"]
         condition = {"type": "condition", "field": control, "operator": "eq", "value": name}
@@ -816,7 +823,7 @@ class Official:
                 key = row["rowId"].lower()
                 previous = records.setdefault(key, (row["rowId"], row[control]))
                 require(previous[1] == row[control], "官方查询同一记录名称冲突")
-        return [record for record, value in records.values() if value == name]
+        return [record for record, value in records.values() if same(value) == wanted]
 
     def tag_index(self, scope, *, approval_clock=None):
         """独立授权指定全表视图及写入窗口内的唯一性证明。任何未知均先于查询停止。"""
@@ -1662,19 +1669,23 @@ def assemble(values, template_cells, config, read_relations, *, is_test, array_c
     return controls, summary
 
 
-def assemble_controls(values, template_cells, config, read_relations, *, is_test, array_controls=(), web_fields=None):
+def assemble_controls(values, template_cells, config, read_relations, *, is_test, array_controls=(), web_fields=None,
+                      approval_url=None):
+    """approval_url 只供 #154 正式单传入本批存档链接；X5 测试单不传，仍照抄模板链接。"""
     schema = config["fields"]
     draft_controls = cell_schema(schema, config["readback_skip"])
-    require(is_test is True, "正式单不得照抄任务审批链接，需人工")
+    require(is_test is True or (is_test is False and approval_url is not None), "正式单不得照抄任务审批链接，需人工")
+    require(approval_url is None or is_test is False, "测试单不得改写任务审批链接")
     fixed = fixed_cells(config, schema, draft_controls)
     tag_control = draft_controls["user_tags"]
     company_control = draft_controls["company"]
     require(isinstance(template_cells, dict)
             and schema.keys() - fixed.keys() <= template_cells.keys(),
             "模板字段不全")
-    approval_link = template_cells[draft_controls["approval_url"]]
+    approval_link = template_cells[draft_controls["approval_url"]] if approval_url is None else approval_url
     require(receipt(approval_link) and urlsplit(approval_link).scheme in ("http", "https")
             and bool(urlsplit(approval_link).hostname), "模板任务审批链接缺失或无效")
+    require(approval_url is None or urlsplit(approval_url).scheme == "https", "本批存档链接无效，停单")
     country = config["template"]["country"]
     country_control = country["control"]
     require(country_control not in (draft_controls[key] for key in (*_VARIABLE, "user_tags", "packages", "company")),
@@ -1725,6 +1736,8 @@ def assemble_controls(values, template_cells, config, read_relations, *, is_test
             source, encoded = "网页公式", web[control][0]
         elif control in fixed:
             source, encoded = "固定值", fixed[control]
+        elif approval_url is not None and control == draft_controls["approval_url"]:
+            source, encoded = "本批存档", encode_cell(approval_url, spec)
         elif control == tag_control:
             source, encoded = "草稿", encode_cell(tag_ids, spec)
         elif control == package_control:
@@ -2409,13 +2422,40 @@ def read_create_response(response):
 class CreateRequest:
     """单跳、预建连，只有一个不可撤销的请求交付点。"""
 
-    def __init__(self, spec, evidence, token, *, connect=http.client.HTTPSConnection):
+    def __init__(self, spec, evidence, token, *, connect=http.client.HTTPSConnection, app_owner=None):
         endpoint = spec["endpoint"]
         require(endpoint == {"host": _CREATE_HOST, "method": "POST", "path": _CREATE_PATH}
                 and endpoint == evidence["create_endpoint"], "建单写入入口与授权登记不符")
         self.endpoint, self.spec, self._token = endpoint.copy(), spec, token
         self.connect = connect
         self.started = False
+        # 正式单（#154）：建单请求体的 appId 与官方应用 ID 同值时，按该凭据的自有位置放行（字段级豁免）；不同值不豁免、照常检查。
+        self.app_owner = app_owner
+
+    def _app_fields(self, guard, body):
+        """app_owner 登记时：凭据短于 8 字符即按凭据冲突停；顶层 appId 与该凭据逐字相等才豁免这一个字段，
+        不相等则不给豁免（返回 None），照常按凭据检查整个请求体——含应用 ID 或令牌的 8 字符片段照停。"""
+        if self.app_owner is None:
+            return None
+        app_id = guard.credentials.get(self.app_owner)
+        if not (isinstance(app_id, str) and len(app_id) >= 8 and len(app_id.strip()) >= 8):
+            guard.conflict = True
+            raise OutletConflict()
+        parsed = decode(body)
+        if isinstance(parsed, dict) and type(parsed.get("appId")) is str and parsed["appId"] == app_id:
+            return {"appId": self.app_owner}
+        return None
+
+    def check_body(self, body):
+        """建单请求体的出口检查（规划与预建连共用）。豁免只给顶层 appId 一个字段，其余位置照常按凭据拦截。"""
+        guard = _outlet.get()
+        if guard is None:
+            return
+        fields = self._app_fields(guard, body)
+        if fields is None:
+            guard.check((body, decode(body)))
+            return
+        guard.check_body(body.decode("utf-8", "surrogateescape") if isinstance(body, bytes) else body, fields)
 
     def payload(self, controls):
         identifiers = self.spec["identifiers"]
@@ -2427,9 +2467,10 @@ class CreateRequest:
     @contextmanager
     def prepare(self, body):
         require(not self.started and len(body) <= _LIMIT, "建单请求已尝试或正文过长")
-        check_outlet((self.endpoint, body, decode(body), "Authorization", "md_pss_id ",
+        check_outlet((self.endpoint, "Authorization", "md_pss_id ",
                       "Accept-Encoding", "identity", "Content-Type", "application/json; charset=utf-8",
                       "Content-Length", len(body)))
+        self.check_body(body)
         guard = _outlet.get()
         if guard:
             guard.check(self._token, guard.session_owner)
@@ -2454,7 +2495,8 @@ class CreateRequest:
                 require(not self.started and connection.sock is not None, "建单传输不可用")
                 if guard:
                     guard.require_clear()
-                    guard.check_http(request, headers={"authorization": (guard.session_owner, "md_pss_id ")})
+                    guard.check_http(request, headers={"authorization": (guard.session_owner, "md_pss_id ")},
+                                     fields=self._app_fields(guard, request.content))
                 check_approval()
                 if guard:
                     guard.require_clear()
@@ -3086,6 +3128,45 @@ def _run(args, directory, clock, guard):
     return _run_registered(args, directory, clock, guard, config_data, authorizations)
 
 
+def order_profiles(config, evidence):
+    """(050 网页字段路径, 标签全表核验路径)。X5 与 #154 正式单共用同一判据。"""
+    web = ("web_rules" in config.get("order_snapshot", {}) or "web_rules_sha256" in evidence
+           or any(spec["label"] in WEB_TYPES for spec in config["fields"].values()))
+    return web, web or "tag_search" in config["official"] or "tag_scope" in evidence
+
+
+def selected_template_tags(config, controls, relations, values, snapshot):
+    """请求所选标签须在模板关联与快照中按全名唯一对应；返回所选标签。"""
+    key = next(key for key, field in config["fields"].items() if field.get("draft") == "user_tags")
+    selected = next(decode(cell["value"]) for cell in controls if cell["controlId"] == key)
+    keys = config["official"]["tag_relation"]["name_keys"]
+    for name, item in zip(values["user_tags"], selected, strict=True):
+        require(any(row["rowId"] == item["sid"] and any(row.get(k) == name for k in keys)
+                    for row in relations[key]) and any(row["name"] == name and row["id"] == item["sid"]
+                    for row in snapshot["tags"]), "模板或快照标签全名未确认")
+    return selected
+
+
+def readback_tag_names_check(api, scope, names, selected):
+    """写后独立核对所选标签的当前全名与全表唯一性；已证实的异名返回假，无法确认时停止。"""
+    try:
+        targeted = api.selected_tag_names(scope, selected)
+    except OutletConflict:
+        raise
+    except (Stop, KeyError, ValueError, TypeError):
+        targeted = None
+    if targeted is not None and targeted != names:
+        return False
+    index = api.tag_index(scope)
+    for name, item in zip(names, selected, strict=True):
+        row_id = item["sid"].lower()
+        if any(other != name and row_id in ids for other, ids in index.items()):
+            return False
+    require(targeted is not None and all(index.get(name) == [item["sid"].lower()]
+            for name, item in zip(names, selected, strict=True)), "标签全名唯一性未确认")
+    return True
+
+
 def check_search_binding(config, official):
     worksheet = config["create"]["identifiers"]["worksheetId"]
     require(receipt(worksheet) and official["search"]["path"] == f"/v3/app/worksheets/{worksheet}/rows/list",
@@ -3270,9 +3351,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
                 relations[control] = api.relations(template_id, control)
                 return relations[control]
 
-            web_profile = ("web_rules" in snapshot or "web_rules_sha256" in evidence
-                           or any(spec["label"] in WEB_TYPES for spec in config["fields"].values()))
-            tag_profile = web_profile or "tag_search" in official or "tag_scope" in evidence
+            web_profile, tag_profile = order_profiles(config, evidence)
             plan_names = {}
             def web_fields(company_row, _packages):
                 return project_web_fields(config, evidence, values, company_row, request_cells, clock)
@@ -3300,13 +3379,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
                 )
 
                 if tag_profile:
-                    key = next(key for key, field in config["fields"].items() if field.get("draft") == "user_tags")
-                    selected_tags = next(decode(cell["value"]) for cell in controls if cell["controlId"] == key)
-                    keys = official["tag_relation"]["name_keys"]
-                    for name, item in zip(values["user_tags"], selected_tags, strict=True):
-                        require(any(row["rowId"] == item["sid"] and any(row.get(k) == name for k in keys)
-                                    for row in relations[key]) and any(row["name"] == name and row["id"] == item["sid"]
-                                    for row in snapshot["tags"]), "模板或快照标签全名未确认")
+                    selected_tags = selected_template_tags(config, controls, relations, values, snapshot)
                     def tag_version():
                         return api.verified_tag_version(evidence.get("tag_scope"), values["user_tags"], selected_tags, clock)
 
@@ -3398,24 +3471,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
                 return source_version
 
             def readback_tag_names():
-                scope = evidence["tag_scope"]
-                names = values["user_tags"]
-                try:
-                    targeted = api.selected_tag_names(scope, selected_tags)
-                except OutletConflict:
-                    raise
-                except (Stop, KeyError, ValueError, TypeError):
-                    targeted = None
-                if targeted is not None and targeted != names:
-                    return False
-                index = api.tag_index(scope)
-                for name, item in zip(names, selected_tags, strict=True):
-                    row_id = item["sid"].lower()
-                    if any(other != name and row_id in ids for other, ids in index.items()):
-                        return False
-                require(targeted is not None and all(index.get(name) == [item["sid"].lower()]
-                        for name, item in zip(names, selected_tags, strict=True)), "标签全名唯一性未确认")
-                return True
+                return readback_tag_names_check(api, evidence["tag_scope"], values["user_tags"], selected_tags)
 
             return service.run_create(lambda stop: run_order(
                 ledger, api, create, service, window, payload, summary, controls, config, evidence,

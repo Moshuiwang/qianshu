@@ -27,6 +27,7 @@ from .sdk import P2CardActionTriggerResponse, _Transport
 from .settings import Settings
 from .state import CALLBACK_RESPONSE_MARGIN
 from .trial_approval import CARD_FORMAT, MANUAL_NOTICE, journal_at
+from .trial_order import record_handoff, unbuilt_notice
 
 
 _LOG = logging.getLogger(__name__)
@@ -250,10 +251,18 @@ class Listener:
                         if not j.db.execute("""UPDATE trial_notification SET status='unknown'
                             WHERE uuid=? AND status='pending'""", (row["uuid"],)).rowcount:
                             raise ValueError
-                needs_contact = row["kind"] == "remind" or row["kind"].startswith(("closed", "archive_"))
-                body = (mention(target, "配置负责人") + " " if target else "") + row["body"]
+                needs_contact = row["kind"] == "remind" or row["kind"].startswith(("closed", "archive_", "order_"))
                 if row["kind"] == "result_manual" or row["kind"].startswith("first_manual:"):
                     body = MANUAL_NOTICE
+                else:
+                    # 「未建单 / 结果未知 / 写错」公告投递前，在与建单领槽互斥的同一写事务里按目标表 + 归一政策名逐条核对：
+                    # 已被新卡接管或已建单的条目标过时；其余条目先持久登记人工移交（占用该政策名），再交出群消息（2d）。
+                    # 投递失败或回执不明时移交保留，守望者核对后销清。
+                    with j.db:
+                        j.db.execute("BEGIN IMMEDIATE")
+                        text, handoff = unbuilt_notice(j.db, row)
+                        record_handoff(j.db, row["card"], handoff, self.clock())
+                    body = (mention(target, "配置负责人") + " " if target else "") + text
                 try:
                     send_trial_message(self.transport, body, row["uuid"], False, claim)
                 except CredentialConflict:

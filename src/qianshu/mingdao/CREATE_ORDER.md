@@ -62,7 +62,7 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 | `official.origin`、`official.token_key`、`official.app_id_key` | 官方 HTTPS 源及私有环境文件中的个人令牌、应用 ID 键名，例如 `https://placeholder.invalid`、`PLACEHOLDER_HAP_TOKEN`、`PLACEHOLDER_HAP_APP_ID` |
 | `official.search` | 含 `path`、`name_control`、`view_ids`。路径为 `/v3/app/worksheets/placeholder_worksheet/rows/list`，名称字段为政策名称的 controlId。视图列表形如 `["placeholder_view"]`，须登记覆盖所有政策记录的全部视图 |
 | `official.tag_relation.name_keys` | 登记 1～2 个不同的候选标签名键，例如 `["placeholder_tag_title_control", "placeholder_tag_alias"]`，用于从模板用户标签的关联行取名称 |
-| `official.page_size`、`official.page_limit` | 每页条数与每视图页数上限，正整数，默认分别为 50、20。查询逐个视图从第 1 页开始，用携带 `viewId` 的官方列表 POST 和名称等值筛选。按端点返回的有效页长、页码、累计数、总数与续页标志判断是否结束。旧 X5 名称查询保留短页终止约定。050 查重须有总数或明确续页标志。空页未达总数、页信号矛盾、任一页失败或超过上限均停止。每行须有 UUID 格式的 `rowId`。先按 `rowId` 忽略大小写合并不同视图的记录，名称冲突即停，再按全名精确匹配。政策同名检查合计须为 0。 |
+| `official.page_size`、`official.page_limit` | 每页条数与每视图页数上限，正整数，默认分别为 50、20。查询逐个视图从第 1 页开始，用携带 `viewId` 的官方列表 POST 和名称等值筛选。按端点返回的有效页长、页码、累计数、总数与续页标志判断是否结束。旧 X5 名称查询保留短页终止约定。050 查重须有总数或明确续页标志。空页未达总数、页信号矛盾、任一页失败或超过上限均停止。每行须有 UUID 格式的 `rowId`。先按 `rowId` 忽略大小写合并不同视图的记录，名称冲突即停，再按全名精确匹配。调用方传入归一函数 `fold` 时（#154 正式单传 `name_key`：全半角统一、空白折叠、区分大小写），查询参数仍按原串精确发出，候选行名称与本条均按 `fold` 归一后比较，相同即算同名；未传时按原串逐字相等，X5 行为不变。政策同名检查合计须为 0。 |
 | `official.read` | `path` 为政策表的 `/v3/app/worksheets/placeholder_worksheet/rows/{record_id}`。详情、日志和删除路径中的 `{record_id}` 均传入 `rowId`。模板、建单回读和删前回读使用同一详情解析，取平铺的 controlId 字段并按 UUID 格式核验 `rowId`，比较忽略大小写。详情或列表缺少有效 `rowId` 即停止，`_id` 仅是系统元数据。记录不存在信号须同时满足私有配置登记的 HTTP 状态、响应 `success: false`、指定路径的值及类型。用 `missing_status`、`missing_key`、`missing_value` 登记，例如错误码的取值路径为 `["error_code"]` |
 | `official.status_control`、`official.status_map` | 政策状态字段的 controlId，如 `placeholder_status_control`。键须同时登记选项 key 与平台显示文本（日志里存的是显示文本），值为产品文档所列状态。官方读记录的政策状态形如 `[{"key": "placeholder_new_option", "value": "新建（占位部门）"}]`。回读至少须命中一项映射，两项均命中时结果须相同。回读和日志用同一个状态控件 |
 | `official.logs` | `path` 为政策记录读取路径加 `/logs`。请求显式取第 1 页、每页 50 条。可用 `page_limit` 设置更严格的停止阈值，须为 1～50 的整数，默认 50，日志条数达到阈值即停止 |
@@ -110,6 +110,8 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 - 私有授权登记中任一条含 `tag_scope`、`concurrent_scope`、`tariffs_scope`、`tasks_scope`、`products_scope`、`plans_scope`、`company_rows_scope` 或 `web_rules_sha256`。
 
 序 2a 和正式单由 #154 共同核验邮件审批、绑定预览、确认有效同意、存档并交接建单。序 2a 不能调用旧 X5 或复制模板审批链接。X7 删除另验当次授权与通知登记。
+
+#154 正式单的明道云适配照本节同一路径取值与核对（`verified_order_rows`、`project_web_fields`、标签全名与版本复核、`approved_names` / `request_display`、带 `approved` 的回读比对）。交接前照 X5 交接前核对重读来源：按原标识重读模板及关联，网页路径再以 `verified_order_rows` 重读平台行、标签详情、资费、同期政策与适用的升包任务，来源变化或读不到即停单；重读完成后再按 X5 `check_start_date` 的同一判据（`effective_start_date` 与证明有效期）核一次，开始日期需顺延或证明已过期即不写出、需重新审批。回读结论直接采用 `compare` 的逐项结果，覆盖全部已写控件（含 `readback_skip`），缺任一已写字段按写错处理。所需授权取自与建单配置同目录的 `create-authorizations.json` 中 `is_test` 为 `false`、`config_sha256` 等于配置完整字节摘要的唯一一条，须含 `web_rules_sha256`、各表 `*_scope` 与 `create_endpoint`。缺失、多条或不符时不装配建单执行器；正式单建单配置不含 `order_snapshot.web_rules` 时同样不装配（非网页正式路径不启用）。该登记含上列 050 键，因此同一运行目录的原格式 X5 入口按本节规则拒绝启动。
 
 - `require_verified_combination(snapshot, policy, benefit)` 从当前私有 `order_snapshot.verified_combinations` 读取二元列表。守望者只登记真实测试单逐项回读一致的组合。缺省、空或未命中时返回停单原因「该类型尚未经真实回读验证」，供 #154 展示。出卡和交接前均须检查。
 - `TrialRegistration` 由 #154 从当次授权构造，含登记编号、产品负责人回执、原登记的测试名称、精确组合与 UTC 截止时刻。`consume` 在私有目录独占创建并同步关闭记录，再核组合和时限，因此失败、过期、并发及重启后的重复尝试均不能复用。其他门禁先失败或在等待期间到期时，调用方须执行同一登记的 `close`。消耗资格不会登记放行名单。
