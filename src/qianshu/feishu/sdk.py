@@ -9,6 +9,7 @@ import re
 import time
 from collections.abc import Awaitable, Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 from contextvars import ContextVar
 from http import HTTPStatus
 from pathlib import Path
@@ -520,6 +521,8 @@ def checked_websocket_connection(url, check):
 class _Connection(ws.Client):
     """绑定 SDK 帧与当前连接。SDK 升级时需复核这些私有生命周期方法。"""
 
+    _injected_options = None
+
     def __init__(self, service, *, approvals: bool = True):
         self.service = service
         self._approvals = approvals
@@ -549,6 +552,8 @@ class _Connection(ws.Client):
                 conn_id, service_id = query[ws.DEVICE_ID][0], query[ws.SERVICE_ID][0]
                 self.service.transport._require_window()
                 options = ws._ws_connect_kwargs()
+                if self._injected_options is not None:
+                    options.update(self._injected_options)
                 http_check = getattr(self.service, "http_check", None)
                 if http_check:
                     options["create_connection"] = checked_websocket_connection(conn_url, http_check)
@@ -610,6 +615,10 @@ class _Connection(ws.Client):
                 origin = self._conn
                 msg = await origin.recv()
                 dispatch = self._frame_timing(origin)
+                if self._injected_options is not None:
+                    await self._handle_message(msg, dispatch)
+                    await asyncio.sleep(0)
+                    continue
                 task = asyncio.create_task(self._handle_message(msg, dispatch))
                 self.frames.add(task)
                 task.add_done_callback(self.frames.discard)
@@ -817,6 +826,7 @@ class FeishuService:
             Entrance(settings, window, self._state, self.transport, process, clock=clock)
             if process is not None else None
         )
+        self._machine_lease = ExitStack()
         self._client = _Connection(self)
 
     def _connected(self, origin) -> None:
@@ -1056,6 +1066,9 @@ class FeishuService:
         return self.window.end.timestamp() - self.clock()
 
     async def _serve(self) -> None:
+        from .handoff import machine_listener
+
+        self._machine_lease.enter_context(machine_listener())
         try:
             async with asyncio.timeout(self._remaining()):
                 delay = 0.25
@@ -1080,6 +1093,11 @@ class FeishuService:
                 raise
 
     async def _stop(self, *, finish_frames=False) -> None:
+        # 真实连接关闭前仍须排斥下一监听器（含收尾中的窗口服务）。
+        with self._machine_lease:
+            await self._stop_connection(finish_frames)
+
+    async def _stop_connection(self, finish_frames) -> None:
         if self._client.receiver is not None:
             self._client.receiver.cancel()
             await asyncio.gather(self._client.receiver, return_exceptions=True)

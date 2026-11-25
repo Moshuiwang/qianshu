@@ -71,3 +71,13 @@ def fork_process():
             if process.is_alive():
                 process.kill()
             process.join()
+
+
+@pytest.fixture(scope="session", autouse=True)
+def isolated_machine_lease(tmp_path_factory):
+    # 测试进程（含 fork 继承者）共享同一测试租约，不接触主机的运行文件。
+    from qianshu.feishu import handoff
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(handoff, "_MACHINE_LEASE", tmp_path_factory.mktemp("machine") / "listener.lock")
+        yield

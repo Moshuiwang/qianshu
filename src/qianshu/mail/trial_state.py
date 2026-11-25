@@ -15,6 +15,7 @@ from qianshu.feishu.handoff import _file
 
 from . import _fingerprint
 from .triage import BodyShape
+from .trial_diagnostics import CLOSE_FAILED, fault_writer
 
 
 FORMAT_VERSION = 1
@@ -102,7 +103,7 @@ def ledger_matches(db):
 
 
 class Store:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, before_failed_close=None, close_failed=None):
         self.path = path
         self._locked = False
         with self.gate():
@@ -123,7 +124,17 @@ class Store:
                     else:
                         self._ledger_valid()
             except BaseException:
-                self.db.close()
+                if before_failed_close is not None:
+                    before_failed_close()
+                try:
+                    self.db.close()
+                except Exception:
+                    if close_failed is None:
+                        writer = fault_writer(path)
+                        writer.post(CLOSE_FAILED)
+                        writer.finish()
+                    else:
+                        close_failed()
                 raise
 
     @contextmanager
@@ -207,13 +218,7 @@ class Store:
         with self.write() as db:
             db.execute("DELETE FROM scan_range WHERE scope=?", (scope,))
             uids = sorted(set(uids))
-            first = start
-            for uid in [*uids, next_uid]:
-                if first < uid:
-                    db.execute("INSERT INTO unknown_range VALUES(?,?,?,?,'unknown')",
-                               (scope, generation, first, uid - 1))
-                    self.notice(f"gap:{scope}:{generation}:{first}", scope, None, "gap", uid - first)
-                first = uid + 1
+            self._record_gaps(scope, generation, start, next_uid, uids)
             db.executemany("INSERT OR IGNORE INTO location(scope,generation,uid) VALUES(?,?,?)",
                            ((scope, generation, uid) for uid in uids))
             if not self.row("""SELECT 1 FROM mailbox WHERE scope=? AND generation=?
@@ -221,6 +226,15 @@ class Store:
                 raise Hold()
             db.execute("INSERT INTO observed_range VALUES(?,?,?)", (scope, generation, next_uid))
             self._advance(scope, generation)
+
+    def _record_gaps(self, scope, generation, start, next_uid, sorted_uids):
+        first = start
+        for uid in (*sorted_uids, next_uid):
+            if first < uid:
+                self.db.execute("INSERT INTO unknown_range VALUES(?,?,?,?,'unknown')",
+                                (scope, generation, first, uid - 1))
+                self.notice(f"gap:{scope}:{generation}:{first}", scope, None, "gap", uid - first)
+            first = uid + 1
 
     def _advance(self, scope, generation):
         if not self.row("SELECT 1 FROM location WHERE scope=? AND generation=? AND status='pending' LIMIT 1",
@@ -452,6 +466,14 @@ class Store:
                 if match is not None:
                     self.review_reused(match, matches[0]["status"], item)
                 observations.append((uid, item.key, item.digest, item.candidate, item.attachments, match))
+            if validity == box["validity"] and box["cursor"] is not None:
+                # 上次 SEARCH 已逐段落账，即使仍有待登记的 UID，该段也不应再次报缺。
+                observed = self.row("SELECT next_uid FROM observed_range WHERE scope=? AND generation=?",
+                                    scope, generation)
+                first = max(box["cursor"], observed[0]) if observed else box["cursor"]
+                if first < cursor:
+                    uids = sorted({row[0] for row in observations if first <= row[0] < cursor})
+                    self._record_gaps(scope, generation, first, cursor, uids)
             old = [tuple(r) for r in db.execute("""SELECT uid,msgkey,digest,candidate,attachments,matched
                 FROM reconciliation WHERE scope=? AND generation=? ORDER BY uid""", (scope, generation))]
             if (box["reason"] != "reconciling" or box["validity"] != validity or box["cursor"] != cursor

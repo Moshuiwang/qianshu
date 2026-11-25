@@ -1,5 +1,18 @@
 """运行飞书群处理服务，或通过同一门禁离线回放一条合成消息。"""
 
+# 监督线程在 setpriv/prlimit 后以隔离脚本模式 exec 同一入口。
+# 正常 python -m qianshu 有模块 spec，不进入此分支。
+if __name__ == "__main__" and __spec__ is None:
+    import sys
+    from pathlib import Path
+
+    if len(sys.argv) not in (4, 5):
+        raise SystemExit(1)
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from qianshu._approval_child import run
+
+    raise SystemExit(run())
+
 import argparse
 import asyncio
 import json
@@ -783,7 +796,12 @@ def main(argv: list[str] | None = None) -> int:
                 from .mail.trial import run_service
                 switches = trial_config(args.trial_switches)
                 if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
-                    run_service(args, settings, path, lambda: switches)
+                    fault_code = run_service(args, settings, path, lambda: switches)
+                    if fault_code:
+                        # 租约及转交库已释放。故障退出不能在 logging.shutdown 再次等处理器锁。
+                        if __name__ == "__main__":
+                            os._exit(fault_code)
+                        return fault_code
                     return 0
             with MentionLog.listening(path, settings) as store:
                 HandoffService(store).run()
