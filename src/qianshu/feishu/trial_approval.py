@@ -139,13 +139,15 @@ def recovery(db):
             SELECT 'manual_check' AS kind, registration, version, n.status
             FROM trial_notification n JOIN trial_card c USING(card) WHERE n.kind='result_manual' OR n.kind LIKE 'first_manual:%'"""))
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_order'").fetchone():
-        from .trial_order import name_fingerprint
+        from .trial_order import READONLY_CHECK, name_fingerprint
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'order' AS kind, registration, version, item, status FROM trial_order
             WHERE status IN ('sending','created','unknown','mismatch')"""))
-        rows.extend({"kind": "order_handoff", "registration": r[0], "version": r[1], "item": r[2],
-                     "name_fp": name_fingerprint(r[3]), "status": "open"} for r in db.execute("""
-            SELECT registration, version, item, name_key FROM trial_handoff WHERE cleared IS NULL"""))
+        # 「只读核对」类移交（同名已有机器人建单记录，G497）不作为可补建项列出，单列可查。
+        rows.extend({"kind": "order_readonly_check" if r[4] == READONLY_CHECK else "order_handoff",
+                     "registration": r[0], "version": r[1], "item": r[2], "name_fp": name_fingerprint(r[3]),
+                     "status": "readonly_check" if r[4] == READONLY_CHECK else "open"} for r in db.execute("""
+            SELECT registration, version, item, name_key, reason FROM trial_handoff WHERE cleared IS NULL"""))
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'order_slot' AS kind, registration, version, item, 'held' AS status FROM trial_order_slot"""))
         rows.extend(dict(row) for row in db.execute("""
@@ -229,6 +231,7 @@ class Journal:
         """
         from .trial_order import card_handoffs, record_handoff, robot_held
         handoffs = card_handoffs(snapshot)
+        held = set()
         with self.db:
             if render is not None:
                 if not self.db.in_transaction:
@@ -241,7 +244,7 @@ class Journal:
                              sha256(packed.encode()).hexdigest(), int(readonly), sent,
                              (int(sent) // 86400 + 2) * 86400, "preparing"))
             if handoffs:
-                record_handoff(self.db, card, handoffs, sent)
+                record_handoff(self.db, card, handoffs, sent, held=held)
 
     def bind(self, card, now):
         row = self.db.execute("SELECT * FROM trial_card WHERE card=?", (card,)).fetchone()

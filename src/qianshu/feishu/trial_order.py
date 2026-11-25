@@ -144,6 +144,8 @@ def card_handoffs(snapshot):
 
 # 出卡登记移交时同名政策已有机器人记录（复核 rv-2d4 P1）：卡面不给可执行的人工建单信号，移交照登、保持同名占位。
 ROBOT_HELD = "该政策已有机器人建单记录，只读核对，请勿重复建单"
+# 「只读核对」类移交的来源标记（G497）：未销清时记在 trial_handoff.reason；守望者销清时改写为销清原因。
+READONLY_CHECK = "readonly_check"
 
 
 def robot_held(db, key, card):
@@ -209,10 +211,12 @@ def _card_reg(db, card):
     return f"{reg} · 版本 {version}"
 
 
-def record_handoff(db, card, items, now):
+def record_handoff(db, card, items, now, *, held=()):
     """公告投递前登记人工移交（占用该政策名）。须守望者销清移交后机器人才允许再接管同一政策。
 
     同一「登记 × 版本 × 条目 × 政策名」已有未销清移交时不重复登记（投递未成、下一轮重投）。
+    held 内的条目（同名已有机器人建单记录，G497）标为「只读核对」类：未销清期间 reason 记 READONLY_CHECK，
+    同样占用政策名、机器人 0 发，但恢复清单不作为可补建项列出（单列 order_readonly_check，可查）。
     """
     reg, version = db.execute("SELECT registration,version FROM trial_card WHERE card=?", (card,)).fetchone()
     for item, key in items:
@@ -221,8 +225,9 @@ def record_handoff(db, card, items, now):
             continue
         target = db.execute("SELECT target FROM trial_order WHERE registration=? AND version=? AND item=?",
                             (reg, version, item)).fetchone()
-        db.execute("INSERT INTO trial_handoff VALUES(?,?,?,?,?,?,NULL,NULL)",
-                   (key, target[0] if target else None, reg, version, item, now))
+        db.execute("INSERT INTO trial_handoff VALUES(?,?,?,?,?,?,NULL,?)",
+                   (key, target[0] if target else None, reg, version, item, now,
+                    READONLY_CHECK if item in held else None))
 
 
 def release_handoff(db, reg, version, item, fingerprint, reason, now):

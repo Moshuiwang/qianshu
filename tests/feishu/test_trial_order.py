@@ -963,9 +963,18 @@ def face_lines(env, version):
     return lines, json.dumps(pages, ensure_ascii=False)
 
 
-def test_robot_sending_same_name_new_card_says_read_only(order):
-    """复核 rv-2d4 P1 复现：旧甲已领槽在途（sending）时出同名新卡、甲未拟建 → 新卡甲写「只读核对，请勿重复建单」，
-    移交照登（同名占位）；旧甲照常发出、回读完成，不重发；乙无机器人记录，照旧「已转人工」并挡住旧乙。"""
+def recovery_kinds(env):
+    """恢复清单里移交两类：可补建项（order_handoff）与只读核对（order_readonly_check），按 (版本, 条目) 列出。"""
+    rows = recovery_rows(env)
+    return {kind: [(r["version"], r["item"]) for r in rows if r["kind"] == kind]
+            for kind in ("order_handoff", "order_readonly_check")}
+
+
+@pytest.mark.parametrize("eligible", [(2,), ()], ids=["mixed", "none"])
+def test_robot_sending_same_name_new_card_says_read_only(order, eligible):
+    """复核 rv-2d4 P1 原样复现（G497）：旧甲已领槽在途（sending）时出同名新卡（甲缺字段未拟建；mixed 为乙拟建的混合卡，
+    none 为全不拟建）→ 新卡甲写「只读核对，请勿重复建单」、不写「已转人工」，不进恢复清单可补建项（单列只读核对、可查），
+    同名占位保留；旧甲照常发出并回读一致、不重发，新卡对甲 0 发。"""
     from qianshu.feishu.trial_order import ROBOT_HELD
     archived(order)  # 版本 1：甲乙都拟建、存档完成
     issued = []
@@ -973,34 +982,45 @@ def test_robot_sending_same_name_new_card_says_read_only(order):
     def new_card_while_sending(item):
         if item == 1 and not issued:
             assert query(order.path, "SELECT item,status FROM trial_order") == [(1, "sending")]
-            issued.append(reissue(order, 2))
+            issued.append(reissue(order, 2, eligible))
     order.mingdao.before_handoff = new_card_while_sending
-    assert order.orders().run_once() is True
+    assert order.orders().run_once() is True and issued
     lines, face = face_lines(order, 2)
     assert ROBOT_HELD in lines[1] and "已转人工" not in lines[1]
-    assert "已转人工" in lines[2] and ROBOT_HELD not in lines[2]
-    assert '"button"' not in face and query(order.path, "SELECT readonly FROM trial_card WHERE version=2") == [(1,)]
-    assert handoffs(order) == [(1, 2, 1, name_key(NAMES[0]), None, None), (1, 2, 2, name_key(NAMES[1]), None, None)]
-    assert order.mingdao.sent == [1]
-    assert query(order.path, "SELECT version,item,status FROM trial_order ORDER BY item") == [(1, 1, "verified")]
-    assert "须守望者销清移交" in notices(order)["order_cancel:2"]
-    assert occupied(order) == {NAMES[0]: (1, False), NAMES[1]: (1, False)}
+    assert ("已转人工" in lines[2]) is (not eligible)
+    assert query(order.path, "SELECT version,item,status FROM trial_order WHERE item=1") == [(1, 1, "verified")]
+    kinds = recovery_kinds(order)
+    assert kinds["order_readonly_check"] == [(2, 1)] and (2, 1) not in kinds["order_handoff"]
+    assert kinds["order_handoff"] == ([] if eligible else [(2, 2)])
+    assert occupied(order)[NAMES[0]] == (1, False)
+    if eligible:
+        assert order.mingdao.sent == [1, 2]  # 乙无同名移交，旧乙照常建成
+    else:
+        assert order.mingdao.sent == [1] and "须守望者销清移交" in notices(order)["order_cancel:2"]
+    sent_before = list(order.mingdao.sent)
     order.orders().run_once()
-    assert order.mingdao.sent == [1] and query(order.path, "SELECT count(*) FROM trial_order") == [(1,)]
+    assert order.mingdao.sent == sent_before and order.mingdao.sent.count(1) == 1
+    assert query(order.path, "SELECT count(*) FROM trial_order WHERE version=2") == [(0,)]
+    assert 1 not in json.loads(query(order.path, "SELECT snapshot FROM trial_card WHERE version=2")[0][0])["eligible"]
 
 
-def test_robot_verified_same_name_new_card_says_read_only(order):
-    """旧甲乙已建成并回读一致（verified）后出同名新卡、都未拟建 → 两条都写「只读核对，请勿重复建单」，移交照登，
-    机器人不重发。"""
+@pytest.mark.parametrize("eligible", [(2,), ()], ids=["mixed", "none"])
+def test_robot_verified_same_name_new_card_says_read_only(order, eligible):
+    """复核 rv-2d4 P1 原样复现之二（G497）：旧甲乙已建成并回读一致（verified）后出同名新卡、甲未拟建 → 甲写
+    「只读核对，请勿重复建单」，不进可补建项，同名占位保留；机器人不重发，新卡对甲 0 发。"""
     from qianshu.feishu.trial_order import ROBOT_HELD
     archived(order)
     assert order.orders().run_once() is True and order.mingdao.sent == [1, 2]
-    reissue(order, 2)
+    reissue(order, 2, eligible)
     lines, face = face_lines(order, 2)
-    assert all(ROBOT_HELD in lines[n] and "已转人工" not in lines[n] for n in (1, 2))
-    assert face.count(ROBOT_HELD) == 2 and '"button"' not in face
-    assert [r[:4] for r in handoffs(order)] == [(1, 2, 1, name_key(NAMES[0])), (1, 2, 2, name_key(NAMES[1]))]
+    assert ROBOT_HELD in lines[1] and "已转人工" not in lines[1]
+    if not eligible:
+        assert ROBOT_HELD in lines[2] and face.count(ROBOT_HELD) == 2 and '"button"' not in face
+    kinds = recovery_kinds(order)
+    assert kinds["order_handoff"] == [] and kinds["order_readonly_check"] == ([(2, 1)] if eligible else [(2, 1), (2, 2)])
+    assert occupied(order)[NAMES[0]] == (1, False)
     assert order.orders().run_once() is False and order.mingdao.sent == [1, 2]
+    assert query(order.path, "SELECT count(*) FROM trial_order WHERE version=2") == [(0,)]
 
 
 @pytest.mark.parametrize("status,held", [("created", True), ("unknown", True), ("mismatch", True), ("aborted", False)])
@@ -1016,6 +1036,9 @@ def test_card_time_hint_follows_notice_adjudication(order, status, held):
     assert (ROBOT_HELD in lines[1]) is held and ("已转人工" in lines[1]) is not held
     assert "已转人工" in lines[2]
     assert [r[:4] for r in handoffs(order)] == [(1, 2, 1, name_key(NAMES[0])), (1, 2, 2, name_key(NAMES[1]))]
+    kinds = recovery_kinds(order)
+    assert kinds["order_readonly_check"] == ([(2, 1)] if held else [])
+    assert kinds["order_handoff"] == ([] if held else [(2, 1)]) + [(2, 2)]
 
 
 # ---------------------------------------------------------------- 守望者子命令与零装配
