@@ -136,14 +136,25 @@ UNNAMED = ""
 
 def card_handoffs(snapshot):
     """出卡即登记人工移交的条目（特批第 3 轮第 1 条）：快照里未列为拟建（`eligible`）的条目逐条按归一政策名占用；
-    缺可信政策名的留空名键，只按「登记 × 版本 × 条目」登记。返回 [(条目, 名键)]，与 record_handoff 同格式。"""
+    缺可信政策名的留空名键，只按「登记 × 版本 × 条目」登记。返回 [(条目, 名键)]，与 record_handoff 同格式。
+
+    同卡同名条目（快照 `same_card`，G507）同样留空名键：政策名由本卡第 N 条（拟建）处理，若按名占用会把第 N 条
+    自己拦下；其移交由 Journal.prepare 标为只读核对类。"""
     eligible = set(snapshot.get("eligible") or [])
-    return [(item, name_key(_reviewed_name(snapshot, item)) or UNNAMED)
+    same = same_card_items(snapshot)
+    return [(item, UNNAMED if item in same else name_key(_reviewed_name(snapshot, item)) or UNNAMED)
             for item in snapshot.get("items") or [] if item not in eligible]
+
+
+def same_card_items(snapshot):
+    """出卡时按归一政策名判为与本卡前一拟建条目同名的条目（G507）。"""
+    return {pair[0] for pair in snapshot.get("same_card") or []}
 
 
 # 出卡登记移交时同名政策已有机器人记录（复核 rv-2d4 P1）：卡面不给可执行的人工建单信号，移交照登、保持同名占位。
 ROBOT_HELD = "该政策已有机器人建单记录，只读核对，请勿重复建单"
+# 同卡内同名（G507）：拟建条目第二条起的卡面文案，{} 为本卡先出现的同名条目号。
+SAME_CARD = "与本卡第 {} 条同名，只读核对"
 # 「只读核对」类移交的来源标记（G497）：未销清时记在 trial_handoff.reason；守望者销清时改写为销清原因。
 READONLY_CHECK = "readonly_check"
 

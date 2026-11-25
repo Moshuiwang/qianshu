@@ -134,9 +134,25 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         eligible = []
     if readonly:
         lines = [CardLine(line.label, "转人工") if line.text == "本次拟建" else line for line in lines]
+    # 同卡内同名去重（G507）：正文与附件可能把同一条政策各列一次。拟建条目按同一归一函数 name_key 去重，第二条起
+    # 改为只读核对、不进 eligible，卡面写「与本卡第 N 条同名，只读核对」；移交在 Journal.prepare 同一事务里登记为
+    # 只读核对类（card_handoffs 对这些条目留空名键、不占用政策名，免得把第 N 条自己拦下）。
+    from qianshu.feishu.trial_order import SAME_CARD, name_key
+    same, first = {}, {}
+    for n in eligible:
+        key = name_key(policies[n - 1].draft.policy_name.value)
+        if key and key in first:
+            same[n] = first[key]
+        elif key:
+            first[key] = n
+    if same:
+        eligible = [n for n in eligible if n not in same]
+        lines = [CardLine(line.label, SAME_CARD.format(same[int(line.label[3:])]))
+                 if line.label.startswith("条目 ") and int(line.label[3:]) in same else line for line in lines]
     # 未列为拟建的条目出卡即登记人工移交（Journal.prepare 同一事务），卡面逐条写明「已转人工」；同名政策已有机器人
     # 建单记录的（held，由 prepare 在登记移交的同一写事务里裁决）改写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
-    handed = {f"条目 {n}": n for n in items if n not in eligible}
+    # 同卡同名条目卡面已写定，不再套「已转人工」或「只读核对，请勿重复建单」。
+    handed = {f"条目 {n}": n for n in items if n not in eligible and n not in same}
 
     def readonly_summary(held):
         """只读卡末页按条目实际类别汇总（复核 rv-2d5 P2）：有只读核对条目时不写「整批转人工」，与逐条提示一致。
@@ -171,6 +187,7 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
 
     journal.prepare(card, reg, version, session, country, {
         "items": items, "eligible": eligible, "missing": missing, "contact": contact,
+        **({"same_card": [[n, same[n]] for n in sorted(same)]} if same else {}),
         "preview": preview.fingerprint if preview else None,
         "order_snapshot_sha256": sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
         "material": material, "drafts": [d.to_dict() for d in parsed],

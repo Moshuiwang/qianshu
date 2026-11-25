@@ -1503,3 +1503,44 @@ def test_readonly_card_hands_off_would_be_eligible_items_too(order, monkeypatch,
     lines, face = face_lines(order, 2)
     assert ROBOT_HELD in lines[1] and "已转人工" not in lines[1] and lines[2].endswith("已转人工")
     assert "本次拟建" not in face and '"button"' not in face
+
+
+# ---------------------------------------------------------------- 同卡内同名去重（守望者 G507）
+
+@pytest.mark.parametrize("names", [("合成政策甲", "合成政策甲"), ("合成政策（A）", "合成政策(A)")],
+                         ids=["exact", "width_only"])
+def test_same_name_twice_in_one_card_builds_first_only(order, monkeypatch, names):
+    """G507：同一封邮件正文与附件把同一条政策各列一次，两条都可拟建（完全同名 / 仅全半角不同）→ 出卡时按同一归一函数
+    去重：只有第 1 条进拟建；第 2 条卡面写「与本卡第 1 条同名，只读核对」，出卡同一事务里登记只读核对类移交（名键留空，
+    不占政策名、不拦第 1 条），恢复清单单列只读核对；同意、存档后机器人只建第 1 条，对第 2 条 0 发，再轮询也不发。"""
+    import qianshu.mail.trial_cards as cards
+    from qianshu.feishu.trial_order import READONLY_CHECK, SAME_CARD
+    real = cards.decision_pages
+
+    def same_policy_twice(trial, row, text, details, parsed, policies, full_review, setup, blocked):
+        for policy, name in zip(policies, names):
+            policy.draft.policy_name.value = name
+            policy.draft.benefit_type.value = "组合0"  # 两条都用已验证组合：去重前都可拟建
+        return real(trial, row, text, details, parsed, policies, full_review, setup, blocked)
+    monkeypatch.setattr(cards, "decision_pages", same_policy_twice)
+    assert name_key(names[0]) == name_key(names[1])
+    accept(order.path)
+    snapshot = json.loads(query(order.path, "SELECT snapshot FROM trial_card")[0][0])
+    assert snapshot["items"] == [1, 2] and snapshot["eligible"] == [1] and snapshot["same_card"] == [[2, 1]]
+    assert query(order.path, "SELECT readonly FROM trial_card") == [(0,)]
+    assert query(order.path, "SELECT registration,version,item,name_key,reason,cleared FROM trial_handoff") == [
+        (1, 1, 2, "", READONLY_CHECK, None)]
+    lines, face = face_lines(order, 1)
+    assert lines[1] == "本次拟建" and lines[2] == SAME_CARD.format(1) == "与本卡第 1 条同名，只读核对"
+    assert "已转人工" not in face and '"button"' in face
+    assert recovery_kinds(order) == {"order_handoff": [], "order_readonly_check": [(1, 2)]}
+    assert order.runner().run_once() is True  # 2c 存档
+    assert query(order.path, "SELECT item,status FROM trial_item_task ORDER BY item") == [(1, "archive_done")]
+    assert order.orders().run_once() is True
+    assert order.mingdao.sent == [1]
+    assert query(order.path, "SELECT version,item,status FROM trial_order") == [(1, 1, "verified")]
+    assert events(order, 2) == []
+    order.orders().run_once()
+    assert order.mingdao.sent == [1]
+    assert query(order.path, "SELECT registration,version,item,name_key,reason,cleared FROM trial_handoff") == [
+        (1, 1, 2, "", READONLY_CHECK, None)]

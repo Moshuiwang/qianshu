@@ -229,14 +229,15 @@ class Journal:
         render(held) 给出卡面（快照 `pages`）：held 为要移交、但同名政策已有机器人建单记录的条目（与公告投递同一裁决
         robot_held），在登记移交的同一写事务里裁决后再渲染，卡面写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
         """
-        from .trial_order import card_handoffs, record_handoff, robot_held
+        from .trial_order import card_handoffs, record_handoff, robot_held, same_card_items
         handoffs = card_handoffs(snapshot)
-        held = set()
+        # 同卡同名条目（G507）一律登记为只读核对类移交。
+        held = same_card_items(snapshot)
         with self.db:
             if render is not None:
                 if not self.db.in_transaction:
                     self.db.execute("BEGIN IMMEDIATE")
-                held = {item for item, key in handoffs if robot_held(self.db, key, card)}
+                held |= {item for item, key in handoffs if robot_held(self.db, key, card)}
                 snapshot = dict(snapshot, pages=render(held))
             packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
             self.db.execute("""INSERT INTO trial_card VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
