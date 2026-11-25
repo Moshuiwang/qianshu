@@ -1041,6 +1041,53 @@ def test_card_time_hint_follows_notice_adjudication(order, status, held):
     assert kinds["order_handoff"] == ([] if held else [(2, 1)]) + [(2, 2)]
 
 
+def final_summary(env, version):
+    """只读卡末页「本批处理」一行的文案。"""
+    pages = json.loads(query(env.path, "SELECT snapshot FROM trial_card WHERE version=?", version)[0][0])["pages"]
+    contents = [e["text"]["content"] for e in pages[-1]["elements"] if e.get("tag") == "div"]
+    return [c.split("\n", 1)[1] for c in contents if c.startswith("本批处理\n")]
+
+
+@pytest.mark.parametrize("kind", ["plain", "mixed", "all_held", "supplement"])
+def test_readonly_card_final_page_summarizes_by_item_kind(order, monkeypatch, kind):
+    """复核 rv-2d5 P2：只读卡末页按条目实际类别汇总，与逐条提示一致——有「只读核对」条目时不写「整批转人工」；
+    缺字段待补充的条目按 G496 定稿前暂用口径「已转人工，补充后由守望者核对解除」。逐条文案不变。"""
+    from qianshu.draft import Uncertainty
+    from qianshu.feishu.trial_order import ROBOT_HELD
+    import qianshu.mail.trial_cards as cards
+    archived(order)
+    if kind == "all_held":
+        assert order.orders().run_once() is True and order.mingdao.sent == [1, 2]
+    elif kind == "mixed":
+        with journal_at(order.path) as j, j.db:
+            j.db.execute("""INSERT INTO trial_order(registration,version,item,card,status,name_key,target,sent)
+                         VALUES(1,9,1,'other-card','verified',?,'sheet',0)""", (name_key(NAMES[0]),))
+    elif kind == "supplement":
+        real = cards.decision_pages
+
+        def missing_field(trial, row, text, details, parsed, policies, *rest):
+            policies[0].draft.benefit_type.value = "组合0"
+            policies[0].draft.gift_days.uncertainty = Uncertainty(reason="合成：赠送天数待申请人补充")
+            return real(trial, row, text, details, parsed, policies, *rest)
+        monkeypatch.setattr(cards, "decision_pages", missing_field)
+    reissue(order, 2)
+    assert query(order.path, "SELECT readonly FROM trial_card WHERE version=2") == [(1,)]
+    lines, face = face_lines(order, 2)
+    expected = {
+        "plain": "整批转人工：2 条已转人工",
+        "mixed": "1 条已转人工；1 条只读核对，请勿重复建单",
+        "all_held": "2 条只读核对，请勿重复建单",
+        "supplement": "整批转人工：1 条已转人工；1 条已转人工，补充后由守望者核对解除",
+    }[kind]
+    assert final_summary(order, 2) == [expected]
+    held = {"plain": set(), "mixed": {1}, "all_held": {1, 2}, "supplement": set()}[kind]
+    assert {n for n in (1, 2) if ROBOT_HELD in lines[n]} == held
+    assert all(("已转人工" in lines[n]) is (n not in held) for n in (1, 2))
+    if kind == "supplement":
+        assert lines[1] == "待人工核对字段，已转人工"
+    assert ("整批转人工" in face) is not held
+
+
 # ---------------------------------------------------------------- 守望者子命令与零装配
 
 def test_guardian_halt_command_reads_back_and_requires_reason(order, capsys):

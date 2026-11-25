@@ -84,7 +84,7 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
     journal = Journal(trial.store.db)
     journal.initialize()
     session = journal.session()
-    lines, eligible, missing = [], [], []
+    lines, eligible, missing, supplement = [], [], [], set()
     items = list(range(1, len(policies) + 1))
     if not domestic:
         lines.append(CardLine("核对卡", "本国未开建单，仅供核对"))
@@ -104,6 +104,8 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
                 reason = "超出试运行建单范围，转人工"
             elif not policy.validation or fields or not policy.approval_url_deferred:
                 reason = "待人工核对字段"
+                if fields:
+                    supplement.add(n)
             elif not domestic or blocked or full_review:
                 reason = "转人工"
             else:
@@ -136,12 +138,24 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
     # 建单记录的（held，由 prepare 在登记移交的同一写事务里裁决）改写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
     handed = {f"条目 {n}": n for n in items if n not in eligible}
 
+    def readonly_summary(held):
+        """只读卡末页按条目实际类别汇总（复核 rv-2d5 P2）：有只读核对条目时不写「整批转人工」，与逐条提示一致。
+        补充类（缺字段待申请人补充）文案按 G496 定稿前的暂用口径。"""
+        plain = sum(n not in held and n not in supplement for n in items)
+        supplied = sum(n not in held and n in supplement for n in items)
+        checked = sum(n in held for n in items)
+        parts = ([f"{plain} 条已转人工"] if plain else []) + (
+            [f"{supplied} 条已转人工，补充后由守望者核对解除"] if supplied else []) + (
+            [f"{checked} 条只读核对，请勿重复建单"] if checked else [])
+        text = "；".join(parts)
+        return text if checked else "整批转人工" + ("：" + text if text else "")
+
     def render(held):
         shown = [CardLine(line.label, handed_text(line.text, handed[line.label] in held))
                  if line.label in handed else line for line in lines]
         details.extend(result_card(page) for page in detail_pages("试运行邮件", shown))
         final = result_card(detail_pages("试运行邮件", [CardLine("本批处理",
-            "整批转人工" if readonly else "请在已发送中核对关联申请及本次无条件同意回复，再核验并决定。")])[0])
+            readonly_summary(held) if readonly else "请在已发送中核对关联申请及本次无条件同意回复，再核验并决定。")])[0])
         if not readonly:
             binding = dict(card=card, registration=reg, version=version, format=CARD_FORMAT)
             buttons = [{"tag": "button", "name": action, "action_type": "form_submit",
