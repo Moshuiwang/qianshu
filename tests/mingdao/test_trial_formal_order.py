@@ -66,7 +66,11 @@ def test_formal_order_with_web_rules_builds_and_reads_back_every_field(case, pla
                 case.values["end_date"], case.values["end_date"], "12", "30", "31", "1", '["none"]',
                 "合成提示", "[]", "1", ""]
     assert [cells[rule["control"]] for rule in rules.values()] == expected
-    assert plan.displayed == plan.written and list(plan.written) == plan.request_fields
+    assert plan.displayed == plan.written
+    # 应回读字段覆盖全部已写控件（含 readback_skip）；指纹仍只取 readback_skip 以外的控件。
+    skipped = [case.config["fields"][c]["label"] for c in case.config["readback_skip"]
+               if c in {cell["controlId"] for cell in plan.extra["controls"]}]
+    assert [f for f in plan.request_fields if f not in skipped] == list(plan.written) and skipped
     assert plan.extra["approved"] is not None
     arm(case, platform)
     handed = []
@@ -141,6 +145,23 @@ def test_readback_compares_approved_business_values(case, platform, business_cli
     record_id = mingdao.send(plan, lambda: None)
     verdict, checks = mingdao.readback(plan, record_id, 30)
     assert verdict == "写错" and [c["字段名"] for c in checks if c["结果"] != "一致"] == ["标签与适用条件关系"]
+
+
+@pytest.mark.parametrize("which", ["skipped", "regular"])
+def test_readback_missing_written_field_is_mismatch(case, platform, business_cli, web_order, which):
+    """修复轮 2 第 4 条：回读缺 1 个已写字段（readback_skip 中的或普通的）→ 采用 X5 compare 逐项结果，判「写错」（不一致），
+    不得汇总成「一致」；应回读字段与逐项结果一一对应。"""
+    rules, _, _ = web_order
+    mingdao = backend(case)
+    plan = mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    control = case.config["readback_skip"][0] if which == "skipped" else rules["文本"]["control"]
+    assert control in {c["controlId"] for c in plan.extra["controls"]}
+    case.readback_change = lambda row: row.pop(control)
+    arm(case, platform)
+    record_id = mingdao.send(plan, lambda: None)
+    verdict, checks = mingdao.readback(plan, record_id, 30)
+    assert verdict == "写错" and [c["字段名"] for c in checks] == plan.request_fields
+    assert [c["字段名"] for c in checks if c["结果"] != "一致"] == [case.config["fields"][control]["label"]]
 
 
 def test_formal_authorization_bound_by_config_digest(case, platform, business_cli, web_order):

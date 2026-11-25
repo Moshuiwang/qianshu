@@ -888,7 +888,9 @@ class MingdaoBackend:
                        for c in O.decode(payload)["receiveControls"] if c["controlId"] not in self.skip}
         fingerprints = self.displayed(shown, controls, inactive)
         require(fingerprints == sent_values, "经卡片确认的取值与请求不一致，需重新审批")
-        return Plan(values["policy_name"], self.target, list(sent_values), fingerprints, sent_values, payload,
+        # 应回读的字段 = 全部已写控件（含 readback_skip：写入值均须回读，CREATE_ORDER.md）。
+        written = list(dict.fromkeys(labels[c["controlId"]] for c in O.decode(payload)["receiveControls"]))
+        return Plan(values["policy_name"], self.target, written, fingerprints, sent_values, payload,
                     {"controls": controls, "packages": values["packages"], "company": values["company"],
                      "config": config, "approved": approved, "tags": values["user_tags"], "selected": selected,
                      "tag_version": tag_version})
@@ -951,15 +953,24 @@ class MingdaoBackend:
                                   read_relations=lambda key: api.relations(record_id, key),
                                   packages=extra["packages"], company=extra["company"], tag_names=tag_names,
                                   approved=extra["approved"])
-        rows = [r for c, r in zip(extra["controls"], report["逐项核对"]) if c["controlId"] not in self.skip]
-        results = [r["结果"] for r in rows]
-        if report["结论"] == "写错" or any(r in ("不一致", "缺失") for r in results):
-            verdict = "写错"
-        elif all(r == "一致" for r in results):
-            verdict = "一致"
-        else:
-            return None, []
-        return verdict, [{"字段名": r["字段名"], "结果": "一致" if r["结果"] == "一致" else "不一致"} for r in rows]
+        return readback_verdict(report)
+
+
+def readback_verdict(report):
+    """正式单回读结论直接采用 X5 `compare` 的逐项结果与结论，覆盖全部已写控件（含 readback_skip），不自行放宽。
+
+    任一已写字段回读缺失或不一致 → 「写错」（守望者 12:0xZ：走写错即停——停写位、后续 0 发、告警）；
+    `compare` 判「一致」且逐项全一致才为「一致」；其余（含「无法核对」）→ 无结论，按结果未知冻结、停住下一条。
+    """
+    rows = report["逐项核对"]
+    results = [r["结果"] for r in rows]
+    if report["结论"] == "写错" or any(r in ("不一致", "缺失") for r in results):
+        verdict = "写错"
+    elif report["结论"] == "一致" and all(r == "一致" for r in results):
+        verdict = "一致"
+    else:
+        return None, []
+    return verdict, [{"字段名": r["字段名"], "结果": "一致" if r["结果"] == "一致" else "不一致"} for r in rows]
 
 
 AUTHORIZATIONS_FILE = "create-authorizations.json"

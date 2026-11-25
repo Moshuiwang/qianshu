@@ -293,6 +293,33 @@ def test_first_readback_mismatch_halts_all_writes_and_alerts(order):
     assert all('<at user_id=\\"ou_config\\">' in t for t in sent(transport))
 
 
+def test_readback_missing_written_field_halts_like_mismatch(order):
+    """修复轮 2 第 4 条（守望者 12:0xZ）：回读缺 1 个已写字段 → 判不一致（不是未确认）、同一事务置停写位、
+    下一条 0 发、告警 @ 配置负责人。回读结论用正式路径同一函数 readback_verdict 从 X5 compare 形状的报告得出。"""
+    from qianshu.feishu.trial_order import readback_verdict
+
+    def readback(plan, record_id, budget):
+        order.mingdao.reads.append(record_id)
+        # X5 compare 对缺失控件给「缺失」，整份结论为「未确认」。
+        return readback_verdict({"结论": "未确认", "逐项核对": [
+            {"字段名": "政策名称", "结果": "一致"}, {"字段名": "任务审批链接", "结果": "缺失"}]})
+    archived(order)
+    order.mingdao.readback = readback
+    order.orders().run_once()
+    assert order.mingdao.sent == [1]  # 下一条 0 发
+    assert query(order.path, "SELECT item,status FROM trial_order") == [(1, "mismatch")]
+    with journal_at(order.path) as j:
+        assert j.write_halted() and j.halt_state()["halt_reason"] == "readback_mismatch"
+    compared = [r for r in ledger(order) if r["event"] == "readback_compared"]
+    assert compared[0]["结论"] == "写错" and compared[0]["counts"] == {"一致": 1, "不一致": 1}
+    texts = notices(order)
+    assert texts["order_mismatch"].endswith(ORDER_NOTICES["mismatch"]) and "建单已停写" in texts["order_cancel:2"]
+    listener, transport = deliver(order)
+    listener.maintain()
+    alerts = [t for t in sent(transport) if ORDER_NOTICES["mismatch"] in t]
+    assert alerts and all('<at user_id=\\"ou_config\\">' in t for t in alerts)
+
+
 @pytest.mark.parametrize("effect", [TimeoutError, ConnectionResetError, "bad_record_id"])
 def test_unknown_send_result_freezes_without_resend(order, effect):
     archived(order)
