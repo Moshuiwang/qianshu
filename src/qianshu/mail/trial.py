@@ -99,11 +99,12 @@ class Trial:
             return
         box = self.box()
         if (box["state"] == "frozen" and box["reason"] == "reconciling"
-                and (validity, next_uid) == (box["validity"], box["cursor"])):
+                and (validity, next_uid) == (box["validity"], box["cursor"])
+                and not self.store.rebuild_incomplete(self.scope, validity, box["generation"])):
             self.flush()
             return
         if validity == box["validity"] and next_uid >= box["peak"]:
-            if box["reason"] == "legacy":
+            if box["reason"] == "legacy" and not self.store.pending(self.scope, box["generation"]):
                 self.flush()
                 return
             if box["state"] == "active" and self.store.row("SELECT 1 FROM legacy WHERE status='pending' LIMIT 1"):
@@ -517,6 +518,7 @@ def run_service(args, settings, path, switches):
     def send(content, request_id, card, check):
         _send_trial_message(service.transport, content, request_id, card, check)
 
+    listener_error = None
     interrupted = False
 
     def record_interrupt(signum, frame):
@@ -546,6 +548,8 @@ def run_service(args, settings, path, switches):
             try:
                 if not interrupted:
                     service.run()
+            except Exception as exc:
+                listener_error = exc
             finally:
                 stop.set()
                 # 仍须等本次收信操作停下；只有关闭数据库这一步有等待上限。
@@ -563,3 +567,5 @@ def run_service(args, settings, path, switches):
             signal.raise_signal(signal.SIGINT)
     if close_fault.is_set() or logs.thread.is_alive():
         return 130 if interrupted else 1
+    if listener_error is not None:
+        raise listener_error

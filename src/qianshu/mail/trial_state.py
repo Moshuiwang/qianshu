@@ -146,10 +146,10 @@ class Store:
     def row(self, sql, *args):
         return self.db.execute(sql, args).fetchone()
 
-    def notice(self, event, scope, reg, kind, quantity=1):
+    def notice(self, event, scope, reg, kind, quantity=1, *, generation=None):
         self.db.execute("""INSERT OR IGNORE INTO notice VALUES(?,?,?,?,'pending',?,?,?,
-            (SELECT generation FROM mailbox WHERE scope=?))""",
-                        (event, scope, reg, kind, str(uuid4()), now(), quantity, scope))
+            coalesce(?,(SELECT generation FROM mailbox WHERE scope=?)))""",
+                        (event, scope, reg, kind, str(uuid4()), now(), quantity, generation, scope))
 
     def review_stale_notices(self, scope):
         self.db.execute("""UPDATE notice SET status='review' WHERE scope=? AND kind='body_missed'
@@ -214,13 +214,57 @@ class Store:
             self._advance(scope, generation)
 
     def _record_gaps(self, scope, generation, start, next_uid, sorted_uids):
-        first = start
-        for uid in (*sorted_uids, next_uid):
-            if first < uid:
-                self.db.execute("INSERT INTO unknown_range VALUES(?,?,?,?,'unknown')",
-                                (scope, generation, first, uid - 1))
-                self.notice(f"gap:{scope}:{generation}:{first}", scope, None, "gap", uid - first)
-            first = uid + 1
+        for first, last in self._missing_ranges([(start, next_uid - 1)], [(u, u) for u in sorted_uids]):
+            self._record_gap(scope, generation, first, last)
+
+    @staticmethod
+    def _missing_ranges(required, covered):
+        """两个闭区间集合的差集，不按 UID 跨度展开。"""
+        coverage = iter(sorted(covered))
+        interval = next(coverage, None)
+        through = 0
+        for start, end in sorted(required):
+            start = max(start, through + 1)
+            through = max(through, end)
+            while start <= end and interval and interval[0] <= end:
+                if start < interval[0]:
+                    yield start, interval[0] - 1
+                start = max(start, interval[1] + 1)
+                if interval[1] <= end:
+                    interval = next(coverage, None)
+            if start <= end:
+                yield start, end
+
+    def _record_gap(self, scope, generation, first, last):
+        self.db.execute("INSERT INTO unknown_range VALUES(?,?,?,?,'unknown')",
+                        (scope, generation, first, last))
+        self.notice(f"gap:{scope}:{generation}:{first}", scope, None, "gap", last - first + 1, generation=generation)
+
+    def _rebuild_gaps(self, scope, validity, generation, search_range=()):
+        # UID 只在同一邮箱及 UIDVALIDITY 下可比较；包括升级前已被替换的未确认快照。
+        def positions(query, *extra):
+            return [(r[0], r[0]) for r in self.db.execute(query, (scope, validity, *extra))]
+
+        required = positions("""SELECT uid FROM location JOIN snapshot USING(scope,generation)
+            WHERE scope=? AND validity=? AND status='pending'""")
+        required += positions("""SELECT uid FROM reconciliation JOIN snapshot USING(scope,generation)
+            WHERE scope=? AND validity=?""")
+        covered = positions("""SELECT uid FROM location JOIN snapshot USING(scope,generation)
+            WHERE scope=? AND validity=? AND registration IS NOT NULL""")
+        covered += positions("""SELECT uid FROM reconciliation JOIN snapshot USING(scope,generation)
+            WHERE scope=? AND validity=? AND generation=?""", generation)
+        for first, last, quantity in self.db.execute("""
+                SELECT g.first,g.last,n.quantity FROM unknown_range g JOIN snapshot USING(scope,generation)
+                LEFT JOIN notice n ON n.event=('gap:' || g.scope || ':' || g.generation || ':' || g.first)
+                    AND n.scope=g.scope AND n.kind='gap'
+                WHERE g.scope=? AND validity=?""", (scope, validity)):
+            if quantity != last - first + 1:
+                raise Hold()
+            covered.append((first, last))
+        return self._missing_ranges([*required, *search_range], covered)
+
+    def rebuild_incomplete(self, scope, validity, generation):
+        return any(self._rebuild_gaps(scope, validity, generation))
 
     def _advance(self, scope, generation):
         if not self.row("SELECT 1 FROM location WHERE scope=? AND generation=? AND status='pending' LIMIT 1",
@@ -461,14 +505,6 @@ class Store:
                 if match is not None:
                     self.review_reused(match, matches[0]["status"], item)
                 observations.append((uid, item.key, item.digest, item.candidate, item.attachments, match))
-            if validity == box["validity"] and box["cursor"] is not None:
-                # 上次 SEARCH 已逐段落账，即使仍有待登记的 UID，该段也不应再次报缺。
-                observed = self.row("SELECT next_uid FROM observed_range WHERE scope=? AND generation=?",
-                                    scope, generation)
-                first = max(box["cursor"], observed[0]) if observed else box["cursor"]
-                if first < cursor:
-                    uids = sorted({row[0] for row in observations if first <= row[0] < cursor})
-                    self._record_gaps(scope, generation, first, cursor, uids)
             old = [tuple(r) for r in db.execute("""SELECT uid,msgkey,digest,candidate,attachments,matched
                 FROM reconciliation WHERE scope=? AND generation=? ORDER BY uid""", (scope, generation))]
             if (box["reason"] != "reconciling" or box["validity"] != validity or box["cursor"] != cursor
@@ -478,6 +514,11 @@ class Store:
                 db.executemany("""INSERT INTO reconciliation(scope,generation,uid,msgkey,digest,candidate,attachments,matched)
                     VALUES(?,?,?,?,?,?,?,?)""",
                                ((scope, generation, *data) for data in observations))
+            search_range = []
+            if validity == box["validity"] and box["cursor"] is not None:
+                search_range.append((box["cursor"], cursor - 1))
+            for first, last in self._rebuild_gaps(scope, validity, generation, search_range):
+                self._record_gap(scope, generation, first, last)
             db.execute("""UPDATE mailbox SET generation=?,validity=?,cursor=?,peak=?,reason='reconciling'
                 WHERE scope=?""", (generation, validity, cursor, cursor, scope))
             self.review_stale_notices(scope)
@@ -485,6 +526,8 @@ class Store:
     def reconcile(self, scope, generation, validity, cursor):
         with self.write() as db:
             box = self.row("SELECT reason FROM mailbox WHERE scope=?", scope)
+            if self.rebuild_incomplete(scope, validity, generation):
+                raise Hold()
             if self.uncovered(scope) or self.row("""SELECT 1 FROM reconciliation WHERE scope=? AND generation=?
                     AND (digest IS NULL OR candidate IS NULL) LIMIT 1""", scope, generation):
                 raise Hold()

@@ -5,8 +5,8 @@ import logging
 import os
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from queue import Full, Queue
-from threading import Event, Thread, current_thread
+from queue import Empty, Full, Queue
+from threading import Event, Lock, Thread, current_thread
 
 from qianshu.feishu.handoff import _file
 
@@ -20,14 +20,19 @@ class Writer:
         self.write = write
         self.pending = Queue(maxsize=64)
         self.stopping = Event()
+        self.lock = Lock()
         self.dropped = 0
         self.thread = Thread(target=self._run, name=name, daemon=True)
         self.thread.start()
 
     def post(self, value):
-        try:
-            self.pending.put_nowait(value)
-        except Full:
+        with self.lock:
+            if not self.stopping.is_set():
+                try:
+                    self.pending.put_nowait(value)
+                    return
+                except Full:
+                    pass
             self.dropped += 1
 
     def _run(self):
@@ -37,16 +42,29 @@ class Writer:
                 try:
                     self.write(value)
                 except Exception:
-                    self.dropped += 1
+                    with self.lock:
+                        self.dropped += 1
 
     def finish(self):
-        self.stopping.set()
+        with self.lock:
+            self.stopping.set()
         # 唤醒空队列；队列已满时写者本就有工作。
         try:
             self.pending.put_nowait(None)
         except Full:
             pass
         self.thread.join(0.1)
+        if self.thread.is_alive():
+            with self.lock:
+                while True:
+                    try:
+                        value = self.pending.get_nowait()
+                    except Empty:
+                        break
+                    if value is not None:
+                        self.dropped += 1
+                # 写者可能刚检查完队列，正进入 get()。
+                self.pending.put_nowait(None)
 
 
 def fault_writer(path):
