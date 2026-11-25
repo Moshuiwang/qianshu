@@ -88,6 +88,20 @@ CREATE TABLE ledger_check(id INTEGER PRIMARY KEY CHECK(id=1), digest TEXT NOT NU
 """
 
 
+def ledger_digest(db):
+    digest = hashlib.sha256()
+    for table in ("budget", "charge"):
+        digest.update(table.encode())
+        for row in db.execute(f"SELECT * FROM {table} ORDER BY id"):
+            digest.update(json.dumps(tuple(row), separators=(",", ":")).encode())
+    return digest.hexdigest()
+
+
+def ledger_matches(db):
+    seal = db.execute("SELECT digest FROM ledger_check WHERE id=1").fetchone()
+    return bool(seal and seal[0] == ledger_digest(db))
+
+
 class Store:
     def __init__(self, path: Path, *, before_failed_close=None, close_failed=None):
         self.path = path
@@ -319,21 +333,12 @@ class Store:
         from qianshu.feishu.state import trial_batch
         return trial_batch(self.db, reg, version)
 
-    def _ledger_digest(self):
-        digest = hashlib.sha256()
-        for table in ("budget", "charge"):
-            digest.update(table.encode())
-            for row in self.db.execute(f"SELECT * FROM {table} ORDER BY id"):
-                digest.update(json.dumps(tuple(row), separators=(",", ":")).encode())
-        return digest.hexdigest()
-
     def _seal_ledger(self):
-        self.db.execute("INSERT OR REPLACE INTO ledger_check VALUES(1,?)", (self._ledger_digest(),))
+        self.db.execute("INSERT OR REPLACE INTO ledger_check VALUES(1,?)", (ledger_digest(self.db),))
 
     def _ledger_valid(self):
         try:
-            seal = self.row("SELECT digest FROM ledger_check WHERE id=1")
-            if seal and seal[0] == self._ledger_digest():
+            if ledger_matches(self.db):
                 return True
         except (sqlite3.DatabaseError, TypeError):
             pass
