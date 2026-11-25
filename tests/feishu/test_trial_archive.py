@@ -194,7 +194,7 @@ def test_unregistered_purpose_never_publishes(env):
     env.switches.pop("MAIL_TRIAL_ARCHIVE_PURPOSE")
     assert env.runner().run_once() is False and env.fake.writes == []
     kind, body = query(env.path, "SELECT kind,body FROM trial_notification")[0]
-    assert kind == "archive_failed" and body.endswith("本批存档发布确认未登记，未建单，已转人工。")
+    assert kind == "archive_failed" and body.endswith("本批存档发布确认未登记，未建单。")
 
 
 def test_purpose_x8a_is_refused_for_ordinary_application_before_any_write(env):
@@ -249,7 +249,7 @@ def test_failure_stops_whole_batch_with_fixed_notice(env):
     assert query(env.path, "SELECT status FROM trial_item_task") == [("closed",)]
     assert query(env.path, "SELECT status FROM trial_card") == [("closed",)]
     assert query(env.path, "SELECT kind,body FROM trial_notification") == [
-        ("archive_failed", "登记 1 · 版本 1 · 本批存档失败，未建单，已转人工。")]
+        ("archive_failed", "登记 1 · 版本 1 · 本批存档失败，未建单。")]
     assert not query(env.path, "SELECT url FROM trial_archive WHERE url IS NOT NULL")
 
 
@@ -459,6 +459,24 @@ def deliver(env, switches=SW):
 
 def sent(transport):
     return [c.args[0].request_body.content for c in transport.im.message.acreate.await_args_list]
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["current", "already-queued"])
+def test_archive_failure_group_message_has_one_handoff(env, legacy):
+    from qianshu.feishu.trial_order import MANUAL
+
+    accept(env.path)
+    env.fake.reject = "share"
+    assert env.runner().run_once()
+    if legacy:
+        with journal_at(env.path) as j, j.db:
+            j.db.execute("""UPDATE trial_notification SET body=?
+                            WHERE kind='archive_failed'""", ("登记 1 · 版本 1 · 本批存档失败，未建单，已转人工。",))
+    listener, transport = deliver(env)
+    listener.maintain()
+    message, = [json.loads(content)["text"] for content in sent(transport)]
+    assert "本批存档失败，未建单。" in message and message.endswith(MANUAL)
+    assert message.count("已转人工") == 1
 
 
 def test_notices_mention_configurator_and_card_is_rewritten(env):
