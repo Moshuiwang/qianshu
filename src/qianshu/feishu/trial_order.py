@@ -984,6 +984,8 @@ def readback_verdict(report):
 
 
 AUTHORIZATIONS_FILE = "create-authorizations.json"
+# 非网页正式路径收窄（特批第 3 轮第 2 条）：不含网页公式字段规则的正式单配置不装配建单执行器，日志写明原因。
+NO_WEB_RULES = "正式单建单配置不含网页公式字段规则（order_snapshot.web_rules），建单执行器不装配，建单 0。"
 # 050 网页字段路径须在正式单授权登记里登记的项（见 CREATE_ORDER.md「050 的字段、授权与回读」）。
 WEB_EVIDENCE = ("web_rules_sha256", "tag_scope", "concurrent_scope", "tariffs_scope", "products_scope", "plans_scope",
                 "company_rows_scope", "create_endpoint")
@@ -1007,7 +1009,8 @@ def formal_authorization(path, config_data):
 
 def build_order_runner(args, settings, state, *, switches, connected, sensitive, archive_runner, switch_file=None):
     """未确认配置下不装配：存档执行器已装配、建单开关开、明道云配置与凭据来源、登录态均已就绪；
-    配置含 050 网页字段或标签全表核验时，另须有按配置摘要绑定的正式单授权登记，且公式授权指纹相符。"""
+    正式单建单配置须含 050 网页公式字段规则（`order_snapshot.web_rules`，特批第 3 轮第 2 条：非网页正式路径不装配），
+    另须有按配置摘要绑定的正式单授权登记，且公式授权指纹相符。X5 命令行不经此处，行为不变。"""
     if archive_runner is None:
         return None
     try:
@@ -1023,6 +1026,9 @@ def build_order_runner(args, settings, state, *, switches, connected, sensitive,
         if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("verified_combinations"), list)
                 or not all(k in config for k in ("create", "official", "template", "fields", "fixed",
                                                   "readback_skip", "applicant_control"))):
+            return None
+        if "web_rules" not in snapshot:
+            _LOG.warning(NO_WEB_RULES)
             return None
         credentials = dict(settings.trial_credentials)
         official = config["official"]

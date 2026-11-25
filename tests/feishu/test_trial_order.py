@@ -960,7 +960,10 @@ def test_guardian_help_states_owner_consent():
     assert "此命令只在产品负责人当场明确同意时由守望者执行" in text.getvalue().replace("\n", "").replace(" ", "")
 
 
-def test_zero_assembly_without_confirmed_configuration(tmp_path):
+def assembly_inputs(tmp_path, *, web_rules=True):
+    """最小正式单建单配置与同目录正式单授权登记（按配置字节摘要绑定）；web_rules 为假时配置不含网页公式字段规则。"""
+    from qianshu.feishu.trial_order import AUTHORIZATIONS_FILE, WEB_EVIDENCE
+    from qianshu.mingdao.create_order import compact, digest
     login = tmp_path / "login"
     login.mkdir(mode=0o700)
     (login / "mingdao-state.json").write_text(json.dumps({"cookies": [{
@@ -969,15 +972,25 @@ def test_zero_assembly_without_confirmed_configuration(tmp_path):
     config = {"create": {"identifiers": {"worksheetId": "sheet"}, "session_cookie": "session"},
               "official": {"token_key": "TOKEN_KEY", "app_id_key": "APP_KEY"}, "template": {}, "fields": {},
               "fixed": {}, "readback_skip": [], "applicant_control": "c",
-              "order_snapshot": {"verified_combinations": []}}
+              "order_snapshot": {"verified_combinations": [], **({"web_rules": {}} if web_rules else {})}}
     path = login / "mingdao.json"
     path.write_text(json.dumps(config))
     path.chmod(0o600)
+    entry = {**{key: {} for key in WEB_EVIDENCE}, "is_test": False, "config_sha256": digest(path.read_bytes()),
+             "web_rules_sha256": digest(compact({}).encode())}
+    (login / AUTHORIZATIONS_FILE).write_text(json.dumps({"formal": entry}))
+    (login / AUTHORIZATIONS_FILE).chmod(0o600)
     good = dict(args=SimpleNamespace(mingdao_config=path),
                 settings=SimpleNamespace(trial_credentials_complete=True, trial_login_dir=login,
                                          trial_credentials=(("TOKEN_KEY", "t"), ("APP_KEY", "a"))),
                 state=tmp_path / "trial-050.sqlite3", switches=lambda: dict(SW), connected=lambda: True,
                 sensitive=(), archive_runner=object())
+    return good, path, config, login
+
+
+def test_zero_assembly_without_confirmed_configuration(tmp_path):
+    # 特批第 3 轮第 2 条：正式单配置须含 web_rules 才装配，「可装配」基线改用含 web_rules 的配置与正式单授权登记。
+    good, path, config, login = assembly_inputs(tmp_path)
     assert isinstance(build_order_runner(**good), OrderRunner)
     variants = {
         "no_archive_runner": dict(archive_runner=None),
@@ -996,6 +1009,16 @@ def test_zero_assembly_without_confirmed_configuration(tmp_path):
     config.pop("order_snapshot")
     path.write_text(json.dumps(config))
     assert build_order_runner(**good) is None
+
+
+def test_formal_config_without_web_rules_is_not_wired(tmp_path, caplog):
+    """非网页正式路径收窄（特批第 3 轮第 2 条）：正式单建单配置不含 order_snapshot.web_rules → 不装配（建单 0），
+    日志写明原因；其余条件（开关、凭据、登录态、授权登记）都齐也一样。"""
+    from qianshu.feishu.trial_order import NO_WEB_RULES
+    good, _, _, _ = assembly_inputs(tmp_path, web_rules=False)
+    with caplog.at_level("WARNING", logger="qianshu.feishu.trial_order"):
+        assert build_order_runner(**good) is None
+    assert NO_WEB_RULES in caplog.messages
 
 
 def test_worker_runs_archive_then_orders_in_one_thread(order):
