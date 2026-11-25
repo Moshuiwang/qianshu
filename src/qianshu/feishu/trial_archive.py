@@ -346,24 +346,31 @@ def build_runner(args, settings, state, handoff_path, *, switches, connected, se
 
 
 @contextmanager
-def archive_worker(runner, *, interval=0.5, join=1.2, orders=None):
-    """存档与建单（2d）在同一专用线程里串行执行：先存档，后建单。"""
-    if runner is None:
+def archive_worker(runner, *, interval=0.5, join=1.2, orders=None, dedupe=None):
+    """同一线程按扫描节奏先存档、再建单，最后处理一条独立的只读查重。"""
+    if runner is None and dedupe is None:
         yield None
         return
     stop = threading.Event()
 
     def loop():
         while not stop.wait(interval):
-            try:
-                runner.run_once()
-            except Exception:
-                _LOG.error("存档执行器本轮未完成，下一轮重试。")
-            if orders is not None:
+            if runner is not None:
+                try:
+                    runner.run_once()
+                except Exception:
+                    _LOG.error("存档执行器本轮未完成，下一轮重试。")
+            if runner is not None and orders is not None:
                 try:
                     orders.run_once()
                 except Exception:
                     _LOG.error("建单执行器本轮未完成，下一轮重试。")
+
+            if dedupe is not None:
+                try:
+                    dedupe()
+                except Exception:
+                    _LOG.error("查重登记读写未确认，请守望者核对。")
 
     thread = threading.Thread(target=loop, name="trial-archive", daemon=True)
     thread.start()

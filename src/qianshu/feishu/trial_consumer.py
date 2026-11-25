@@ -19,6 +19,7 @@ from .sdk import lark
 from .settings import load_handoff_settings
 from .trial_approval import CARD_FORMAT, Journal, journal_at
 from .trial_archive import archive_worker, build_runner
+from . import trial_dedupe
 from .trial_listener import ApprovalSettings, Listener
 from .trial_order import build_order_runner
 
@@ -189,7 +190,13 @@ def running(arguments, connected):
             orders = build_order_runner(args, settings, consumer.listener.path, switches=consumer.switches,
                                         connected=connected, sensitive=consumer.listener.transport.sensitive_values,
                                         archive_runner=runner, switch_file=consumer.switch_file)
-            with archive_worker(runner, orders=orders):
+            trial_dedupe.recover(state)
+
+            def lookup(names):
+                return trial_dedupe.official_matches(args.mingdao_config, settings,
+                                                     consumer.listener.transport.sensitive_values, names)
+
+            with archive_worker(runner, orders=orders, dedupe=lambda: trial_dedupe.scan(state, lookup)):
                 yield consumer
     finally:
         consumer.origin.close_code = 1
