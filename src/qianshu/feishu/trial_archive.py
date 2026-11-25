@@ -28,21 +28,40 @@ _PAGE_WRITE = re.compile(r"/documents/([A-Za-z0-9]+)/blocks/")
 _REQUIRED = ("FEISHU_APP_ID", "FEISHU_APP_SECRET", A._SHARE, *A._ROUTES.values())
 
 
+def ordinary_purpose(switches):
+    """普通申请入口可用的存档发布用途：只认 X8b（首批真实明细首次发布），其余（含 X8a、未登记）返回 None。
+
+    X8a（【测试】单批次合成试写）不得用于普通申请：它只是一次合成试写确认，不授权发布真实申请明细。
+    段 3 接入点：X8a 只能经【测试】单的一次性测试登记放行——由该入口核对 X8a 绑定的测试登记及其版本，
+    并在认领本批的同一事务内一次性消费该绑定（见 ArchiveRunner._claim）。本片未实现，普通入口一律拒绝 X8a。
+    """
+    return "X8b" if switches.get(PURPOSE_KEY) == "X8b" else None
+
+
 class DisconnectGate:
     """包住存档传输。断线（G464 / G466）后不再放行新的写步骤。
 
-    写步骤进入时若已观察到断线，则拒绝；若此刻才首次观察到断线，则该步已登记为发送中，照发这 1 步；
-    写步骤返回时若观察到断线，则该步是断线时在途的那 1 步。此后的写一律拒绝，读照常。
+    断线判序只在「写步骤登记为发送中」的边界做一次：存档执行在登记之后、发出之前调用 admit()。
+    此刻仍未观察到断线，才证明登记先于断线，发给本步 1 张放行票；已观察到断线（含读请求期间观察到的），
+    或判断本身出错（先后无法确认），一律不放行，本步不发。写请求只凭放行票发出，票用一次即失效。
+    持票的那 1 步若在发出前或返回时观察到断线，即断线时在途的那 1 步：照发、单独计数，此后的写一律拒绝，读照常。
     """
 
     def __init__(self, inner, connected, on_disconnect_write):
         self.inner, self.connected, self.on_write = inner, connected, on_disconnect_write
         self.closed = False
+        self.ticket = False
         self.disconnect_write = False
         self.last_write_ok = False
         self.refused = 0
         self.created = None
         self.page_writes = []
+
+    def _up(self):
+        try:
+            return self.connected() is True
+        except Exception:
+            return False
 
     def _mark(self):
         self.closed = True
@@ -53,14 +72,27 @@ class DisconnectGate:
             except Exception:
                 pass  # 计数在收口时再写一次
 
+    def admit(self):
+        """写步骤已登记为发送中之后调用。返回假表示断线在先或先后无法确认，本步不得发出。"""
+        if self.closed or not self._up():
+            self.closed = True
+            self.ticket = False
+            self.refused += 1
+            return False
+        self.ticket = True
+        return True
+
     def request(self, method, path, *, query, body):
         write = method != "GET"
         if write:
-            if self.closed:
+            if self.closed or not self.ticket:
+                self.closed = True
+                self.ticket = False
                 self.refused += 1
                 raise A.ArchiveRejected
-            if not self.connected():
-                self._mark()
+            self.ticket = False
+            if not self._up():
+                self._mark()  # 登记先于断线的那 1 步：照发
             self.last_write_ok = False
         reply = self.inner.request(method, path, query=query, body=body)
         if write:
@@ -69,8 +101,10 @@ class DisconnectGate:
                 self.created = reply["document"]["document_id"]
             elif (hit := _PAGE_WRITE.search(path)):
                 self.page_writes.append(hit[1])
-            if not self.connected():
+            if not self._up():
                 self._mark()
+        elif not self._up():
+            self.closed = True  # 读请求期间观察到断线：此后不再放行任何写步骤
         return reply
 
 
@@ -115,7 +149,7 @@ class ArchiveRunner:
             switches = self.switches()
         except Exception:
             return "switch"
-        self._purpose = switches.get(PURPOSE_KEY)
+        self._purpose = ordinary_purpose(switches)
         if (switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
                 or switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true"):
             return "switch"
@@ -138,7 +172,7 @@ class ArchiveRunner:
         if (not snapshot.get("preview") or not isinstance(material, dict) or not snapshot.get("eligible")
                 or material.get("country") != row["country"]):
             return "material"
-        if switches.get(PURPOSE_KEY) not in ("X8a", "X8b"):
+        if ordinary_purpose(switches) is None:
             return "unconfirmed"
         return ""
 
@@ -156,6 +190,7 @@ class ArchiveRunner:
             if code:
                 self._stop(j, row, "unconfirmed" if code == "unconfirmed" else "failed", "gate", code)
                 return None
+            # 段 3 接入点：【测试】单的 X8a 一次性登记在此核对（绑定的测试登记与版本）并在本事务内消费。
             purpose = self._purpose
             reg, version, card = row["registration"], row["version"], row["card"]
             j.db.execute("INSERT INTO trial_archive(registration,version,card,status,purpose,started) "
@@ -183,8 +218,9 @@ class ArchiveRunner:
         else:
             j.db.execute("INSERT INTO trial_archive(registration,version,card,status,stage,reason,finished) "
                          "VALUES(?,?,?,'failed',?,?,?)", (reg, version, card, stage, reason, time.time()))
+        notice = {"unknown": "archive_unknown", "disconnected": "archive_stopped"}.get(kind, "archive_failed")
         j.db.execute("INSERT OR IGNORE INTO trial_notification VALUES(?,?,?,?,'pending')", (
-            card, "archive_unknown" if unknown else "archive_failed", _uuid(),
+            card, notice, _uuid(),
             f"登记 {reg} · 版本 {version} · {ARCHIVE_NOTICES[kind]}"))
 
     def _run(self, job):
@@ -254,7 +290,12 @@ class ArchiveRunner:
                 j.db.execute("UPDATE trial_archive SET disconnect_writes=1 WHERE registration=? AND version=?",
                              (reg, version))
             if running:
-                if isinstance(result, A.ArchiveSuccess):
+                if isinstance(result, A.ArchiveSuccess) and disconnected:
+                    # 最后一个写步骤在断线期间返回成功：存档已建成，但断线后整批停下，不进入待建单（2d 不再消费）。
+                    self._stop(j, row, "disconnected", "done", "disconnect")
+                    j.db.execute("""UPDATE trial_archive SET status='success', url=?, card_update='none'
+                                 WHERE registration=? AND version=?""", (result.url, reg, version))
+                elif isinstance(result, A.ArchiveSuccess):
                     open_card = j.db.execute("SELECT 1 FROM trial_card WHERE card=? AND status='accepted'",
                                              (card,)).fetchone()
                     j.db.execute("""UPDATE trial_archive SET status='success', url=?, stage='done', finished=?,

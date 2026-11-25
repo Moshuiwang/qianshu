@@ -34,7 +34,7 @@ SW = dict(MAIL_TRIAL_RECEIVE_ENABLED="true", MAIL_TRIAL_CARD_ENABLED="true", MAI
 
 
 class Fake:
-    """假飞书传输。hook(stage) 在写步骤生效后、返回前调用。"""
+    """假飞书传输。hook(stage) 在写步骤生效后、返回前调用；读目的页时以 "target" 调用。"""
 
     def __init__(self):
         self.writes, self.permission = [], {}
@@ -42,6 +42,10 @@ class Fake:
         self.reads = []
 
     def request(self, method, path, *, query, body):
+        if path.endswith("get_node") or (method == "GET" and not path.endswith("/public")):
+            self.reads.append("target")
+            if self.hook:
+                self.hook("target")
         if path.endswith("get_node"):
             return {"node": {"obj_token": "Target", "obj_type": "docx"}}
         if method == "GET" and not path.endswith("/public"):
@@ -193,13 +197,47 @@ def test_unregistered_purpose_never_publishes(env):
     assert kind == "archive_failed" and body.endswith("本批存档发布确认未登记，未建单，已转人工。")
 
 
-def test_purpose_must_match_the_previewed_content(env):
-    # 卡上预览按 X8b 展示；登记成 X8a 后内容（标题标记）不同，指纹对不上，零写入。
+def test_purpose_x8a_is_refused_for_ordinary_application_before_any_write(env):
+    # X8a 只授权【测试】单合成试写：普通申请在授权核对处即按「发布确认未登记」停下，不出存档授权、零写入。
     accept(env.path)
     env.switches["MAIL_TRIAL_ARCHIVE_PURPOSE"] = "X8a"
-    assert env.runner().run_once() is True and env.fake.writes == []
-    assert query(env.path, "SELECT status,stage,reason FROM trial_archive") == [("failed", "prepare", "register")]
+    assert env.runner().run_once() is False and env.fake.writes == []
+    assert query(env.path, "SELECT status,stage,reason FROM trial_archive") == [("failed", "gate", "unconfirmed")]
     assert query(env.path, "SELECT status FROM trial_item_task") == [("closed",)]
+    assert query(env.path, "SELECT kind,body FROM trial_notification") == [
+        ("archive_failed", "登记 1 · 版本 1 · " + ARCHIVE_NOTICES["unconfirmed"])]
+    assert not list(env.tmp.glob("journals/*"))
+
+
+def test_x8a_never_publishes_two_ordinary_batches(env):
+    # 同一 X8a 确认下，两批普通申请照常核验、同意，均不发布。
+    second = env.tmp / "second"
+    second.mkdir(mode=0o700)
+    paths = [env.path, second / "trial-050.sqlite3"]
+    switches = dict(SW, MAIL_TRIAL_ARCHIVE_PURPOSE="X8a")
+    for path in paths:
+        accept(path)
+        runner = ArchiveRunner(path, switches=lambda: switches, config=CFG, sensitive=(), ledger=env.ledger,
+                               connected=lambda: True, clock=lambda: env.now, factory=lambda cfg: env.fake)
+        assert runner.run_once() is False and runner.run_once() is False
+        assert query(path, "SELECT status,reason FROM trial_archive") == [("failed", "unconfirmed")]
+        assert query(path, "SELECT body FROM trial_notification")[0][0].endswith(ARCHIVE_NOTICES["unconfirmed"])
+    assert env.fake.writes == [] and env.fake.reads == []
+    with A._database(env.ledger) as grants:
+        assert grants.execute("SELECT count(*) FROM grants").fetchone()[0] == 0
+
+
+def test_x8a_card_shows_no_publishable_preview_and_is_readonly(tmp_path, monkeypatch):
+    import test_trial_paths as paths
+    monkeypatch.setattr(paths, "switches", lambda: dict(SW, MAIL_TRIAL_ARCHIVE_PURPOSE="X8a"))
+    path = tmp_path / "trial-050.sqlite3"
+    store, _, card, pages = paths.setup_card(path)
+    store.db.close()
+    content = json.dumps(pages, ensure_ascii=False)
+    assert ARCHIVE_NOTICES["unconfirmed"] in content and "【测试】" not in content
+    assert "存档标题" not in content and '"form"' not in content and "整批转人工" in content
+    readonly, snapshot = query(path, "SELECT readonly,snapshot FROM trial_card")[0]
+    assert readonly and json.loads(snapshot)["preview"] is None and json.loads(snapshot)["material"] is None
 
 
 def test_failure_stops_whole_batch_with_fixed_notice(env):
@@ -303,15 +341,53 @@ def test_disconnect_during_step_sends_that_one_step_only(env):
         assert j.disconnect_archive_writes() == 1
 
 
-def test_disconnect_between_steps_sends_the_registered_step_then_stops(env):
+def test_disconnect_during_permission_read_sends_no_summary(env):
     accept(env.path, mixed=True)
     env.fake.hook = lambda stage: setattr(env, "connected", False) if stage == "verify" else None
     env.runner().run_once()
-    # 断线在只读核对时观察到：已登记发送中的第 1 个汇总写照发，第 2 个汇总写不发。
+    # 断线在权限回读期间：汇总写尚未登记发送中，一个也不发（两页汇总写均为 0）。
+    assert env.fake.writes == ["create", "Created", "share"]
+    assert query(env.path, "SELECT status,stage,reason,disconnect_writes FROM trial_archive") == [
+        ("failed", "summary", "rejected", 0)]
+    assert not query(env.path, "SELECT * FROM trial_archive_page")
+    assert query(env.path, "SELECT kind,body FROM trial_notification") == [
+        ("archive_failed", "登记 1 · 版本 1 · " + ARCHIVE_NOTICES["failed"])]
+    assert query(env.path, "SELECT status FROM trial_item_task") == [("closed",)]
+
+
+def test_disconnect_during_target_read_sends_no_create(env):
+    accept(env.path)
+    env.fake.hook = lambda stage: setattr(env, "connected", False) if stage == "target" else None
+    env.runner().run_once()
+    assert env.fake.writes == [] and env.fake.reads
+    assert query(env.path, "SELECT status,stage,reason,disconnect_writes FROM trial_archive") == [
+        ("failed", "create", "rejected", 0)]
+    assert query(env.path, "SELECT kind FROM trial_notification") == [("archive_failed",)]
+    assert query(env.path, "SELECT status FROM trial_card") == [("closed",)]
+
+
+def test_last_step_in_flight_at_disconnect_stops_batch_instead_of_pending_order(env):
+    accept(env.path)
+    env.fake.hook = lambda stage: setattr(env, "connected", False) if stage == "Target" else None
+    env.runner().run_once()
     assert env.fake.writes == ["create", "Created", "share", "Target"]
-    assert query(env.path, "SELECT status,disconnect_writes FROM trial_archive") == [("failed", 1)]
-    assert query(env.path, "SELECT kind FROM trial_archive_page") == [("定向政策",)]
-    assert query(env.path, "SELECT count(*) FROM trial_notification WHERE kind='archive_disconnect'") == [(1,)]
+    status, reason, writes, url, update = query(
+        env.path, "SELECT status,reason,disconnect_writes,url,card_update FROM trial_archive")[0]
+    assert (status, reason, writes, update) == ("success", "disconnect", 1, "none") and url.endswith("/docx/Created")
+    assert query(env.path, "SELECT kind,page FROM trial_archive_page") == [("定向政策", "Target")]
+    assert query(env.path, "SELECT status FROM trial_item_task") == [("closed",)]
+    assert query(env.path, "SELECT status FROM trial_task") == [("closed",)]
+    assert query(env.path, "SELECT status FROM trial_card") == [("closed",)]
+    notices = dict(query(env.path, "SELECT kind,body FROM trial_notification"))
+    assert notices == {"archive_disconnect": "登记 1 · 版本 1 · " + DISCONNECT_NOTICES[0],
+                       "archive_stopped": "登记 1 · 版本 1 · " + ARCHIVE_NOTICES["disconnected"]}
+    listener, transport = deliver(env)
+    listener.maintain()
+    texts = sent(transport)
+    assert len(texts) == 2 and all('<at user_id=\\"ou_config\\">' in t for t in texts)
+    assert any("未建单" in t for t in texts)
+    assert transport.order_http.async_request.await_count == 0  # 不改写为「已建存档，等待建单」
+    assert env.runner().run_once() is False and len(env.fake.writes) == 4
 
 
 def test_disconnect_before_start_claims_nothing(env):
@@ -330,16 +406,32 @@ def test_disconnect_gate_counts_one_and_reads_stay_open():
             return {"document": {"document_id": "Doc"}}
 
     gate = DisconnectGate(Inner(), lambda: state["up"], lambda: marks.append(1))
+    with pytest.raises(A.ArchiveRejected):  # 未经登记边界放行的写不发
+        DisconnectGate(Inner(), lambda: True, lambda: None).request("POST", A._DOCS, query={}, body={})
+    assert gate.admit()
     gate.request("POST", A._DOCS, query={}, body={})
     assert not marks
+    with pytest.raises(A.ArchiveRejected):  # 放行票只用一次
+        gate.request("POST", A._DOCS, query={}, body={})
+    gate = DisconnectGate(Inner(), lambda: state["up"], lambda: marks.append(1))
+    assert gate.admit()  # 登记后核对时仍连通：登记先于断线
     state["up"] = False
-    gate.request("GET", "/x", query={}, body=None)  # 只读核对不受限
     gate.request("POST", A._DOCS, query={}, body={})  # 已登记发送中的 1 步照发
-    assert marks == [1] and calls == ["POST", "GET", "POST"]
+    assert marks == [1] and calls == ["POST", "POST"]
+    assert gate.admit() is False  # 断线后登记的步骤不放行
     with pytest.raises(A.ArchiveRejected):
         gate.request("POST", A._DOCS, query={}, body={})
-    assert calls == ["POST", "GET", "POST"] and gate.refused == 1 and marks == [1]
-    assert gate.request("GET", "/y", query={}, body=None)
+    assert calls == ["POST", "POST"] and marks == [1]
+    assert gate.request("GET", "/y", query={}, body=None)  # 只读核对不受限
+    # 读请求期间观察到断线：此后登记的写一律不放行，不计为断线写。
+    state["up"], marks[:] = True, []
+    gate = DisconnectGate(Inner(), lambda: state["up"], lambda: marks.append(1))
+    state["up"] = False
+    gate.request("GET", "/x", query={}, body=None)
+    state["up"] = True  # 即便随后又判为连通，也不再放行
+    assert gate.admit() is False and not marks and calls[-1] == "GET"
+    # 判断本身出错（先后无法确认）：不放行。
+    assert DisconnectGate(Inner(), lambda: 1 / 0, lambda: None).admit() is False
 
 
 def test_halt_flag_roundtrip(env):

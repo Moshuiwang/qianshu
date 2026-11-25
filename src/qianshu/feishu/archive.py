@@ -411,6 +411,8 @@ def _execute(db, grants, batch, config, digest, material, transport, registry):
     if row["state"] != "ready":
         return _freeze(db) if row["state"] == "sending" else _result(row)
     request = (transport if transport is not None else _SDK(config)).request
+    # 可选的放行核对：写步骤登记为发送中之后、发出之前调用；返回假则本步不发（试运行断线规则）。
+    admit = getattr(transport, "admit", None)
     pages = _targets(config, request)
     title, blocks, summaries = material.title, material.blocks, dict(material.summaries)
     chunks = [blocks[i:i+40] for i in range(0, len(blocks), 40)]
@@ -429,6 +431,10 @@ def _execute(db, grants, batch, config, digest, material, transport, registry):
         claim = db.execute("""UPDATE run SET state='sending', stage=?, plan=?
                               WHERE state='ready' AND step=?""", (stage, plan, index))
         if not claim.rowcount:
+            return _result(_row(db))
+        if admit is not None and stage != "verify" and not admit():
+            # 登记之后才核对：此刻仍未观察到断线，才能证明登记先于断线；否则本步确证未发出。
+            db.execute("UPDATE run SET state='failed', reason='rejected' WHERE state='sending'")
             return _result(_row(db))
         reference = ""
         key = str(uuid5(NAMESPACE_URL, f"{digest}/{index}"))
