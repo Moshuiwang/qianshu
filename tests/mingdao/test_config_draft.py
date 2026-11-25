@@ -179,3 +179,47 @@ def test_selected_credential_conflict_still_stops(case, invocation):
     base["configurator"]["id"] = case.official_token
     path.write_text(draft.x5.compact(base))
     assert draft.main(args) != 0 and not requests and not list(out.iterdir())
+
+
+def test_owned_web_app_id_only_in_config(case, invocation, capsys, caplog):
+    args, out, requests = invocation
+    app = case.ids["official_app"]
+    case.config["create"]["identifiers"]["appId"] = app
+    (case.private / "base.json").write_text(draft.x5.compact(case.config))
+
+    assert draft.main(args) == 0 and requests
+    assert {p.name for p in out.iterdir()} == set(draft.FILES)
+    cfg, auth, sources = [(out / name).read_text() for name in draft.FILES]
+    assert json.loads(cfg)["create"]["identifiers"]["appId"] == app and cfg.count(app) == 1
+    stdout, stderr = capsys.readouterr()
+    public = auth + sources + stdout + stderr + caplog.text
+    assert app not in public and case.official_token not in public + cfg
+
+
+@pytest.mark.parametrize("mode", ["token", "other_path", "contains_app", "app_fragment", "shared_key"])
+def test_web_app_id_conflicts_before_read(case, invocation, mode):
+    args, out, requests = invocation
+    app = case.ids["official_app"]
+    identifiers = case.config["create"]["identifiers"]
+    identifiers["appId"] = app
+    if mode == "token":
+        identifiers["appId"] = case.official_token
+    elif mode == "other_path":
+        identifiers["extra"] = app
+    elif mode == "contains_app":
+        identifiers["appId"] = "prefix-" + app
+    elif mode == "app_fragment":
+        identifiers["appId"] = app[:8]
+    else:
+        case.config["official"]["token_key"] = case.config["official"]["app_id_key"]
+    (case.private / "base.json").write_text(draft.x5.compact(case.config))
+    assert draft.main(args) != 0 and not requests and not list(out.iterdir())
+
+
+def test_x5_default_rejects_equal_web_app_id(case):
+    official = case.config["official"]
+    app = case.ids["official_app"]
+    case.config["create"]["identifiers"]["appId"] = app
+    secrets = {official["app_id_key"]: app, official["token_key"]: case.official_token}
+    with pytest.raises(draft.x5.OutletConflict):
+        draft.x5.configure_x5_outlet(draft.x5.Outlet(), secrets, case.config, {"cookies": []})
