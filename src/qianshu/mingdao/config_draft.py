@@ -301,16 +301,18 @@ def official_bindings(stream, *, names):
     return selected
 
 
-def require_owned_app_id(config, official_app):
+def has_owned_app_id(config, official_app):
     create = config.get("create")
     identifiers = create.get("identifiers") if isinstance(create, dict) else None
     value = identifiers.get("appId") if isinstance(identifiers, dict) else None
-    x5.require(isinstance(value, str) and value == official_app, "网页建单应用 ID 与官方应用 ID 不符")
+    x5.require(isinstance(value, str), "网页建单应用 ID 无效")
+    return value == official_app
 
 
 def split_owned_app_id(config, official_app):
     """分开检查精确匹配的字段值，保留所有键名供常规检查。"""
-    require_owned_app_id(config, official_app)
+    if not has_owned_app_id(config, official_app):
+        return config
     create = config["create"]
     checked_create = {**create, "identifiers": {**create["identifiers"], "appId": ""}}
     return {**config, "create": checked_create}
@@ -319,13 +321,15 @@ def split_owned_app_id(config, official_app):
 def write_owned_config(path, cfg, official_app, owner, guard):
     # 核对实际待写 JSON 的指定路径，再定位唯一豁免区间。
     wire = x5.compact(cfg) + "\n"
-    require_owned_app_id(x5.decode(wire), official_app)
-    encoded = x5.compact(official_app)
-    field = '"appId":' + encoded
-    x5.require(wire.count(field) == 1, "应用标识位置不唯一")
-    start = wire.index(field) + len('"appId":"')
+    spans = []
+    if has_owned_app_id(x5.decode(wire), official_app):
+        encoded = x5.compact(official_app)
+        field = '"appId":' + encoded
+        x5.require(wire.count(field) == 1, "应用标识位置不唯一")
+        start = wire.index(field) + len('"appId":"')
+        spans.append((start, start + len(encoded) - 2, owner))
     guard.check(path.name)
-    guard.check_text(wire, [(start, start + len(encoded) - 2, owner)])
+    guard.check_text(wire, spans)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as stream:
         stream.write(wire)
@@ -350,8 +354,8 @@ def run(args):
         names = {base["official"][field] for field in ("token_key", "app_id_key")}
         secrets = x5.read_x5_settings(args.env_file, filter_stream=partial(official_bindings, names=names))
         app_owner = base["official"]["app_id_key"]
-        # 同一个键兼作 token 时，不能给予应用 ID 豁免。
-        official_app = secrets.get(app_owner) if len(names) == 2 else None
+        x5.require(len(names) == 2, "官方接口鉴权配置无效")
+        official_app = secrets.get(app_owner)
         x5.require(all(isinstance(secrets.get(name), str) and len(secrets[name]) >= 8 for name in names),
                    "官方接口鉴权配置无效")
         base_to_check = split_owned_app_id(base, official_app)

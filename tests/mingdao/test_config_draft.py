@@ -229,7 +229,7 @@ def test_x5_default_rejects_equal_web_app_id(case):
         draft.x5.configure_x5_outlet(draft.x5.Outlet(), secrets, case.config, {"cookies": []})
 
 
-@pytest.mark.parametrize("mode", ["different", "prefix", "non_string", "short_pat", "short_app"])
+@pytest.mark.parametrize("mode", ["non_string", "short_pat", "short_app"])
 def test_binding_preflight_stops(case, invocation, mode):
     args, out, requests = invocation
     app = case.ids["official_app"]
@@ -240,15 +240,34 @@ def test_binding_preflight_stops(case, invocation, mode):
         pat = pat[:7]
     (case.private / "synthetic-settings").write_text(
         f"PLACEHOLDER_OFFICIAL_TOKEN={pat}\nPLACEHOLDER_OFFICIAL_APP={app}\n")
-    value = {"different": "unrelated-web-id", "prefix": app[:7], "non_string": 123}.get(mode, app)
-    case.config["create"]["identifiers"]["appId"] = value
+    case.config["create"]["identifiers"]["appId"] = 123 if mode == "non_string" else app
     (case.private / "base.json").write_text(draft.x5.compact(case.config))
     assert draft.main(args) != 0
     assert not requests and not list(out.iterdir())
 
 
+@pytest.mark.parametrize("mode", ["different", "prefix", "embedded_app_fragment", "embedded_pat_fragment"])
+def test_unowned_web_app_id_checks_fragments(case, invocation, mode):
+    args, out, requests = invocation
+    app = case.ids["official_app"]
+    value = {
+        "different": "unrelated-web-id",
+        "prefix": app[:7],
+        "embedded_app_fragment": "web-" + app[2:10] + "-id",
+        "embedded_pat_fragment": "web-" + case.official_token[2:10] + "-id",
+    }[mode]
+    case.config["create"]["identifiers"]["appId"] = value
+    (case.private / "base.json").write_text(draft.x5.compact(case.config))
+    if mode in ("different", "prefix"):
+        assert draft.main(args) == 0 and requests
+        assert {p.name for p in out.iterdir()} == set(draft.FILES)
+        assert json.loads((out / draft.FILES[0]).read_text())["create"]["identifiers"]["appId"] == value
+    else:
+        assert draft.main(args) != 0 and not requests and not list(out.iterdir())
+
+
 @pytest.mark.parametrize("stage", ["output", "serialized"])
-def test_output_binding_stops_after_read(case, invocation, monkeypatch, stage):
+def test_output_binding_after_read(case, invocation, monkeypatch, stage):
     args, out, requests = invocation
     app = case.ids["official_app"]
     case.config["create"]["identifiers"]["appId"] = app
@@ -264,7 +283,6 @@ def test_output_binding_stops_after_read(case, invocation, monkeypatch, stage):
             return cfg
 
         monkeypatch.setattr(draft, "generate", mismatched_output)
-        monkeypatch.setattr(draft, "write_owned_config", lambda *args: events.append("unexpected_write"))
     else:
         write_config = draft.write_owned_config
 
@@ -284,5 +302,10 @@ def test_output_binding_stops_after_read(case, invocation, monkeypatch, stage):
             return write_config(path, cfg, *args)
 
         monkeypatch.setattr(draft, "write_owned_config", mismatched_wire)
-    assert draft.main(args) != 0
-    assert events == [stage] and requests and not list(out.iterdir())
+    if stage == "output":
+        assert draft.main(args) == 0
+        assert {p.name for p in out.iterdir()} == set(draft.FILES)
+        assert json.loads((out / draft.FILES[0]).read_text())["create"]["identifiers"]["appId"] == "unrelated-web-id"
+    else:
+        assert draft.main(args) != 0 and not list(out.iterdir())
+    assert events == [stage] and requests
