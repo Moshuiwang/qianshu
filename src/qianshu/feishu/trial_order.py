@@ -38,14 +38,20 @@ ORDER_NOTICES = {
     "done": "均已建单并逐条回读一致，提交由人工在明道云处理。",
 }
 SUPERSEDED = "本条「未建单」公告已过时：相关条目已由新卡接管或已建单，请勿据此重复建单，以私有登记为准。"
-# 合批公告部分条目被接管时，其余条目逐条写明（审核 P1-1）。
-UNBUILT_ITEMS = "未建单，已转人工。"
-# 公告登记人工移交后附在群提示末尾（G488 取舍 A）。
+# 转人工固定文案（守望者 G510，治根）：卡面与公告凡涉及转人工的（收口、晚投、「未建单」、出卡转人工的条目、同名组、
+# 只读核对），一律只用这一句，不给任何可执行的建单指示；可不可以补建只由守望者判定、另行通知。
+# 建成、写错即停告警、结果未知三类公告本来就不指示人去建单，不用这一句。
+MANUAL = "已转人工，守望者核对后另行通知是否补建，请勿据此直接建单。"
+# 合批公告部分条目被接管时，其余条目逐条写明（审核 P1-1）；转人工由整条公告的固定文案（MANUAL）说明。
+UNBUILT_ITEMS = "未建单。"
+# 结果未知类公告登记人工移交后附在群提示末尾（G488 取舍 A；G510 只保留给结果未知、写错两类，文案不变）。
 HANDOFF_NOTE = "\n相关政策已交人工，机器人对同名政策的新卡一律不建，需守望者核对后解除。"
+# G510 之前排队的旧公告（2b / 2c 收口）里的可执行字样：投递时改写，群里只出现固定文案。
+LEGACY_WORDS = (("，未建单，转人工", "，未建单"),)
 # 含这些字样的公告交人工处理：发出前先持久登记人工移交、占用该政策名（审核 P1-3）。
 HANDOFF_WORDS = ("未建单", "结果未知", "未发出")
-# 因断线而未发出的条目的固定公告（G464，守望者 12:0xZ）：按实际原因写，不写成「建单开关已关闭」。
-DISCONNECT_UNSENT = "断线期间未发出，已转人工。"
+# 因断线而未发出的条目的固定公告（G464，守望者 12:0xZ）：按实际原因写，不写成「建单开关已关闭」；转人工用固定文案（G510）。
+DISCONNECT_UNSENT = "断线期间未发出。" + MANUAL
 CANCEL_REASONS = {
     "consent": "同意已失效或卡片已关闭",
     "switch": "建单开关已关闭",
@@ -54,14 +60,14 @@ CANCEL_REASONS = {
     "disconnected": "断线",
     "combination": "该类型尚未经真实回读验证",
     "archive": "取不到本批存档链接",
-    "handoff": "该条已交人工处理，须守望者销清移交后才可再建",
+    "handoff": "该条已交人工处理",
     "plan": "建单字段未能核实",
     "format": "台账标识格式不符",
     "ledger": "建单台账未能写入",
     "not_sent": "建单请求未发出",
     "previous": "同批前序条目未建成",
     "slot": "本条发送登记已变化",
-    "reapprove": "开始日期需顺延或来源证明已过期，需重新审批",
+    "reapprove": "开始日期需顺延或来源证明已过期",
 }
 # 已占用建单资格的状态：在途、已建、写错、未知。
 ACTIVE = ("sending", "created", "verified", "mismatch", "unknown")
@@ -145,9 +151,10 @@ def card_handoffs(snapshot):
 
 
 # 同卡同名合组（守望者 G509）：同一张卡内（含只读卡）归一政策名相同的条目合为一组，组有 2 条及以上时整组机器人 0 发、
-# 合成一项人工移交。卡面与所有公告统一用这一文案（公告句末加「。」），{} 为组内条目号（「、」分隔）。
-SAME_NAME_GROUP = "本卡第 {} 条同名，合为一项交人工核对；由人工逐条确认后建单"
-GROUP_WORD = "合为一项交人工核对"
+# 合成一项人工移交。卡面与所有公告统一用这一文案（句末加「。」），{} 为组内条目号（「、」分隔）；转人工只用固定文案
+# MANUAL（G510），组文案本身不给建单指示。
+SAME_NAME_GROUP = "本卡第 {} 条同名，合为一项"
+GROUP_WORD = "条同名，合为一项"
 # 组移交的来源标记：未销清时记在 trial_handoff.reason，每组一行、登记在同组首条上；守望者按组销清时改写为销清原因。
 SAME_NAME_GROUP_MARK = "same_name_group"
 # 组销清时每个成员的去向。
@@ -208,20 +215,29 @@ def group_member(db, reg, version, item):
     return group_of(snapshot).get(item) if snapshot else None
 
 
-# 出卡登记移交时同名政策已有机器人记录（复核 rv-2d4 P1）：卡面不给可执行的人工建单信号，移交照登、保持同名占位。
-ROBOT_HELD = "该政策已有机器人建单记录，只读核对，请勿重复建单"
+# 出卡登记移交或建单前查重时同名政策已有机器人记录（复核 rv-2d4 P1、G506）：移交照登「只读核对」类、保持同名占位；
+# 卡面与公告同样只写固定文案 MANUAL（G510），已有记录只在恢复清单的 robot_record 里如实标出，供守望者判定。
 # 「只读核对」类移交的来源标记（G497）：未销清时记在 trial_handoff.reason；守望者销清时改写为销清原因。
 READONLY_CHECK = "readonly_check"
 
 
-def robot_held(db, key, card):
+def robot_held(db, key, card, members=()):
     """同一归一政策名已有其他卡的机器人在途、已建、写错或结果未知记录（`ACTIVE`）。
 
     公告投递裁决（unbuilt_notice）、出卡登记移交（Journal.prepare）与建单前置检查及领槽事务（OrderRunner._one /
     _admit，G506）共用这一判定；空名键一律不算。
+    members 为本卡条目（恢复清单的 robot_record，G510）：本卡这些条目自己的 `ACTIVE` 记录同样算（如旧快照组内成员
+    已建、重启后转结果未知），供守望者判定是否补建。
     """
-    return bool(key) and db.execute(f"""SELECT 1 FROM trial_order WHERE name_key=? AND card!=?
-        AND status IN ({','.join('?' * len(ACTIVE))})""", (key, card, *ACTIVE)).fetchone() is not None
+    if not key:
+        return False
+    marks = ",".join("?" * len(ACTIVE))
+    if db.execute(f"SELECT 1 FROM trial_order WHERE name_key=? AND card!=? AND status IN ({marks})",
+                  (key, card, *ACTIVE)).fetchone():
+        return True
+    items = ",".join("?" * len(members))
+    return bool(members) and db.execute(f"""SELECT 1 FROM trial_order WHERE card=? AND item IN ({items})
+        AND status IN ({marks})""", (card, *members, *ACTIVE)).fetchone() is not None
 
 
 def notice_items(kind, snapshot):
@@ -244,7 +260,10 @@ def unbuilt_notice(db, row):
     已被新卡接管或已建单的条目标「已过时」、不登记移交；其余条目保留原文案并各自登记移交。全部过时才整条改为过时文案。
     同卡同名组（G509，按快照可信政策名重算，旧快照同样适用）整组按一项组移交处理：不逐条裁决过时、不逐条登记，
     只登记一项组移交（record_handoff 落在同组首条上）；整批公告未写组文案的（含存档失败、旧版排队的公告）逐组补写
-    「本卡第 M、N 条同名，合为一项交人工核对；由人工逐条确认后建单。」。
+    「本卡第 M、N 条同名，合为一项。」。
+
+    转人工只用固定文案 MANUAL（G510）：旧版排队公告里的可执行字样（LEGACY_WORDS）投递时改写；未带固定文案的
+    （旧版排队、存档失败整批）在末尾补一次。只含结果未知、未补写任何条目的公告照旧附 HANDOFF_NOTE（结果未知类不变）。
     """
     body = row["body"]
     if row["kind"].startswith("order_unknown:") or row["kind"] == "order_mismatch":
@@ -273,6 +292,8 @@ def unbuilt_notice(db, row):
     if taken and not keep and not unnamed and not groups:
         return f"登记 {_card_reg(db, row['card'])} · {SUPERSEDED}", []
     text = body
+    for old, new in LEGACY_WORDS:
+        text = text.replace(old, new)
     if taken:
         # 部分接管：逐条写明——已接管或已建单的标过时，其余条目明确「未建单」并各自登记移交。
         rest = sorted([item for item, _ in keep] + unnamed)
@@ -281,7 +302,11 @@ def unbuilt_notice(db, row):
             text += f"\n条目 {'、'.join(map(str, rest))} · {UNBUILT_ITEMS}"
     text += "".join(f"\n{group_text(group)}。" for group in groups if group_text(group) not in text)
     handoff = keep + [(group[0], name_key(_reviewed_name(snapshot, group[0]))) for group in groups]
-    return text + (HANDOFF_NOTE if handoff else ""), handoff
+    if MANUAL in text:
+        return text, handoff
+    if text == body and "结果未知" in body:
+        return text + (HANDOFF_NOTE if handoff else ""), handoff
+    return text + "\n" + MANUAL, handoff
 
 
 def _card_reg(db, card):
@@ -297,6 +322,8 @@ def record_handoff(db, card, items, now, *, held=()):
     同样占用政策名、机器人 0 发，但恢复清单不作为可补建项列出（单列 order_readonly_check，可查）。
     同卡同名组（G509）的成员一律合为一项组移交：登记在同组首条上、按组名键占用、reason 记 SAME_NAME_GROUP_MARK，
     同组只登记一行；恢复清单按组列出全部成员，须守望者按组销清。
+    已销清的不再重开（复核 rv-2dI P1-2）：组按「登记 × 版本 × 组名键」、单条按「登记 × 版本 × 条目」已有销清记录的，
+    关卡、晚投与建单撤销都不再插入开放移交。
     """
     reg, version, packed = db.execute("SELECT registration,version,snapshot FROM trial_card WHERE card=?",
                                       (card,)).fetchone()
@@ -305,10 +332,18 @@ def record_handoff(db, card, items, now, *, held=()):
     for item, key in items:
         mark = READONLY_CHECK if item in held else None
         if item in grouped:
-            item = grouped[item][0]
+            group = grouped[item]
+            item = group[0]
             key, mark = name_key(_reviewed_name(snapshot, item)), SAME_NAME_GROUP_MARK
-        if db.execute("""SELECT 1 FROM trial_handoff WHERE name_key=? AND registration=? AND version=? AND item=?
-                      AND cleared IS NULL""", (key, reg, version, item)).fetchone():
+            # 组销清（release_group）清的是组内全部成员行：按组名键核，组内成员行（含旧版逐条登记的）同样算。
+            cleared = db.execute(f"""SELECT 1 FROM trial_handoff WHERE registration=? AND version=?
+                                 AND cleared IS NOT NULL AND (name_key=? OR item IN ({','.join('?' * len(group))}))""",
+                                 (reg, version, key, *group)).fetchone()
+        else:
+            cleared = db.execute("""SELECT 1 FROM trial_handoff WHERE registration=? AND version=? AND item=?
+                                 AND cleared IS NOT NULL""", (reg, version, item)).fetchone()
+        if cleared or db.execute("""SELECT 1 FROM trial_handoff WHERE name_key=? AND registration=? AND version=?
+                                 AND item=? AND cleared IS NULL""", (key, reg, version, item)).fetchone():
             continue
         target = db.execute("SELECT target FROM trial_order WHERE registration=? AND version=? AND item=?",
                             (reg, version, item)).fetchone()
@@ -743,11 +778,11 @@ class OrderRunner:
         return f"登记 {row['registration']} · 版本 {row['version']} · 条目 {'、'.join(map(str, items))} · "
 
     def _cancel(self, job, items, code, *, held=()):
-        """未发的条目撤销：置终态并公告「未建单」@ 配置负责人。
+        """未发的条目撤销：置终态并公告「未建单」@ 配置负责人；转人工只写固定文案 MANUAL（G510）。
 
-        held（[(条目, 名键)]）为同名政策已有机器人建单记录的条目（G506）：同一事务里登记只读核对类移交，公告写
-        「只读核对，请勿重复建单」，不写「未建单」（投递端不再按「未建单」改写或补登移交）。
-        code 为 group（同卡同名组，G509）时同一事务里登记一项组移交，公告写组文案。
+        held（[(条目, 名键)]）为同名政策已有机器人建单记录的条目（G506）：同一事务里登记只读核对类移交，公告只写固定
+        文案，不写「未建单」（投递端不再按「未建单」改写或补登移交）。
+        code 为 group（同卡同名组，G509）时同一事务里登记一项组移交，公告写组文案加固定文案。
         """
         if not items:
             return
@@ -764,10 +799,10 @@ class OrderRunner:
                     grouped = group_of(job.snapshot)
                     groups = list(dict.fromkeys(tuple(grouped[item]) for item in items))
                     record_handoff(j.db, row["card"], [(group[0], "") for group in groups], self.clock())
-                    text = "".join(group_text(group) + "。" for group in groups)
+                    text = "".join(group_text(group) + "。" for group in groups) + MANUAL
                 else:
-                    text = (DISCONNECT_UNSENT if code == "disconnected" else ROBOT_HELD + "。" if code == "held"
-                            else CANCEL_REASONS[code] + "，未建单，已转人工。")
+                    text = (DISCONNECT_UNSENT if code == "disconnected" else MANUAL if code == "held"
+                            else CANCEL_REASONS[code] + "，未建单。" + MANUAL)
                 self._notice(j, row["card"], "order_cancel:" + ",".join(map(str, items)), self._head(row, items) + text)
         except Exception:
             self.frozen = True

@@ -145,6 +145,8 @@ def recovery(db):
             SELECT 'order' AS kind, registration, version, item, status FROM trial_order
             WHERE status IN ('sending','created','unknown','mismatch')"""))
         # 「只读核对」类移交（同名已有机器人建单记录，G497）不作为可补建项列出，单列可查。
+        # 每项移交（单条、只读核对、组）都带 robot_record（G510）：同一归一政策名在他卡、或本卡该条 / 组内成员有机器人在途、
+        # 已建、写错或结果未知记录（robot_held）。群里只说「已转人工」，是否补建由守望者据此加官方只读查重与本地台账判定。
         # 同卡同名组（G509）：同一登记版本里属于同一同名组的未销清移交（含旧版逐条登记的）合为一项 order_group_handoff，
         # 列出全部成员（条目号、展示名指纹）与差异摘要（只写字段名与「相同 / 不同」），须守望者按组销清。
         groups = {}
@@ -161,11 +163,13 @@ def recovery(db):
                                  "item": group[0], "name_fp": name_fingerprint(key), "status": "open",
                                  "members": [{"item": n, "display": f"条目 {n}",
                                               "display_fp": display_fingerprint(snapshot, n)} for n in group],
-                                 "diff": group_diff(snapshot, group), "robot_record": robot_held(db, key, r[5])})
+                                 "diff": group_diff(snapshot, group),
+                                 "robot_record": robot_held(db, key, r[5], members=group)})
                 continue
             rows.append({"kind": "order_readonly_check" if r[4] == READONLY_CHECK else "order_handoff",
                          "registration": r[0], "version": r[1], "item": r[2], "name_fp": name_fingerprint(r[3]),
-                         "status": "readonly_check" if r[4] == READONLY_CHECK else "open"})
+                         "status": "readonly_check" if r[4] == READONLY_CHECK else "open",
+                         "robot_record": robot_held(db, r[3], r[5], members=(r[2],))})
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'order_slot' AS kind, registration, version, item, 'held' AS status FROM trial_order_slot"""))
         rows.extend(dict(row) for row in db.execute("""
@@ -245,7 +249,8 @@ class Journal:
         不重复登记。
 
         render(held) 给出卡面（快照 `pages`）：held 为要移交、但同名政策已有机器人建单记录的条目（与公告投递同一裁决
-        robot_held），在登记移交的同一写事务里裁决后再渲染，卡面写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
+        robot_held），在登记移交的同一写事务里裁决后再渲染；held 只决定移交记为「只读核对」类，卡面与其他转人工条目
+        一样只写固定文案（G510）。
         """
         from .trial_order import card_handoffs, group_of, record_handoff, robot_held
         handoffs = card_handoffs(snapshot)
@@ -332,16 +337,18 @@ class Journal:
         self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
                         AND kind='remind' AND status='pending'""", (card,))
         # 同卡同名组（G509，按快照可信政策名重算）：同组合为一项交人工，公告写组文案；组移交在投递时登记（unbuilt_notice）。
-        from .trial_order import group_of, group_text, same_name_groups
+        # 转人工只写固定文案 MANUAL（G510），不给可执行的建单指示；notify 在原因后补「。」，故去掉固定文案句末「。」。
+        from .trial_order import MANUAL, group_of, group_text, same_name_groups
+        manual = MANUAL.removesuffix("。")
         snapshot = json.loads(row["snapshot"])
         grouped = group_of(snapshot)
         if not known and not uncertain and not done and (not legacy or legacy[0] in safe):
             if not grouped:
-                self.notify(row, "closed", reason + "，未建单，转人工")
+                self.notify(row, "closed", reason + "，未建单。" + manual)
                 return
             plain = [n for n in snapshot["items"] if n not in grouped]
-            tail = "".join(group_text(group) + "。" for group in same_name_groups(snapshot)).removesuffix("。")
-            self.notify(row, "closed", (reason + "，未建单，转人工。" if plain else reason + "。") + tail, items=plain)
+            tail = "".join(group_text(group) + "。" for group in same_name_groups(snapshot))
+            self.notify(row, "closed", (reason + "，未建单。" if plain else reason + "。") + tail + manual, items=plain)
             return
         settled = done | known | uncertain
         for item in sorted(set(snapshot["items"]) | known | uncertain):
@@ -349,7 +356,7 @@ class Journal:
                 # 同卡同名组（G509）：组内未进入建单的成员合为一条公告、一项组移交（投递时登记），不逐条给可执行移交。
                 pending = [n for n in grouped[item] if n not in settled]
                 if item == pending[0]:
-                    self.notify(row, f"closed_{item}", reason + "，" + group_text(grouped[item]),
+                    self.notify(row, f"closed_{item}", reason + "，" + group_text(grouped[item]) + "。" + manual,
                                 items=grouped[item])
                 continue
             if item in done:
@@ -361,7 +368,7 @@ class Journal:
             elif item in uncertain or (legacy and legacy[0] not in safe):
                 detail = "结果未知，请人工到明道云核对"
             else:
-                detail = "未建单，转人工"
+                detail = "未建单。" + manual
             self.notify(row, f"closed_{item}", reason + "，" + detail, items=[item])
 
     def rotate(self, session, reason, *, instant=None):
