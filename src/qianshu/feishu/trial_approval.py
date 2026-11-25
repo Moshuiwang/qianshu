@@ -61,6 +61,9 @@ CREATE TABLE IF NOT EXISTS trial_dedupe(
  id INTEGER PRIMARY KEY, registration INTEGER NOT NULL, version INTEGER NOT NULL, name_fp TEXT NOT NULL,
  reason TEXT NOT NULL, status TEXT NOT NULL, matches INTEGER, order_states TEXT, robot_record INTEGER);
 CREATE TABLE IF NOT EXISTS trial_guardian_log(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS trial_test_binding(authorization TEXT PRIMARY KEY, registration INTEGER NOT NULL,
+ version INTEGER NOT NULL, card TEXT NOT NULL UNIQUE, status TEXT NOT NULL, bound REAL NOT NULL,
+ UNIQUE(registration,version));
 """
 
 # 存档阶段的条目任务状态：archive_pending 尚无外写（关卡时可安全关闭）；archive_running 已发起存档；
@@ -177,6 +180,12 @@ def recovery(db):
             SELECT 'order_slot' AS kind, registration, version, item, 'held' AS status FROM trial_order_slot"""))
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'write_halt' AS kind, reason AS status FROM trial_halt"""))
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_test_binding'").fetchone():
+        # 段 3（G505 第 4 条）：测试单回读一致只在恢复清单标记，不自动登记 verified_combinations。
+        from .trial_test import READY
+        rows.extend({"kind": "test_combination_ready", "registration": r[0], "version": r[1], "status": READY}
+                    for r in db.execute("""SELECT registration, version FROM trial_test_binding
+                                        WHERE status='verified' ORDER BY rowid"""))
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_known_record'").fetchone():
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'known_record' AS kind, registration, version, r.item, 'readback_pending' AS status
@@ -271,6 +280,10 @@ class Journal:
                             (card, reg, version, CARD_FORMAT, session, country, packed,
                              sha256(packed.encode()).hexdigest(), int(readonly), sent,
                              (int(sent) // 86400 + 2) * 86400, "preparing"))
+            if snapshot.get("test_authorization"):
+                # 段 3（G515）：出卡快照冻结的测试授权登记号在同一事务里登记绑定；已被他卡占用即不登记，该卡不放行。
+                self.db.execute("INSERT OR IGNORE INTO trial_test_binding VALUES(?,?,?,?,'bound',?)",
+                                (snapshot["test_authorization"], reg, version, card, sent))
             if handoffs:
                 record_handoff(self.db, card, handoffs, sent, held=held)
 
@@ -391,7 +404,7 @@ class Journal:
                 self.close(row, reason)
             self.db.execute("INSERT OR REPLACE INTO trial_session VALUES(1,?)", (session,))
 
-    def scan(self, now, *, create_enabled=True):
+    def scan(self, now, *, create_enabled=True, test_exception=None):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             # 存档进行中的批次由存档执行器收口，扫描不抢先关闭（开始存档前的授权只核一次）。
@@ -399,7 +412,8 @@ class Journal:
             for row in self.db.execute("""SELECT * FROM trial_card WHERE status IN ('open','accepted')
                     AND card NOT IN (SELECT card FROM trial_archive WHERE status='running')
                     AND card NOT IN (SELECT card FROM trial_order WHERE status IN ('sending','created'))""").fetchall():
-                if not create_enabled and row["status"] == "accepted":
+                if (not create_enabled and row["status"] == "accepted"
+                        and not (test_exception and test_exception(self.db, row, "active"))):
                     self.close(row, "建单开关关闭")
                 elif trial_batch(self.db, row["registration"], row["version"])[3]:
                     self.close(row, "批次冻结或版本失效")
@@ -416,7 +430,7 @@ class Journal:
 
     def action(self, session, card, reg, version, message, action, event, actor, created,
                clock, current, member, switches, *, reason="", claimed=False, queue_update=False,
-               archive=False):
+               archive=False, test_exception=None):
         refused = "卡片绑定、身份或有效期不符"
         reload_switches = switches if callable(switches) else None
         if reload_switches:
@@ -451,8 +465,10 @@ class Journal:
                     or [r[0] for r in pages] != list(range(1, len(snapshot["pages"]) + 1))
                     or pages[-1][1] != message or not row["sent"] <= created <= clock() < row["expires"]):
                 return refused
+            # 段 3（G514）：建单开关关闭时只放行绑定当次有效测试授权的那一张卡（唯一例外判定）。
+            excepted = action == "approve" and bool(test_exception and test_exception(self.db, row, "approve"))
             if action == "approve":
-                if switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true":
+                if switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true" and not excepted:
                     return "建单未开启"
                 verified = self.db.execute(
                     "SELECT recorded FROM trial_receipt WHERE card=? AND action='verify'", (card,)).fetchone()
@@ -469,7 +485,8 @@ class Journal:
                         or latest.get("MAIL_TRIAL_CREATE_COUNTRY") != row["country"]
                         or actor not in latest.get("MAIL_TRIAL_APPROVER_OPEN_IDS", "").split(",")):
                     return refused
-                if action == "approve" and latest.get("MAIL_TRIAL_CREATE_ENABLED") != "true":
+                if action == "approve" and latest.get("MAIL_TRIAL_CREATE_ENABLED") != "true" and not (
+                        test_exception and test_exception(self.db, row, "approve")):
                     return "建单未开启"
             if (not current() or clock() >= row["expires"] or session != self.session()
                     or (queue_update and not self.granted(session, created))):

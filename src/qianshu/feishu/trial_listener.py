@@ -184,7 +184,10 @@ def approval_setup(path, switches):
     if not isinstance(contact, str) or not re.fullmatch(r"ou_[a-zA-Z0-9]+", contact):
         contact = ""
     snapshot = config.get("order_snapshot", {})
-    return switches(), snapshot if isinstance(snapshot, dict) else {}, contact
+    from .trial_test import registry_of
+    # 第 4 项：段 3 测试授权登记路径（与明道云配置同目录），出卡时据此判定是否绑定测试授权（G515）。
+    return (switches(), snapshot if isinstance(snapshot, dict) else {}, contact,
+            registry_of(path.parent) if path else None)
 
 
 class Listener:
@@ -192,6 +195,9 @@ class Listener:
         self.path, self.settings, self.switches, self.clock = path, settings, switches, clock
         self.queue_updates = False
         self.archive_wired = False  # 存档执行器已装配：同意后进入建存档，而非「执行器未就绪」
+        # 段 3：测试授权登记（明道云配置同目录）。未配置明道云时为 None，例外判定一律不放行。
+        from .trial_test import registry_of
+        self.registry = registry_of(getattr(settings, "trial_login_dir", None))
         self.origin, self.session, self.connected_at = None, "", 0
         self._rotation_lock = Lock()
         self._pending = None
@@ -241,7 +247,8 @@ class Listener:
                 if j.session():
                     j.rotate("", "审批已关闭", instant=self.clock())
             else:
-                j.scan(self.clock(), create_enabled=self.switches().get("MAIL_TRIAL_CREATE_ENABLED") == "true")
+                j.scan(self.clock(), create_enabled=self.switches().get("MAIL_TRIAL_CREATE_ENABLED") == "true",
+                       test_exception=self.test_exception)
             for row in j.db.execute("""SELECT n.*, c.snapshot FROM trial_notification n JOIN trial_card c
                                        USING(card) WHERE n.status='pending' ORDER BY n.rowid""").fetchall():
                 target = json.loads(row["snapshot"]).get("contact")
@@ -335,6 +342,11 @@ class Listener:
             request = PatchMessageRequest.builder().message_id(message).request_body(body).build()
             option = RequestOption.builder().tenant_access_token(await transport._tenant_token()).build()
             await transport.order_http.async_request(request, option, "patch", PatchMessageResponse)
+
+    def test_exception(self, db, row, stage):
+        """段 3 唯一例外判定（trial_test.trial_test_exception）在审批门禁与扫描处的接入。"""
+        from .trial_test import card_exception
+        return card_exception(db, self.registry, row, self.clock(), stage) is not None
 
     def refuse_click(self, data, *, notify=True):
         event = data.header.event_id
@@ -468,6 +480,6 @@ class Listener:
                                 value["action"], key, actor, times[0], self.clock,
                                 lambda: current() and 0 <= self.clock()-times[0] <= max_age,
                                 member, switches, reason=reason, claimed=True, queue_update=self.queue_updates,
-                                archive=self.archive_wired)
+                                archive=self.archive_wired, test_exception=self.test_exception)
         async with asyncio.timeout(max(0, deadline-time.monotonic())):
             return response(await asyncio.to_thread(record))

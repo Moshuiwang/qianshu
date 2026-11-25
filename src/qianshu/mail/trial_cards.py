@@ -74,7 +74,8 @@ def handed_text(reason):
 
 
 def decision_pages(trial, row, text, details, parsed, policies, full_review, setup, blocked):
-    settings, snapshot, contact = setup
+    settings, snapshot, contact, *extra = setup
+    registry = extra[0] if extra else None
     countries = [d.field_results.get("country") for d in parsed]
     country = settings.get("MAIL_TRIAL_CREATE_COUNTRY", "")
     domestic = bool(country and countries and all(
@@ -86,6 +87,15 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
     session = journal.session()
     lines, eligible, missing = [], [], []
     items = list(range(1, len(policies) + 1))
+    # 段 3（G515）：卡片标识 = 收信登记号 × 版本。命中一条有效测试授权（唯一例外判定）且存档用途为 X8a 时，
+    # 把授权登记号冻结进快照并在卡面回显；本卡以授权里的精确组合代替 verified_combinations，存档只用 X8a。
+    from qianshu.feishu.trial_archive import test_purpose
+    from qianshu.feishu.trial_test import SNAPSHOT_KEY, trial_test_exception
+    test = None
+    if registry is not None and test_purpose(settings) and len(policies) == 1:
+        test = trial_test_exception(journal.db, registry, registration=reg, version=version, card=card,
+                                    snapshot={"reviewed": [asdict(policies[0].draft)]},
+                                    now=trial.clock().timestamp(), stage="issue")
     if not domestic:
         lines.append(CardLine("核对卡", "本国未开建单，仅供核对"))
     for n, policy in enumerate(policies, 1):
@@ -95,7 +105,8 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         if fields:
             missing.append(f"条目 {n} · " + "、".join(_FIELD_LABELS.get(f, f) for f in fields))
         try:
-            require_verified_combination(snapshot, draft.policy_type.value, draft.benefit_type.value)
+            if test is None:
+                require_verified_combination(snapshot, draft.policy_type.value, draft.benefit_type.value)
         except UnverifiedCombination:
             reason = "该类型尚未经真实回读验证"
         else:
@@ -112,13 +123,14 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         lines.append(CardLine(f"条目 {n}", reason))
     preview = material = None
     if (domestic and row["attachments"] == 0 and not blocked and not full_review and policies
-            and settings.get("MAIL_TRIAL_ARCHIVE_PURPOSE") == "X8a"):
+            and settings.get("MAIL_TRIAL_ARCHIVE_PURPOSE") == "X8a" and test is None):
         # X8a 只授权【测试】单的合成试写，普通申请不得据此发布：不出预览、卡片只读，整批转人工。
         lines.append(CardLine("存档预览", ARCHIVE_NOTICES["unconfirmed"]))
     elif domestic and row["attachments"] == 0 and not blocked and not full_review and policies:
         try:
             # 普通申请只按首次真实发布（X8b）展示；执行时未登记 X8b 即不发布。
-            batch = VerifiedArchiveBatch(str(reg), str(version), trial.clock().date(), country, "X8b",
+            batch = VerifiedArchiveBatch(str(reg), str(version), trial.clock().date(), country,
+                                         "X8a" if test is not None else "X8b",
                                          text, tuple(archive_policy(d, text) for d in parsed), True)
             preview = preview_archive_batch(batch, config=trial.config, sensitive_values=trial.sensitive)
             material = asdict(batch) | {"utc_date": batch.utc_date.isoformat()}
@@ -144,6 +156,9 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         eligible = []
     if readonly:
         lines = [CardLine(line.label, "转人工") if line.text == "本次拟建" else line for line in lines]
+        test = None  # 只读卡不绑定测试授权
+    if test is not None:
+        lines.append(CardLine("测试授权", f"授权登记号 {test.registration}"))
     # 未列为拟建的条目出卡即登记人工移交（Journal.prepare 同一事务），卡面逐条只写转人工固定文案（G510）；同名政策
     # 已有机器人建单记录的（held，由 prepare 在登记移交的同一写事务里裁决）卡面同样只写固定文案，移交标「只读核对」类。
     # 同卡同名组的条目卡面已写定。
@@ -169,6 +184,7 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         return details
 
     journal.prepare(card, reg, version, session, country, {
+        **({SNAPSHOT_KEY: test.registration} if test is not None else {}),
         "items": items, "eligible": eligible, "missing": missing, "contact": contact,
         "preview": preview.fingerprint if preview else None,
         "order_snapshot_sha256": sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),

@@ -24,6 +24,8 @@ from qianshu.mingdao.create_order import (
 
 from .state import trial_batch
 from .trial_approval import CARD_FORMAT, journal_at
+from .trial_test import (advance as advance_test, bound as test_bound, card_exception, close as close_test,
+                         has_test_entries, registry_of, snapshot_exception)
 
 _LOG = logging.getLogger(__name__)
 LEDGER_FILE = "trial-orders.jsonl"
@@ -68,6 +70,7 @@ CANCEL_REASONS = {
     "previous": "同批前序条目未建成",
     "slot": "本条发送登记已变化",
     "reapprove": "开始日期需顺延或来源证明已过期",
+    "test": "测试授权不符、已消耗或已过期",
 }
 # 已占用建单资格的状态：在途、已建、写错、未知。
 ACTIVE = ("sending", "created", "verified", "mismatch", "unknown")
@@ -447,12 +450,13 @@ class OrderRunner:
     """每轮至多处理一张存档已建、待建单的卡。同批逐条串行，全局至多 1 个在途建单请求。"""
 
     def __init__(self, path, *, switches, backend, connected, ledger_dir, clock=time.time, pause=time.sleep,
-                 readback_seconds=120, switch_file=None):
+                 readback_seconds=120, switch_file=None, registry=None):
         self.path, self.switches, self.backend, self.connected = path, switches, backend, connected
         # 只读开关文件、不含连接判断的读法（G464 交接回退）：交接处连接状态与开关文件分开核对。未提供时沿用 switches。
         self.switch_file = switch_file or switches
         self.ledger_dir, self.clock, self.pause = Path(ledger_dir), clock, pause
         self.readback_seconds = readback_seconds
+        self.registry = registry  # 段 3 测试授权登记；None 时例外判定一律不放行
         self.frozen = False  # 登记库提交失败或结果不明：本进程不再发任何建单
         self._settled = False
 
@@ -676,7 +680,12 @@ class OrderRunner:
                 return "consent"
             if self.clock() >= current["expires"]:
                 return "expired"
-            if (switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true" or switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
+            # 段 3：绑定测试授权的卡只走唯一例外判定（替代建单开关与 verified_combinations），资格已在存档认领时消耗。
+            test = test_bound(job.snapshot)
+            if test and card_exception(j.db, self.registry, current, self.clock(), "order") is None:
+                return "test"
+            if ((not test and switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true")
+                    or switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
                     or switches.get("MAIL_TRIAL_CREATE_COUNTRY") != current["country"]):
                 return "switch"
             if j.write_halted():
@@ -693,6 +702,8 @@ class OrderRunner:
             if j.db.execute("SELECT 1 FROM trial_order_slot").fetchone():
                 return "busy"
             now = self.clock()
+            if test and not advance_test(j.db, job.snapshot, "consumed", "sending"):
+                return "test"
             j.db.execute("INSERT INTO trial_order_slot VALUES(1,?,?,?,?)", (reg, version, item, now))
             j.db.execute("""INSERT INTO trial_order(registration,version,item,card,status,name_key,target,sent)
                          VALUES(?,?,?,?,'sending',?,?,?)""", (reg, version, item, card, key, plan.target, now))
@@ -717,6 +728,8 @@ class OrderRunner:
                 switches = {}
             with journal_at(self.path) as j:
                 card = self._consent(j, row, item, "order_running", bound=up)
+                test = (card_exception(j.db, self.registry, card, self.clock(), "handoff")
+                        if test_bound(job.snapshot) and card is not None else None)
                 slot = j.db.execute("SELECT registration, version, item FROM trial_order_slot WHERE id=1").fetchone()
                 sending = j.db.execute("""SELECT status FROM trial_order WHERE registration=? AND version=?
                                        AND item=?""", (reg, version, item)).fetchone()
@@ -725,8 +738,11 @@ class OrderRunner:
                 raise Refused("consent")
             if self.clock() >= card["expires"]:
                 raise Refused("expired")
+            if test_bound(job.snapshot) and test is None:
+                raise Refused("test")
             # 生产开关是 Config（Mapping，不是 dict）：按映射核对，不得因类型拦下。
-            if (not isinstance(switches, Mapping) or switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true"
+            if (not isinstance(switches, Mapping)
+                    or (test is None and switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true")
                     or switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
                     or switches.get("MAIL_TRIAL_CREATE_COUNTRY") != card["country"]):
                 raise Refused("switch")
@@ -793,6 +809,8 @@ class OrderRunner:
                 marks = ",".join("?" * len(items))
                 j.db.execute(f"""UPDATE trial_item_task SET status='closed' WHERE card=? AND item IN ({marks})
                              AND status IN ('archive_done','order_running')""", (row["card"], *items))
+                if test_bound(job.snapshot):
+                    close_test(j.db, job.snapshot)  # 段 3：测试卡未发出即永久关闭同一登记
                 if held:
                     record_handoff(j.db, row["card"], held, self.clock(), held={item for item, _ in held})
                 if code == "group":
@@ -857,6 +875,9 @@ class OrderRunner:
             j.db.execute("UPDATE trial_item_task SET status='order_done' WHERE card=? AND item=?", (row["card"], item))
             j.db.execute("DELETE FROM trial_order_slot WHERE registration=? AND version=? AND item=?",
                          (row["registration"], row["version"], item))
+            if test_bound(job.snapshot):
+                # 段 3（G505 第 4 条）：只在恢复清单标记「测试单回读一致，可由守望者登记组合」，不登记 verified_combinations。
+                advance_test(j.db, job.snapshot, "sending", "verified")
             if disconnect:
                 self._notice(j, row["card"], "order_disconnect", self._head(row, [item]) + ORDER_NOTICES["disconnect"])
 
@@ -926,7 +947,8 @@ class OrderRunner:
         row = job.row
         require(canonical_card(row["card"]) and (record_id is None or uuid_record(record_id)), "台账标识格式不符")
         registration = ledger_registration(row["registration"], row["version"], item)
-        entry = dict(registration=registration, event=event, name=plan.name, record_id=record_id, is_test=False,
+        entry = dict(registration=registration, event=event, name=plan.name, record_id=record_id,
+                     is_test=test_bound(job.snapshot),
                      utc=datetime.now(UTC).isoformat(), card_uuid=row["card"], trial_registration=row["registration"],
                      trial_version=row["version"], item=item, country=row["country"], target=plan.target, **extra)
         line = compact(entry) + "\n"
@@ -949,7 +971,7 @@ class MingdaoBackend:
     """
 
     def __init__(self, config, *, official_token, official_app_id, login_token, options_data, sensitive,
-                 evidence=None, bound=(), clock=time.time):
+                 evidence=None, bound=(), clock=time.time, test_combination=None):
         from qianshu.mingdao import create_order as O
         self.O, self.config = O, config
         self.official = (official_token, official_app_id)
@@ -958,6 +980,8 @@ class MingdaoBackend:
         self.target = config["create"]["identifiers"]["worksheetId"]
         self.skip = set(config["readback_skip"])
         self.evidence, self.bound, self.clock = evidence, tuple(bound), clock
+        # 段 3：绑定测试授权的卡以授权里的精确组合代替 verified_combinations（唯一例外判定）。
+        self.test_combination = test_combination
         self.web, self.tags = O.order_profiles(config, evidence or {})
 
     @contextmanager
@@ -1046,7 +1070,9 @@ class MingdaoBackend:
         today = datetime.fromtimestamp(now, UTC).date()
         draft, sources, owners, values, inactive = self._values(snapshot, item, today)
         shown = self.card_face(snapshot, item, values)
-        O.require_verified_combination(self.snapshot, values["policy_type"], values["benefit_type"])
+        if not (self.test_combination and test_bound(snapshot)
+                and self.test_combination(snapshot, values["policy_type"], values["benefit_type"])):
+            O.require_verified_combination(self.snapshot, values["policy_type"], values["benefit_type"])
         O.verify_company_inputs(draft, sources, owners, self.snapshot, self.config["template"]["country"]["value"])
         catalog_rate = O.check_catalog(values, self.snapshot, draft["field_results"])
         projected, assembly = O.x5_projection(values, self.config, inactive)
@@ -1271,9 +1297,12 @@ def build_order_runner(args, settings, state, *, switches, connected, sensitive,
     try:
         from qianshu.mingdao.create_order import decode, digest, extract_token, order_profiles, private_bytes
         current = switches()
-        if current.get("MAIL_TRIAL_CREATE_ENABLED") != "true" or current.get("MAIL_TRIAL_CARD_ENABLED") != "true":
-            return None
         if args.mingdao_config is None or not settings.trial_credentials_complete or settings.trial_login_dir is None:
+            return None
+        # 段 3：建单开关关闭时只在测试授权登记可读且含测试条目时装配；放行与否只由唯一例外判定决定。
+        registry = registry_of(args.mingdao_config.parent)
+        if current.get("MAIL_TRIAL_CARD_ENABLED") != "true" or (
+                current.get("MAIL_TRIAL_CREATE_ENABLED") != "true" and not has_test_entries(registry)):
             return None
         config_data = private_bytes(args.mingdao_config)
         config = decode(config_data)
@@ -1309,10 +1338,15 @@ def build_order_runner(args, settings, state, *, switches, connected, sensitive,
             config_path = args.mingdao_config
             bound = [(digest(config_data), lambda: digest(private_bytes(config_path))),
                      (compact(evidence), lambda: compact(formal_authorization(registry, private_bytes(config_path))))]
+
+        def test_combination(snapshot, policy, benefit):
+            return snapshot_exception(state, registry, snapshot, time.time(), "order", policy=policy,
+                                      benefit=benefit) is not None
         backend = MingdaoBackend(config, official_token=token, official_app_id=app, login_token=login,
-                                 options_data=options, sensitive=sensitive, evidence=evidence, bound=bound)
+                                 options_data=options, sensitive=sensitive, evidence=evidence, bound=bound,
+                                 test_combination=test_combination)
         seconds = int(current.get(READBACK_KEY, "120"))
     except Exception:
         return None
     return OrderRunner(state, switches=switches, backend=backend, connected=connected, ledger_dir=state.parent,
-                       readback_seconds=seconds, switch_file=switch_file)
+                       readback_seconds=seconds, switch_file=switch_file, registry=registry)
