@@ -109,7 +109,7 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 
 序 2a 和正式单由 #154 共同核验邮件审批、绑定预览、确认有效同意、存档并交接建单。序 2a 不能调用旧 X5 或复制模板审批链接。X7 删除另验当次授权与通知登记。
 
-#154 正式单的明道云适配照本节同一路径取值与核对（`verified_order_rows`、`project_web_fields`、标签全名与版本复核、`approved_names` / `request_display`、带 `approved` 的回读比对）。交接前照 X5 交接前核对重读来源：按原标识重读模板及关联，网页路径再以 `verified_order_rows` 重读平台行、标签详情、资费、同期政策与适用的升包任务，来源变化或读不到即停单。回读结论直接采用 `compare` 的逐项结果，覆盖全部已写控件（含 `readback_skip`），缺任一已写字段按写错处理。所需授权取自与建单配置同目录的 `create-authorizations.json` 中 `is_test` 为 `false`、`config_sha256` 等于配置完整字节摘要的唯一一条，须含 `web_rules_sha256`、各表 `*_scope` 与 `create_endpoint`。缺失、多条或不符时不装配建单执行器；正式单建单配置不含 `order_snapshot.web_rules` 时同样不装配（非网页正式路径不启用）。该登记含上列 050 键，因此同一运行目录的原格式 X5 入口按本节规则拒绝启动。
+#154 正式单的明道云适配照本节同一路径取值与核对（`verified_order_rows`、`project_web_fields`、标签全名与版本复核、`approved_names` / `request_display`、带 `approved` 的回读比对）。交接前照 X5 交接前核对重读来源：按原标识重读模板及关联，网页路径再以 `verified_order_rows` 重读平台行、标签详情、资费、同期政策与适用的升包任务，来源变化或读不到即停单；重读完成后再按 X5 `check_start_date` 的同一判据（`effective_start_date` 与证明有效期）核一次，开始日期需顺延或证明已过期即不写出、需重新审批。回读结论直接采用 `compare` 的逐项结果，覆盖全部已写控件（含 `readback_skip`），缺任一已写字段按写错处理。所需授权取自与建单配置同目录的 `create-authorizations.json` 中 `is_test` 为 `false`、`config_sha256` 等于配置完整字节摘要的唯一一条，须含 `web_rules_sha256`、各表 `*_scope` 与 `create_endpoint`。缺失、多条或不符时不装配建单执行器；正式单建单配置不含 `order_snapshot.web_rules` 时同样不装配（非网页正式路径不启用）。该登记含上列 050 键，因此同一运行目录的原格式 X5 入口按本节规则拒绝启动。
 
 - `require_verified_combination(snapshot, policy, benefit)` 从当前私有 `order_snapshot.verified_combinations` 读取二元列表。守望者只登记真实测试单逐项回读一致的组合。缺省、空或未命中时返回停单原因「该类型尚未经真实回读验证」，供 #154 展示。出卡和交接前均须检查。
 - `TrialRegistration` 由 #154 从当次授权构造，含登记编号、产品负责人回执、原登记的测试名称、精确组合与 UTC 截止时刻。`consume` 在私有目录独占创建并同步关闭记录，再核组合和时限，因此失败、过期、并发及重启后的重复尝试均不能复用。其他门禁先失败或在等待期间到期时，调用方须执行同一登记的 `close`。消耗资格不会登记放行名单。

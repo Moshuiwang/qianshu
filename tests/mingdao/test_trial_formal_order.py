@@ -163,6 +163,48 @@ def test_source_change_during_preconnect_never_writes(case, platform, business_c
     assert stopped.value.code == "plan" and platform.create_count == 0
 
 
+@pytest.mark.parametrize("change", ["start_date", "proof", "same_day"])
+def test_reread_across_utc_midnight_rechecks_start_date_and_proof(case, platform, business_cli, web_order, monkeypatch,
+                                                                  change):
+    """特批第 3 轮第 3 条（复核 P1-3）：真实 CreateRequest.prepare，23:59:45Z 规划、来源重读结束于次日 00:00:05Z →
+    开始日期需顺延，写出 0 次、按需重新审批收口；同期政策与标签证明在重读期间过期同样 0 发；
+    对照：重读结束仍在当日（23:59:58Z）→ 照常写出 1 次。"""
+    start = datetime.fromisoformat(case.values["start_date"]).replace(tzinfo=UTC)
+    if change == "proof":
+        # 开始日期为次日、跨零点不需顺延；证明在次日 00:00:00Z 到期。
+        planned, ended, until = start - timedelta(seconds=15), start + timedelta(seconds=5), start
+    else:
+        day_end = start + timedelta(hours=23, minutes=59, seconds=45)
+        planned, until = day_end, start + timedelta(days=3)
+        ended = day_end + timedelta(seconds=13 if change == "same_day" else 20)
+    assert datetime.fromisoformat(case.config["order_snapshot"]["concurrent_policies"]["as_of"]) <= planned
+    case.evidence["tag_scope"]["unique_until"] = until.isoformat()
+    case.evidence["concurrent_scope"]["unique_until"] = until.isoformat()
+    case.config["order_snapshot"]["concurrent_policies"]["valid_until"] = until.isoformat()
+    clock = [planned.timestamp()]
+    mingdao = backend(case, clock=lambda: clock[0])
+    plan = mingdao.plan(card_snapshot(case), 1, URL, now=clock[0], sent=clock[0])
+    local, calls = MingdaoBackend._local, []
+
+    def reread_done(self):
+        # 交接前复核：平台读取之后的第二次本地核对即来源重读结束，此刻时钟已走到 ended。
+        local(self)
+        calls.append(1)
+        if len(calls) == 2:
+            clock[0] = ended.timestamp()
+    monkeypatch.setattr(MingdaoBackend, "_local", reread_done)
+    monkeypatch.setattr(order, "CreateRequest", partial(order.CreateRequest.func, connect=platform.connection))
+    arm(case, platform)
+    handed = []
+    if change == "same_day":
+        assert mingdao.send(plan, lambda: handed.append(1)) == case.ids["created"]
+        assert handed == [1] and platform.create_count == 1
+        return
+    with pytest.raises(NotSent) as stopped:
+        mingdao.send(plan, lambda: handed.append(1))
+    assert stopped.value.code == "reapprove" and handed == [] and platform.create_count == 0 and len(calls) == 2
+
+
 def test_readback_compares_approved_business_values(case, platform, business_cli, web_order):
     rules, _, _ = web_order
     mingdao = backend(case)

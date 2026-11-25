@@ -13,7 +13,7 @@ import unicodedata
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from hashlib import sha256
 from pathlib import Path
 from uuid import UUID
@@ -61,6 +61,7 @@ CANCEL_REASONS = {
     "not_sent": "建单请求未发出",
     "previous": "同批前序条目未建成",
     "slot": "本条发送登记已变化",
+    "reapprove": "开始日期需顺延或来源证明已过期，需重新审批",
 }
 # 已占用建单资格的状态：在途、已建、写错、未知。
 ACTIVE = ("sending", "created", "verified", "mismatch", "unknown")
@@ -871,7 +872,8 @@ class MingdaoBackend:
         require(fingerprints == sent_values, "经卡片确认的取值与请求不一致，需重新审批")
         # 交接前来源复核的原值（照 X5 bound_sources：模板及关联、网页路径的平台来源）。
         source = {"values": base_values, "catalog_rate": catalog_rate, "cells": cells, "relations": dict(relations),
-                  "platform": self._platform_digest(sources_read) if self.web else None}
+                  "platform": self._platform_digest(sources_read) if self.web else None,
+                  "draft_start": draft["start_date"]["value"], "start_date": base_values["start_date"]}
         # 应回读的字段 = 全部已写控件（含 readback_skip：写入值均须回读，CREATE_ORDER.md）。
         written = list(dict.fromkeys(labels[c["controlId"]] for c in O.decode(payload)["receiveControls"]))
         return Plan(values["policy_name"], self.target, written, fingerprints, sent_values, payload,
@@ -905,7 +907,7 @@ class MingdaoBackend:
 
     def recheck(self, plan):
         """交接前复核（照 X5 交接前核对）：证明有效期；先核本地配置与授权登记（撤权后不按旧登记查平台）；重读模板及关联与
-        平台来源；标签全名唯一性版本；平台读取之后再核一次本地配置与授权登记。"""
+        平台来源；标签全名唯一性版本；平台读取之后再核一次本地配置与授权登记；最后按 X5 判据再核开始日期与证明有效期。"""
         O = self.O
         extra = plan.extra
         try:
@@ -922,6 +924,21 @@ class MingdaoBackend:
             raise
         except Exception:
             raise Refused("plan") from None
+        try:
+            self._start_window(extra["source"])
+        except O.OutletConflict:
+            raise
+        except Exception:
+            raise Refused("reapprove") from None
+
+    def _start_window(self, source):
+        """照 X5 `check_start_date`：耗时的来源重读完成后、写出前，用 X5 同一判据（`effective_start_date` 与证明有效期）
+        再核一次。重读跨过 UTC 零点致开始日期需顺延，或证明在重读期间过期 → 不写出、需重新审批（特批第 3 轮第 3 条）。"""
+        O = self.O
+        today = datetime.fromtimestamp(self.clock(), UTC).date()
+        approved = O.effective_start_date(date.fromisoformat(source["draft_start"]), today)
+        require(source["start_date"] == approved.isoformat(), "经卡片确认的开始日期已过，需重新审批")
+        self._proof_window()
 
     def send(self, plan, handoff):
         """预建连后先复核来源，再由 handoff 在实际交接处复核；不符或交接前失败均确证未写出。"""

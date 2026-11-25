@@ -749,6 +749,22 @@ def test_release_clears_only_the_confirmed_registration(order, capsys):
     assert NAMES[0] not in json.dumps([before, after], ensure_ascii=False)
 
 
+def test_reread_reapprove_closes_as_not_sent_and_asks_reapproval(order):
+    """特批第 3 轮第 3 条：适配层在来源重读后核到开始日期需顺延或证明过期（NotSent reapprove）→ 确证未发出：释放在途槽，
+    公告需重新审批、未建单，同批余项不发。"""
+    archived(order)
+
+    def reapprove(plan, handoff):
+        raise NotSent("reapprove")
+    order.mingdao.send = reapprove
+    assert order.orders().run_once() is True
+    assert query(order.path, "SELECT item,status FROM trial_order") == [(1, "aborted")]
+    assert query(order.path, "SELECT * FROM trial_order_slot") == []
+    text = notices(order)["order_cancel:1"]
+    assert "需重新审批，未建单，已转人工。" in text and "order_cancel:2" in notices(order)
+    assert events(order, 1)[-2:] == ["aborted_before_write", "approval_closed"]
+
+
 # ---------------------------------------------------------------- 出卡即登记人工移交（特批第 3 轮第 1 条）
 
 def issue(env, monkeypatch, eligible):
