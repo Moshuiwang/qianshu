@@ -140,3 +140,21 @@ python -m qianshu.mingdao.create_order --config .private/占位配置.json --reg
 `verified_order_rows` 保存各次详情投影及其读取方法。出卡使用该投影生成业务显示值、请求和回读期望。交接前按原 ID 重读，逐项核对。部署端缺少已登记的列或详情读取能力时，该组合停单。
 数字证据按原文坐标核对，数值记号本身和前后各四个 Unicode 码点内出现减号或连字符即转人工。
 写后独立核对所选标签详情，全表不可读时仍保留已经证实的异名。050 先写私有报告和台账，再返回逐单结论；回读公告由 #154 取得结论后处理。D15 的删除公告和删除核验仍按原授权执行。
+
+## 配置草稿生成（只读）
+
+部署 050 前，在受控入口用已有 X5 的连接、目标表和控件映射起草正式单材料。目标模板默认为 X5 配置的 `template.row_id`。同国家的其他模板可用 `--template-row-id` 指定。
+
+```sh
+python -m qianshu.mingdao.config_draft --config <私有X5配置> --env-file <X5业务凭据文件> --out-dir <已有0700目录> [--template-row-id <模板UUID>] [--read-scopes <私有范围JSON>]
+```
+
+`--read-scopes` 是 0600 JSON 对象，按上表的 `tag_scope`、`concurrent_scope`、`tariffs_scope`、`tasks_scope` 等键提供独立读取范围。指定任务时提供 `record_id`。仅经 X5 官方接口读取模板、模板关联行及已定位的业务表。当前 X5 没有网页公式定义读接口，模板控件能绑定的先绑定，公式及其参数留待人工核对。进程环境含飞书转交配置、输出目录权限不符或已有同名文件时，在发请求前退出。
+
+输出三份 0600 JSON 文件：
+
+- `order-config.draft.json` 保存 X5 目标、控件、同国家模板及 `order_snapshot`，内含 `web_rules` 和有来源的业务行。
+- `create-authorization.draft.json` 为一条 `is_test=false` 的登记，绑定配置完整字节及公式规范 JSON 的 SHA-256。负责人回执留为「待产品负责人确认」。范围内的私有标识须在确认时补齐。
+- `sources.json` 的 `items` 逐项记录对象类别、UTC 时刻、内容指纹、条目数及缺失标志。定位指纹为路径数组紧凑 JSON 的 SHA-256 前 12 位，根路径名分别为 `config`、`authorization`，模板关联读取另用 `relations`。数组下标从 0 开始。
+
+产物经守望者核结构、产品负责人确认后才落盘为正式配置。补齐占位并按最终字节重算摘要，把登记放入同目录 `create-authorizations.json` 的登记号下。部署后读回 `sha256sum <配置>`，与登记的 `config_sha256` 逐字比对，并核实摘要匹配且 `is_test=false` 的登记只有一条。
