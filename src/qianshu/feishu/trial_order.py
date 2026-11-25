@@ -635,9 +635,15 @@ class OrderRunner:
 # ---------------------------------------------------------------- 生产适配（明道云）
 
 class MingdaoBackend:
-    """复用 X5 的组装与核对：草稿 → 字段 → 模板组装（任务审批链接 = 本批存档链接）→ 请求核对 → 建单 → 官方回读比对。"""
+    """复用 X5 的组装与核对：草稿 → 字段 → 模板组装（任务审批链接 = 本批存档链接）→ 请求核对 → 建单 → 官方回读比对。
 
-    def __init__(self, config, *, official_token, official_app_id, login_token, options_data, sensitive):
+    配置含 050 网页公式字段时，照 X5 `_run_registered` 的同一路径取值与核对：`verified_order_rows`（平台行与资费）、
+    `project_web_fields`、标签全名与版本复核、`approved_names` / `request_display`，回读把 `approved` 交给 `compare`。
+    所需授权（`web_rules_sha256`、各表读范围、建单入口）来自按配置摘要绑定的正式单授权登记 `evidence`。
+    """
+
+    def __init__(self, config, *, official_token, official_app_id, login_token, options_data, sensitive,
+                 evidence=None, bound=(), clock=time.time):
         from qianshu.mingdao import create_order as O
         self.O, self.config = O, config
         self.official = (official_token, official_app_id)
@@ -645,6 +651,8 @@ class MingdaoBackend:
         self.snapshot = config.get("order_snapshot", {})
         self.target = config["create"]["identifiers"]["worksheetId"]
         self.skip = set(config["readback_skip"])
+        self.evidence, self.bound, self.clock = evidence, tuple(bound), clock
+        self.web, self.tags = O.order_profiles(config, evidence or {})
 
     @contextmanager
     def _guard(self):
@@ -711,17 +719,63 @@ class MingdaoBackend:
             result[spec["label"]] = O.digest(encoded.encode())[:16]
         return result
 
+    def card_face(self, snapshot, item, values):
+        """出卡时冻结的卡面业务值（快照 reviewed）逐项核对建单取值；有任何差异即停单、需重新审批（审核 P1-2）。
+
+        reviewed 是出卡时经校验的草稿（开始日期已按出卡当日顺延），与建单当日重算的取值逐字段比较，跨 UTC 日顺延即不符。
+        """
+        O = self.O
+        reason = "经卡片确认的取值已变化，需重新审批"
+        try:
+            reviewed = snapshot["reviewed"][item - 1]
+            shown = {key: field["value"] for key, field in reviewed.items()
+                     if key in O._ORDER_FIELDS and isinstance(field, dict) and field.get("value") is not None}
+        except (KeyError, IndexError, TypeError, AttributeError):
+            raise O.Stop(reason) from None
+        require(shown.keys() == values.keys() and all(compact(shown[k]) == compact(values[k]) for k in shown), reason)
+        return shown
+
+    def displayed(self, shown, controls, inactive):
+        """台账 displayed 指纹：草稿可变字段取卡面快照值编码；模板、平台与固定字段没有单独的卡面值，取请求值。"""
+        O = self.O
+        result = {}
+        for cell in controls:
+            if cell["controlId"] in self.skip:
+                continue
+            spec = self.config["fields"][cell["controlId"]]
+            key = spec.get("draft")
+            encoded = cell["value"]
+            if key in O._VARIABLE:
+                encoded = O.encode_cell(None if key in inactive else shown.get(key), spec)
+            result[spec["label"]] = O.digest(encoded.encode())[:16]
+        return result
+
+    def _proof_window(self):
+        O = self.O
+        if self.tags:
+            require(self.clock() < O.utc(self.evidence["tag_scope"]["unique_until"]).timestamp(), "标签唯一性证明已到期")
+        if self.web:
+            require(self.clock() < O.utc(self.snapshot["concurrent_policies"]["valid_until"]).timestamp(),
+                    "同期政策来源已过期")
+
     def plan(self, snapshot, item, url, *, now, sent):
         O = self.O
+        require(not self.tags or self.evidence is not None, "正式单授权登记缺失，需人工")
+        evidence = self.evidence or {}
         today = datetime.fromtimestamp(now, UTC).date()
         draft, sources, owners, values, inactive = self._values(snapshot, item, today)
         shown = self.card_face(snapshot, item, values)
         O.require_verified_combination(self.snapshot, values["policy_type"], values["benefit_type"])
         O.verify_company_inputs(draft, sources, owners, self.snapshot, self.config["template"]["country"]["value"])
-        O.check_catalog(values, self.snapshot, draft["field_results"])
+        catalog_rate = O.check_catalog(values, self.snapshot, draft["field_results"])
         projected, assembly = O.x5_projection(values, self.config, inactive)
+        O.check_search_binding(self.config, self.config["official"])
+        self._proof_window()
+        config = self.config
+        create = O.CreateRequest(config["create"], evidence if self.evidence is not None
+                                 else {"create_endpoint": config["create"]["endpoint"]}, self.login)
         with self._api() as api:
-            template_id = self.config["template"]["row_id"]
+            template_id = config["template"]["row_id"]
             require(O.uuid_record(template_id), "模板记录编号须为 UUID")
             cells = api.detail(api.read(template_id), template_id)
             relations = {}
@@ -729,34 +783,82 @@ class MingdaoBackend:
             def rows(control):
                 relations[control] = api.relations(template_id, control)
                 return relations[control]
-            arrays = {c for c, s in self.config["fields"].items() if s.get("draft") in values
+            request_cells, request_relations, plan_names, sources_read = cells, relations, {}, {}
+            if self.web:
+                # 照 X5 050 路径：平台行、资费与同期政策按授权登记重读，公式与显示值用详情投影。
+                for control, spec in config["fields"].items():
+                    if spec.get("draft") in ("company", "user_tags", "packages"):
+                        O.template_relation_rows(cells, control, rows, spec["label"])
+                verified = O.verified_order_rows(api, config, evidence, values, cells, relations, catalog_rate,
+                                                 self.clock)
+                config, values = verified.config, verified.values
+                request_cells, request_relations = verified.cells, verified.relations
+                plan_names, sources_read = verified.plan_names, verified.sources
+                projected, assembly = O.x5_projection(values, config, inactive)
+
+            def web_fields(company_row, _packages):
+                return O.project_web_fields(config, evidence, values, company_row, request_cells, self.clock)
+            arrays = {c for c, s in config["fields"].items() if s.get("draft") in values
                       and "draft" not in assembly["fields"][c] and s["type"] in (10, 26, 29, 34)}
-            controls, _, _ = O.assemble_controls(projected, cells, assembly, rows, is_test=False,
-                                                 array_controls=arrays, approval_url=url)
-            create = O.CreateRequest(self.config["create"], {"create_endpoint": self.config["create"]["endpoint"]},
-                                     self.login)
+            controls, summary, web = O.assemble_controls(
+                projected, request_cells, assembly, request_relations.__getitem__ if self.web else rows,
+                is_test=False, array_controls=arrays, web_fields=web_fields if self.web else None, approval_url=url)
+            selected = tag_version = None
+            if self.tags:
+                selected = O.selected_template_tags(config, controls, relations, values, self.snapshot)
+                tag_version = (sources_read["tags"][0] if self.web else
+                               api.verified_tag_version(evidence.get("tag_scope"), values["user_tags"], selected,
+                                                        self.clock))
             payload = create.payload(controls)
-            O.verify_order_request(payload, self.config, cells, relations, values, inactive, self.sensitive,
+            O.verify_order_request(payload, config, request_cells, request_relations, values, inactive, self.sensitive,
                                    draft["field_results"]["packages"]["statement"])
+            check_outlet((payload, O.decode(payload)))
             require(O.decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
+            approved = O.approved_names(controls, config, values, web, plan_names, request_cells) if self.web else None
+            if self.web:
+                O.request_display(payload, config, values, inactive, summary, web, plan_names, approved)
             require(not api.find(values["policy_name"]), "已存在同名记录，需人工")
-        labels = {c["controlId"]: self.config["fields"][c["controlId"]]["label"] for c in controls}
+        labels = {c["controlId"]: config["fields"][c["controlId"]]["label"] for c in controls}
         sent_values = {labels[c["controlId"]]: O.digest(c["value"].encode())[:16]
                        for c in O.decode(payload)["receiveControls"] if c["controlId"] not in self.skip}
         fingerprints = self.displayed(shown, controls, inactive)
         require(fingerprints == sent_values, "经卡片确认的取值与请求不一致，需重新审批")
         return Plan(values["policy_name"], self.target, list(sent_values), fingerprints, sent_values, payload,
-                    {"controls": controls, "packages": values["packages"], "company": values["company"]})
+                    {"controls": controls, "packages": values["packages"], "company": values["company"],
+                     "config": config, "approved": approved, "tags": values["user_tags"], "selected": selected,
+                     "tag_version": tag_version})
+
+    def recheck(self, plan):
+        """交接前复核（照 X5 交接前核对）：证明有效期、标签全名唯一性版本；平台读取之后再核本地配置与授权登记。"""
+        O = self.O
+        try:
+            self._proof_window()
+            if self.tags:
+                extra = plan.extra
+                with self._api() as api:
+                    current = api.verified_tag_version(self.evidence.get("tag_scope"), extra["tags"],
+                                                       extra["selected"], self.clock)
+                    require(current == extra["tag_version"], "所选标签全名或版本已变化")
+            for initial, read in self.bound:
+                require(read() == initial, "建单配置或授权登记已变化，需重新审批")
+        except O.OutletConflict:
+            raise
+        except Exception:
+            raise Refused("plan") from None
 
     def send(self, plan, handoff):
-        """预建连后由 handoff 在实际交接处复核；复核不符或交接前失败均确证未写出。"""
+        """预建连后先复核来源，再由 handoff 在实际交接处复核；不符或交接前失败均确证未写出。"""
         O = self.O
-        create = O.CreateRequest(self.config["create"], {"create_endpoint": self.config["create"]["endpoint"]},
-                                 self.login)
+        create = O.CreateRequest(self.config["create"], self.evidence if self.evidence is not None
+                                 else {"create_endpoint": self.config["create"]["endpoint"]}, self.login)
+
+        def check():
+            self.recheck(plan)
+            handoff()
         with self._guard():
             try:
                 with create.prepare(plan.payload) as (transmit, read_id):
-                    transmit(handoff)
+                    transmit(check)
                     return read_id()
             except Refused as error:
                 if not create.started:
@@ -769,37 +871,68 @@ class MingdaoBackend:
 
     def readback(self, plan, record_id, budget):
         O = self.O
+        extra = plan.extra
         with self._api() as api:
             raw = api.read(record_id, budget=budget)
             if raw is O._MISSING:
                 return None, []
             observed = api.detail(raw, record_id)
-            report, _ = O.compare(plan.extra["controls"], observed, self.config,
+            tag_names = None
+            if self.tags:
+                def tag_names():
+                    return O.readback_tag_names_check(api, self.evidence["tag_scope"], extra["tags"],
+                                                      extra["selected"])
+            report, _ = O.compare(extra["controls"], observed, extra["config"],
                                   read_relations=lambda key: api.relations(record_id, key),
-                                  packages=plan.extra["packages"], company=plan.extra["company"])
-        rows = [r for c, r in zip(plan.extra["controls"], report["逐项核对"]) if c["controlId"] not in self.skip]
+                                  packages=extra["packages"], company=extra["company"], tag_names=tag_names,
+                                  approved=extra["approved"])
+        rows = [r for c, r in zip(extra["controls"], report["逐项核对"]) if c["controlId"] not in self.skip]
         results = [r["结果"] for r in rows]
-        if all(r == "一致" for r in results):
-            verdict = "一致"
-        elif any(r in ("不一致", "缺失") for r in results):
+        if report["结论"] == "写错" or any(r in ("不一致", "缺失") for r in results):
             verdict = "写错"
+        elif all(r == "一致" for r in results):
+            verdict = "一致"
         else:
             return None, []
         return verdict, [{"字段名": r["字段名"], "结果": "一致" if r["结果"] == "一致" else "不一致"} for r in rows]
 
 
+AUTHORIZATIONS_FILE = "create-authorizations.json"
+# 050 网页字段路径须在正式单授权登记里登记的项（见 CREATE_ORDER.md「050 的字段、授权与回读」）。
+WEB_EVIDENCE = ("web_rules_sha256", "tag_scope", "concurrent_scope", "tariffs_scope", "products_scope", "plans_scope",
+                "company_rows_scope", "create_endpoint")
+
+
+def formal_authorization(path, config_data):
+    """正式单授权登记：与明道云配置同目录的私有授权登记中，`is_test` 为假且 `config_sha256` 等于本配置
+    完整字节摘要的唯一一条。缺失、多条或不可读返回 None（不装配）。"""
+    from qianshu.mingdao.create_order import decode, digest, private_bytes
+    try:
+        registry = decode(private_bytes(path))
+    except Exception:
+        return None
+    if not isinstance(registry, dict):
+        return None
+    wanted = digest(config_data)
+    matched = [entry for entry in registry.values() if isinstance(entry, dict) and entry.get("is_test") is False
+               and entry.get("config_sha256") == wanted]
+    return matched[0] if len(matched) == 1 else None
+
+
 def build_order_runner(args, settings, state, *, switches, connected, sensitive, archive_runner):
-    """未确认配置下不装配：存档执行器已装配、建单开关开、明道云配置与凭据来源、登录态均已就绪。"""
+    """未确认配置下不装配：存档执行器已装配、建单开关开、明道云配置与凭据来源、登录态均已就绪；
+    配置含 050 网页字段或标签全表核验时，另须有按配置摘要绑定的正式单授权登记，且公式授权指纹相符。"""
     if archive_runner is None:
         return None
     try:
-        from qianshu.mingdao.create_order import decode, extract_token, private_bytes
+        from qianshu.mingdao.create_order import decode, digest, extract_token, order_profiles, private_bytes
         current = switches()
         if current.get("MAIL_TRIAL_CREATE_ENABLED") != "true" or current.get("MAIL_TRIAL_CARD_ENABLED") != "true":
             return None
         if args.mingdao_config is None or not settings.trial_credentials_complete or settings.trial_login_dir is None:
             return None
-        config = decode(private_bytes(args.mingdao_config))
+        config_data = private_bytes(args.mingdao_config)
+        config = decode(config_data)
         snapshot = config.get("order_snapshot")
         if (not isinstance(snapshot, dict) or not isinstance(snapshot.get("verified_combinations"), list)
                 or not all(k in config for k in ("create", "official", "template", "fields", "fixed",
@@ -813,8 +946,24 @@ def build_order_runner(args, settings, state, *, switches, connected, sensitive,
         login = extract_token(decode(private_bytes(settings.trial_login_dir / "mingdao-state.json")),
                               config["create"]["session_cookie"])
         options = (Path(__file__).resolve().parents[3] / "rules" / "parse-options.tsv").read_bytes()
+        evidence, bound = None, []
+        web, tags = order_profiles(config, {})
+        if web or tags:
+            registry = args.mingdao_config.parent / AUTHORIZATIONS_FILE
+            evidence = formal_authorization(registry, config_data)
+            if evidence is None:
+                return None
+            web, tags = order_profiles(config, evidence)
+            if web and (not all(k in evidence for k in WEB_EVIDENCE) or evidence["web_rules_sha256"] != digest(
+                    compact(snapshot.get("web_rules")).encode())):
+                return None
+            if tags and "tag_scope" not in evidence:
+                return None
+            config_path = args.mingdao_config
+            bound = [(digest(config_data), lambda: digest(private_bytes(config_path))),
+                     (compact(evidence), lambda: compact(formal_authorization(registry, private_bytes(config_path))))]
         backend = MingdaoBackend(config, official_token=token, official_app_id=app, login_token=login,
-                                 options_data=options, sensitive=sensitive)
+                                 options_data=options, sensitive=sensitive, evidence=evidence, bound=bound)
         seconds = int(current.get(READBACK_KEY, "120"))
     except Exception:
         return None

@@ -3051,6 +3051,45 @@ def _run(args, directory, clock, guard):
     return _run_registered(args, directory, clock, guard, config_data, authorizations)
 
 
+def order_profiles(config, evidence):
+    """(050 网页字段路径, 标签全表核验路径)。X5 与 #154 正式单共用同一判据。"""
+    web = ("web_rules" in config.get("order_snapshot", {}) or "web_rules_sha256" in evidence
+           or any(spec["label"] in WEB_TYPES for spec in config["fields"].values()))
+    return web, web or "tag_search" in config["official"] or "tag_scope" in evidence
+
+
+def selected_template_tags(config, controls, relations, values, snapshot):
+    """请求所选标签须在模板关联与快照中按全名唯一对应；返回所选标签。"""
+    key = next(key for key, field in config["fields"].items() if field.get("draft") == "user_tags")
+    selected = next(decode(cell["value"]) for cell in controls if cell["controlId"] == key)
+    keys = config["official"]["tag_relation"]["name_keys"]
+    for name, item in zip(values["user_tags"], selected, strict=True):
+        require(any(row["rowId"] == item["sid"] and any(row.get(k) == name for k in keys)
+                    for row in relations[key]) and any(row["name"] == name and row["id"] == item["sid"]
+                    for row in snapshot["tags"]), "模板或快照标签全名未确认")
+    return selected
+
+
+def readback_tag_names_check(api, scope, names, selected):
+    """写后独立核对所选标签的当前全名与全表唯一性；已证实的异名返回假，无法确认时停止。"""
+    try:
+        targeted = api.selected_tag_names(scope, selected)
+    except OutletConflict:
+        raise
+    except (Stop, KeyError, ValueError, TypeError):
+        targeted = None
+    if targeted is not None and targeted != names:
+        return False
+    index = api.tag_index(scope)
+    for name, item in zip(names, selected, strict=True):
+        row_id = item["sid"].lower()
+        if any(other != name and row_id in ids for other, ids in index.items()):
+            return False
+    require(targeted is not None and all(index.get(name) == [item["sid"].lower()]
+            for name, item in zip(names, selected, strict=True)), "标签全名唯一性未确认")
+    return True
+
+
 def check_search_binding(config, official):
     worksheet = config["create"]["identifiers"]["worksheetId"]
     require(receipt(worksheet) and official["search"]["path"] == f"/v3/app/worksheets/{worksheet}/rows/list",
@@ -3235,9 +3274,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
                 relations[control] = api.relations(template_id, control)
                 return relations[control]
 
-            web_profile = ("web_rules" in snapshot or "web_rules_sha256" in evidence
-                           or any(spec["label"] in WEB_TYPES for spec in config["fields"].values()))
-            tag_profile = web_profile or "tag_search" in official or "tag_scope" in evidence
+            web_profile, tag_profile = order_profiles(config, evidence)
             plan_names = {}
             def web_fields(company_row, _packages):
                 return project_web_fields(config, evidence, values, company_row, request_cells, clock)
@@ -3265,13 +3302,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
                 )
 
                 if tag_profile:
-                    key = next(key for key, field in config["fields"].items() if field.get("draft") == "user_tags")
-                    selected_tags = next(decode(cell["value"]) for cell in controls if cell["controlId"] == key)
-                    keys = official["tag_relation"]["name_keys"]
-                    for name, item in zip(values["user_tags"], selected_tags, strict=True):
-                        require(any(row["rowId"] == item["sid"] and any(row.get(k) == name for k in keys)
-                                    for row in relations[key]) and any(row["name"] == name and row["id"] == item["sid"]
-                                    for row in snapshot["tags"]), "模板或快照标签全名未确认")
+                    selected_tags = selected_template_tags(config, controls, relations, values, snapshot)
                     def tag_version():
                         return api.verified_tag_version(evidence.get("tag_scope"), values["user_tags"], selected_tags, clock)
 
@@ -3363,24 +3394,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
                 return source_version
 
             def readback_tag_names():
-                scope = evidence["tag_scope"]
-                names = values["user_tags"]
-                try:
-                    targeted = api.selected_tag_names(scope, selected_tags)
-                except OutletConflict:
-                    raise
-                except (Stop, KeyError, ValueError, TypeError):
-                    targeted = None
-                if targeted is not None and targeted != names:
-                    return False
-                index = api.tag_index(scope)
-                for name, item in zip(names, selected_tags, strict=True):
-                    row_id = item["sid"].lower()
-                    if any(other != name and row_id in ids for other, ids in index.items()):
-                        return False
-                require(targeted is not None and all(index.get(name) == [item["sid"].lower()]
-                        for name, item in zip(names, selected_tags, strict=True)), "标签全名唯一性未确认")
-                return True
+                return readback_tag_names_check(api, evidence["tag_scope"], values["user_tags"], selected_tags)
 
             return service.run_create(lambda stop: run_order(
                 ledger, api, create, service, window, payload, summary, controls, config, evidence,
