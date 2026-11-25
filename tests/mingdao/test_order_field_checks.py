@@ -101,7 +101,7 @@ def test_search_page_contract(case, mode, expected_pages):
         if mode == "empty" and page == 2:
             rows = []
         total = 1 if mode == "description" else 2
-        return httpx.Response(200, json={"success": True, "error_code": 0, "error_msg": "成功",
+        return httpx.Response(200, json={"success": True, "error_code": 1, "error_msg": "成功",
             "data": {"rows": rows, "total": total, "pageIndex": page, "pageSize": 1, "hasMore": page < total}})
     with httpx.Client(transport=httpx.MockTransport(respond)) as client:
         api = order.Official(cfg, case.official_token, case.ids["official_app"], client)

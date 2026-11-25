@@ -509,7 +509,7 @@ class Platform:
 
     @staticmethod
     def response(data, *, success=True, **envelope):
-        return httpx.Response(200, json={"success": success, "error_code": 0, "data": data, **envelope})
+        return httpx.Response(200, json={"success": success, "error_code": 1, "data": data, **envelope})
 
     def connection(self, host, **kwargs):
         platform = self
@@ -3612,3 +3612,130 @@ def test_reentry_gates(reentry, case, business_cli, platform, monkeypatch, mode)
             book.reserve()
     else:
         reentry.frozen()
+
+
+@pytest.mark.parametrize("code_fields", [{"error_code": 1}, {}], ids=["integer-one", "omitted"])
+def test_official_read_accepts_success_code(case, code_fields):
+    data = {"rowId": case.ids["template"]}
+    payload = {"success": True, "data": data, **code_fields}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    with httpx.Client(transport=transport) as client:
+        api = order.Official(case.config["official"], case.official_token, case.ids["official_app"], client)
+        assert api.read(case.ids["template"]) == data
+
+
+@pytest.mark.parametrize(("success", "code"), [
+    (True, 0), (True, 2), (True, True), (True, "1"), (False, 1), (True, 300107),
+])
+def test_official_read_rejects_unconfirmed_result(case, success, code):
+    payload = {"success": success, "data": {"rowId": case.ids["template"]}, "error_code": code}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    with httpx.Client(transport=transport) as client:
+        api = order.Official(case.config["official"], case.official_token, case.ids["official_app"], client)
+        with pytest.raises(order.Stop, match="^官方接口结果未确认$"):
+            api.read(case.ids["template"])
+
+
+@pytest.mark.parametrize(("cell", "row_ids"), [
+    ([{"sid": "A", "name": "合成公司"}], ["A"]),
+    ([{"sid": "a"}], ["A"]),
+    ([{"sid": "B"}, {"sid": "A"}], ["A", "B"]),
+    ([], []),
+])
+def test_template_relation_list_matches(cell, row_ids):
+    rows = [{"rowId": row_id} for row_id in row_ids]
+    assert order.template_relation_rows({"company": cell}, "company", {"company": rows}.__getitem__, "公司") is rows
+
+
+@pytest.mark.parametrize(("cell", "row_ids"), [
+    ([{"sid": "A"}, {"sid": "B"}], ["A"]),
+    ([], ["A"]),
+    ([{"sid": "A"}, {"sid": "a"}], ["A", "a"]),
+    ([{"sid": "A"}, {"sid": "B"}], ["A", "a"]),
+    ([{"name": "合成公司"}], ["A"]),
+    ([{"sid": 1}], ["A"]),
+    ([{"sid": ""}], ["A"]),
+    ([{"sid": "A", "extra": 1}], ["A"]),
+    (["A"], ["A"]),
+    ([{"sid": "B"}], ["A"]),
+])
+def test_template_relation_list_stops(cell, row_ids):
+    rows = [{"rowId": row_id} for row_id in row_ids]
+    with pytest.raises(order.Stop, match="^模板公司字段计数与关联行总数不一致，需人工$"):
+        order.template_relation_rows({"company": cell}, "company", {"company": rows}.__getitem__, "公司")
+
+
+def test_assemble_template_relation_list_company(case):
+    control, _, matched = company_relation(case)
+    case.relations[control] = [matched]
+    case.cells[control] = [{"name": "占位显示名", "sid": matched["rowId"].upper()}]
+    controls, _ = assemble(case)
+    company, = (field for field in controls if field["controlId"] == control)
+    assert json.loads(company["value"]) == [{"sid": matched["rowId"]}]
+
+
+def test_x5_relation_list_readback(case):
+    company, _, _ = company_relation(case)
+
+    def references(rows):
+        return [{"name": "合成显示名", "sid": row["rowId"].upper()} for row in reversed(rows)]
+
+    for key, rows in case.relations.items():
+        case.cells[key] = references(rows)
+    platform = Platform(case)
+
+    def detail(row):
+        for key, rows in platform.created_relations.items():
+            row[key] = references(rows)
+
+    platform.before_read = detail
+    assert run_case(case, platform, Approvals(platform))
+    assert platform.create_count == 1
+    assert len(platform.created_relations[company]) == 1
+    path, = case.private.glob("create-readback-*.json")
+    assert json.loads(path.read_text())["结论"] == "一致"
+
+
+@pytest.mark.parametrize("approved", [False, True])
+@pytest.mark.parametrize("shape", ["valid", "extra", "short", "wrong", "duplicate", "non_dict"])
+def test_relation_list_readback_grades(case, approved, shape):
+    company, _, matched = company_relation(case)
+    tags = case.control["user_tags"]
+    case.config["fields"]["subtable"] = {"type": 34, "label": "子表", "children": {"child": {"type": 2}}}
+    relations = {
+        company: [matched],
+        tags: [{"rowId": "A"}, {"rowId": "B"}],
+        "subtable": [{"rowId": "C", "child": "甲"}, {"rowId": "D", "child": "乙"}],
+    }
+    written = {
+        company: [{"sid": matched["rowId"]}],
+        tags: [{"sid": "A"}, {"sid": "B"}],
+        "subtable": [{"child": "甲"}, {"child": "乙"}],
+    }
+    names = {company: [case.values["company"]], tags: ["标签甲", "标签乙"], "subtable": [{}, {}]}
+    expected = [{"controlId": key, "value": order.compact(value)} for key, value in written.items()]
+    raw = {}
+    for key, rows in relations.items():
+        items = [{"sid": row["rowId"].swapcase(), "name": "占位"} for row in reversed(rows)]
+        if shape == "extra":
+            items.append({"sid": "extra"})
+        elif shape == "short":
+            items.pop()
+        elif shape == "wrong":
+            items[0]["sid"] = "wrong"
+        elif shape == "duplicate":
+            items[0] = items[-1]
+            if len(items) == 1:
+                items.append(items[0])
+        elif shape == "non_dict":
+            items[0] = "非对象"
+        raw[key] = items
+
+    report, _ = order.compare(expected, raw, case.config, read_relations=relations.__getitem__,
+                              packages=[], company=case.values["company"], tag_names=lambda: True,
+                              approved=names if approved else None)
+    results = [row["结果"] for row in report["逐项核对"]]
+    if shape == "valid":
+        assert results == ["一致"] * 3
+    else:
+        assert results == (["无法核对"] * 3 if approved else ["不确定", "不一致", "不一致"])
