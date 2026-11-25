@@ -37,12 +37,13 @@ def record(item):
 
 
 class FakeMingdao:
-    """假明道云：plan 只用卡片快照里的政策名；send 记录发出的条目；readback 按 verdicts 返回。"""
+    """假明道云：plan 只用卡片快照里的政策名；send 先「预建连」再调交接回调，通过后才记为发出；readback 按 verdicts 返回。"""
 
     def __init__(self):
         self.sent, self.reads, self.urls = [], [], []
         self.plan_errors, self.verdicts, self.send_errors = {}, {}, {}
         self.on_send = None
+        self.before_handoff = None  # 预建连期间发生的事（如时钟走过截止、开关关闭、断线）
         self.record_ids = {}
 
     def plan(self, snapshot, item, url, *, now, sent):
@@ -53,8 +54,14 @@ class FakeMingdao:
         values = {"政策名称": sha256(name.encode()).hexdigest()[:16], "任务审批链接": sha256(url.encode()).hexdigest()[:16]}
         return Plan(name, "sheet", list(FIELDS), values, dict(values), {"item": item, "url": url})
 
-    def send(self, plan):
+    def send(self, plan, handoff):
         item = plan.payload["item"]
+        if self.before_handoff:
+            self.before_handoff(item)
+        try:
+            handoff()
+        except Exception as error:
+            raise NotSent(getattr(error, "code", "not_sent")) from None
         self.sent.append(item)
         if self.on_send:
             self.on_send(item)
@@ -312,6 +319,64 @@ def test_proven_not_sent_releases_slot_and_stops_batch(order):
     assert query(order.path, "SELECT * FROM trial_order_slot") == []
     assert query(order.path, "SELECT status FROM trial_item_task ORDER BY item") == [("closed",), ("closed",)]
     assert events(order, 1)[-2:] == ["aborted_before_write", "approval_closed"]
+
+
+@pytest.mark.parametrize("change", ["expired", "create_off", "halted", "slot"])
+def test_handoff_rechecks_after_preconnect_and_writes_nothing(order, change):
+    """P1-1：预建连期间时钟走过截止、开关关闭、停写位置位或本条持槽被动过 → 交接处拒绝，写出 0 次。"""
+    archived(order)
+
+    def preconnect(item):
+        if change == "expired":
+            order.now = NOW + 3 * 86400
+        elif change == "create_off":
+            order.switches["MAIL_TRIAL_CREATE_ENABLED"] = "false"
+        else:
+            with journal_at(order.path) as j, j.db:
+                if change == "halted":
+                    j.db.execute("INSERT INTO trial_halt VALUES(1,'守望者停写',0)")
+                else:
+                    j.db.execute("DELETE FROM trial_order_slot")
+    order.mingdao.before_handoff = preconnect
+    order.orders().run_once()
+    assert order.mingdao.sent == [] and order.mingdao.reads == []
+    assert query(order.path, "SELECT item,status FROM trial_order") == [(1, "aborted")]
+    assert query(order.path, "SELECT * FROM trial_order_slot") == []
+    assert query(order.path, "SELECT status FROM trial_item_task ORDER BY item") == [("closed",), ("closed",)]
+    reason = {"expired": "审批到期", "create_off": "建单开关已关闭", "halted": "建单已停写", "slot": "本条发送登记已变化"}
+    assert reason[change] + "，未建单" in notices(order)["order_cancel:1"]
+    assert events(order, 1)[-2:] == ["aborted_before_write", "approval_closed"]
+
+
+def test_disconnect_seen_right_after_registration_commit_sends_nothing(order):
+    """G464 判序：登记提交后才核断线；此刻已断线即不能证明登记先于断线，本条与余项都不发。"""
+    archived(order)
+    runner = order.orders()
+    admit = runner._admit
+
+    def admit_then_drop(*args):
+        code = admit(*args)
+        order.connected = False
+        return code
+    runner._admit = admit_then_drop
+    runner.run_once()
+    assert order.mingdao.sent == []
+    assert query(order.path, "SELECT item,status,disconnect FROM trial_order") == [(1, "aborted", 0)]
+    texts = notices(order)
+    assert "断线，未建单" in texts["order_cancel:1"] and "断线，未建单" in texts["order_cancel:2"]
+    assert "order_disconnect" not in texts
+
+
+def test_disconnect_during_preconnect_sends_the_registered_one(order):
+    """登记提交后仍连通、预建连期间才断线：登记先于断线的那 1 张照发、单独计数，其余撤销。"""
+    archived(order)
+    order.mingdao.before_handoff = lambda item: setattr(order, "connected", False)
+    order.orders().run_once()
+    assert order.mingdao.sent == [1] and order.mingdao.reads == [record(1)]
+    assert query(order.path, "SELECT item,status,disconnect FROM trial_order") == [(1, "verified", 1)]
+    texts = notices(order)
+    assert texts["order_disconnect"].endswith(ORDER_NOTICES["disconnect"])
+    assert "断线，未建单" in texts["order_cancel:2"]
 
 
 def test_unverified_combination_stops_only_that_item(order):
@@ -628,7 +693,8 @@ class Slow:
     def plan(self, snapshot, item, url, *, now, sent):
         name = snapshot["reviewed"][item - 1]["policy_name"]["value"]
         return Plan(name, "sheet", ["政策名称"], {"政策名称": "a"}, {"政策名称": "a"}, {"item": item})
-    def send(self, plan):
+    def send(self, plan, handoff):
+        handoff()
         note(f"send {plan.payload['item']}")
         Path(spec["flag"]).write_text("in-flight")
         if spec["mode"] == "kill":

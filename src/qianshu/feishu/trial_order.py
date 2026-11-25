@@ -51,6 +51,7 @@ CANCEL_REASONS = {
     "ledger": "建单台账未能写入",
     "not_sent": "建单请求未发出",
     "previous": "同批前序条目未建成",
+    "slot": "本条发送登记已变化",
 }
 # 已占用建单资格的状态：在途、已建、写错、未知。
 ACTIVE = ("sending", "created", "verified", "mismatch", "unknown")
@@ -90,7 +91,19 @@ class Plan:
 
 
 class NotSent(Exception):
-    """建单请求确证未交给传输层。"""
+    """建单请求确证未交给传输层。code 为撤销原因（CANCEL_REASONS 的键）。"""
+
+    def __init__(self, code="not_sent"):
+        super().__init__(code)
+        self.code = code
+
+
+class Refused(Exception):
+    """实际交接处复核不符：本条不写出。"""
+
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
 
 
 @dataclass
@@ -308,6 +321,9 @@ class OrderRunner:
             self._abort_ledger(job, item, plan, code)
             self._cancel(job, [item], code)
             return "stop", code
+        if not self._up():
+            # 断线判序在登记提交之后做（G464）：此刻已观察到断线，登记不能证明先于断线，本条不发。
+            return self._not_sent(job, item, plan, "disconnected")
         try:
             self._ledger(job, item, plan, "create_attempt", request_fields=plan.request_fields, approved=True)
         except Exception:
@@ -315,24 +331,16 @@ class OrderRunner:
             return "stop", "previous"
         if self.clock() >= row["expires"]:
             # 回调校验与发出建单共用同一截止时间：截止后不发。
-            self._abort_ledger(job, item, plan, "expired")
-            self._aborted(job, item)
-            self._cancel(job, [item], "expired")
-            return "stop", "expired"
-        disconnect = not self._up()
-        if disconnect:
-            # 已在事务里登记发送（登记先于断线）的那 1 张：照发、单独计数（G464）。
-            self._mark_disconnect(row, item)
+            return self._not_sent(job, item, plan, "expired")
+        state = {"disconnect": False}
         try:
-            record_id = self.backend.send(plan)
-        except NotSent:
-            self._abort_ledger(job, item, plan, "not_sent")
-            self._aborted(job, item)
-            self._cancel(job, [item], "not_sent")
-            return "stop", "not_sent"
+            record_id = self.backend.send(plan, self._handoff(job, item, state))
+        except NotSent as error:
+            return self._not_sent(job, item, plan, error.code if error.code in CANCEL_REASONS else "not_sent")
         except Exception:
-            self._unknown(job, item, plan, None, "send", disconnect=disconnect or not self._up())
+            self._unknown(job, item, plan, None, "send", disconnect=state["disconnect"] or not self._up())
             return "stop", "previous"
+        disconnect = state["disconnect"]
         if not disconnect and not self._up():
             # 请求在途时观察到断线：即断线时在途的那 1 张，照常回读核对、单独计数。
             disconnect = True
@@ -404,6 +412,47 @@ class OrderRunner:
                          VALUES(?,?,?,?,'sending',?,?,?)""", (reg, version, item, card, key, plan.target, now))
             j.db.execute("UPDATE trial_item_task SET status='order_running' WHERE card=? AND item=?", (card, item))
             return ""
+
+    def _handoff(self, job, item, state):
+        """实际交接回调：预建连之后、真正写出请求之前再核截止、建单开关、停写位、本条持槽与发送记录。
+
+        任一不符即抛出，传输层不写出（确证未发出）。此刻才观察到断线的，是登记先于断线的那 1 张：照发、单独计数（G464）。
+        """
+        row = job.row
+        reg, version = row["registration"], row["version"]
+
+        def check():
+            try:
+                switches = self.switches()
+            except Exception:
+                switches = {}
+            with journal_at(self.path) as j:
+                card = j.db.execute("SELECT country, expires FROM trial_card WHERE card=?", (row["card"],)).fetchone()
+                slot = j.db.execute("SELECT registration, version, item FROM trial_order_slot WHERE id=1").fetchone()
+                sending = j.db.execute("""SELECT status FROM trial_order WHERE registration=? AND version=?
+                                       AND item=?""", (reg, version, item)).fetchone()
+                halted = j.write_halted()
+            if card is None or self.clock() >= card["expires"]:
+                raise Refused("expired")
+            if (not isinstance(switches, dict) or switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true"
+                    or switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
+                    or switches.get("MAIL_TRIAL_CREATE_COUNTRY") != card["country"]):
+                raise Refused("switch")
+            if halted:
+                raise Refused("halted")
+            if slot is None or tuple(slot) != (reg, version, item) or sending is None or sending[0] != "sending":
+                raise Refused("slot")
+            if not self._up():
+                state["disconnect"] = True
+                self._mark_disconnect(row, item)
+        return check
+
+    def _not_sent(self, job, item, plan, code):
+        """确证未发出：释放在途槽，撤销本条并公告「未建单」，同批余项停发。"""
+        self._abort_ledger(job, item, plan, code)
+        self._aborted(job, item)
+        self._cancel(job, [item], code)
+        return "stop", code
 
     # ------------------------------------------------------------ 回读
 
@@ -670,15 +719,20 @@ class MingdaoBackend:
         return Plan(values["policy_name"], self.target, list(fingerprints), fingerprints, sent_values, payload,
                     {"controls": controls, "packages": values["packages"], "company": values["company"]})
 
-    def send(self, plan):
+    def send(self, plan, handoff):
+        """预建连后由 handoff 在实际交接处复核；复核不符或交接前失败均确证未写出。"""
         O = self.O
         create = O.CreateRequest(self.config["create"], {"create_endpoint": self.config["create"]["endpoint"]},
                                  self.login)
         with self._guard():
             try:
                 with create.prepare(plan.payload) as (transmit, read_id):
-                    transmit(lambda: None)
+                    transmit(handoff)
                     return read_id()
+            except Refused as error:
+                if not create.started:
+                    raise NotSent(error.code) from None
+                raise
             except Exception:
                 if not create.started:
                     raise NotSent from None
