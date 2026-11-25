@@ -37,6 +37,10 @@ ORDER_NOTICES = {
     "done": "均已建单并逐条回读一致，提交由人工在明道云处理。",
 }
 SUPERSEDED = "本条「未建单」公告已过时：相关条目已由新卡接管或已建单，请勿据此重复建单，以私有登记为准。"
+# 公告登记人工移交后附在群提示末尾（G488 取舍 A）。
+HANDOFF_NOTE = "\n相关政策已交人工，机器人对同名政策的新卡一律不建，需守望者核对后解除。"
+# 含这些字样的公告交人工处理：发出前先持久登记人工移交、占用该政策名（审核 P1-3）。
+HANDOFF_WORDS = ("未建单", "结果未知")
 CANCEL_REASONS = {
     "consent": "同意已失效或卡片已关闭",
     "switch": "建单开关已关闭",
@@ -130,29 +134,37 @@ def notice_items(kind, snapshot):
 
 
 def unbuilt_notice(db, row):
-    """旧「未建单」公告投递前核对（cd-carry P1-1）。返回 (实际投递文案, 投递后登记移交的条目)。
+    """「未建单 / 结果未知 / 写错」公告投递前核对（cd-carry P1-1、审核 P1-3 / P1-4）。返回 (实际投递文案, 须登记移交的条目)。
 
-    条目按目标表 + 归一政策名核对：若已被新卡接管或已建单，改为固定的过时文案，不登记移交。
+    调用方须在投递前、与建单领槽互斥的同一写事务里调用并登记移交（record_handoff）。条目逐条按目标表 + 归一政策名核对：
+    已被新卡接管或已建单的条目标「已过时」、不登记移交；其余条目保留原文案并各自登记移交。全部过时才整条改为过时文案。
     """
     body = row["body"]
     if row["kind"].startswith("order_unknown:") or row["kind"] == "order_mismatch":
         # 结果未知、写错：同样已交人工，登记移交；释放在途槽也经守望者销清移交。
-        return body, [(r[0], r[1]) for r in db.execute("""SELECT item, name_key FROM trial_order WHERE card=?
-                      AND status IN ('unknown','mismatch') AND name_key IS NOT NULL""", (row["card"],))]
-    if "未建单" not in body:
+        items = [(r[0], r[1]) for r in db.execute("""SELECT item, name_key FROM trial_order WHERE card=?
+                 AND status IN ('unknown','mismatch') AND name_key IS NOT NULL""", (row["card"],))]
+        return body + (HANDOFF_NOTE if items else ""), items
+    if not any(word in body for word in HANDOFF_WORDS):
         return body, []
     snapshot = json.loads(row["snapshot"])
-    items = []
+    keep, taken, unnamed = [], [], []
     for item in notice_items(row["kind"], snapshot):
         key = name_key(_reviewed_name(snapshot, item))
         if not key:
+            unnamed.append(item)
             continue
-        taken = db.execute(f"""SELECT 1 FROM trial_order WHERE name_key=? AND card!=?
-                           AND status IN ({','.join('?' * len(ACTIVE))})""", (key, row["card"], *ACTIVE)).fetchone()
-        if taken:
-            return f"登记 {_card_reg(db, row['card'])} · {SUPERSEDED}", []
-        items.append((item, key))
-    return body, items
+        if db.execute(f"""SELECT 1 FROM trial_order WHERE name_key=? AND card!=?
+                      AND status IN ({','.join('?' * len(ACTIVE))})""", (key, row["card"], *ACTIVE)).fetchone():
+            taken.append(item)
+        else:
+            keep.append((item, key))
+    if taken and not keep and not unnamed:
+        return f"登记 {_card_reg(db, row['card'])} · {SUPERSEDED}", []
+    text = body
+    if taken:
+        text += f"\n条目 {'、'.join(map(str, taken))} · {SUPERSEDED}"
+    return text + (HANDOFF_NOTE if keep else ""), keep
 
 
 def _card_reg(db, card):
@@ -161,9 +173,15 @@ def _card_reg(db, card):
 
 
 def record_handoff(db, card, items, now):
-    """「未建单」公告已投递：条目交人工。须守望者销清移交后机器人才允许再接管同一政策。"""
+    """公告投递前登记人工移交（占用该政策名）。须守望者销清移交后机器人才允许再接管同一政策。
+
+    同一「登记 × 版本 × 条目 × 政策名」已有未销清移交时不重复登记（投递未成、下一轮重投）。
+    """
     reg, version = db.execute("SELECT registration,version FROM trial_card WHERE card=?", (card,)).fetchone()
     for item, key in items:
+        if db.execute("""SELECT 1 FROM trial_handoff WHERE name_key=? AND registration=? AND version=? AND item=?
+                      AND cleared IS NULL""", (key, reg, version, item)).fetchone():
+            continue
         target = db.execute("SELECT target FROM trial_order WHERE registration=? AND version=? AND item=?",
                             (reg, version, item)).fetchone()
         db.execute("INSERT INTO trial_handoff VALUES(?,?,?,?,?,?,NULL,NULL)",
@@ -171,7 +189,10 @@ def record_handoff(db, card, items, now):
 
 
 def release_handoff(db, reg, version, item, fingerprint, reason, now):
-    """守望者销清移交（产品负责人当场同意后）。登记 ID 与政策名指纹都对上才写；返回 (改前, 改后) 状态。"""
+    """守望者销清移交（产品负责人当场同意后）。登记 ID 与政策名指纹都对上才写；返回 (改前, 改后) 状态。
+
+    只作用于双确认对应的那一条「登记 × 版本 × 条目」：不清同名其他登记的移交，只释放该条自己持有的在途槽（审核 P2）。
+    """
     require(receipt(reason), "须写明原因")
     rows = db.execute("""SELECT name_key FROM trial_handoff WHERE registration=? AND version=? AND item=?
                       AND cleared IS NULL""", (reg, version, item)).fetchall()
@@ -179,23 +200,26 @@ def release_handoff(db, reg, version, item, fingerprint, reason, now):
     require(len(keys) == 1 and name_fingerprint(next(iter(keys))) == fingerprint, "登记 ID 或政策名指纹与登记库不符")
     key = next(iter(keys))
     before = handoff_state(db, key)
-    db.execute("UPDATE trial_handoff SET cleared=?, reason=? WHERE name_key=? AND cleared IS NULL", (now, reason, key))
-    held = db.execute("""SELECT 1 FROM trial_order_slot s JOIN trial_order o USING(registration,version,item)
-                      WHERE o.name_key=?""", (key,)).fetchone()
-    if held:
-        db.execute("DELETE FROM trial_order_slot WHERE id=1")
+    db.execute("""UPDATE trial_handoff SET cleared=?, reason=? WHERE name_key=? AND registration=? AND version=?
+               AND item=? AND cleared IS NULL""", (now, reason, key, reg, version, item))
+    db.execute("""DELETE FROM trial_order_slot WHERE registration=? AND version=? AND item=? AND EXISTS(
+               SELECT 1 FROM trial_order o WHERE o.registration=? AND o.version=? AND o.item=? AND o.name_key=?)""",
+               (reg, version, item, reg, version, item, key))
     db.execute("INSERT INTO trial_guardian_log VALUES(?,?,?)",
                (now, f"release_handoff {reg}-{version}-{item} {name_fingerprint(key)}", reason))
     return before, handoff_state(db, key)
 
 
 def handoff_state(db, key):
-    open_count = db.execute("SELECT count(*) FROM trial_handoff WHERE name_key=? AND cleared IS NULL",
-                            (key,)).fetchone()[0]
-    slot = db.execute("""SELECT 1 FROM trial_order_slot s JOIN trial_order o USING(registration,version,item)
-                      WHERE o.name_key=?""", (key,)).fetchone()
+    """同名政策的移交与在途槽状态；有多条同名未销清移交时逐条列出（只回显登记号与指纹，不回显政策名）。"""
+    opened = [{"registration": r[0], "version": r[1], "item": r[2]} for r in db.execute(
+        """SELECT registration, version, item FROM trial_handoff WHERE name_key=? AND cleared IS NULL
+        ORDER BY rowid""", (key,))]
+    slot = db.execute("""SELECT s.registration, s.version, s.item FROM trial_order_slot s
+                      JOIN trial_order o USING(registration,version,item) WHERE o.name_key=?""", (key,)).fetchone()
     orders = [r[0] for r in db.execute("SELECT status FROM trial_order WHERE name_key=? ORDER BY sent", (key,))]
-    return {"name_fp": name_fingerprint(key), "open_handoffs": open_count, "slot_held": bool(slot), "orders": orders}
+    return {"name_fp": name_fingerprint(key), "open_handoffs": len(opened), "open": opened, "slot_held": bool(slot),
+            "slot": dict(zip(("registration", "version", "item"), slot)) if slot else None, "orders": orders}
 
 
 class OrderRunner:
@@ -317,6 +341,10 @@ class OrderRunner:
         if code == "busy":
             self._abort_ledger(job, item, plan, code)
             return "wait", code
+        if code == "handoff":
+            self._abort_ledger(job, item, plan, code)
+            self._cancel(job, [item], code)
+            return "skip", ""
         if code:
             self._abort_ledger(job, item, plan, code)
             self._cancel(job, [item], code)
@@ -404,6 +432,10 @@ class OrderRunner:
                 return "switch"
             if j.write_halted():
                 return "halted"
+            # 人工移交与机器人发送资格在同一写事务里按「目标表 × 归一政策名」裁决（审核 P1-3）。
+            if j.db.execute("""SELECT 1 FROM trial_handoff WHERE name_key=? AND cleared IS NULL
+                            AND (target IS NULL OR target=?)""", (key, plan.target)).fetchone():
+                return "handoff"
             if j.db.execute("SELECT 1 FROM trial_order_slot").fetchone():
                 return "busy"
             now = self.clock()

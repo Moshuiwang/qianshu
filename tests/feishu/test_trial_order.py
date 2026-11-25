@@ -517,6 +517,98 @@ def test_release_also_frees_frozen_slot(order, capsys):
     assert query(order.path, "SELECT status FROM trial_order") == [("unknown",)]  # 不改冻结记录，只放行后续
 
 
+def old_card(env, names, kind, body):
+    """同名政策的旧卡（登记 1 · 版本 0，已关闭）与其排队中的公告。"""
+    with journal_at(env.path) as j, j.db:
+        row = dict(j.db.execute("SELECT * FROM trial_card").fetchone())
+        snapshot = json.loads(row["snapshot"])
+        for n, name in enumerate(names):
+            snapshot["reviewed"][n]["policy_name"]["value"] = name
+        snapshot["eligible"] = snapshot["items"] = list(range(1, len(names) + 1))
+        packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        old = str(uuid5(NS, "old-card"))
+        row.update(card=old, version=0, status="closed", snapshot=packed, fingerprint=sha256(packed.encode()).hexdigest())
+        j.db.execute(f"INSERT INTO trial_card VALUES({','.join('?' * len(row))})", tuple(row.values()))
+        j.db.execute("INSERT INTO trial_notification VALUES(?,?,?,?,'pending')", (old, kind, str(uuid5(NS, kind)), body))
+    return old
+
+
+@pytest.mark.parametrize("moment", ["receipt_returned", "receipt_lost", "between_checks"])
+def test_notice_visible_before_receipt_new_card_sends_nothing(order, moment):
+    """P1-3：旧公告已在群里可见、回执未返回时推进同名新卡 → 机器人 0 发；回执丢失时移交照样保留。"""
+    from unittest.mock import AsyncMock
+    archived(order)
+    old_card(order, [NAMES[0]], "closed_1", "登记 1 · 条目 1 · 审批到期，未建单，转人工。待补项：无。")
+    listener, transport = deliver(order)
+    runner = order.orders()
+    if moment == "between_checks":
+        # 公告事务恰在建单的预查之后、领槽事务之前提交：领槽事务内裁决，仍 0 发。
+        admit = runner._admit
+        delivered = []
+
+        def notice_commits_first(*args):
+            if not delivered:
+                delivered.append(listener.maintain())
+            return admit(*args)
+        runner._admit = notice_commits_first
+        runner.run_once()
+    else:
+        async def visible(*args, **kwargs):
+            runner.run_once()
+            if moment == "receipt_lost":
+                raise ConnectionResetError
+            return SimpleNamespace(success=lambda: True, data=SimpleNamespace(message_id="receipt"))
+        transport.im.message.acreate = AsyncMock(side_effect=visible)
+        if moment == "receipt_lost":
+            with pytest.raises(Exception):
+                listener.maintain()
+        else:
+            listener.maintain()
+    assert 1 not in order.mingdao.sent
+    assert query(order.path, "SELECT registration,version,item,cleared FROM trial_handoff") == [(1, 0, 1, None)]
+    text = sent(transport)[0]
+    assert "未建单" in text and "需守望者核对后解除" in text and SUPERSEDED not in text
+    assert "须守望者销清移交" in notices(order)["order_cancel:1"]
+
+
+def test_merged_notice_partly_taken_keeps_other_item_unbuilt_and_handed_off(order):
+    """P1-4：甲、乙合批的旧公告，新卡只接管甲 → 甲标过时，乙仍有「未建单」提示与移交记录。"""
+    archived(order)
+    old_card(order, list(NAMES), "closed", "登记 1 · 条目 1、2 · 审批到期，未建单，转人工。待补项：无。")
+    with journal_at(order.path) as j, j.db:
+        j.db.execute("""INSERT INTO trial_order(registration,version,item,card,status,name_key,target,sent)
+                     VALUES(1,1,1,(SELECT card FROM trial_card WHERE version=1),'verified',?,'sheet',0)""",
+                     (name_key(NAMES[0]),))
+    listener, transport = deliver(order)
+    listener.maintain()
+    text, = sent(transport)
+    assert "条目 1、2 · 审批到期，未建单，转人工" in text and "条目 1 · " + SUPERSEDED in text
+    assert "需守望者核对后解除" in text
+    assert query(order.path, "SELECT item,name_key,cleared FROM trial_handoff") == [(2, name_key(NAMES[1]), None)]
+
+
+def test_release_clears_only_the_confirmed_registration(order, capsys):
+    """守望者销清只作用于双确认的那一条：同名其他登记的移交与在途槽不动，回显全部同名未销清移交。"""
+    from qianshu import __main__ as cli
+    archived(order)
+    key = name_key(NAMES[0])
+    with journal_at(order.path) as j, j.db:
+        for version in (0, 2):
+            j.db.execute("INSERT INTO trial_handoff VALUES(?,NULL,1,?,1,0,NULL,NULL)", (key, version))
+        j.db.execute("""INSERT INTO trial_order(registration,version,item,card,status,name_key,target,sent)
+                     VALUES(1,2,1,'other-card','unknown',?,'sheet',0)""", (key,))
+        j.db.execute("INSERT INTO trial_order_slot VALUES(1,1,2,1,0)")
+    assert cli.main(["--trial-release-handoff", "1", "0", "1", name_fingerprint(key), "--state", str(order.path),
+                     "--reason", "人工已核"]) == 0
+    before, after = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    other = {"registration": 1, "version": 2, "item": 1}
+    assert before["before"]["open"] == [{"registration": 1, "version": 0, "item": 1}, other]
+    assert after["after"]["open"] == [other] and after["after"]["slot"] == other
+    assert query(order.path, "SELECT version FROM trial_handoff WHERE cleared IS NULL") == [(2,)]
+    assert query(order.path, "SELECT registration,version,item FROM trial_order_slot") == [(1, 2, 1)]
+    assert NAMES[0] not in json.dumps([before, after], ensure_ascii=False)
+
+
 # ---------------------------------------------------------------- 守望者子命令与零装配
 
 def test_guardian_halt_command_reads_back_and_requires_reason(order, capsys):
@@ -631,9 +723,17 @@ def test_worker_runs_archive_then_orders_in_one_thread(order):
         seen.append(threading.current_thread().name)
         return original()
     orders.run_once = run_once
+    import sqlite3
+
+    def status():
+        # 轮询读与工作线程的提交竞争登记库锁（忙等 0.25 秒）：读不到就下一轮再读，不当作失败。
+        try:
+            return query(order.path, "SELECT status FROM trial_card")
+        except sqlite3.OperationalError:
+            return None
     with archive_worker(order.runner(), interval=0.01, join=5, orders=orders):
         end = time.monotonic() + 10
-        while time.monotonic() < end and query(order.path, "SELECT status FROM trial_card") != [("done",)]:
+        while time.monotonic() < end and status() != [("done",)]:
             time.sleep(0.02)
     assert order.mingdao.sent == [1, 2] and set(seen) == {"trial-archive"}
 

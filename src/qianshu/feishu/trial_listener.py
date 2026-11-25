@@ -252,12 +252,17 @@ class Listener:
                             WHERE uuid=? AND status='pending'""", (row["uuid"],)).rowcount:
                             raise ValueError
                 needs_contact = row["kind"] == "remind" or row["kind"].startswith(("closed", "archive_", "order_"))
-                # 旧「未建单」公告投递前按目标表 + 归一政策名核对：已被新卡接管或已建单的改为过时文案（2d）。
-                text, handoff = unbuilt_notice(j.db, row)
-                body = (mention(target, "配置负责人") + " " if target else "") + text
                 if row["kind"] == "result_manual" or row["kind"].startswith("first_manual:"):
                     body = MANUAL_NOTICE
-                    handoff = []
+                else:
+                    # 「未建单 / 结果未知 / 写错」公告投递前，在与建单领槽互斥的同一写事务里按目标表 + 归一政策名逐条核对：
+                    # 已被新卡接管或已建单的条目标过时；其余条目先持久登记人工移交（占用该政策名），再交出群消息（2d）。
+                    # 投递失败或回执不明时移交保留，守望者核对后销清。
+                    with j.db:
+                        j.db.execute("BEGIN IMMEDIATE")
+                        text, handoff = unbuilt_notice(j.db, row)
+                        record_handoff(j.db, row["card"], handoff, self.clock())
+                    body = (mention(target, "配置负责人") + " " if target else "") + text
                 try:
                     send_trial_message(self.transport, body, row["uuid"], False, claim)
                 except CredentialConflict:
@@ -272,8 +277,6 @@ class Listener:
                 with j.db:
                     j.db.execute("UPDATE trial_notification SET status=? WHERE uuid=?",
                                  ("missing_contact" if needs_contact and not target else "sent", row["uuid"]))
-                    # 「未建单」已告知人工：登记移交，守望者销清前机器人不再接管同一政策。
-                    record_handoff(j.db, row["card"], handoff, self.clock())
 
             self._rewrite_archived_cards(j)
 
