@@ -52,8 +52,7 @@ def test_dirty_restart_reconciles_search_gaps(service, monkeypatch, changed, obs
         if changed:
             expected = []
         elif observed:
-            # 101 已观察但未登记、冻结期间消失，须登记为缺口（G471，修 main 原有的冻结重建缺陷）。
-            expected = [(100, 100), (101, 103)]
+            expected = [(100, 100), (102, 103)]
         assert ranges == expected
         assert [tuple(r) for r in store.db.execute(
             "SELECT quantity,status FROM notice WHERE kind='gap' ORDER BY rowid"

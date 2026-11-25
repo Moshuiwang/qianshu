@@ -99,12 +99,11 @@ class Trial:
             return
         box = self.box()
         if (box["state"] == "frozen" and box["reason"] == "reconciling"
-                and (validity, next_uid) == (box["validity"], box["cursor"])
-                and not self.store.rebuild_incomplete(self.scope, validity, box["generation"])):
+                and (validity, next_uid) == (box["validity"], box["cursor"])):
             self.flush()
             return
         if validity == box["validity"] and next_uid >= box["peak"]:
-            if box["reason"] == "legacy" and not self.store.pending(self.scope, box["generation"]):
+            if box["reason"] == "legacy":
                 self.flush()
                 return
             if box["state"] == "active" and self.store.row("SELECT 1 FROM legacy WHERE status='pending' LIMIT 1"):
