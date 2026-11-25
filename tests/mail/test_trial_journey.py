@@ -211,21 +211,28 @@ def test_unicode_limit_after_quote_removal_and_sender_privacy(monkeypatch, size)
 
 def test_rebuild_requires_current_snapshot_and_preserves_historical_identity(tmp_path):
     store = Store(tmp_path / "trial")
-    store.begin("scope")
-    store.activate("scope", 1, 10, 0)
-    store.searching("scope", 1, 10, 11)
-    assert Store(store.path).begin("scope") == "frozen"
+    inbox = Inbox()
+    trial = revision_trial(store, inbox, [])
+    scope = trial.scope
+    inbox.messages.clear()
+    inbox.next_uid = 10
+    trial.poll()
+    store.searching(scope, 1, 10, 11)
+    assert Store(store.path).begin(scope) == "frozen"
     item = fixture_item(synthetic(2, "synthetic").as_bytes())
-    store.rebuild("scope", 2, 3, 1, [(2, item)])
+    store.rebuild(scope, 2, 3, 1, [(2, item)])
     first = store.row("SELECT generation FROM mailbox")[0]
     second_item = fixture_item(synthetic(3, "changed").as_bytes())
-    store.rebuild("scope", 2, 3, 1, [(2, second_item)])
+    store.rebuild(scope, 2, 3, 1, [(2, second_item)])
     with pytest.raises(Hold):
-        store.reconcile("scope", first, 2, 3)
+        store.request_confirmation(scope, first, 2, 3)
     second = store.row("SELECT generation FROM mailbox")[0]
-    store.reconcile("scope", second, 2, 3)
-    store.observe("scope", second, 3, 4, [3])
-    reg = store.register("scope", second, 3, second_item)
+    inbox.generation, inbox.next_uid = 2, 3
+    inbox.messages[2] = synthetic(3, "changed")
+    store.request_confirmation(scope, second, 2, 3)
+    trial.poll()
+    store.observe(scope, second, 3, 4, [3])
+    reg = store.register(scope, second, 3, second_item)
     assert store.row("SELECT status FROM registration WHERE id=?", reg)[0] == "manual"
 
 

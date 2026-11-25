@@ -5,6 +5,8 @@ import hashlib
 import json
 import os
 import sqlite3
+import stat
+from bisect import bisect_left
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime
 from decimal import Decimal
@@ -33,6 +35,10 @@ FROM notice WHERE kind IN ('body_missed','interrupted')
 
 class Hold(RuntimeError):
     """未获派发资格。"""
+
+
+class FolderHold(Hold):
+    """已绑定文件夹与本轮配置不一致。"""
 
 
 class FormatHold(Hold):
@@ -80,6 +86,60 @@ CREATE TABLE IF NOT EXISTS reconciliation(scope TEXT, generation INTEGER, uid IN
 """
 
 
+# 同一次冻结的 UID 边界独立于人工快照代次；旧格式库打开时也创建此表。
+_RECOVERY_SCHEMA = """CREATE TABLE IF NOT EXISTS recovery_window(
+ scope TEXT PRIMARY KEY, validity INTEGER, first INTEGER, high INTEGER)"""
+
+
+_REQUEST_SCHEMA = """CREATE TABLE IF NOT EXISTS recovery_request(
+ id INTEGER PRIMARY KEY, scope TEXT NOT NULL, generation INTEGER NOT NULL, validity INTEGER NOT NULL,
+ cursor INTEGER NOT NULL, freeze_id INTEGER NOT NULL, retry_of INTEGER NOT NULL DEFAULT 0,
+ actor INTEGER NOT NULL, requested TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+ reason TEXT, completed TEXT, gaps INTEGER, UNIQUE(scope,generation,validity,cursor,freeze_id,retry_of))"""
+
+RECOVERY_REASONS = {"mail_read": "邮箱读取失败", "snapshot": "快照身份不符", "folder": "文件夹不符"}
+
+
+# 事件、允许的源状态（冻结时使用 reason）、有序前置条件、执行动作。
+# 重建原因只在这里枚举。条件按行优先匹配，未匹配的转移保持冻结。
+_REBUILD = frozenset({"mapping", "missing", "seen", "unclean_close", "folder",
+                      "generation", "initialization", "originals", "interrupted_search",
+                      "reconciling"})
+_FROZEN = _REBUILD | {"legacy"}
+_ALL = _FROZEN | {"initializing", "active"}
+_TRANSITIONS = (
+    ("open", _ALL, "folder_conflict", "freeze_folder"),
+    ("open", {"initializing"}, "always", "freeze_initialization"),
+    ("open", {"active"}, "uncovered", "freeze_originals"),
+    ("open", {"active"}, "interrupted", "freeze_interrupted_search"),
+    ("open", _ALL, "always", "resume"),
+    ("freeze", {"legacy"}, "same_legacy_epoch", "keep_legacy"),
+    ("freeze", _ALL, "legacy_requested", "bind_legacy"),
+    ("freeze", _ALL, "freeze_reason", "mark_frozen"),
+    ("verify", {"active"}, "same_epoch", "raise_peak"),
+    ("verify", _ALL, "always", "freeze_generation"),
+    ("scan", {"initializing"}, "always", "activate"),
+    ("scan", _ALL, "changed_epoch", "freeze_generation"),
+    ("scan", _FROZEN, "uncovered", "hold"),
+    ("scan", {"active"}, "pending_legacy", "freeze_legacy"),
+    ("scan", {"legacy"}, "always", "check_legacy"),
+    ("scan", _REBUILD, "always", "rebuild"),
+    ("scan", {"active"}, "always", "observe"),
+    ("snapshot", _REBUILD, "snapshot_changed", "replace_snapshot"),
+    ("snapshot", {"reconciling"}, "always", "retain_snapshot"),
+    ("confirm", {"legacy"}, "approved_snapshot", "settle_legacy"),
+    ("confirm", {"reconciling"}, "approved_snapshot", "settle_snapshot"),
+)
+
+
+def transition(box, event, **facts):
+    phase = box["reason"] if box["state"] == "frozen" else box["state"]
+    for trigger, sources, guard, action in _TRANSITIONS:
+        if trigger == event and phase in sources and (guard == "always" or facts.get(guard)):
+            return action
+    raise Hold()
+
+
 _LEDGER_SCHEMA = """
 CREATE TABLE budget(id INTEGER PRIMARY KEY CHECK(id=1), imported INTEGER, at TEXT, stopped INTEGER DEFAULT 0);
 CREATE TABLE charge(id INTEGER PRIMARY KEY, registration INTEGER, model TEXT, at TEXT,
@@ -106,6 +166,7 @@ class Store:
     def __init__(self, path: Path, *, before_failed_close=None, close_failed=None):
         self.path = path
         self._locked = False
+        self.process_confirmation = None
         with self.gate():
             fresh = not path.exists()
             os.close(_file(path, create=fresh))
@@ -123,6 +184,8 @@ class Store:
                         raise FormatHold(FORMAT_HOLD)
                     else:
                         self._ledger_valid()
+                    db.execute(_RECOVERY_SCHEMA)
+                    db.execute(_REQUEST_SCHEMA)
             except BaseException:
                 if before_failed_close is not None:
                     before_failed_close()
@@ -176,26 +239,20 @@ class Store:
 
     def begin(self, scope, folder=None):
         with self.write() as db:
+            binding = self.row("SELECT folder FROM trial_folder WHERE scope=?", scope)
             if folder is not None:
-                binding = self.row("SELECT folder FROM trial_folder WHERE scope=?", scope)
-                if binding and binding[0] != folder:
-                    self._freeze(scope, "folder")
-                    return "folder_conflict"
                 db.execute("INSERT OR IGNORE INTO trial_folder VALUES(?,?)", (scope, folder))
-            row = self.row("SELECT state FROM mailbox WHERE scope=?", scope)
-            if row is None:
+            box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
+            if box is None:
                 db.execute("INSERT INTO mailbox(scope,state) VALUES(?,'initializing')", (scope,))
                 return "initializing"
-            if row[0] == "initializing":
-                self._freeze(scope, "initialization")
-                return "frozen"
-            if row[0] == "active" and self.uncovered(scope):
-                self._freeze(scope, "originals")
-                return "frozen"
-            if row[0] == "active" and self.row("SELECT 1 FROM scan_range WHERE scope=?", scope):
-                self._freeze(scope, "interrupted_search")
-                return "frozen"
-            return row[0]
+            action = transition(box, "open", folder_conflict=folder and binding and binding[0] != folder,
+                                uncovered=self.uncovered(scope),
+                                interrupted=self.row("SELECT 1 FROM scan_range WHERE scope=?", scope))
+            if action == "resume":
+                return box["state"]
+            self._freeze(scope, action.removeprefix("freeze_"))
+            return "folder_conflict" if action == "freeze_folder" else "frozen"
 
     def peak(self, scope, next_uid):
         with self.write() as db:
@@ -227,14 +284,26 @@ class Store:
             db.execute("INSERT INTO observed_range VALUES(?,?,?)", (scope, generation, next_uid))
             self._advance(scope, generation)
 
-    def _record_gaps(self, scope, generation, start, next_uid, sorted_uids):
+    def _record_gaps(self, scope, generation, start, next_uid, uids):
+        # 同一 UIDVALIDITY 的快照可能有多个本地代次。按区间跳过已有缺口，
+        # 即使区间很大也不逐个枚举 UID。
+        covered = [(uid, uid) for uid in uids if start <= uid < next_uid]
+        existing = self.db.execute("""SELECT u.first,u.last,u.generation FROM unknown_range u
+            JOIN snapshot s USING(scope,generation) JOIN mailbox m USING(scope)
+            WHERE u.scope=? AND s.validity=m.validity AND u.last>=? AND u.first<?""",
+                                       (scope, start, next_uid))
+        for low, high, prior_generation in existing:
+            event = f"gap:{scope}:{prior_generation}:{low}"
+            if not self.row("SELECT 1 FROM notice WHERE event=?", event):
+                self.notice(event, scope, None, "gap", high - low + 1)
+            covered.append((low, high))
         first = start
-        for uid in (*sorted_uids, next_uid):
-            if first < uid:
+        for low, high in sorted(covered) + [(next_uid, next_uid)]:
+            if first < low:
                 self.db.execute("INSERT INTO unknown_range VALUES(?,?,?,?,'unknown')",
-                                (scope, generation, first, uid - 1))
-                self.notice(f"gap:{scope}:{generation}:{first}", scope, None, "gap", uid - first)
-            first = uid + 1
+                                (scope, generation, first, low - 1))
+                self.notice(f"gap:{scope}:{generation}:{first}", scope, None, "gap", low - first)
+            first = max(first, high + 1)
 
     def _advance(self, scope, generation):
         if not self.row("SELECT 1 FROM location WHERE scope=? AND generation=? AND status='pending' LIMIT 1",
@@ -249,14 +318,26 @@ class Store:
             AND status='pending' ORDER BY uid""", (scope, generation))]
 
     def _freeze(self, scope, reason):
-        box = self.row("SELECT state FROM mailbox WHERE scope=?", scope)
+        box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
+        allowed = reason in _FROZEN - {"reconciling"}
+        action = transition(box, "freeze", freeze_reason=allowed,
+                            legacy_requested=reason == "legacy",
+                            same_legacy_epoch=allowed and reason != "generation")
         fresh = box["state"] != "frozen"
+        if fresh and box["cursor"] is not None:
+            self.db.execute("INSERT OR REPLACE INTO recovery_window VALUES(?,?,?,?)",
+                            (scope, box["validity"], box["cursor"], box["peak"]))
+        if action == "keep_legacy":
+            reason = "legacy"
         if fresh:
             self.db.execute("UPDATE registration SET version=version+1 WHERE scope=?", (scope,))
         self.db.execute("UPDATE mailbox SET state='frozen',reason=? WHERE scope=?", (reason, scope))
         if reason == "generation":
             self.review_stale_notices(scope)
-        generation = self.row("SELECT generation FROM mailbox WHERE scope=?", scope)[0]
+        generation = box["generation"]
+        if action == "bind_legacy":
+            self.db.execute("""INSERT OR IGNORE INTO legacy_review SELECT ?,?,source FROM legacy
+                WHERE status='pending'""", (scope, generation))
         count = self.row("SELECT count(*) FROM registration WHERE scope=?", scope)[0]
         event = f"freeze:{scope}:{generation}"
         # 对账恢复后代次可能不变；新一次冻结须有新事件号，不得被同名去重吞掉（G448）。
@@ -446,15 +527,106 @@ class Store:
                            (_fingerprint(scope, fingerprint, str(delivered)),))
 
     def freeze_legacy(self, scope, generation):
-        with self.write() as db:
+        with self.write():
+            if not self.row("SELECT 1 FROM mailbox WHERE scope=? AND generation=?", scope, generation):
+                raise Hold()
             self._freeze(scope, "legacy")
-            db.execute("""INSERT OR IGNORE INTO legacy_review SELECT ?,?,source FROM legacy
-                WHERE status='pending'""", (scope, generation))
+
+    @staticmethod
+    def same_epoch(box, validity, next_uid):
+        return box["validity"] == validity and next_uid >= (box["peak"] or 0)
+
+    def verify_epoch(self, scope, validity, next_uid):
+        with self.write() as db:
+            box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
+            action = transition(box, "verify", same_epoch=self.same_epoch(box, validity, next_uid))
+            if action == "raise_peak":
+                db.execute("UPDATE mailbox SET peak=? WHERE scope=?", (next_uid, scope))
+                return True
+            self._freeze(scope, "generation")
+            return False
+
+    def scan_action(self, scope, validity, next_uid):
+        with self.write():
+            box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
+            changed = not self.same_epoch(box, validity, next_uid)
+            action = transition(box, "scan", changed_epoch=changed,
+                                uncovered=self.uncovered(scope),
+                                pending_legacy=self.row("SELECT 1 FROM legacy WHERE status='pending' LIMIT 1"))
+            if action == "freeze_generation":
+                self._freeze(scope, "generation")
+            elif action == "freeze_legacy":
+                self._freeze(scope, "legacy")
+            else:
+                return action
+            box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
+            return transition(box, "scan", uncovered=self.uncovered(scope))
+
+    def recovery_ranges(self, scope, validity, first, high):
+        # 水位以下只核对本 UIDVALIDITY 的快照实际包含过的位置。将相邻 UID
+        # 合为半开区间，避免把两个历史 UID 之间从未观察的位置误报为缺口。
+        previous = None
+        for (uid,) in self.db.execute("""SELECT DISTINCT r.uid FROM reconciliation r
+                JOIN snapshot s USING(scope,generation)
+                WHERE r.scope=? AND s.validity=? AND r.uid<? ORDER BY r.uid""",
+                                      (scope, validity, first)):
+            if previous is None or uid != previous + 1:
+                if previous is not None:
+                    yield start, previous + 1
+                start = uid
+            previous = uid
+        if previous is not None:
+            if previous + 1 == first:
+                first = start
+            else:
+                yield start, previous + 1
+        if first < high:
+            yield first, high
+
+    def recovery_gaps(self, box, validity, next_uid, uids):
+        scope, generation = box["scope"], box["generation"]
+        window = self.row("SELECT * FROM recovery_window WHERE scope=?", scope)
+        if validity != box["validity"] or box["cursor"] is None:
+            # 新 UIDVALIDITY 的第一份快照仍为基线，不把旧位置映射到新代。
+            self.db.execute("INSERT OR REPLACE INTO recovery_window VALUES(?,?,?,?)",
+                            (scope, validity, next_uid, next_uid))
+            return
+        if window is None:
+            # 升级前已在等待确认的快照：从最近一次启用/已结清的快照恢复边界。
+            baseline = self.row("""SELECT initial FROM snapshot s WHERE scope=? AND validity=?
+                AND generation<=? AND (generation=1 OR EXISTS (SELECT 1 FROM location l
+                    WHERE l.scope=s.scope AND l.generation=s.generation)
+                    OR NOT EXISTS (SELECT 1 FROM snapshot prev WHERE prev.scope=s.scope
+                        AND prev.generation=s.generation-1 AND prev.validity=s.validity))
+                ORDER BY generation DESC LIMIT 1""", scope, validity, generation)
+            first = baseline[0] if box["reason"] == "reconciling" and baseline else box["cursor"]
+            high = box["peak"]
+        else:
+            first, high = window["first"], window["high"]
+        observed = self.row("SELECT next_uid FROM observed_range WHERE scope=? AND generation=?",
+                            scope, generation)
+        high = max(next_uid, high or 0, observed[0] if observed else 0)
+        self.db.execute("INSERT OR REPLACE INTO recovery_window VALUES(?,?,?,?)",
+                        (scope, validity, first, high))
+        for low, end in self.recovery_ranges(scope, validity, first, high):
+            covered = uids[bisect_left(uids, low):bisect_left(uids, end)]
+            self._record_gaps(scope, generation, low, end, covered)
+
+    def check_legacy(self, scope, validity, next_uid, uids):
+        with self.write() as db:
+            box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
+            if transition(box, "scan") != "check_legacy" or box["validity"] != validity:
+                raise Hold()
+            self.recovery_gaps(box, validity, next_uid, uids)
+            present = set(uids)
+            db.executemany("""UPDATE location SET status='unknown' WHERE scope=? AND generation=?
+                AND uid=? AND status='pending'""", ((scope, box["generation"], uid)
+                for uid in self.pending(scope, box["generation"]) if uid not in present))
 
     def rebuild(self, scope, validity, cursor, history, entries):
         with self.write() as db:
             box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
-            if box["state"] != "frozen":
+            if transition(box, "scan") != "rebuild":
                 raise Hold()
             generation = box["generation"]
             observations = []
@@ -466,18 +638,12 @@ class Store:
                 if match is not None:
                     self.review_reused(match, matches[0]["status"], item)
                 observations.append((uid, item.key, item.digest, item.candidate, item.attachments, match))
-            if validity == box["validity"] and box["cursor"] is not None:
-                # 上次 SEARCH 已逐段落账，即使仍有待登记的 UID，该段也不应再次报缺。
-                observed = self.row("SELECT next_uid FROM observed_range WHERE scope=? AND generation=?",
-                                    scope, generation)
-                first = max(box["cursor"], observed[0]) if observed else box["cursor"]
-                if first < cursor:
-                    uids = sorted({row[0] for row in observations if first <= row[0] < cursor})
-                    self._record_gaps(scope, generation, first, cursor, uids)
+            self.recovery_gaps(box, validity, cursor, [row[0] for row in observations])
             old = [tuple(r) for r in db.execute("""SELECT uid,msgkey,digest,candidate,attachments,matched
                 FROM reconciliation WHERE scope=? AND generation=? ORDER BY uid""", (scope, generation))]
-            if (box["reason"] != "reconciling" or box["validity"] != validity or box["cursor"] != cursor
-                    or old != observations):
+            changed = (box["reason"] != "reconciling" or box["validity"] != validity
+                       or box["cursor"] != cursor or old != observations)
+            if transition(box, "snapshot", snapshot_changed=changed) == "replace_snapshot":
                 generation += 1
                 db.execute("INSERT INTO snapshot VALUES(?,?,?,?,?,?)", (scope, generation, validity, cursor, history, now()))
                 db.executemany("""INSERT INTO reconciliation(scope,generation,uid,msgkey,digest,candidate,attachments,matched)
@@ -487,36 +653,120 @@ class Store:
                 WHERE scope=?""", (generation, validity, cursor, cursor, scope))
             self.review_stale_notices(scope)
 
-    def reconcile(self, scope, generation, validity, cursor):
+    @classmethod
+    @contextmanager
+    def confirmation_store(cls, path):
+        """守望者只打开已存在的私有库，避免服务启动时的账本修复。"""
+        store = cls.__new__(cls)
+        store.path, store._locked = path, False
+        os.close(_file(path))
+        with store.gate(), closing(sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True)) as db:
+            store.db = db
+            db.row_factory = sqlite3.Row
+            if store.row("PRAGMA user_version")[0] != FORMAT_VERSION:
+                raise FormatHold(FORMAT_HOLD)
+            yield store
+
+    @staticmethod
+    def confirmation_list(path, db):
+        meta = path.lstat()
+        if (not stat.S_ISREG(meta.st_mode) or stat.S_IMODE(meta.st_mode) != 0o600
+                or meta.st_uid != os.getuid() or meta.st_nlink != 1
+                or stat.S_IMODE(path.parent.stat().st_mode) != 0o700):
+            raise ValueError("须指定私有登记库。")
+        if db.execute("PRAGMA user_version").fetchone()[0] != FORMAT_VERSION:
+            raise ValueError("登记库格式版本不符。")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='recovery_request'").fetchone():
+            return []
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute("SELECT * FROM recovery_request ORDER BY id")]
+
+    def request_confirmation(self, scope, generation, validity, cursor, retry_of=0):
         with self.write() as db:
-            box = self.row("SELECT reason FROM mailbox WHERE scope=?", scope)
-            if self.uncovered(scope) or self.row("""SELECT 1 FROM reconciliation WHERE scope=? AND generation=?
-                    AND (digest IS NULL OR candidate IS NULL) LIMIT 1""", scope, generation):
+            db.execute(_REQUEST_SCHEMA)
+            freeze = self.row("SELECT max(rowid) FROM notice WHERE scope=? AND kind='freeze'", scope)[0]
+            key = (scope, generation, validity, cursor, freeze or 0, retry_of)
+            previous = self.row("""SELECT id FROM recovery_request WHERE scope=? AND generation=?
+                AND validity=? AND cursor=? AND freeze_id=? AND retry_of=?""", *key)
+            if previous:
+                return previous[0]
+            self.confirm_action(scope, generation, validity, cursor)
+            if retry_of and not self.row("""SELECT 1 FROM recovery_request WHERE id=? AND status='hold'
+                AND scope=? AND generation=? AND validity=? AND cursor=? AND freeze_id=?""",
+                                         retry_of, *key[:-1]):
                 raise Hold()
-            if db.execute("""UPDATE mailbox SET state='active',reason=NULL WHERE scope=? AND generation=?
-                AND validity=? AND cursor=? AND state='frozen' AND reason IN ('reconciling','legacy')""",
-                          (scope, generation, validity, cursor)).rowcount != 1:
-                raise Hold()
-            # 本次水位以前未能证明的新信、旧待办和可能已发的工作均交人工。
-            pending = db.execute("""SELECT id FROM registration WHERE scope=?
-                AND status NOT IN ('done','no','frozen','manual',?)""", (scope, MANUAL_BODY_MISSED)).fetchall()
-            for reg, in pending:
-                db.execute("UPDATE registration SET version=version+1 WHERE id=?", (reg,))
-                self.finish(reg, "manual", reason="reconciliation")
-            for row in list(db.execute("""SELECT * FROM reconciliation WHERE scope=? AND generation=?
-                    AND matched IS NULL""", (scope, generation))):
-                reg = db.execute("""INSERT INTO registration(scope,msgkey,digest,candidate,attachments,status,
-                    reason,created) VALUES(?,?,?,?,?,'review','reconciliation',?)""",
-                                 (scope, row["msgkey"], row["digest"], row["candidate"],
-                                  row["attachments"], now())).lastrowid
-                self.finish(reg, "manual")
-                db.execute("UPDATE reconciliation SET matched=? WHERE scope=? AND generation=? AND uid=?",
-                           (reg, scope, generation, row["uid"]))
-            db.execute("DELETE FROM scan_range WHERE scope=?", (scope,))
+            return db.execute("""INSERT INTO recovery_request(scope,generation,validity,cursor,
+                freeze_id,retry_of,actor,requested) VALUES(?,?,?,?,?,?,?,?)""",
+                              (*key, os.getuid(), now())).lastrowid
+
+    def reconcile(self, scope, generation, validity, cursor):
+        """兼容常驻进程内的同步调用，同样经过请求登记和服务重读。"""
+        if self.process_confirmation is None:
+            raise Hold()
+        request = self.request_confirmation(scope, generation, validity, cursor)
+        self.process_confirmation()
+        if self.row("SELECT status FROM recovery_request WHERE id=?", request)[0] != "restored":
+            raise Hold()
+
+    def finish_confirmation(self, request, reason=None):
+        scope = request["scope"]
+        with self.write() as db:
+            count = None
+            kind = "recovery_" + (reason or "restored")
+            if reason is None:
+                window = self.row("SELECT * FROM recovery_window WHERE scope=?", scope)
+                count = 0
+                if window:
+                    for low, end in self.recovery_ranges(scope, window["validity"], window["first"], window["high"]):
+                        count += self.row("""SELECT coalesce(sum(min(u.last,?)-max(u.first,?)+1),0)
+                            FROM unknown_range u JOIN snapshot s USING(scope,generation)
+                            WHERE u.scope=? AND s.validity=? AND u.last>=? AND u.first<?""",
+                                          end - 1, low, scope, window["validity"], low, end)[0]
+                self._settle(db, scope, request["generation"], request["validity"], request["cursor"])
+            db.execute("""UPDATE recovery_request SET status=?,reason=?,completed=?,gaps=? WHERE id=?""",
+                       ("hold" if reason else "restored", reason, now(), count, request["id"]))
+            self.notice(f"recovery:{request['id']}", scope, None, kind, count)
+
+    def confirm_action(self, scope, generation, validity, cursor):
+        box = self.row("SELECT * FROM mailbox WHERE scope=?", scope)
+        if box is None:
+            raise Hold()
+        approved = (generation, validity, cursor) == (box["generation"], box["validity"], box["cursor"])
+        return transition(box, "confirm", approved_snapshot=approved and not self.uncovered(scope))
+
+    def _settle(self, db, scope, generation, validity, cursor):
+        action = self.confirm_action(scope, generation, validity, cursor)
+        if self.row("""SELECT 1 FROM reconciliation WHERE scope=? AND generation=?
+                AND (digest IS NULL OR candidate IS NULL) LIMIT 1""", scope, generation):
+            raise Hold()
+        if db.execute("""UPDATE mailbox SET state='active',reason=NULL WHERE scope=? AND generation=?
+            AND validity=? AND cursor=? AND state='frozen'""",
+                      (scope, generation, validity, cursor)).rowcount != 1:
+            raise Hold()
+        # 本次水位以前未能证明的新信、旧待办和可能已发的工作均交人工。
+        pending = db.execute("""SELECT id FROM registration WHERE scope=?
+            AND status NOT IN ('done','no','frozen','manual',?)""", (scope, MANUAL_BODY_MISSED)).fetchall()
+        for reg, in pending:
+            db.execute("UPDATE registration SET version=version+1 WHERE id=?", (reg,))
+            self.finish(reg, "manual", reason="reconciliation")
+        for row in list(db.execute("""SELECT * FROM reconciliation WHERE scope=? AND generation=?
+                AND matched IS NULL""", (scope, generation))):
+            reg = db.execute("""INSERT INTO registration(scope,msgkey,digest,candidate,attachments,status,
+                reason,created) VALUES(?,?,?,?,?,'review','reconciliation',?)""",
+                             (scope, row["msgkey"], row["digest"], row["candidate"],
+                              row["attachments"], now())).lastrowid
+            self.finish(reg, "manual")
+            db.execute("UPDATE reconciliation SET matched=? WHERE scope=? AND generation=? AND uid=?",
+                       (reg, scope, generation, row["uid"]))
+        db.execute("DELETE FROM scan_range WHERE scope=?", (scope,))
+        if action == "settle_legacy":
+            self._advance(scope, generation)
+        else:
             db.execute("DELETE FROM observed_range WHERE scope=?", (scope,))
-            db.execute("""INSERT OR IGNORE INTO location(scope,generation,uid,registration,status)
-                SELECT scope,generation,uid,matched,'reviewed' FROM reconciliation WHERE scope=? AND generation=?""",
-                       (scope, generation))
-            if box["reason"] == "legacy":
-                db.execute("""UPDATE legacy SET status='reviewed' WHERE source IN
-                    (SELECT source FROM legacy_review WHERE scope=? AND generation=?)""", (scope, generation))
+        db.execute("DELETE FROM recovery_window WHERE scope=?", (scope,))
+        db.execute("""INSERT OR IGNORE INTO location(scope,generation,uid,registration,status)
+            SELECT scope,generation,uid,matched,'reviewed' FROM reconciliation WHERE scope=? AND generation=?""",
+                   (scope, generation))
+        if action == "settle_legacy":
+            db.execute("""UPDATE legacy SET status='reviewed' WHERE source IN
+                (SELECT source FROM legacy_review WHERE scope=? AND generation=?)""", (scope, generation))

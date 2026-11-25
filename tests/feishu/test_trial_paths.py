@@ -203,3 +203,36 @@ def test_single_connection_callback_then_disabled_cli_recovery(tmp_path, monkeyp
         assert bodies and all("未建单" in row[0] for row in bodies)
     assert delivered.is_set() and deliveries
     assert all('<at user_id="ou_config">' in message for message in deliveries)
+
+
+def test_cli_recovery_lists_confirmations_and_approvals(tmp_path, monkeypatch, capsys):
+    # 同一试运行登记库：冻结确认请求与审批恢复事项须由守望者一次调用全部列出。
+    from qianshu import __main__ as cli
+    from qianshu.feishu.trial_approval import Journal
+    from qianshu.mail.trial_state import _REQUEST_SCHEMA
+    from tests.feishu.test_trial_approval import bind, click
+
+    path = tmp_path / "trial-050.sqlite3"
+    store = Store(path)
+    with store.write() as db:
+        db.execute("INSERT INTO mailbox(scope,state) VALUES('s','active')")
+        db.execute("INSERT INTO registration(id,scope,version,attachments,status) VALUES(1,'s',1,0,'done')")
+        db.execute(_REQUEST_SCHEMA)
+        db.execute("""INSERT INTO recovery_request(scope,generation,validity,cursor,freeze_id,actor,requested)
+            VALUES('s',1,1,1,0,0,'2030-01-01T00:00:00+00:00')""")
+    journal = Journal(store.db)
+    journal.rotate("session", "连接")
+    bind(journal)
+    assert "已核验" in click(journal, "verify")
+    assert "执行器未就绪" in click(journal, "approve")
+    store.db.close()
+    for key in ("MAIL_USER", "MAIL_PASSWORD", "MINGDAO_ACCOUNT", "MINGDAO_PASSWORD",
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AI_BACKUP_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    assert cli.main(["--state", str(path), "--list-recovery"]) == 0
+    output = capsys.readouterr()
+    rows = json.loads(output.out)
+    confirmations = [row for row in rows if "kind" not in row]
+    assert [(row["scope"], row["status"]) for row in confirmations] == [("s", "pending")]
+    assert {row["kind"] for row in rows if "kind" in row} >= {"trial_task", "trial_card"}
+    assert "确认请求数 1" in output.err and "审批恢复事项数" in output.err
