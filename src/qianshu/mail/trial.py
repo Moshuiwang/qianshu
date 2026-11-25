@@ -560,6 +560,22 @@ class Trial:
             self.stop.wait(30)
 
 
+def business_config(business):
+    """出卡预览与存档执行共用同一份业务配置，预览指纹才能对得上。"""
+    from dotenv import dotenv_values
+    from qianshu.config import load_config
+    from qianshu.parse.model import load_model_config
+
+    config = dict(load_model_config(env_file=business, config=load_config("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD",
+                                                                          env_file=business)))
+    config.setdefault("MAIL_PORT", "993")
+    with business.open(encoding="utf-8-sig") as stream:
+        private_dir = dotenv_values(stream=stream, interpolate=False).get("MAIL_PRIVATE_DIR")
+    if private_dir:
+        config["MAIL_PRIVATE_DIR"] = private_dir
+    return config
+
+
 @contextmanager
 def _polling_worker(args, settings, path, switches, send, sensitive, report, *, setup=None):
     from threading import Event, Thread
@@ -573,13 +589,7 @@ def _polling_worker(args, settings, path, switches, send, sensitive, report, *, 
     business = args.business_env_file
     if business is None:
         raise ConfigError("试运行收信须显式指定业务私有配置。")
-    config = dict(load_model_config(env_file=business, config=load_config("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD",
-                                                                          env_file=business)))
-    config.setdefault("MAIL_PORT", "993")
-    with business.open(encoding="utf-8-sig") as stream:
-        private_dir = dotenv_values(stream=stream, interpolate=False).get("MAIL_PRIVATE_DIR")
-    if private_dir:
-        config["MAIL_PRIVATE_DIR"] = private_dir
+    config = business_config(business)
     if config.get("FEISHU_CHAT_ID") != settings.chat_id:
         raise ConfigError("试运行汇报群与业务登记不符。")
     state = path.with_name("trial-050.sqlite3")

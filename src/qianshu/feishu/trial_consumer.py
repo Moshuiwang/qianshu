@@ -18,6 +18,7 @@ from qianshu.mingdao.create_order import decode, private_bytes
 from .sdk import lark
 from .settings import load_handoff_settings
 from .trial_approval import CARD_FORMAT, Journal, journal_at
+from .trial_archive import archive_worker, build_runner
 from .trial_listener import ApprovalSettings, Listener
 
 
@@ -172,7 +173,12 @@ def running(arguments, connected):
                          available=lambda: consumer.origin.close_code is None,
                          sender=consumer.listener.transport) as ended:
             consumer.ended = ended
-            yield consumer
+            # 出卡与建单开关均开、配置已确认才装配存档执行器；否则同意后只记录，存档写为 0。
+            runner = build_runner(args, settings, consumer.listener.path, path, switches=consumer.switches,
+                                  connected=connected, sensitive=consumer.listener.transport.sensitive_values)
+            consumer.listener.archive_wired = runner is not None
+            with archive_worker(runner):
+                yield consumer
     finally:
         consumer.origin.close_code = 1
         consumer.listener.rotate(None, "连接断开")

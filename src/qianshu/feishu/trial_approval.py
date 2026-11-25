@@ -42,7 +42,28 @@ CREATE TABLE IF NOT EXISTS trial_known_record(
  card TEXT, item INTEGER, record_id TEXT NOT NULL, PRIMARY KEY(card,item));
 CREATE TABLE IF NOT EXISTS trial_notification(card TEXT, kind TEXT, uuid TEXT UNIQUE, body TEXT,
  status TEXT, PRIMARY KEY(card,kind));
+CREATE TABLE IF NOT EXISTS trial_halt(id INTEGER PRIMARY KEY CHECK(id=1), reason TEXT NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS trial_archive(
+ registration INTEGER, version INTEGER, card TEXT NOT NULL, status TEXT NOT NULL, purpose TEXT, url TEXT,
+ stage TEXT, reason TEXT, started REAL, finished REAL, disconnect_writes INTEGER NOT NULL DEFAULT 0,
+ card_update TEXT NOT NULL DEFAULT 'none', PRIMARY KEY(registration,version));
+CREATE TABLE IF NOT EXISTS trial_archive_page(
+ registration INTEGER, version INTEGER, kind TEXT, page TEXT, summary TEXT, PRIMARY KEY(registration,version,kind));
 """
+
+# 存档阶段的条目任务状态：archive_pending 尚无外写（关卡时可安全关闭）；archive_running 已发起存档；
+# archive_done 存档已建、待建单（2d 消费）；archive_unknown 结果未知，冻结等人工。
+ARCHIVE_SAFE = ("executor_unavailable", "archive_pending", "archive_done")
+ARCHIVE_NOTICES = {
+    "gate": "本批存档失败，未建单，已转人工。",
+    "failed": "本批存档失败，未建单，已转人工。",
+    "unconfirmed": "本批存档发布确认未登记，未建单，已转人工。",
+    "unknown": "本批存档结果未知，未建单，请配置负责人核对存档文档与汇总页。",
+}
+DISCONNECT_NOTICES = (
+    "断线期间已发出 1 个存档写步骤，已核对该步骤结果。",
+    "断线期间已发出 1 个存档写步骤，该步骤结果未能核对。",
+)
 
 
 @contextmanager
@@ -123,9 +144,26 @@ class Journal:
             if statement.strip():
                 self.db.execute(statement)
 
+    def write_halted(self):
+        """持久停写位。置位后不再发起任何存档写（2d 建单共用）。"""
+        return self.db.execute("SELECT 1 FROM trial_halt WHERE id=1").fetchone() is not None
+
+    def halt_writes(self, reason, now):
+        with self.db:
+            self.db.execute("INSERT OR IGNORE INTO trial_halt VALUES(1,?,?)", (reason, now))
+
+    def clear_halt(self):
+        with self.db:
+            self.db.execute("DELETE FROM trial_halt WHERE id=1")
+
+    def disconnect_archive_writes(self):
+        """断线期间发出的存档写步骤总数，供日报单列。"""
+        return self.db.execute("SELECT coalesce(sum(disconnect_writes),0) FROM trial_archive").fetchone()[0]
+
     def notice_counts(self):
         return self.db.execute("""SELECT
-            (SELECT count(*) FROM trial_notification WHERE kind='result_manual' OR kind GLOB 'first_manual:*'),
+            (SELECT count(*) FROM trial_notification WHERE kind='result_manual' OR kind GLOB 'first_manual:*'
+             OR kind GLOB 'archive_*'),
             (SELECT count(*) FROM trial_notification WHERE status NOT IN ('sent','cancelled')) +
             (SELECT count(*) FROM trial_feedback WHERE status!='sent')""").fetchone()
 
@@ -192,16 +230,26 @@ class Journal:
 
     def close(self, row, reason):
         card = row["card"]
-        safe = {"executor_unavailable", "closed"}
+        safe = {*ARCHIVE_SAFE, "closed"}
         legacy = self.db.execute("SELECT status FROM trial_task WHERE card=?", (card,)).fetchone()
         tasks = dict(self.db.execute("SELECT item,status FROM trial_item_task WHERE card=?", (card,)))
         known = {r[0] for r in self.db.execute("""SELECT item FROM trial_known_record
                          WHERE card=? AND length(trim(record_id))>0""", (card,))}
         uncertain = {item for item, status in tasks.items() if status not in safe}
         self.db.execute("UPDATE trial_card SET status='closed' WHERE card=?", (card,))
-        self.db.execute("""UPDATE trial_item_task SET status='closed' WHERE card=? AND status='executor_unavailable'
-                        AND item NOT IN (SELECT item FROM trial_known_record WHERE card=?)""", (card, card))
-        self.db.execute("UPDATE trial_task SET status='closed' WHERE card=? AND status='executor_unavailable'", (card,))
+        marks = ",".join("?" * len(ARCHIVE_SAFE))
+        self.db.execute(f"""UPDATE trial_item_task SET status='closed' WHERE card=? AND status IN ({marks})
+                        AND item NOT IN (SELECT item FROM trial_known_record WHERE card=?)""",
+                        (card, *ARCHIVE_SAFE, card))
+        self.db.execute(f"UPDATE trial_task SET status='closed' WHERE card=? AND status IN ({marks})",
+                        (card, *ARCHIVE_SAFE))
+        # 存档已发起而卡片在途关闭：结果不明，冻结等人工，不重发。
+        self.db.execute("UPDATE trial_archive SET status='unknown', reason='card_closed' WHERE card=? AND status='running'",
+                        (card,))
+        self.db.execute("UPDATE trial_item_task SET status='archive_unknown' WHERE card=? AND status='archive_running'",
+                        (card,))
+        self.db.execute("UPDATE trial_task SET status='archive_unknown' WHERE card=? AND status='archive_running'",
+                        (card,))
         self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
                         AND kind='remind' AND status='pending'""", (card,))
         if not known and not uncertain and (not legacy or legacy[0] in safe):
@@ -210,6 +258,8 @@ class Journal:
         for item in sorted(set(json.loads(row["snapshot"])["items"]) | known | uncertain):
             if item in known:
                 detail = "已有记录待回读，请按私有登记只读核对"
+            elif tasks.get(item, "").startswith("archive_"):
+                detail = "存档结果未知，请核对存档文档与汇总页"
             elif item in uncertain or (legacy and legacy[0] not in safe):
                 detail = "结果未知，请人工到明道云核对"
             else:
@@ -236,7 +286,9 @@ class Journal:
     def scan(self, now, *, create_enabled=True):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
-            for row in self.db.execute("SELECT * FROM trial_card WHERE status IN ('open','accepted')"):
+            # 存档进行中的批次由存档执行器收口，扫描不抢先关闭（开始存档前的授权只核一次）。
+            for row in self.db.execute("""SELECT * FROM trial_card WHERE status IN ('open','accepted')
+                    AND card NOT IN (SELECT card FROM trial_archive WHERE status='running')""").fetchall():
                 if not create_enabled and row["status"] == "accepted":
                     self.close(row, "建单开关关闭")
                 elif trial_batch(self.db, row["registration"], row["version"])[3]:
@@ -253,7 +305,8 @@ class Journal:
             return self.db.execute("INSERT OR IGNORE INTO trial_event VALUES(?,0)", (event,)).rowcount == 1
 
     def action(self, session, card, reg, version, message, action, event, actor, created,
-               clock, current, member, switches, *, reason="", claimed=False, queue_update=False):
+               clock, current, member, switches, *, reason="", claimed=False, queue_update=False,
+               archive=False):
         refused = "卡片绑定、身份或有效期不符"
         reload_switches = switches if callable(switches) else None
         if reload_switches:
@@ -326,7 +379,8 @@ class Journal:
                 self.close(row, "驳回：" + (reason or "点击人未认可本批草稿，请联系点击人核对原因"))
                 return "已驳回"
             self.db.execute("UPDATE trial_card SET status='accepted' WHERE card=?", (card,))
-            self.db.execute("INSERT INTO trial_task VALUES(?,'executor_unavailable')", (card,))
-            self.db.executemany("""INSERT INTO trial_item_task VALUES(?,?,?,'formal',?,'executor_unavailable')""",
-                                ((reg, version, item, card) for item in snapshot["eligible"]))
-            return "有效同意已记录，执行器未就绪"
+            state = "archive_pending" if archive else "executor_unavailable"
+            self.db.execute("INSERT INTO trial_task VALUES(?,?)", (card, state))
+            self.db.executemany("""INSERT INTO trial_item_task VALUES(?,?,?,'formal',?,?)""",
+                                ((reg, version, item, card, state) for item in snapshot["eligible"]))
+            return "有效同意已记录，将建存档" if archive else "有效同意已记录，执行器未就绪"

@@ -104,7 +104,9 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
     preview = material = None
     if domestic and row["attachments"] == 0 and not blocked and not full_review and policies:
         try:
-            batch = VerifiedArchiveBatch(str(reg), str(version), trial.clock().date(), country, "X8b",
+            # 发布用途取自守望者登记的确认项；未登记时按首次真实发布展示，执行时未登记即不发布。
+            purpose = settings.get("MAIL_TRIAL_ARCHIVE_PURPOSE") or "X8b"
+            batch = VerifiedArchiveBatch(str(reg), str(version), trial.clock().date(), country, purpose,
                                          text, tuple(archive_policy(d, text) for d in parsed), True)
             preview = preview_archive_batch(batch, config=trial.config, sensitive_values=trial.sensitive)
             material = asdict(batch) | {"utc_date": batch.utc_date.isoformat()}

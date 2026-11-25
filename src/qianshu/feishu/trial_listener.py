@@ -30,6 +30,7 @@ from .trial_approval import CARD_FORMAT, MANUAL_NOTICE, journal_at
 
 
 _LOG = logging.getLogger(__name__)
+ARCHIVED_TEXT = "已建存档，等待建单"
 
 
 class MessageNotSent(RuntimeError):
@@ -189,6 +190,7 @@ class Listener:
     def __init__(self, path, settings, switches, *, clock=time.time, defer_rotation=False, transport=None):
         self.path, self.settings, self.switches, self.clock = path, settings, switches, clock
         self.queue_updates = False
+        self.archive_wired = False  # 存档执行器已装配：同意后进入建存档，而非「执行器未就绪」
         self.origin, self.session, self.connected_at = None, "", 0
         self._rotation_lock = Lock()
         self._pending = None
@@ -248,7 +250,7 @@ class Listener:
                         if not j.db.execute("""UPDATE trial_notification SET status='unknown'
                             WHERE uuid=? AND status='pending'""", (row["uuid"],)).rowcount:
                             raise ValueError
-                needs_contact = row["kind"] == "remind" or row["kind"].startswith("closed")
+                needs_contact = row["kind"] == "remind" or row["kind"].startswith(("closed", "archive_"))
                 body = (mention(target, "配置负责人") + " " if target else "") + row["body"]
                 if row["kind"] == "result_manual" or row["kind"].startswith("first_manual:"):
                     body = MANUAL_NOTICE
@@ -267,6 +269,8 @@ class Listener:
                     j.db.execute("UPDATE trial_notification SET status=? WHERE uuid=?",
                                  ("missing_contact" if needs_contact and not target else "sent", row["uuid"]))
 
+            self._rewrite_archived_cards(j)
+
             for row in j.db.execute("SELECT * FROM trial_feedback WHERE status='pending'").fetchall():
                 def claim_feedback():
                     with j.db:
@@ -281,6 +285,47 @@ class Listener:
                     continue
                 with j.db:
                     j.db.execute("UPDATE trial_feedback SET status='sent' WHERE uuid=?", (row["uuid"],))
+
+    def _rewrite_archived_cards(self, j):
+        """存档已建：改写原卡为「已建存档，等待建单」。改卡失败或未知按卡版本登记人工核对，不重试。"""
+        rows = j.db.execute("""SELECT a.registration, a.version, a.card, c.snapshot, d.message
+            FROM trial_archive a JOIN trial_card c USING(card)
+            JOIN card_intent i ON i.registration=a.registration AND i.version=a.version
+            JOIN trial_delivery d USING(uuid)
+            WHERE a.status='success' AND a.card_update='pending' AND c.status='accepted'
+            AND i.page=(SELECT max(page) FROM card_intent WHERE registration=a.registration
+                        AND version=a.version AND status='sent')""").fetchall()
+        for row in rows:
+            with j.db:
+                if not j.db.execute("""UPDATE trial_archive SET card_update='unknown' WHERE registration=?
+                        AND version=? AND card_update='pending'""", (row["registration"], row["version"])).rowcount:
+                    continue
+            try:
+                transport = self.transport
+                if not transport.order_http or not callable(transport.before_send):
+                    raise OutletUnavailable("缺少试运行凭据出口检查器")
+                page = json.loads(row["snapshot"])["pages"][-1]
+                page["elements"] = [e for e in page["elements"] if e.get("tag") != "form"]
+                page["elements"].append({"tag": "div", "text": {"tag": "plain_text", "content": ARCHIVED_TEXT}})
+                asyncio.run(self._patch_card(row["message"], page))
+            except Exception:
+                with j.db:
+                    j.manual(row["card"])
+                    j.db.execute("""UPDATE trial_archive SET card_update='manual' WHERE registration=?
+                                 AND version=?""", (row["registration"], row["version"]))
+            else:
+                with j.db:
+                    j.db.execute("""UPDATE trial_archive SET card_update='sent' WHERE registration=?
+                                 AND version=?""", (row["registration"], row["version"]))
+
+    async def _patch_card(self, message, page):
+        transport = self.transport
+        with transport.trial_action():
+            transport.before_send("patch_content", page)
+            body = PatchMessageRequestBody.builder().content(json.dumps(page, ensure_ascii=False)).build()
+            request = PatchMessageRequest.builder().message_id(message).request_body(body).build()
+            option = RequestOption.builder().tenant_access_token(await transport._tenant_token()).build()
+            await transport.order_http.async_request(request, option, "patch", PatchMessageResponse)
 
     def refuse_click(self, data, *, notify=True):
         event = data.header.event_id
@@ -313,7 +358,8 @@ class Listener:
                 page = json.loads(row["snapshot"])["pages"][-1]
                 if row["action"] != "verify":
                     page["elements"] = [e for e in page["elements"] if e.get("tag") != "form"]
-                text = {"verify": "邮件审批已核验", "approve": "有效同意已记录，执行器未就绪",
+                text = {"verify": "邮件审批已核验",
+                        "approve": "有效同意已记录，将建存档" if self.archive_wired else "有效同意已记录，执行器未就绪",
                         "reject": "已驳回"}[row["action"]]
                 page["elements"].append({"tag": "div", "text": {"tag": "plain_text", "content": text}})
                 with transport.trial_action():
@@ -412,6 +458,7 @@ class Listener:
                 return j.action(session, value["card"], value["registration"], value["version"], msg,
                                 value["action"], key, actor, times[0], self.clock,
                                 lambda: current() and 0 <= self.clock()-times[0] <= max_age,
-                                member, switches, reason=reason, claimed=True, queue_update=self.queue_updates)
+                                member, switches, reason=reason, claimed=True, queue_update=self.queue_updates,
+                                archive=self.archive_wired)
         async with asyncio.timeout(max(0, deadline-time.monotonic())):
             return response(await asyncio.to_thread(record))

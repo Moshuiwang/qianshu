@@ -177,3 +177,9 @@ def _approval_switches(values, result):
     for key in ("MAIL_TRIAL_CREATE_ENABLED", "MAIL_TRIAL_CREATE_COUNTRY", "MAIL_TRIAL_APPROVER_OPEN_IDS"):
         if key in values:
             result[key] = values[key]
+    # 守望者登记的存档发布确认（X8a 合成试写 / X8b 首次真实发布）。未登记即不发布。
+    purpose = values.get("MAIL_TRIAL_ARCHIVE_PURPOSE", "")
+    if purpose not in {"", "X8a", "X8b"}:
+        raise ConfigError("试运行存档发布确认须为 X8a 或 X8b。")
+    if purpose:
+        result["MAIL_TRIAL_ARCHIVE_PURPOSE"] = purpose
