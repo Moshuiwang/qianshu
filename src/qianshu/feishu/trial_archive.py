@@ -346,7 +346,8 @@ def build_runner(args, settings, state, handoff_path, *, switches, connected, se
 
 
 @contextmanager
-def archive_worker(runner, *, interval=0.5, join=1.2):
+def archive_worker(runner, *, interval=0.5, join=1.2, orders=None):
+    """存档与建单（2d）在同一专用线程里串行执行：先存档，后建单。"""
     if runner is None:
         yield None
         return
@@ -358,6 +359,11 @@ def archive_worker(runner, *, interval=0.5, join=1.2):
                 runner.run_once()
             except Exception:
                 _LOG.error("存档执行器本轮未完成，下一轮重试。")
+            if orders is not None:
+                try:
+                    orders.run_once()
+                except Exception:
+                    _LOG.error("建单执行器本轮未完成，下一轮重试。")
 
     thread = threading.Thread(target=loop, name="trial-archive", daemon=True)
     thread.start()

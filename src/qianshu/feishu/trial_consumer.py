@@ -20,6 +20,7 @@ from .settings import load_handoff_settings
 from .trial_approval import CARD_FORMAT, Journal, journal_at
 from .trial_archive import archive_worker, build_runner
 from .trial_listener import ApprovalSettings, Listener
+from .trial_order import build_order_runner
 
 
 def load_approval_settings(args):
@@ -177,7 +178,11 @@ def running(arguments, connected):
             runner = build_runner(args, settings, consumer.listener.path, path, switches=consumer.switches,
                                   connected=connected, sensitive=consumer.listener.transport.sensitive_values)
             consumer.listener.archive_wired = runner is not None
-            with archive_worker(runner):
+            # 建单执行器（2d）只在存档执行器已装配、明道云配置与登录态就绪时装配；否则建单写为 0。
+            orders = build_order_runner(args, settings, consumer.listener.path, switches=consumer.switches,
+                                        connected=connected, sensitive=consumer.listener.transport.sensitive_values,
+                                        archive_runner=runner)
+            with archive_worker(runner, orders=orders):
                 yield consumer
     finally:
         consumer.origin.close_code = 1

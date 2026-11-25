@@ -49,6 +49,15 @@ CREATE TABLE IF NOT EXISTS trial_archive(
  card_update TEXT NOT NULL DEFAULT 'none', PRIMARY KEY(registration,version));
 CREATE TABLE IF NOT EXISTS trial_archive_page(
  registration INTEGER, version INTEGER, kind TEXT, page TEXT, summary TEXT, PRIMARY KEY(registration,version,kind));
+CREATE TABLE IF NOT EXISTS trial_order(
+ registration INTEGER, version INTEGER, item INTEGER, card TEXT NOT NULL, status TEXT NOT NULL, name_key TEXT,
+ target TEXT, record_id TEXT, reason TEXT, sent REAL, finished REAL, disconnect INTEGER NOT NULL DEFAULT 0,
+ PRIMARY KEY(registration,version,item));
+CREATE TABLE IF NOT EXISTS trial_order_slot(id INTEGER PRIMARY KEY CHECK(id=1), registration INTEGER NOT NULL,
+ version INTEGER NOT NULL, item INTEGER NOT NULL, at REAL NOT NULL);
+CREATE TABLE IF NOT EXISTS trial_handoff(name_key TEXT NOT NULL, target TEXT, registration INTEGER, version INTEGER,
+ item INTEGER, opened REAL NOT NULL, cleared REAL, reason TEXT);
+CREATE TABLE IF NOT EXISTS trial_guardian_log(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
 """
 
 # 存档阶段的条目任务状态：archive_pending 尚无外写（关卡时可安全关闭）；archive_running 已发起存档；
@@ -102,7 +111,7 @@ def recovery(db):
         SELECT 'trial_card' AS kind, registration, version, status FROM trial_card
         WHERE status IN ('preparing','open','accepted','partial')
         UNION ALL SELECT 'trial_task', c.registration, c.version, t.status
-        FROM trial_task t JOIN trial_card c USING(card) WHERE t.status!='closed'
+        FROM trial_task t JOIN trial_card c USING(card) WHERE t.status NOT IN ('closed','order_done')
         UNION ALL SELECT 'trial_notification', c.registration, c.version, n.status
         FROM trial_notification n JOIN trial_card c USING(card)
         WHERE n.status IN ('pending','unknown','blocked','missing_contact')
@@ -118,7 +127,7 @@ def recovery(db):
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_item_task'").fetchone():
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'item_task' AS kind, registration, version, item, status FROM trial_item_task
-            WHERE status!='closed'"""))
+            WHERE status NOT IN ('closed','order_done')"""))
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_feedback'").fetchone():
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'update' AS kind, registration, version, u.status FROM trial_update u JOIN trial_card c
@@ -129,6 +138,18 @@ def recovery(db):
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'manual_check' AS kind, registration, version, n.status
             FROM trial_notification n JOIN trial_card c USING(card) WHERE n.kind='result_manual' OR n.kind LIKE 'first_manual:%'"""))
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_order'").fetchone():
+        from .trial_order import name_fingerprint
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'order' AS kind, registration, version, item, status FROM trial_order
+            WHERE status IN ('sending','created','unknown','mismatch')"""))
+        rows.extend({"kind": "order_handoff", "registration": r[0], "version": r[1], "item": r[2],
+                     "name_fp": name_fingerprint(r[3]), "status": "open"} for r in db.execute("""
+            SELECT registration, version, item, name_key FROM trial_handoff WHERE cleared IS NULL"""))
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'order_slot' AS kind, registration, version, item, 'held' AS status FROM trial_order_slot"""))
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'write_halt' AS kind, reason AS status FROM trial_halt"""))
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_known_record'").fetchone():
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'known_record' AS kind, registration, version, r.item, 'readback_pending' AS status
@@ -158,6 +179,20 @@ class Journal:
         with self.db:
             self.db.execute("DELETE FROM trial_halt WHERE id=1")
 
+    def disconnect_orders(self):
+        """断线期间照发的建单数（G464），供日报单列。"""
+        return self.db.execute("SELECT count(*) FROM trial_order WHERE disconnect=1").fetchone()[0]
+
+    def halt_state(self):
+        """停写位当前值与最后一次变更（守望者读回）。"""
+        halt = self.db.execute("SELECT reason, at FROM trial_halt WHERE id=1").fetchone()
+        last = self.db.execute("""SELECT at, action, reason FROM trial_guardian_log
+                               WHERE action IN ('halt_set','halt_clear','request_create_off')
+                               ORDER BY rowid DESC LIMIT 1""").fetchone()
+        return {"halted": halt is not None, "halt_reason": halt[0] if halt else None,
+                "halt_at": halt[1] if halt else None,
+                "last_change": dict(zip(("at", "action", "reason"), last)) if last else None}
+
     def disconnect_archive_writes(self):
         """断线期间发出的存档写步骤总数，供日报单列。"""
         return self.db.execute("SELECT coalesce(sum(disconnect_writes),0) FROM trial_archive").fetchone()[0]
@@ -165,7 +200,7 @@ class Journal:
     def notice_counts(self):
         return self.db.execute("""SELECT
             (SELECT count(*) FROM trial_notification WHERE kind='result_manual' OR kind GLOB 'first_manual:*'
-             OR kind GLOB 'archive_*'),
+             OR kind GLOB 'archive_*' OR kind GLOB 'order_unknown:*' OR kind='order_mismatch'),
             (SELECT count(*) FROM trial_notification WHERE status NOT IN ('sent','cancelled')) +
             (SELECT count(*) FROM trial_feedback WHERE status!='sent')""").fetchone()
 
@@ -237,7 +272,8 @@ class Journal:
         tasks = dict(self.db.execute("SELECT item,status FROM trial_item_task WHERE card=?", (card,)))
         known = {r[0] for r in self.db.execute("""SELECT item FROM trial_known_record
                          WHERE card=? AND length(trim(record_id))>0""", (card,))}
-        uncertain = {item for item, status in tasks.items() if status not in safe}
+        done = {item for item, status in tasks.items() if status == "order_done"}
+        uncertain = {item for item, status in tasks.items() if status not in safe and item not in done}
         self.db.execute("UPDATE trial_card SET status='closed' WHERE card=?", (card,))
         marks = ",".join("?" * len(ARCHIVE_SAFE))
         self.db.execute(f"""UPDATE trial_item_task SET status='closed' WHERE card=? AND status IN ({marks})
@@ -254,11 +290,13 @@ class Journal:
                         (card,))
         self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
                         AND kind='remind' AND status='pending'""", (card,))
-        if not known and not uncertain and (not legacy or legacy[0] in safe):
+        if not known and not uncertain and not done and (not legacy or legacy[0] in safe):
             self.notify(row, "closed", reason + "，未建单，转人工")
             return
         for item in sorted(set(json.loads(row["snapshot"])["items"]) | known | uncertain):
-            if item in known:
+            if item in done:
+                detail = "已建单并回读一致"
+            elif item in known:
                 detail = "已有记录待回读，请按私有登记只读核对"
             elif tasks.get(item, "").startswith("archive_"):
                 detail = "存档结果未知，请核对存档文档与汇总页"
@@ -289,8 +327,10 @@ class Journal:
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             # 存档进行中的批次由存档执行器收口，扫描不抢先关闭（开始存档前的授权只核一次）。
+            # 建单在途（已登记发送、待回读）的批次同样由建单执行器收口。
             for row in self.db.execute("""SELECT * FROM trial_card WHERE status IN ('open','accepted')
-                    AND card NOT IN (SELECT card FROM trial_archive WHERE status='running')""").fetchall():
+                    AND card NOT IN (SELECT card FROM trial_archive WHERE status='running')
+                    AND card NOT IN (SELECT card FROM trial_order WHERE status IN ('sending','created'))""").fetchall():
                 if not create_enabled and row["status"] == "accepted":
                     self.close(row, "建单开关关闭")
                 elif trial_batch(self.db, row["registration"], row["version"])[3]:

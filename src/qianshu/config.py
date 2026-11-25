@@ -183,3 +183,9 @@ def _approval_switches(values, result):
         raise ConfigError("试运行存档发布确认须为 X8a 或 X8b。")
     if purpose:
         result["MAIL_TRIAL_ARCHIVE_PURPOSE"] = purpose
+    # 建单官方回读等待上限（秒，2d）。未登记按 120 秒。
+    readback = values.get("MAIL_TRIAL_READBACK_SECONDS")
+    if readback is not None:
+        if not re.fullmatch(r"[1-9][0-9]{0,2}", readback or "") or int(readback) > 600:
+            raise ConfigError("建单回读等待上限须为 1 至 600 秒。")
+        result["MAIL_TRIAL_READBACK_SECONDS"] = readback

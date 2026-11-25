@@ -24,9 +24,15 @@ def _guardian_environment_blocked():
 
 
 _GUARDIAN_HELP = "守望者命令检测到业务凭据，请使用 scripts/guardian-trial.sh。"
+# 2c/2d 部署与巡检用的守望者命令：只用飞书转交配置，不读业务凭据；带业务凭据的环境拒绝运行。
+_DEPLOY_COMMANDS = {"--trial-init-archive-ledger", "--trial-halt", "--trial-release-handoff"}
+_DEPLOY_HELP = "守望者命令检测到业务凭据，请在不含业务凭据的环境中运行（env -i）。"
 if (__name__ == "__main__" and {"--trial-reconcile", "--list-recovery"}.intersection(sys.argv[1:])
         and _guardian_environment_blocked()):
     sys.exit(_GUARDIAN_HELP)
+if (__name__ == "__main__" and any(arg.split("=")[0] in _DEPLOY_COMMANDS for arg in sys.argv[1:])
+        and _guardian_environment_blocked()):
+    sys.exit(_DEPLOY_HELP)
 
 import argparse
 import asyncio
@@ -39,7 +45,7 @@ import tempfile
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import closing, contextmanager, nullcontext
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from functools import partial
 from hashlib import sha256
 from pathlib import Path
@@ -729,6 +735,85 @@ def _serve(
             log_unfinished()
 
 
+def _guardian_deploy(parser, args, chosen):
+    """2c/2d 守望者受控入口。每次执行后读回并打印状态；不读任何业务凭据。"""
+    others = (args.inject, args.handoff_only, args.mail, args.trial_switches, args.list_recovery,
+              args.trial_publish_switches, args.trial_import_spend is not None, args.trial_reconcile,
+              args.business_env_file, args.mingdao_config)
+    if len(chosen) != 1 or any(others):
+        parser.error("守望者命令须单独运行。")
+    if args.trial_init_archive_ledger is not None:
+        from .feishu import archive as A
+        path = args.trial_init_archive_ledger
+        if path.name != "archive-ledger.sqlite3" or args.state is not None or args.reason is not None:
+            parser.error("初始化存档授权库须单独指定 私有目录/archive-ledger.sqlite3。")
+        existed = path.exists() or path.is_symlink()
+        try:
+            if not existed:
+                A.initialize_archive_ledger(path)
+            with A._database(path) as db:
+                columns = [row["name"] for row in db.execute("PRAGMA table_info(grants)")]
+        except Exception:
+            print("存档授权库初始化或读回失败，请核对私有目录。", file=sys.stderr)
+            return 1
+        result = "已存在，未覆盖" if existed else "已初始化"
+        print(json.dumps({"path": str(path), "result": result, "exists": True, "grants_columns": columns},
+                         ensure_ascii=False))
+        return 0 if columns else 1
+    if args.state is None or args.state.name != "trial-050.sqlite3":
+        parser.error("守望者命令须指定 --state 私有目录/trial-050.sqlite3。")
+    from .feishu.trial_approval import journal_at
+    now = time.time()
+    if args.trial_halt is not None:
+        if (args.trial_halt == "status") != (args.reason is None) or (args.reason is not None and not args.reason.strip()):
+            parser.error("停写位置位与清除须带 --reason；读回不带原因。")
+        try:
+            with journal_at(args.state) as j:
+                if args.trial_halt != "status":
+                    with j.db:
+                        j.db.execute("BEGIN IMMEDIATE")
+                        j.initialize()
+                        if args.trial_halt == "set":
+                            j.db.execute("INSERT OR IGNORE INTO trial_halt VALUES(1,?,?)", (args.reason, now))
+                        else:
+                            j.db.execute("DELETE FROM trial_halt WHERE id=1")
+                        j.db.execute("INSERT INTO trial_guardian_log VALUES(?,?,?)",
+                                     (now, "halt_" + args.trial_halt, args.reason))
+                state = j.halt_state()
+        except Exception:
+            print("停写位读写失败，请核对私有登记库。", file=sys.stderr)
+            return 1
+        for key in ("halt_at",):
+            if state[key] is not None:
+                state[key] = datetime.fromtimestamp(state[key], timezone.utc).isoformat()
+        if state["last_change"]:
+            state["last_change"]["at"] = datetime.fromtimestamp(state["last_change"]["at"], timezone.utc).isoformat()
+        print(json.dumps(state, ensure_ascii=False))
+        return 0
+    from .feishu.trial_order import handoff_state, name_fingerprint, release_handoff
+    raw = args.trial_release_handoff
+    if args.reason is None or not args.reason.strip() or not all(x.isdecimal() for x in raw[:3]) \
+            or not re.fullmatch(r"[0-9a-f]{16}", raw[3]):
+        parser.error("销清移交须带 登记 版本 条目 政策名指纹 与 --reason。")
+    reg, version, item = map(int, raw[:3])
+    try:
+        with journal_at(args.state) as j:
+            keys = {r[0] for r in j.db.execute("""SELECT name_key FROM trial_handoff WHERE registration=?
+                    AND version=? AND item=? AND cleared IS NULL""", (reg, version, item))}
+            if len(keys) != 1 or name_fingerprint(next(iter(keys))) != raw[3]:
+                print("登记 ID 或政策名指纹与登记库不符，未写入。", file=sys.stderr)
+                return 1
+            print(json.dumps({"before": handoff_state(j.db, next(iter(keys)))}, ensure_ascii=False))
+            with j.db:
+                j.db.execute("BEGIN IMMEDIATE")
+                release_handoff(j.db, reg, version, item, raw[3], args.reason, now)
+            print(json.dumps({"after": handoff_state(j.db, next(iter(keys)))}, ensure_ascii=False))
+    except Exception:
+        print("销清移交失败，请核对私有登记库。", file=sys.stderr)
+        return 1
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="常驻转交飞书群 @，或在登记的验收窗口内处理飞书群申请。",
@@ -758,7 +843,21 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trial-reconcile", nargs=4, metavar=("SCOPE", "GEN", "VALIDITY", "NEXT"),
                         help="按已核准的代次与水位登记确认请求，由常驻收信服务复核")
     parser.add_argument("--retry-of", type=int, help="重新确认时指定上一条 Hold 请求编号")
+    parser.add_argument("--trial-init-archive-ledger", type=Path, metavar="ARCHIVE_LEDGER",
+                        help="守望者部署用：仅首次初始化存档授权库（已有库不覆盖），执行后读回库与表结构。")
+    parser.add_argument("--trial-halt", choices=("status", "set", "clear"),
+                        help="守望者用：读回 / 置位 / 清除建单停写位（置位与清除须带 --reason，写入登记库留痕），执行后读回。")
+    parser.add_argument("--trial-release-handoff", nargs=4, metavar=("REGISTRATION", "VERSION", "ITEM", "NAME_FP"),
+                        help="守望者用：销清某条的人工移交，机器人重新取得该政策的建单资格。"
+                             "此命令只在产品负责人当场明确同意时由守望者执行。须带登记 ID 与政策名指纹，均对上才写。")
+    parser.add_argument("--reason", help="停写位置位 / 清除与销清移交的原因（写入登记库）")
     args = parser.parse_args(argv)
+    deploy = [name for name in ("trial_init_archive_ledger", "trial_halt", "trial_release_handoff")
+              if getattr(args, name) is not None]
+    if deploy:
+        if _guardian_environment_blocked():
+            parser.error(_DEPLOY_HELP)
+        return _guardian_deploy(parser, args, deploy)
     if (args.trial_reconcile or args.list_recovery) and _guardian_environment_blocked():
         parser.error(_GUARDIAN_HELP)
     if args.retry_of is not None and (not args.trial_reconcile or args.retry_of < 1):

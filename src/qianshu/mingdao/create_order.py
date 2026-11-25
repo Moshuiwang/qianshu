@@ -1646,19 +1646,23 @@ def assemble(values, template_cells, config, read_relations, *, is_test, array_c
     return controls, summary
 
 
-def assemble_controls(values, template_cells, config, read_relations, *, is_test, array_controls=(), web_fields=None):
+def assemble_controls(values, template_cells, config, read_relations, *, is_test, array_controls=(), web_fields=None,
+                      approval_url=None):
+    """approval_url 只供 #154 正式单传入本批存档链接；X5 测试单不传，仍照抄模板链接。"""
     schema = config["fields"]
     draft_controls = cell_schema(schema, config["readback_skip"])
-    require(is_test is True, "正式单不得照抄任务审批链接，需人工")
+    require(is_test is True or (is_test is False and approval_url is not None), "正式单不得照抄任务审批链接，需人工")
+    require(approval_url is None or is_test is False, "测试单不得改写任务审批链接")
     fixed = fixed_cells(config, schema, draft_controls)
     tag_control = draft_controls["user_tags"]
     company_control = draft_controls["company"]
     require(isinstance(template_cells, dict)
             and schema.keys() - fixed.keys() <= template_cells.keys(),
             "模板字段不全")
-    approval_link = template_cells[draft_controls["approval_url"]]
+    approval_link = template_cells[draft_controls["approval_url"]] if approval_url is None else approval_url
     require(receipt(approval_link) and urlsplit(approval_link).scheme in ("http", "https")
             and bool(urlsplit(approval_link).hostname), "模板任务审批链接缺失或无效")
+    require(approval_url is None or urlsplit(approval_url).scheme == "https", "本批存档链接无效，停单")
     country = config["template"]["country"]
     country_control = country["control"]
     require(country_control not in (draft_controls[key] for key in (*_VARIABLE, "user_tags", "packages", "company")),
@@ -1709,6 +1713,8 @@ def assemble_controls(values, template_cells, config, read_relations, *, is_test
             source, encoded = "网页公式", web[control][0]
         elif control in fixed:
             source, encoded = "固定值", fixed[control]
+        elif approval_url is not None and control == draft_controls["approval_url"]:
+            source, encoded = "本批存档", encode_cell(approval_url, spec)
         elif control == tag_control:
             source, encoded = "草稿", encode_cell(tag_ids, spec)
         elif control == package_control:
