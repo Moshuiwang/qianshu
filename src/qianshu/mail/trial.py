@@ -19,11 +19,14 @@ from .imap import MailError, trial_connect
 from .segmented import read_segmented
 from .triage import MailItem, classify, input_limit, trial_model
 from .trial_diagnostics import CLOSE_FAILED, CLOSE_TIMEOUT, fault_writer, listener_logs
-from .trial_state import BODY_NOTICE, FormatHold, Hold, Store
+from .trial_state import BODY_NOTICE, RECOVERY_REASONS, FolderHold, FormatHold, Hold, Store
 
 _LOG = logging.getLogger(__name__)
 _MAIL_CLOSE_TIMEOUT = 2
 _NOTICES = {
+    **{"recovery_" + code: f"收信确认未完成：{label}，请配置负责人核对"
+       for code, label in RECOVERY_REASONS.items()},
+    "recovery_restored": "收信已恢复，缺口 {n} 个已登记待人工核对",
     "received": "收到，待核对 1 封。",
     "deferred": "今日解析已达上限，1 封顺延至下一 UTC 日。",
     "conflict": "身份冲突，已冻结 {n} 封，待人工核对。",
@@ -39,7 +42,7 @@ _NOTICES = {
 
 
 class Recovery:
-    """轮询与独立人工确认共用的只读邮箱取证入口。"""
+    """常驻服务的快照重建与确认取证。"""
 
     def __init__(self, config, connector, enabled):
         self.config = config
@@ -47,14 +50,38 @@ class Recovery:
         self.scope = _fingerprint(config["MAIL_HOST"], config["MAIL_USER"])
         self.folder = config.get("MAIL_FOLDER", "INBOX")
 
-    def refresh(self, store, scope):
+    def verify_request(self, store, request):
+        scope = request["scope"]
         binding = store.row("SELECT folder FROM trial_folder WHERE scope=?", scope)
         if scope != self.scope or not binding or binding[0] != _fingerprint(self.folder):
+            raise FolderHold()
+        generation, validity, cursor = (request[key] for key in ("generation", "validity", "cursor"))
+        freeze = store.row("SELECT max(rowid) FROM notice WHERE scope=? AND kind='freeze'", scope)[0]
+        if request["freeze_id"] != (freeze or 0):
             raise Hold()
+        action = store.confirm_action(scope, generation, validity, cursor)
+        box = store.row("SELECT * FROM mailbox WHERE scope=?", scope)
         with self.connector(self.config) as mailbox:
             snapshot = mailbox.snapshot(self.folder)
-            action = store.scan_action(scope, *snapshot[:2])
-            self.capture(store, mailbox, snapshot, action)
+            if not store.same_epoch(box, *snapshot[:2]):
+                raise Hold()
+            next_uid = snapshot[1]
+            first = cursor if action == "settle_legacy" else 1
+            present = mailbox.interval(first, next_uid - 1)
+            if (not self.enabled() or mailbox.interval(first, next_uid - 1) != present
+                    or mailbox.snapshot(self.folder) != snapshot):
+                raise Hold()
+        if action == "settle_legacy":
+            store.check_legacy(scope, validity, next_uid, present)
+            return
+        if len(present) != snapshot[2]:
+            raise Hold()
+        with store.write():
+            store.recovery_gaps(box, validity, next_uid, present)
+        expected = tuple(row[0] for row in store.db.execute("""SELECT uid FROM reconciliation
+            WHERE scope=? AND generation=? ORDER BY uid""", (scope, generation)))
+        if next_uid != cursor or present != expected:
+            raise Hold()
 
     def capture(self, store, mailbox, snapshot, action):
         validity, next_uid, history = snapshot
@@ -101,7 +128,7 @@ class Trial:
         self.recovery = Recovery(config, connector, self.enabled)
         self.scope = self.recovery.scope
         self.folder = self.recovery.folder
-        store.refresh_for_confirmation = self.recovery.refresh
+        store.process_confirmation = self.process_confirmation
 
     def enabled(self, card=False):
         settings = self.switches
@@ -121,11 +148,31 @@ class Trial:
             raise MailError("已读位置或状态变化。")
         return read_segmented(mailbox, uid, seen)
 
+    def process_confirmation(self):
+        with self.store.gate():
+            request = self.store.row("""SELECT * FROM recovery_request WHERE scope=? AND status='pending'
+                ORDER BY id LIMIT 1""", self.scope)
+            if request is None:
+                return False
+            try:
+                self.recovery.verify_request(self.store, request)
+                self.store.finish_confirmation(request)
+            except FolderHold:
+                self.store.finish_confirmation(request, "folder")
+            except (MailError, OSError):
+                self.store.finish_confirmation(request, "mail_read")
+            except Hold:
+                self.store.finish_confirmation(request, "snapshot")
+        return True
+
     def poll(self):
         if not self.enabled():
             return
         if self.legacy_path is not None:
             self.store.import_legacy(self.legacy_path)
+        if self.process_confirmation():
+            self.flush()
+            return
         state = self.store.begin(self.scope, _fingerprint(self.folder))
         if state == "folder_conflict":
             self.flush()

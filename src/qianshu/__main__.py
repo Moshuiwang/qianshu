@@ -742,8 +742,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trial-switches", type=Path, help="常驻转交服务的试运行私有开关文件")
     parser.add_argument("--trial-import-spend", help="一次性登记已核定的开发期累计美元金额")
     parser.add_argument("--trial-reconcile", nargs=4, metavar=("SCOPE", "GEN", "VALIDITY", "NEXT"),
-                        help="人工完成对账后，按已核准的代次与水位恢复派发")
+                        help="按已核准的代次与水位登记确认请求，由常驻收信服务复核")
+    parser.add_argument("--retry-of", type=int, help="重新确认时指定上一条 Hold 请求编号")
     args = parser.parse_args(argv)
+    if args.retry_of is not None and (not args.trial_reconcile or args.retry_of < 1):
+        parser.error("--retry-of 需要确认命令及正整数编号。")
     if args.trial_import_spend is not None or args.trial_reconcile:
         if (args.state is None or args.state.name != "trial-050.sqlite3"
                 or any((args.mail, args.handoff_only, args.trial_switches, args.inject, args.list_recovery))
@@ -751,19 +754,16 @@ def main(argv: list[str] | None = None) -> int:
             parser.error("费用导入及人工对账须独立指定 --state 私有目录/trial-050.sqlite3。")
         from .mail.trial_state import FormatHold, Store
         try:
-            check_output_path(args.state)
-            store = Store(args.state)
-            with closing(store.db):
-                if args.trial_reconcile:
-                    scope, *numbers = args.trial_reconcile
-                    from .mail.imap import trial_connect
-                    from .mail.trial import Recovery
-                    config = dict(load_config("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD",
-                                              env_file=args.business_env_file or args.env_file))
-                    config.setdefault("MAIL_PORT", "993")
-                    reader = Recovery(config, trial_connect, lambda: True)
-                    store.reconcile(scope, *map(int, numbers), refresh=reader.refresh)
-                else:
+            if args.trial_reconcile:
+                check_output_path(args.state, git_env={"PATH": os.defpath})
+                scope, *numbers = args.trial_reconcile
+                with Store.confirmation_store(args.state) as store:
+                    request = store.request_confirmation(scope, *map(int, numbers), retry_of=args.retry_of or 0)
+                print(f"确认请求 {request}")
+            else:
+                check_output_path(args.state)
+                store = Store(args.state)
+                with closing(store.db):
                     store.import_spend(args.trial_import_spend)
         except FormatHold as exc:
             print(exc, file=sys.stderr)
@@ -778,12 +778,17 @@ def main(argv: list[str] | None = None) -> int:
         if args.state is None or any((args.inject, args.handoff_only, args.mail)):
             parser.error("--list-recovery 需要 --state，并须独立于发送入口运行。")
         try:
-            rows = State.recovery_list(args.state)
+            if args.state.name == "trial-050.sqlite3":
+                from .mail.trial_state import Store
+                rows = Store.confirmation_list(args.state)
+            else:
+                rows = State.recovery_list(args.state)
         except (OSError, ValueError, sqlite3.Error):
             print("恢复清单读取失败，请核对私有入口库。", file=sys.stderr)
             return 1
         print(json.dumps(rows, ensure_ascii=False))
-        print(f"未完成记录数 {len(rows)}", file=sys.stderr)
+        label = "确认请求数" if args.state.name == "trial-050.sqlite3" else "未完成记录数"
+        print(f"{label} {len(rows)}", file=sys.stderr)
         return 0
     if args.handoff_only:
         if any((args.window_start, args.window_end, args.state, args.inject, args.mail,

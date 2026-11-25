@@ -45,14 +45,15 @@ def test_dirty_restart_reconciles_search_gaps(service, monkeypatch, changed, obs
     with closing(store.db):
         box = store.row("SELECT * FROM mailbox")
         assert box["reason"] == "reconciling"
-        store.reconcile(trial.scope, box["generation"], inbox.generation, inbox.next_uid)
+        store.request_confirmation(trial.scope, box["generation"], inbox.generation, inbox.next_uid)
+        revision_trial(store, inbox, []).poll()
         assert store.row("SELECT state FROM mailbox")[0] == "active"
         ranges = [tuple(r) for r in store.db.execute("SELECT first,last FROM unknown_range ORDER BY first")]
         expected = [(100, 101)]
         if changed:
             expected = []
         elif observed:
-            expected = [(100, 100), (102, 103)]
+            expected = [(100, 100), (101, 103)]
         assert ranges == expected
         assert [tuple(r) for r in store.db.execute(
             "SELECT quantity,status FROM notice WHERE kind='gap' ORDER BY rowid"
