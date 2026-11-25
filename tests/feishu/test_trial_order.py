@@ -912,6 +912,112 @@ def test_card_time_handoff_blocks_same_name_new_version(order):
     assert 2 not in order.mingdao.sent
 
 
+# ---------------------------------------------------------------- 同名已有机器人记录时的移交提示（复核 rv-2d4 P1）
+
+def reissue(env, version, eligible=(), names=NAMES):
+    """同一登记的新版本真实出卡（decision_pages → Journal.prepare 原样执行，不轮换会话、不动旧卡）：
+    eligible 内的条目用已验证组合（拟建），其余用未验证组合。"""
+    from dataclasses import fields
+    from datetime import UTC, datetime
+    from qianshu.draft import DraftField, OfferPolicyDraft
+    from qianshu.mail.trial_cards import decision_pages
+    from qianshu.mail.trial_state import Store
+    from qianshu.parse import ParsedPolicyDraft
+    from qianshu.parse.protocol import FieldResult, StatementStatus
+    from qianshu.pipeline import _Policy
+    from qianshu.validate import ValidationResult
+    from test_trial_paths import switches
+    store = Store(env.path)
+    try:
+        text = "\n".join(f"{f}：明细{n}" for n, f in enumerate(
+            ("活动周期", "每个标签的用户数", "政策内容", "使用场景", "标签名称")))
+        trial = SimpleNamespace(store=store, config={}, clock=lambda: datetime(2030, 1, 1, 1, tzinfo=UTC),
+                                sensitive=())
+        drafts, policies = [], []
+        for n, name in enumerate(names, 1):
+            draft = ParsedPolicyDraft(**{f.name: DraftField() for f in fields(OfferPolicyDraft)})
+            draft.policy_type.value = "定向政策"
+            draft.trigger_once.value = "否"
+            draft.effective_multiplier.value = 1
+            draft.maintain_mutual_exclusion_group.value = "是"
+            draft.benefit_type.value = "组合0" if n in eligible else "组合1"
+            draft.policy_name.value = name
+            draft.source_span = (0, len(text))
+            draft.field_results = {"country": FieldResult(SimpleNamespace(status=StatementStatus.CERTAIN), "区域甲",
+                                                          True, needs_confirmation=False)}
+            draft.to_dict = lambda: {"sample": True}
+            drafts.append(draft)
+            policies.append(_Policy(draft, (), {}, ValidationResult(())))
+        return decision_pages(trial, {"id": 1, "version": version, "attachments": 0}, text, [], drafts, policies,
+                              False, (switches(), {"verified_combinations": [["定向政策", "组合0"]]}, "ou_config"),
+                              False)
+    finally:
+        store.db.close()
+
+
+def face_lines(env, version):
+    """卡面逐条文案：{条目号: 文案}。"""
+    pages = json.loads(query(env.path, "SELECT snapshot FROM trial_card WHERE version=?", version)[0][0])["pages"]
+    contents = [e["text"]["content"] for page in pages for e in page["elements"] if e.get("tag") == "div"]
+    lines = {int(c.split("\n", 1)[0][3:]): c.split("\n", 1)[1] for c in contents if c.startswith("条目 ")}
+    return lines, json.dumps(pages, ensure_ascii=False)
+
+
+def test_robot_sending_same_name_new_card_says_read_only(order):
+    """复核 rv-2d4 P1 复现：旧甲已领槽在途（sending）时出同名新卡、甲未拟建 → 新卡甲写「只读核对，请勿重复建单」，
+    移交照登（同名占位）；旧甲照常发出、回读完成，不重发；乙无机器人记录，照旧「已转人工」并挡住旧乙。"""
+    from qianshu.feishu.trial_order import ROBOT_HELD
+    archived(order)  # 版本 1：甲乙都拟建、存档完成
+    issued = []
+
+    def new_card_while_sending(item):
+        if item == 1 and not issued:
+            assert query(order.path, "SELECT item,status FROM trial_order") == [(1, "sending")]
+            issued.append(reissue(order, 2))
+    order.mingdao.before_handoff = new_card_while_sending
+    assert order.orders().run_once() is True
+    lines, face = face_lines(order, 2)
+    assert ROBOT_HELD in lines[1] and "已转人工" not in lines[1]
+    assert "已转人工" in lines[2] and ROBOT_HELD not in lines[2]
+    assert '"button"' not in face and query(order.path, "SELECT readonly FROM trial_card WHERE version=2") == [(1,)]
+    assert handoffs(order) == [(1, 2, 1, name_key(NAMES[0]), None, None), (1, 2, 2, name_key(NAMES[1]), None, None)]
+    assert order.mingdao.sent == [1]
+    assert query(order.path, "SELECT version,item,status FROM trial_order ORDER BY item") == [(1, 1, "verified")]
+    assert "须守望者销清移交" in notices(order)["order_cancel:2"]
+    assert occupied(order) == {NAMES[0]: (1, False), NAMES[1]: (1, False)}
+    order.orders().run_once()
+    assert order.mingdao.sent == [1] and query(order.path, "SELECT count(*) FROM trial_order") == [(1,)]
+
+
+def test_robot_verified_same_name_new_card_says_read_only(order):
+    """旧甲乙已建成并回读一致（verified）后出同名新卡、都未拟建 → 两条都写「只读核对，请勿重复建单」，移交照登，
+    机器人不重发。"""
+    from qianshu.feishu.trial_order import ROBOT_HELD
+    archived(order)
+    assert order.orders().run_once() is True and order.mingdao.sent == [1, 2]
+    reissue(order, 2)
+    lines, face = face_lines(order, 2)
+    assert all(ROBOT_HELD in lines[n] and "已转人工" not in lines[n] for n in (1, 2))
+    assert face.count(ROBOT_HELD) == 2 and '"button"' not in face
+    assert [r[:4] for r in handoffs(order)] == [(1, 2, 1, name_key(NAMES[0])), (1, 2, 2, name_key(NAMES[1]))]
+    assert order.orders().run_once() is False and order.mingdao.sent == [1, 2]
+
+
+@pytest.mark.parametrize("status,held", [("created", True), ("unknown", True), ("mismatch", True), ("aborted", False)])
+def test_card_time_hint_follows_notice_adjudication(order, status, held):
+    """出卡提示与公告投递同一裁决（robot_held / ACTIVE）：在途、已建、写错、结果未知都按「只读核对」；确证未发出不算。"""
+    from qianshu.feishu.trial_order import ROBOT_HELD
+    archived(order)
+    with journal_at(order.path) as j, j.db:
+        j.db.execute("""INSERT INTO trial_order(registration,version,item,card,status,name_key,target,sent)
+                     VALUES(1,9,1,'other-card',?,?,'sheet',0)""", (status, name_key(NAMES[0])))
+    reissue(order, 2)
+    lines, _ = face_lines(order, 2)
+    assert (ROBOT_HELD in lines[1]) is held and ("已转人工" in lines[1]) is not held
+    assert "已转人工" in lines[2]
+    assert [r[:4] for r in handoffs(order)] == [(1, 2, 1, name_key(NAMES[0])), (1, 2, 2, name_key(NAMES[1]))]
+
+
 # ---------------------------------------------------------------- 守望者子命令与零装配
 
 def test_guardian_halt_command_reads_back_and_requires_reason(order, capsys):

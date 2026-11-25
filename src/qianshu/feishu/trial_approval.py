@@ -218,16 +218,24 @@ class Journal:
                JOIN trial_interval i USING(session) WHERE g.session=? AND e.enabled=1 AND e.closed IS NULL
                AND i.closed IS NULL AND max(i.opened,e.opened)<=?""", (session, created)).fetchone() is not None
 
-    def prepare(self, card, reg, version, session, country, snapshot, readonly, sent):
+    def prepare(self, card, reg, version, session, country, snapshot, readonly, sent, *, render=None):
         """卡片快照落盘；同一事务里给未列为拟建的条目逐条登记人工移交（特批第 3 轮第 1 条）。
 
         收口不再靠公告组合给这些条目补移交；投递端逐条裁决照旧用于拟建条目，同一条目已有未销清移交时按现有去重
         不重复登记。
+
+        render(held) 给出卡面（快照 `pages`）：held 为要移交、但同名政策已有机器人建单记录的条目（与公告投递同一裁决
+        robot_held），在登记移交的同一写事务里裁决后再渲染，卡面写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
         """
-        from .trial_order import card_handoffs, record_handoff
-        packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        from .trial_order import card_handoffs, record_handoff, robot_held
         handoffs = card_handoffs(snapshot)
         with self.db:
+            if render is not None:
+                if not self.db.in_transaction:
+                    self.db.execute("BEGIN IMMEDIATE")
+                held = {item for item, key in handoffs if robot_held(self.db, key, card)}
+                snapshot = dict(snapshot, pages=render(held))
+            packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
             self.db.execute("""INSERT INTO trial_card VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (card, reg, version, CARD_FORMAT, session, country, packed,
                              sha256(packed.encode()).hexdigest(), int(readonly), sent,

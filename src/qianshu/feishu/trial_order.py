@@ -142,6 +142,19 @@ def card_handoffs(snapshot):
             for item in snapshot.get("items") or [] if item not in eligible]
 
 
+# 出卡登记移交时同名政策已有机器人记录（复核 rv-2d4 P1）：卡面不给可执行的人工建单信号，移交照登、保持同名占位。
+ROBOT_HELD = "该政策已有机器人建单记录，只读核对，请勿重复建单"
+
+
+def robot_held(db, key, card):
+    """同一归一政策名已有其他卡的机器人在途、已建、写错或结果未知记录（`ACTIVE`）。
+
+    公告投递裁决（unbuilt_notice）与出卡登记移交（Journal.prepare）共用这一判定；空名键一律不算。
+    """
+    return bool(key) and db.execute(f"""SELECT 1 FROM trial_order WHERE name_key=? AND card!=?
+        AND status IN ({','.join('?' * len(ACTIVE))})""", (key, card, *ACTIVE)).fetchone() is not None
+
+
 def notice_items(kind, snapshot):
     """「未建单」公告实际涉及的条目：与公告文案同一来源（审核 P1-1）。
 
@@ -176,8 +189,7 @@ def unbuilt_notice(db, row):
         if not key:
             unnamed.append(item)
             continue
-        if db.execute(f"""SELECT 1 FROM trial_order WHERE name_key=? AND card!=?
-                      AND status IN ({','.join('?' * len(ACTIVE))})""", (key, row["card"], *ACTIVE)).fetchone():
+        if robot_held(db, key, row["card"]):
             taken.append(item)
         else:
             keep.append((item, key))
