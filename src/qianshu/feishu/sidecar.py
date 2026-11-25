@@ -13,7 +13,7 @@ from pathlib import Path
 from tempfile import mkstemp
 from threading import Event, Lock
 
-from .._approval_protocol import ENVELOPE, PACKET_LIMIT, SERVICE_STATUS, SNAPSHOT
+from .._approval_protocol import ENVELOPE, PACKET_LIMIT, SERVICE_STATUS, SNAPSHOT, TEST_CARD
 
 FRESH = 2.0
 POLL = 0.05
@@ -58,6 +58,22 @@ def child_memory_limit(ceiling_bytes=128 << 20):
     return limit
 
 
+def test_card(field):
+    """状态帧尾部的当前有效测试卡（段 3，G516 乙）。旧帧（无此字段）、缺字段或字段不一致一律返回 None，按非测试卡处理。
+
+    只用于监督进程选应答文案，放不放行仍只由子进程核对。"""
+    if len(field) != TEST_CARD.size:
+        return None
+    flag, registration, version, raw = TEST_CARD.unpack(field)
+    try:
+        key = raw.rstrip(b"\0").decode()
+    except UnicodeDecodeError:
+        return None
+    if flag != 1 or not registration or not version or not key.strip() or "\0" in key:
+        return None
+    return registration, version, key
+
+
 def process_birth(pid):
     # /proc/<pid>/stat 的 comm 可含空格与括号。22 栏为创建时钟刻度。
     try:
@@ -97,6 +113,7 @@ class Sidecar:
         self.last_snapshot = 0.0
         self.io_errors = 0
         self.manual_checks = self.pending_notices = 0
+        self.test_card = None
         self.started = False
 
     def connect(self):
@@ -171,17 +188,19 @@ class Sidecar:
         # 快消费者可在一个采样周期内完成多次，按原采样时间排空反向快照。
         for _ in range(128):
             try:
-                packet = gen.channel.recv(SNAPSHOT.size + SERVICE_STATUS.size + 1)
+                packet = gen.channel.recv(SNAPSHOT.size + SERVICE_STATUS.size + TEST_CARD.size + 1)
             except BlockingIOError:
                 return True
             if self.service_args:
-                if len(packet) != SNAPSHOT.size + SERVICE_STATUS.size:
+                base = SNAPSHOT.size + SERVICE_STATUS.size
+                if len(packet) not in (base, base + TEST_CARD.size):
                     return False
                 enabled, manual, pending = SERVICE_STATUS.unpack_from(packet, SNAPSHOT.size)
                 if enabled not in (0, 1):
                     return False
                 self.create_enabled = bool(enabled)
                 self.manual_checks, self.pending_notices = manual, pending
+                self.test_card = test_card(packet[base:])
                 packet = packet[:SNAPSHOT.size]
             if len(packet) != SNAPSHOT.size:
                 return False

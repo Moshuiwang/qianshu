@@ -106,6 +106,8 @@ class Consumer:
         self.deadline = self.next_scan = 0.0
         self.ended = None
         self.manual_checks = self.pending_notices = 0
+        # 段 3（G516 乙）：当前有效测试卡（登记、版本、授权登记号、卡），随状态帧告知监督进程，只用于选应答文案。
+        self.test_card = None
 
     def switch_file(self):
         """只读开关文件（不含连接判断）：建单交接处与连接状态分开核对（G464）。文件换过或出卡关闭即拒绝。"""
@@ -129,6 +131,9 @@ class Consumer:
             self.listener.maintain()
             with journal_at(self.listener.path) as j, j.db:
                 self.manual_checks, self.pending_notices = j.notice_counts()
+                from .trial_test import active_test_card
+                self.test_card = (None if self.create_enabled else
+                                  active_test_card(j.db, self.listener.registry, self.listener.clock()))
                 epoch = j.active_epoch(self.initial)
                 if self.epoch_loaded and epoch != self.epoch:
                     raise ValueError("E-TRIAL-DISABLED")
@@ -150,7 +155,10 @@ class Consumer:
         if (not isinstance(value, dict) or type(value.get("format")) is not int
                 or value["format"] != CARD_FORMAT or value.get("action") not in ("verify", "approve", "reject")):
             return
-        if value["action"] == "approve" and not self.create_enabled:
+        test = getattr(self, "test_card", None)
+        if value["action"] == "approve" and not self.create_enabled and not (
+                test and (value.get("registration"), value.get("version"), value.get("card")) == (test[0], test[1], test[3])):
+            # 关建单开关：只有当前有效测试卡交审批门禁再核（唯一例外判定），其余照旧拒绝。
             self.listener.refuse_click(data, notify=False)
             return
         if self.epoch is not None:
