@@ -10,6 +10,7 @@ import logging
 import re
 import time
 import unicodedata
+from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -42,7 +43,9 @@ UNBUILT_ITEMS = "未建单，已转人工。"
 # 公告登记人工移交后附在群提示末尾（G488 取舍 A）。
 HANDOFF_NOTE = "\n相关政策已交人工，机器人对同名政策的新卡一律不建，需守望者核对后解除。"
 # 含这些字样的公告交人工处理：发出前先持久登记人工移交、占用该政策名（审核 P1-3）。
-HANDOFF_WORDS = ("未建单", "结果未知")
+HANDOFF_WORDS = ("未建单", "结果未知", "未发出")
+# 因断线而未发出的条目的固定公告（G464，守望者 12:0xZ）：按实际原因写，不写成「建单开关已关闭」。
+DISCONNECT_UNSENT = "断线期间未发出，已转人工。"
 CANCEL_REASONS = {
     "consent": "同意已失效或卡片已关闭",
     "switch": "建单开关已关闭",
@@ -235,8 +238,10 @@ class OrderRunner:
     """每轮至多处理一张存档已建、待建单的卡。同批逐条串行，全局至多 1 个在途建单请求。"""
 
     def __init__(self, path, *, switches, backend, connected, ledger_dir, clock=time.time, pause=time.sleep,
-                 readback_seconds=120):
+                 readback_seconds=120, switch_file=None):
         self.path, self.switches, self.backend, self.connected = path, switches, backend, connected
+        # 只读开关文件、不含连接判断的读法（G464 交接回退）：交接处连接状态与开关文件分开核对。未提供时沿用 switches。
+        self.switch_file = switch_file or switches
         self.ledger_dir, self.clock, self.pause = Path(ledger_dir), clock, pause
         self.readback_seconds = readback_seconds
         self.frozen = False  # 登记库提交失败或结果不明：本进程不再发任何建单
@@ -414,6 +419,24 @@ class OrderRunner:
 
     # ------------------------------------------------------------ 五项同事务
 
+    @staticmethod
+    def _consent(j, row, item, task_status, *, bound=True):
+        """同意有效性判定（领槽事务与实际交接共用，审核 P1-3）：卡片格式、指纹与快照摘要未变，所属登记的批次版本
+        未失效、未冻结，条目任务处于 task_status；bound 时另核卡片仍为「已同意」且会话未换。不符返回 None。
+
+        断线后才在交接处观察到的那 1 张（G464）免核「已同意」与会话两项：二者随断线后的会话轮换而变，只因断线不得拦下；
+        批次版本、冻结状态与原同意绑定照核。
+        """
+        current = j.db.execute("SELECT * FROM trial_card WHERE card=?", (row["card"],)).fetchone()
+        task = j.db.execute("SELECT status FROM trial_item_task WHERE card=? AND item=?", (row["card"], item)).fetchone()
+        if (current is None or current["format"] != CARD_FORMAT or current["fingerprint"] != row["fingerprint"]
+                or sha256(current["snapshot"].encode()).hexdigest() != current["fingerprint"]
+                or trial_batch(j.db, row["registration"], row["version"])[3] or not task or task[0] != task_status
+                or (bound and (current["status"] != "accepted" or not current["session"]
+                               or current["session"] != j.session()))):
+            return None
+        return current
+
     def _admit(self, job, item, plan, key):
         """同一写事务：①截止未到 ②建单开关开 ③停写位未置 ④在途槽空闲并占用 ⑤写入发送记录。返回空串表示放行。"""
         row = job.row
@@ -424,15 +447,10 @@ class OrderRunner:
                 switches = self.switches()
             except Exception:
                 switches = {}
-            current = j.db.execute("SELECT * FROM trial_card WHERE card=?", (card,)).fetchone()
-            task = j.db.execute("SELECT status FROM trial_item_task WHERE card=? AND item=?", (card, item)).fetchone()
             if not self._up():
                 return "disconnected"
-            if (current is None or current["status"] != "accepted" or current["format"] != CARD_FORMAT
-                    or current["fingerprint"] != row["fingerprint"]
-                    or sha256(current["snapshot"].encode()).hexdigest() != current["fingerprint"]
-                    or not current["session"] or current["session"] != j.session()
-                    or trial_batch(j.db, reg, version)[3] or not task or task[0] != "archive_done"):
+            current = self._consent(j, row, item, "archive_done")
+            if current is None:
                 return "consent"
             if self.clock() >= current["expires"]:
                 return "expired"
@@ -455,27 +473,33 @@ class OrderRunner:
             return ""
 
     def _handoff(self, job, item, state):
-        """实际交接回调：预建连之后、真正写出请求之前再核截止、建单开关、停写位、本条持槽与发送记录。
+        """实际交接回调：预建连之后、真正写出请求之前再核同意与批次有效性（与领槽同口径）、截止、建单开关、停写位、
+        本条持槽与发送记录。
 
-        任一不符即抛出，传输层不写出（确证未发出）。此刻才观察到断线的，是登记先于断线的那 1 张：照发、单独计数（G464）。
+        任一不符即抛出，传输层不写出（确证未发出）。连接状态与开关文件分开核对（G464）：此刻才观察到断线的，是登记先于
+        断线的那 1 张——只因断线不拦下，照发、单独公告与计数；开关文件真关闭才按开关关闭处理。
         """
         row = job.row
         reg, version = row["registration"], row["version"]
 
         def check():
+            up = self._up()
             try:
-                switches = self.switches()
+                switches = self.switch_file()
             except Exception:
                 switches = {}
             with journal_at(self.path) as j:
-                card = j.db.execute("SELECT country, expires FROM trial_card WHERE card=?", (row["card"],)).fetchone()
+                card = self._consent(j, row, item, "order_running", bound=up)
                 slot = j.db.execute("SELECT registration, version, item FROM trial_order_slot WHERE id=1").fetchone()
                 sending = j.db.execute("""SELECT status FROM trial_order WHERE registration=? AND version=?
                                        AND item=?""", (reg, version, item)).fetchone()
                 halted = j.write_halted()
-            if card is None or self.clock() >= card["expires"]:
+            if card is None:
+                raise Refused("consent")
+            if self.clock() >= card["expires"]:
                 raise Refused("expired")
-            if (not isinstance(switches, dict) or switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true"
+            # 生产开关是 Config（Mapping，不是 dict）：按映射核对，不得因类型拦下。
+            if (not isinstance(switches, Mapping) or switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true"
                     or switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
                     or switches.get("MAIL_TRIAL_CREATE_COUNTRY") != card["country"]):
                 raise Refused("switch")
@@ -483,7 +507,7 @@ class OrderRunner:
                 raise Refused("halted")
             if slot is None or tuple(slot) != (reg, version, item) or sending is None or sending[0] != "sending":
                 raise Refused("slot")
-            if not self._up():
+            if not up or not self._up():
                 state["disconnect"] = True
                 self._mark_disconnect(row, item)
         return check
@@ -537,8 +561,8 @@ class OrderRunner:
                 marks = ",".join("?" * len(items))
                 j.db.execute(f"""UPDATE trial_item_task SET status='closed' WHERE card=? AND item IN ({marks})
                              AND status IN ('archive_done','order_running')""", (row["card"], *items))
-                self._notice(j, row["card"], "order_cancel:" + ",".join(map(str, items)),
-                             self._head(row, items) + CANCEL_REASONS[code] + "，未建单，已转人工。")
+                text = DISCONNECT_UNSENT if code == "disconnected" else CANCEL_REASONS[code] + "，未建单，已转人工。"
+                self._notice(j, row["card"], "order_cancel:" + ",".join(map(str, items)), self._head(row, items) + text)
         except Exception:
             self.frozen = True
             _LOG.error("撤销登记未成功，已冻结，转人工。")
@@ -960,7 +984,7 @@ def formal_authorization(path, config_data):
     return matched[0] if len(matched) == 1 else None
 
 
-def build_order_runner(args, settings, state, *, switches, connected, sensitive, archive_runner):
+def build_order_runner(args, settings, state, *, switches, connected, sensitive, archive_runner, switch_file=None):
     """未确认配置下不装配：存档执行器已装配、建单开关开、明道云配置与凭据来源、登录态均已就绪；
     配置含 050 网页字段或标签全表核验时，另须有按配置摘要绑定的正式单授权登记，且公式授权指纹相符。"""
     if archive_runner is None:
@@ -1009,4 +1033,4 @@ def build_order_runner(args, settings, state, *, switches, connected, sensitive,
     except Exception:
         return None
     return OrderRunner(state, switches=switches, backend=backend, connected=connected, ledger_dir=state.parent,
-                       readback_seconds=seconds)
+                       readback_seconds=seconds, switch_file=switch_file)

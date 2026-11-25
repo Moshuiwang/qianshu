@@ -106,6 +106,13 @@ class Consumer:
         self.ended = None
         self.manual_checks = self.pending_notices = 0
 
+    def switch_file(self):
+        """只读开关文件（不含连接判断）：建单交接处与连接状态分开核对（G464）。文件换过或出卡关闭即拒绝。"""
+        values = trial_config(self.args.trial_switches, approval=True)
+        if switch_source(self.args.trial_switches) != self.initial or values.get("MAIL_TRIAL_CARD_ENABLED") != "true":
+            raise ValueError("E-TRIAL-DISABLED")
+        return values
+
     def switches(self):
         values = trial_config(self.args.trial_switches, approval=True)
         if (not self.connected() or switch_source(self.args.trial_switches) != self.initial
@@ -181,7 +188,7 @@ def running(arguments, connected):
             # 建单执行器（2d）只在存档执行器已装配、明道云配置与登录态就绪时装配；否则建单写为 0。
             orders = build_order_runner(args, settings, consumer.listener.path, switches=consumer.switches,
                                         connected=connected, sensitive=consumer.listener.transport.sensitive_values,
-                                        archive_runner=runner)
+                                        archive_runner=runner, switch_file=consumer.switch_file)
             with archive_worker(runner, orders=orders):
                 yield consumer
     finally:

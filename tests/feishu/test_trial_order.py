@@ -239,7 +239,8 @@ def test_five_checks_in_one_transaction_any_failure_sends_nothing(order, scenari
         return
     assert query(order.path, "SELECT status FROM trial_item_task ORDER BY item") == [("closed",), ("closed",)]
     bodies = [b for k, b in notices(order).items() if k.startswith("order_cancel")]
-    assert bodies and all("未建单，已转人工。" in b for b in bodies)
+    expected = "断线期间未发出，已转人工。" if case == "disconnected" else "未建单，已转人工。"
+    assert bodies and all(expected in b for b in bodies)
     assert events(order, 1) == ["create_reserved", "aborted_before_write", "approval_closed"]
     assert all(r.get("allowed_writes", 0) == 0 for r in ledger(order))
 
@@ -363,7 +364,7 @@ def test_disconnect_seen_right_after_registration_commit_sends_nothing(order):
     assert order.mingdao.sent == []
     assert query(order.path, "SELECT item,status,disconnect FROM trial_order") == [(1, "aborted", 0)]
     texts = notices(order)
-    assert "断线，未建单" in texts["order_cancel:1"] and "断线，未建单" in texts["order_cancel:2"]
+    assert "断线期间未发出，已转人工。" in texts["order_cancel:1"] and "断线期间未发出，已转人工。" in texts["order_cancel:2"]
     assert "order_disconnect" not in texts
 
 
@@ -376,7 +377,90 @@ def test_disconnect_during_preconnect_sends_the_registered_one(order):
     assert query(order.path, "SELECT item,status,disconnect FROM trial_order") == [(1, "verified", 1)]
     texts = notices(order)
     assert texts["order_disconnect"].endswith(ORDER_NOTICES["disconnect"])
-    assert "断线，未建单" in texts["order_cancel:2"]
+    assert "断线期间未发出，已转人工。" in texts["order_cancel:2"]
+
+
+def production_switches(env, values=SW):
+    """生产 `Consumer.switches()` / `Consumer.switch_file()`：读真实私有开关文件，连接判断用替身断线开关。"""
+    from qianshu.feishu.trial_consumer import Consumer, switch_source
+    path = env.tmp / "trial-switches.env"
+    if path.exists():
+        path.unlink()
+    path.write_text("".join(f"{k}={v}\n" for k, v in values.items()))
+    path.chmod(0o600)
+    consumer = Consumer.__new__(Consumer)
+    consumer.args = SimpleNamespace(trial_switches=path)
+    consumer.connected = lambda: env.connected
+    consumer.initial = switch_source(path)
+    return consumer
+
+
+def production_runner(env, consumer):
+    return OrderRunner(env.path, switches=consumer.switches, switch_file=consumer.switch_file, backend=env.mingdao,
+                       connected=lambda: env.connected, ledger_dir=env.tmp, clock=lambda: env.now,
+                       pause=lambda seconds: None, readback_seconds=5)
+
+
+def test_production_switches_connected_builds_both(order):
+    """生产开关返回 Config（映射、非 dict）：连通时交接处照常放行，两条都建。"""
+    archived(order)
+    production_runner(order, production_switches(order)).run_once()
+    assert order.mingdao.sent == [1, 2]
+    assert query(order.path, "SELECT item,status,disconnect FROM trial_order ORDER BY item") == [
+        (1, "verified", 0), (2, "verified", 0)]
+
+
+@pytest.mark.parametrize("switch", ["on", "off"])
+def test_production_switches_disconnect_during_preconnect(order, switch):
+    """修复轮 2 第 3 条（G464 交接回退）：用生产开关函数复演——领槽提交后仍连通、预建连期间断线。
+    开关仍开 → 登记先于断线的那 1 张照发（写出 1 次）、单独公告与计数，余项按「断线期间未发出」公告，
+    不得写成「建单开关已关闭」；开关文件真关闭 → 按开关关闭处理，写出 0 次。"""
+    archived(order)
+    consumer = production_switches(order)
+    assert consumer.switches()["MAIL_TRIAL_CREATE_ENABLED"] == "true"
+
+    def preconnect(item):
+        order.connected = False
+        if switch == "off":
+            production_switches(order, dict(SW, MAIL_TRIAL_CREATE_ENABLED="false"))
+    order.mingdao.before_handoff = preconnect
+    production_runner(order, consumer).run_once()
+    texts = notices(order)
+    if switch == "on":
+        with pytest.raises(ValueError):
+            consumer.switches()  # 断线后生产 switches() 本身拒绝：交接处不得因此拦下
+        assert order.mingdao.sent == [1] and order.mingdao.reads == [record(1)]
+        assert query(order.path, "SELECT item,status,disconnect FROM trial_order") == [(1, "verified", 1)]
+        assert texts["order_disconnect"] == "登记 1 · 版本 1 · 条目 1 · " + ORDER_NOTICES["disconnect"]
+        assert texts["order_cancel:2"] == "登记 1 · 版本 1 · 条目 2 · 断线期间未发出，已转人工。"
+        assert not any("建单开关已关闭" in b for b in texts.values())
+        with journal_at(order.path) as j:
+            assert j.disconnect_orders() == 1
+    else:
+        assert order.mingdao.sent == []
+        assert query(order.path, "SELECT item,status FROM trial_order") == [(1, "aborted")]
+        assert "建单开关已关闭，未建单" in texts["order_cancel:1"]
+
+
+@pytest.mark.parametrize("change", ["frozen", "bumped"])
+def test_batch_frozen_or_bumped_during_preconnect_writes_nothing(order, change):
+    """修复轮 2 第 2 条：领槽后、预建连期间收信线程冻结登记并升版（同 trial_state 改件冲突的真实写法）→
+    交接处按与领槽同口径的同意判定拒绝，写出 0 次，按确证未发出公告未建单。"""
+    archived(order)
+
+    def preconnect(item):
+        with journal_at(order.path) as j, j.db:
+            if change == "frozen":
+                j.db.execute("UPDATE registration SET status='frozen',version=version+1,reason='conflict' WHERE id=1")
+            else:
+                j.db.execute("UPDATE registration SET version=version+1 WHERE id=1")
+    order.mingdao.before_handoff = preconnect
+    order.orders().run_once()
+    assert order.mingdao.sent == [] and order.mingdao.reads == []
+    assert query(order.path, "SELECT item,status FROM trial_order") == [(1, "aborted")]
+    assert query(order.path, "SELECT * FROM trial_order_slot") == []
+    assert "同意已失效或卡片已关闭，未建单" in notices(order)["order_cancel:1"]
+    assert events(order, 1)[-2:] == ["aborted_before_write", "approval_closed"]
 
 
 def test_unverified_combination_stops_only_that_item(order):
@@ -420,7 +504,7 @@ def test_disconnect_in_flight_sends_that_one_reads_back_and_cancels_rest(order):
     assert query(order.path, "SELECT item,status,disconnect FROM trial_order") == [(1, "verified", 1)]
     texts = notices(order)
     assert texts["order_disconnect"] == "登记 1 · 版本 1 · 条目 1 · " + ORDER_NOTICES["disconnect"]
-    assert "断线，未建单" in texts["order_cancel:2"]
+    assert "断线期间未发出，已转人工。" in texts["order_cancel:2"]
     with journal_at(order.path) as j:
         assert j.disconnect_orders() == 1
 
@@ -879,7 +963,7 @@ def test_real_child_sends_in_flight_order_after_parent_hangs_up(order):
     assert query(order.path, "SELECT item,status,disconnect FROM trial_order") == [(1, "verified", 1)]
     texts = notices(order)
     assert texts["order_disconnect"].endswith(ORDER_NOTICES["disconnect"])
-    assert "断线，未建单" in texts["order_cancel:2"]
+    assert "断线期间未发出，已转人工。" in texts["order_cancel:2"]
 
 
 def test_real_child_killed_mid_send_freezes_as_unknown_and_never_resends(order):
