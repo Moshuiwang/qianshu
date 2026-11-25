@@ -587,6 +587,32 @@ def test_merged_notice_partly_taken_keeps_other_item_unbuilt_and_handed_off(orde
     assert query(order.path, "SELECT item,name_key,cleared FROM trial_handoff") == [(2, name_key(NAMES[1]), None)]
 
 
+def test_merged_notice_covers_manual_item_not_in_eligible(order):
+    """修复轮 2 P1-1：乙因字段待核对标人工（items=[甲,乙]、eligible=[甲]），旧卡按真实关卡逻辑排队甲乙的「未建单」公告；
+    新卡只接管甲并先建成 → 甲标过时，乙仍有「未建单」提示与移交记录。"""
+    from qianshu.feishu.trial_approval import Journal
+    archived(order)
+    old = old_card(order, list(NAMES), "placeholder", "占位")
+    with journal_at(order.path) as j, j.db:
+        snapshot = json.loads(j.db.execute("SELECT snapshot FROM trial_card WHERE card=?", (old,)).fetchone()[0])
+        snapshot.update(items=[1, 2], eligible=[1])
+        packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        j.db.execute("UPDATE trial_card SET status='open', snapshot=?, fingerprint=? WHERE card=?",
+                     (packed, sha256(packed.encode()).hexdigest(), old))
+        j.db.execute("DELETE FROM trial_notification WHERE card=?", (old,))
+        Journal(j.db).close(j.db.execute("SELECT * FROM trial_card WHERE card=?", (old,)).fetchone(), "审批到期")
+        j.db.execute("""INSERT INTO trial_order(registration,version,item,card,status,name_key,target,sent)
+                     VALUES(1,1,1,(SELECT card FROM trial_card WHERE version=1),'verified',?,'sheet',0)""",
+                     (name_key(NAMES[0]),))
+    assert "条目 1、2 · 审批到期，未建单" in notices(order)["closed"]
+    listener, transport = deliver(order)
+    listener.maintain()
+    text, = sent(transport)
+    assert "条目 1 · " + SUPERSEDED in text and "条目 2 · 未建单，已转人工。" in text and "需守望者核对后解除" in text
+    assert query(order.path, "SELECT version,item,name_key,cleared FROM trial_handoff") == [
+        (0, 2, name_key(NAMES[1]), None)]
+
+
 def test_release_clears_only_the_confirmed_registration(order, capsys):
     """守望者销清只作用于双确认的那一条：同名其他登记的移交与在途槽不动，回显全部同名未销清移交。"""
     from qianshu import __main__ as cli

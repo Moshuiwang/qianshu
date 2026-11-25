@@ -37,6 +37,8 @@ ORDER_NOTICES = {
     "done": "均已建单并逐条回读一致，提交由人工在明道云处理。",
 }
 SUPERSEDED = "本条「未建单」公告已过时：相关条目已由新卡接管或已建单，请勿据此重复建单，以私有登记为准。"
+# 合批公告部分条目被接管时，其余条目逐条写明（审核 P1-1）。
+UNBUILT_ITEMS = "未建单，已转人工。"
 # 公告登记人工移交后附在群提示末尾（G488 取舍 A）。
 HANDOFF_NOTE = "\n相关政策已交人工，机器人对同名政策的新卡一律不建，需守望者核对后解除。"
 # 含这些字样的公告交人工处理：发出前先持久登记人工移交、占用该政策名（审核 P1-3）。
@@ -125,12 +127,16 @@ def _reviewed_name(snapshot, item):
 
 
 def notice_items(kind, snapshot):
-    """「未建单」公告涉及的条目。"""
+    """「未建单」公告实际涉及的条目：与公告文案同一来源（审核 P1-1）。
+
+    单条关卡与建单撤销按键名里的条目；整批公告（关卡 `closed`、存档失败等）按 `Journal.notify` 列出的申请全部条目
+    （快照 `items`，含原本就标人工、未列为拟建的条目），不得只取拟建（`eligible`）。
+    """
     if kind.startswith("closed_"):
         return [int(kind.split("_", 1)[1])]
     if kind.startswith("order_cancel:"):
         return [int(n) for n in kind.split(":", 1)[1].split(",")]
-    return list(snapshot.get("eligible") or snapshot.get("items") or [])
+    return list(dict.fromkeys([*(snapshot.get("items") or []), *(snapshot.get("eligible") or [])]))
 
 
 def unbuilt_notice(db, row):
@@ -163,7 +169,10 @@ def unbuilt_notice(db, row):
         return f"登记 {_card_reg(db, row['card'])} · {SUPERSEDED}", []
     text = body
     if taken:
+        # 部分接管：逐条写明——已接管或已建单的标过时，其余条目明确「未建单」并各自登记移交。
+        rest = sorted([item for item, _ in keep] + unnamed)
         text += f"\n条目 {'、'.join(map(str, taken))} · {SUPERSEDED}"
+        text += f"\n条目 {'、'.join(map(str, rest))} · {UNBUILT_ITEMS}"
     return text + (HANDOFF_NOTE if keep else ""), keep
 
 
