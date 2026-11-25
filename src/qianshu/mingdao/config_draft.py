@@ -301,21 +301,26 @@ def official_bindings(stream, *, names):
     return selected
 
 
+def require_owned_app_id(config, official_app):
+    create = config.get("create")
+    identifiers = create.get("identifiers") if isinstance(create, dict) else None
+    value = identifiers.get("appId") if isinstance(identifiers, dict) else None
+    x5.require(isinstance(value, str) and value == official_app, "网页建单应用 ID 与官方应用 ID 不符")
+
+
 def split_owned_app_id(config, official_app):
     """分开检查精确匹配的字段值，保留所有键名供常规检查。"""
+    require_owned_app_id(config, official_app)
     create = config["create"]
-    identifiers = create["identifiers"]
-    value = identifiers.get("appId")
-    if not isinstance(value, str) or value != official_app:
-        return config, None
-    checked_create = {**create, "identifiers": {**identifiers, "appId": ""}}
-    return {**config, "create": checked_create}, value
+    checked_create = {**create, "identifiers": {**create["identifiers"], "appId": ""}}
+    return {**config, "create": checked_create}
 
 
-def write_owned_config(path, cfg, web_app, owner, guard):
-    # 结构检查已核对所有键值。对实际落盘字节定位唯一字段，只放行其值内的片段。
+def write_owned_config(path, cfg, official_app, owner, guard):
+    # 核对实际待写 JSON 的指定路径，再定位唯一豁免区间。
     wire = x5.compact(cfg) + "\n"
-    encoded = x5.compact(web_app)
+    require_owned_app_id(x5.decode(wire), official_app)
+    encoded = x5.compact(official_app)
     field = '"appId":' + encoded
     x5.require(wire.count(field) == 1, "应用标识位置不唯一")
     start = wire.index(field) + len('"appId":"')
@@ -347,25 +352,27 @@ def run(args):
         app_owner = base["official"]["app_id_key"]
         # 同一个键兼作 token 时，不能给予应用 ID 豁免。
         official_app = secrets.get(app_owner) if len(names) == 2 else None
-        base_to_check, web_app = split_owned_app_id(base, official_app)
+        x5.require(all(isinstance(secrets.get(name), str) and len(secrets[name]) >= 8 for name in names),
+                   "官方接口鉴权配置无效")
+        base_to_check = split_owned_app_id(base, official_app)
         _, setting = x5.configure_x5_outlet(guard, secrets, base_to_check, {"cookies": []})
-        guard.check(web_app, app_owner)
+        guard.check(official_app, app_owner)
         guard.check(scopes)
         app = setting("app_id_key")
         with x5.official_reader(base["official"], setting("token_key"), app, check=wire_check) as api:
             cfg = generate(api, base, scopes, template, sources, config_time)
         auth = authorization(cfg, scopes, app, sources)
         outputs = (cfg, auth, {"items": sources.entries})
-        cfg_to_check, web_app = split_owned_app_id(cfg, official_app)
-        guard.check(web_app, app_owner)
+        cfg_to_check = split_owned_app_id(cfg, official_app)
+        guard.check(official_app, app_owner)
         guard.check((cfg_to_check, *outputs[1:]))
         with TemporaryDirectory(dir=directory) as stage:
             written = []
             try:
                 for name, value in zip(FILES, outputs, strict=True):
                     path = Path(stage) / name
-                    if name == FILES[0] and web_app is not None:
-                        write_owned_config(path, value, web_app, app_owner, guard)
+                    if name == FILES[0]:
+                        write_owned_config(path, value, official_app, app_owner, guard)
                     else:
                         x5.exclusive(path, value)
                 for name in FILES:
