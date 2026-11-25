@@ -1673,7 +1673,7 @@ def test_mixed_card_same_name_group_includes_handed_off_member(order, monkeypatc
 
 def test_archive_failure_whole_batch_notice_hands_off_one_group(order, monkeypatch):
     """G509 存档失败整批：同名组卡（第 1、2 条同名，第 3 条拟建）获同意后存档关卡失败 → 整批公告补写组文案一次、末尾补
-    转人工固定文案一次（G510；2c 存档公告原文「…未建单，已转人工。」按 2c 已合并用例保留），移交仍只有一项组移交加第 3 条
+    转人工固定文案一次（G510），移交仍只有一项组移交加第 3 条
     单项，机器人 0 发。"""
     from qianshu.feishu.trial_approval import ARCHIVE_NOTICES
     from qianshu.feishu.trial_order import SAME_NAME_GROUP_MARK

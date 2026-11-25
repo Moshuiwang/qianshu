@@ -64,12 +64,12 @@ CREATE TABLE IF NOT EXISTS trial_guardian_log(at REAL NOT NULL, action TEXT NOT 
 # archive_done 存档已建、待建单（2d 消费）；archive_unknown 结果未知，冻结等人工。
 ARCHIVE_SAFE = ("executor_unavailable", "archive_pending", "archive_done")
 ARCHIVE_NOTICES = {
-    "gate": "本批存档失败，未建单，已转人工。",
-    "failed": "本批存档失败，未建单，已转人工。",
-    "unconfirmed": "本批存档发布确认未登记，未建单，已转人工。",
+    "gate": "本批存档失败，未建单。",
+    "failed": "本批存档失败，未建单。",
+    "unconfirmed": "本批存档发布确认未登记，未建单。",
     "unknown": "本批存档结果未知，未建单，请配置负责人核对存档文档与汇总页。",
     # 最后一个存档写步骤在断线期间返回成功：存档已建成，但断线后不进入待建单。
-    "disconnected": "本批存档已建成，因断线未建单，已转人工。",
+    "disconnected": "本批存档已建成，因断线未建单。",
 }
 DISCONNECT_NOTICES = (
     "断线期间已发出 1 个存档写步骤，已核对该步骤结果。",
