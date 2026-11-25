@@ -129,24 +129,18 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         else:
             lines.extend([CardLine("存档标题", preview.title), CardLine("存档预览", preview.body),
                           *(CardLine(kind + "汇总行", summary) for kind, summary in preview.summaries)])
-    # 同卡内同名去重（G507、G508）：正文与附件可能把同一条政策各列一次。全部条目按同一归一函数 name_key 分组，同组
-    # 只有首条按自身情况处理（拟建或转人工，可执行移交只给首条）；第二条起一律只读核对、不进 eligible，卡面写
-    # 「与本卡第 N 条同名，只读核对」；移交在 Journal.prepare 同一事务里登记为只读核对类（card_handoffs 对这些条目
-    # 留空名键、不占用政策名，免得把第 N 条自己拦下）。首条已转人工的混合卡，同名后条沿用首条的移交，不另给可执行移交。
-    # 快照 same_card 即整卡收口（Journal.close）与晚投登记（unbuilt_notice）共用的分组。去重放在只读判定之前：
-    # 拟建条目全被去重时卡片按只读出。
-    from qianshu.feishu.trial_order import SAME_CARD, name_key
-    same, first = {}, {}
-    for n in items:
-        key = name_key(policies[n - 1].draft.policy_name.value)
-        if key and key in first:
-            same[n] = first[key]
-        elif key:
-            first[key] = n
-    if same:
-        eligible = [n for n in eligible if n not in same]
-        lines = [CardLine(line.label, SAME_CARD.format(same[int(line.label[3:])]))
-                 if line.label.startswith("条目 ") and int(line.label[3:]) in same else line for line in lines]
+    # 同卡同名合组（守望者 G509）：正文与附件可能把同一条政策各列一次，也可能同名而内容不同。全部条目（含只读卡）按
+    # 唯一归一函数 name_key 分组（same_name_groups，与出卡登记、整卡收口、晚投登记、建单执行、恢复清单、组销清共用），
+    # 组有 2 条及以上时整组机器人 0 发：组内条目都不进 eligible，卡面逐条写「本卡第 M、N 条同名，合为一项交人工核对；
+    # 由人工逐条确认后建单」；Journal.prepare 同一事务里合为一项组移交（record_handoff）。分组放在只读判定之前：
+    # 拟建条目全在组内时卡片按只读出。
+    from qianshu.feishu.trial_order import group_of, group_text
+    grouped = group_of({"items": items, "reviewed": [{"policy_name": {"value": p.draft.policy_name.value}}
+                                                     for p in policies]})
+    if grouped:
+        eligible = [n for n in eligible if n not in grouped]
+        lines = [CardLine(line.label, group_text(grouped[int(line.label[3:])]))
+                 if line.label.startswith("条目 ") and int(line.label[3:]) in grouped else line for line in lines]
     readonly = not (preview and eligible and session and contact and settings.get("MAIL_TRIAL_APPROVER_OPEN_IDS"))
     if readonly:
         eligible = []
@@ -154,18 +148,21 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         lines = [CardLine(line.label, "转人工") if line.text == "本次拟建" else line for line in lines]
     # 未列为拟建的条目出卡即登记人工移交（Journal.prepare 同一事务），卡面逐条写明「已转人工」；同名政策已有机器人
     # 建单记录的（held，由 prepare 在登记移交的同一写事务里裁决）改写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
-    # 同卡同名条目卡面已写定，不再套「已转人工」或「只读核对，请勿重复建单」。
-    handed = {f"条目 {n}": n for n in items if n not in eligible and n not in same}
+    # 同卡同名组的条目卡面已写定，不再套「已转人工」或「只读核对，请勿重复建单」。
+    handed = {f"条目 {n}": n for n in items if n not in eligible and n not in grouped}
 
     def readonly_summary(held):
         """只读卡末页按条目实际类别汇总（复核 rv-2d5 P2）：有只读核对条目时不写「整批转人工」，与逐条提示一致。
         补充类（缺字段待申请人补充）文案按 G496 定稿前的暂用口径。"""
-        plain = sum(n not in held and n not in supplement for n in items)
-        supplied = sum(n not in held and n in supplement for n in items)
-        checked = sum(n in held for n in items)
+        single = [n for n in items if n not in grouped]
+        plain = sum(n not in held and n not in supplement for n in single)
+        supplied = sum(n not in held and n in supplement for n in single)
+        checked = sum(n in held for n in single)
+        groups = len({tuple(group) for group in grouped.values()})
         parts = ([f"{plain} 条已转人工"] if plain else []) + (
             [f"{supplied} 条已转人工，补充后由守望者核对解除"] if supplied else []) + (
-            [f"{checked} 条只读核对，请勿重复建单"] if checked else [])
+            [f"{checked} 条只读核对，请勿重复建单"] if checked else []) + (
+            [f"{len(grouped)} 条同名合为 {groups} 项交人工核对"] if grouped else [])
         text = "；".join(parts)
         return text if checked else "整批转人工" + ("：" + text if text else "")
 
@@ -190,7 +187,6 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
 
     journal.prepare(card, reg, version, session, country, {
         "items": items, "eligible": eligible, "missing": missing, "contact": contact,
-        **({"same_card": [[n, same[n]] for n in sorted(same)]} if same else {}),
         "preview": preview.fingerprint if preview else None,
         "order_snapshot_sha256": sha256(json.dumps(snapshot, sort_keys=True).encode()).hexdigest(),
         "material": material, "drafts": [d.to_dict() for d in parsed],

@@ -139,15 +139,33 @@ def recovery(db):
             SELECT 'manual_check' AS kind, registration, version, n.status
             FROM trial_notification n JOIN trial_card c USING(card) WHERE n.kind='result_manual' OR n.kind LIKE 'first_manual:%'"""))
     if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_order'").fetchone():
-        from .trial_order import READONLY_CHECK, name_fingerprint
+        from .trial_order import (READONLY_CHECK, display_fingerprint, group_diff, group_of, name_fingerprint,
+                                  name_key, robot_held)
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'order' AS kind, registration, version, item, status FROM trial_order
             WHERE status IN ('sending','created','unknown','mismatch')"""))
         # 「只读核对」类移交（同名已有机器人建单记录，G497）不作为可补建项列出，单列可查。
-        rows.extend({"kind": "order_readonly_check" if r[4] == READONLY_CHECK else "order_handoff",
-                     "registration": r[0], "version": r[1], "item": r[2], "name_fp": name_fingerprint(r[3]),
-                     "status": "readonly_check" if r[4] == READONLY_CHECK else "open"} for r in db.execute("""
-            SELECT registration, version, item, name_key, reason FROM trial_handoff WHERE cleared IS NULL"""))
+        # 同卡同名组（G509）：同一登记版本里属于同一同名组的未销清移交（含旧版逐条登记的）合为一项 order_group_handoff，
+        # 列出全部成员（条目号、展示名指纹）与差异摘要（只写字段名与「相同 / 不同」），须守望者按组销清。
+        groups = {}
+        for r in db.execute("""SELECT h.registration, h.version, h.item, h.name_key, h.reason, c.card, c.snapshot
+                FROM trial_handoff h LEFT JOIN trial_card c ON c.registration=h.registration AND c.version=h.version
+                WHERE h.cleared IS NULL ORDER BY h.rowid"""):
+            snapshot = json.loads(r[6]) if r[6] else {}
+            group = group_of(snapshot).get(r[2])
+            if group:
+                if (r[0], r[1], group[0]) not in groups:
+                    groups[r[0], r[1], group[0]] = True
+                    key = name_key(snapshot["reviewed"][group[0] - 1]["policy_name"]["value"])
+                    rows.append({"kind": "order_group_handoff", "registration": r[0], "version": r[1],
+                                 "item": group[0], "name_fp": name_fingerprint(key), "status": "open",
+                                 "members": [{"item": n, "display": f"条目 {n}",
+                                              "display_fp": display_fingerprint(snapshot, n)} for n in group],
+                                 "diff": group_diff(snapshot, group), "robot_record": robot_held(db, key, r[5])})
+                continue
+            rows.append({"kind": "order_readonly_check" if r[4] == READONLY_CHECK else "order_handoff",
+                         "registration": r[0], "version": r[1], "item": r[2], "name_fp": name_fingerprint(r[3]),
+                         "status": "readonly_check" if r[4] == READONLY_CHECK else "open"})
         rows.extend(dict(row) for row in db.execute("""
             SELECT 'order_slot' AS kind, registration, version, item, 'held' AS status FROM trial_order_slot"""))
         rows.extend(dict(row) for row in db.execute("""
@@ -229,15 +247,16 @@ class Journal:
         render(held) 给出卡面（快照 `pages`）：held 为要移交、但同名政策已有机器人建单记录的条目（与公告投递同一裁决
         robot_held），在登记移交的同一写事务里裁决后再渲染，卡面写「只读核对，请勿重复建单」（复核 rv-2d4 P1）。
         """
-        from .trial_order import card_handoffs, record_handoff, robot_held, same_card_items
+        from .trial_order import card_handoffs, group_of, record_handoff, robot_held
         handoffs = card_handoffs(snapshot)
-        # 同卡同名条目（G507）一律登记为只读核对类移交。
-        held = same_card_items(snapshot)
+        # 同卡同名组（G509）的成员由 record_handoff 合为一项组移交，不按单条只读核对裁决。
+        grouped = group_of(snapshot)
+        held = set()
         with self.db:
             if render is not None:
                 if not self.db.in_transaction:
                     self.db.execute("BEGIN IMMEDIATE")
-                held |= {item for item, key in handoffs if robot_held(self.db, key, card)}
+                held = {item for item, key in handoffs if item not in grouped and robot_held(self.db, key, card)}
                 snapshot = dict(snapshot, pages=render(held))
             packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
             self.db.execute("""INSERT INTO trial_card VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
@@ -271,7 +290,8 @@ class Journal:
         snapshot = json.loads(row["snapshot"])
         items = "、".join(str(i) for i in (snapshot["items"] if items is None else items))
         missing = "、".join(snapshot["missing"]) or "无"
-        body = f"登记 {row['registration']} · 条目 {items} · {reason}。待补项：{missing}。"
+        # 条目为空（整卡都在同卡同名组里，G509）时不写「条目」段，组内条目号由组文案给出。
+        body = f"登记 {row['registration']} · {'条目 ' + items + ' · ' if items else ''}{reason}。待补项：{missing}。"
         self.db.execute("INSERT OR IGNORE INTO trial_notification VALUES(?,?,?,?,'pending')",
                         (row["card"], kind, str(uuid4()), body))
 
@@ -311,19 +331,28 @@ class Journal:
                         (card,))
         self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
                         AND kind='remind' AND status='pending'""", (card,))
-        # 同卡同名后条（快照 same_card，G508）：沿用同组首条的归属，公告写「与本卡第 N 条同名，只读核对」，
-        # 不作为「未建单，转人工」列出；整批公告里由投递端逐条补写（unbuilt_notice），同样不登记可执行移交。
-        from .trial_order import SAME_CARD, same_card_owner
+        # 同卡同名组（G509，按快照可信政策名重算）：同组合为一项交人工，公告写组文案；组移交在投递时登记（unbuilt_notice）。
+        from .trial_order import group_of, group_text, same_name_groups
         snapshot = json.loads(row["snapshot"])
-        owner = same_card_owner(snapshot)
+        grouped = group_of(snapshot)
         if not known and not uncertain and not done and (not legacy or legacy[0] in safe):
-            self.notify(row, "closed", reason + "，未建单，转人工",
-                        items=[n for n in snapshot["items"] if n not in owner] if owner else None)
+            if not grouped:
+                self.notify(row, "closed", reason + "，未建单，转人工")
+                return
+            plain = [n for n in snapshot["items"] if n not in grouped]
+            tail = "".join(group_text(group) + "。" for group in same_name_groups(snapshot)).removesuffix("。")
+            self.notify(row, "closed", (reason + "，未建单，转人工。" if plain else reason + "。") + tail, items=plain)
             return
+        settled = done | known | uncertain
         for item in sorted(set(snapshot["items"]) | known | uncertain):
-            if item in owner and item not in done and item not in known and item not in uncertain:
-                detail = SAME_CARD.format(owner[item])
-            elif item in done:
+            if item in grouped and item not in settled:
+                # 同卡同名组（G509）：组内未进入建单的成员合为一条公告、一项组移交（投递时登记），不逐条给可执行移交。
+                pending = [n for n in grouped[item] if n not in settled]
+                if item == pending[0]:
+                    self.notify(row, f"closed_{item}", reason + "，" + group_text(grouped[item]),
+                                items=grouped[item])
+                continue
+            if item in done:
                 detail = "已建单并回读一致"
             elif item in known:
                 detail = "已有记录待回读，请按私有登记只读核对"
