@@ -457,3 +457,21 @@ def test_formal_order_real_shapes_list_company_and_error_code_one(case, platform
     record = platform.rows[record_id]
     assert isinstance(record[company], list) and record[company][0]["sid"].lower() == selected["sid"].lower()
     assert envelopes and all(body["success"] is True and body["error_code"] == 1 for body in envelopes)
+
+
+@pytest.mark.parametrize("returned", ["edge_space", "ideographic_space", "near"])
+def test_official_duplicate_check_matches_by_normalized_name(case, platform, business_cli, web_order, returned):
+    """G506：官方查重按原串精确查询（替身平台逐次断言查询值等于原政策名），返回的候选行名称与本条按同一归一函数
+    （name_key）比对——首尾空格、全角空格变体即算同名命中、停单 0 发；归一后仍不同的近似名不算。"""
+    from test_create_order import record_identity
+    name = case.values["policy_name"]
+    spec = case.config["official"]["search"]
+    shown = {"edge_space": f"  {name} ", "ideographic_space": f"　{name}　", "near": name + "（占位后缀）"}[returned]
+    platform.query_pages[(spec["view_ids"][0], 1)] = [{**record_identity(str(uuid4())), spec["name_control"]: shown}]
+    mingdao = backend(case)
+    if returned == "near":
+        assert mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time()).name == name
+    else:
+        with pytest.raises(order.Stop, match="已存在同名记录"):
+            mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    assert "search" in platform.actions and platform.create_count == 0

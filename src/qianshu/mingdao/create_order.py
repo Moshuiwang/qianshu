@@ -803,7 +803,11 @@ class Official:
         require(status is not None, error)
         return Record(record_id, name, status, utc(raw["_updatedAt"], platform=True), state)
 
-    def find(self, name):
+    def find(self, name, fold=None):
+        """官方同名查询：明道云端按原串精确查询。fold 为归一函数时（#154 正式单传入 `name_key`），查询前按它算出
+        本条的归一名，返回后候选行名称按同一函数归一、与本条相同即算同名命中；未传时按原串逐字相等（X5 不变）。"""
+        same = fold or (lambda value: value)
+        wanted = same(name)
         spec = self.config["search"]
         control = spec["name_control"]
         condition = {"type": "condition", "field": control, "operator": "eq", "value": name}
@@ -819,7 +823,7 @@ class Official:
                 key = row["rowId"].lower()
                 previous = records.setdefault(key, (row["rowId"], row[control]))
                 require(previous[1] == row[control], "官方查询同一记录名称冲突")
-        return [record for record, value in records.values() if value == name]
+        return [record for record, value in records.values() if same(value) == wanted]
 
     def tag_index(self, scope, *, approval_clock=None):
         """独立授权指定全表视图及写入窗口内的唯一性证明。任何未知均先于查询停止。"""

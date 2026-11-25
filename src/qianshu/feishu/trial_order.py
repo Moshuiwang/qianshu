@@ -151,7 +151,8 @@ READONLY_CHECK = "readonly_check"
 def robot_held(db, key, card):
     """同一归一政策名已有其他卡的机器人在途、已建、写错或结果未知记录（`ACTIVE`）。
 
-    公告投递裁决（unbuilt_notice）与出卡登记移交（Journal.prepare）共用这一判定；空名键一律不算。
+    公告投递裁决（unbuilt_notice）、出卡登记移交（Journal.prepare）与建单前置检查及领槽事务（OrderRunner._one /
+    _admit，G506）共用这一判定；空名键一律不算。
     """
     return bool(key) and db.execute(f"""SELECT 1 FROM trial_order WHERE name_key=? AND card!=?
         AND status IN ({','.join('?' * len(ACTIVE))})""", (key, card, *ACTIVE)).fetchone() is not None
@@ -348,6 +349,13 @@ class OrderRunner:
     def _one(self, job, item):
         """返回 (verified|skip|stop|wait, 停批原因)。"""
         row = job.row
+        # 本地同名查重（G506）：同一归一政策名已有其他卡的机器人记录，本条不建、不碰明道云，登记只读核对类移交。
+        reviewed = name_key(_reviewed_name(job.snapshot, item))
+        with journal_at(self.path) as j:
+            held = robot_held(j.db, reviewed, row["card"])
+        if held:
+            self._cancel(job, [item], "held", held=[(item, reviewed)])
+            return "skip", ""
         try:
             plan = self.backend.plan(job.snapshot, item, job.url, now=self.clock(), sent=row["sent"])
         except UnverifiedCombination:
@@ -385,9 +393,9 @@ class OrderRunner:
         if code == "busy":
             self._abort_ledger(job, item, plan, code)
             return "wait", code
-        if code == "handoff":
+        if code in ("handoff", "held"):
             self._abort_ledger(job, item, plan, code)
-            self._cancel(job, [item], code)
+            self._cancel(job, [item], code, held=[(item, key)] if code == "held" else ())
             return "skip", ""
         if code:
             self._abort_ledger(job, item, plan, code)
@@ -489,6 +497,11 @@ class OrderRunner:
                 return "switch"
             if j.write_halted():
                 return "halted"
+            # 本地同名查重与领槽同一写事务（G506）：同一归一政策名已有其他卡的机器人在途、已建、写错或结果未知记录，
+            # 本条不建，登记只读核对类移交（与 G497 同口径）。
+            if robot_held(j.db, key, card):
+                record_handoff(j.db, card, [(item, key)], self.clock(), held={item})
+                return "held"
             # 人工移交与机器人发送资格在同一写事务里按「目标表 × 归一政策名」裁决（审核 P1-3）。
             if j.db.execute("""SELECT 1 FROM trial_handoff WHERE name_key=? AND cleared IS NULL
                             AND (target IS NULL OR target=?)""", (key, plan.target)).fetchone():
@@ -580,8 +593,12 @@ class OrderRunner:
     def _head(row, items):
         return f"登记 {row['registration']} · 版本 {row['version']} · 条目 {'、'.join(map(str, items))} · "
 
-    def _cancel(self, job, items, code):
-        """未发的条目撤销：置终态并公告「未建单」@ 配置负责人。"""
+    def _cancel(self, job, items, code, *, held=()):
+        """未发的条目撤销：置终态并公告「未建单」@ 配置负责人。
+
+        held（[(条目, 名键)]）为同名政策已有机器人建单记录的条目（G506）：同一事务里登记只读核对类移交，公告写
+        「只读核对，请勿重复建单」，不写「未建单」（投递端不再按「未建单」改写或补登移交）。
+        """
         if not items:
             return
         row = job.row
@@ -591,7 +608,10 @@ class OrderRunner:
                 marks = ",".join("?" * len(items))
                 j.db.execute(f"""UPDATE trial_item_task SET status='closed' WHERE card=? AND item IN ({marks})
                              AND status IN ('archive_done','order_running')""", (row["card"], *items))
-                text = DISCONNECT_UNSENT if code == "disconnected" else CANCEL_REASONS[code] + "，未建单，已转人工。"
+                if held:
+                    record_handoff(j.db, row["card"], held, self.clock(), held={item for item, _ in held})
+                text = (DISCONNECT_UNSENT if code == "disconnected" else ROBOT_HELD + "。" if code == "held"
+                        else CANCEL_REASONS[code] + "，未建单，已转人工。")
                 self._notice(j, row["card"], "order_cancel:" + ",".join(map(str, items)), self._head(row, items) + text)
         except Exception:
             self.frozen = True
@@ -889,7 +909,8 @@ class MingdaoBackend:
             approved = O.approved_names(controls, config, values, web, plan_names, request_cells) if self.web else None
             if self.web:
                 O.request_display(payload, config, values, inactive, summary, web, plan_names, approved)
-            require(not api.find(values["policy_name"]), "已存在同名记录，需人工")
+            # 官方查重：查询参数按原串发出；候选行名称与本条按同一归一（name_key）比对，归一同名即命中（G506）。
+            require(not api.find(values["policy_name"], fold=name_key), "已存在同名记录，需人工")
         labels = {c["controlId"]: config["fields"][c["controlId"]]["label"] for c in controls}
         sent_values = {labels[c["controlId"]]: O.digest(c["value"].encode())[:16]
                        for c in O.decode(payload)["receiveControls"] if c["controlId"] not in self.skip}

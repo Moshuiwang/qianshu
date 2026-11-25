@@ -1385,3 +1385,121 @@ def test_real_child_killed_mid_send_freezes_as_unknown_and_never_resends(order):
     assert query(order.path, "SELECT item FROM trial_order_slot") == [(1,)]
     assert notices(order)["order_unknown:1"].endswith(ORDER_NOTICES["unknown"])
     assert events(order, 1)[-1] == "create_unknown"
+
+
+# ---------------------------------------------------------------- 同名归一查重（守望者 G506，agy P1-2）
+
+BASE = "合成 政策（A）"
+VARIANTS = {
+    "half_width_brackets": "合成 政策(A)",
+    "full_width_letter_and_space": "合成　政策（Ａ）",
+    "multi_space": "合成   政策（A）",
+    "edge_space": "  合成 政策（A） ",
+}
+
+
+def prior_order(env, status, name=BASE):
+    """其他卡（登记 1 · 版本 9）的机器人建单记录，名键按同一归一函数存。不占在途槽：只测本地查重本身
+    （真实在途时在途槽先挡住其他批次）。"""
+    with journal_at(env.path) as j, j.db:
+        j.db.execute("""INSERT INTO trial_order(registration,version,item,card,status,name_key,target,sent)
+                     VALUES(1,9,1,'other-card',?,?,'sheet',0)""", (status, name_key(name)))
+
+
+def rename_first(env, name):
+    """本卡第 1 条的政策名改为 name（申请人退回后重发、顺手改了标点或空格）。"""
+    reviewed = json.loads(query(env.path, "SELECT snapshot FROM trial_card")[0][0])["reviewed"]
+    reviewed[0]["policy_name"]["value"] = name
+    rewrite_snapshot(env.path, reviewed=reviewed)
+
+
+@pytest.mark.parametrize("status", ["sending", "unknown", "verified"], ids=["in_flight", "unknown", "built"])
+@pytest.mark.parametrize("variant", list(VARIANTS.values()), ids=list(VARIANTS))
+def test_same_normalized_name_with_robot_record_sends_nothing_and_says_read_only(order, variant, status):
+    """G506：同一归一政策名已有其他卡的机器人在途 / 结果未知 / 已建成记录（无移交），新卡同名变体（全半角括号、全角字母
+    与空格、多空格、首尾空格）获同意 → 前置检查即停：机器人 0 发、不调用明道云组装与查重，公告写「只读核对，请勿重复建单」，
+    登记只读核对类移交；投递照原文、不改写过时、不补登；再轮询也不发。"""
+    from qianshu.feishu.trial_order import READONLY_CHECK, ROBOT_HELD
+    archived(order)
+    rename_first(order, variant)
+    prior_order(order, status)
+    assert variant != BASE and name_key(variant) == name_key(BASE)
+    assert order.orders().run_once() is True
+    assert order.mingdao.sent == [2] and len(order.mingdao.urls) == 1  # 甲未进 plan：不碰明道云
+    assert notices(order)["order_cancel:1"] == "登记 1 · 版本 1 · 条目 1 · " + ROBOT_HELD + "。"
+    assert query(order.path, "SELECT count(*) FROM trial_order WHERE version=1 AND item=1") == [(0,)]
+    assert query(order.path, "SELECT item,status FROM trial_item_task ORDER BY item") == [
+        (1, "closed"), (2, "order_done")]
+    assert events(order, 1) == []
+    expected = [(1, 1, 1, name_key(BASE), READONLY_CHECK, None)]
+    assert query(order.path, "SELECT registration,version,item,name_key,reason,cleared FROM trial_handoff") == expected
+    kinds = recovery_kinds(order)
+    assert kinds == {"order_handoff": [], "order_readonly_check": [(1, 1)]}
+    listener, transport = deliver(order)
+    listener.maintain()
+    texts = sent(transport)
+    assert any(ROBOT_HELD in t and "条目 1" in t for t in texts)
+    assert not any(SUPERSEDED in t or "未建单" in t for t in texts)
+    assert query(order.path, "SELECT registration,version,item,name_key,reason,cleared FROM trial_handoff") == expected
+    order.orders().run_once()
+    assert order.mingdao.sent == [2]
+
+
+@pytest.mark.parametrize("status", ["sending", "unknown", "verified"], ids=["in_flight", "unknown", "built"])
+def test_same_name_record_landing_before_slot_is_caught_in_slot_transaction(order, status):
+    """G506：同名机器人记录恰在前置检查之后、领槽事务之前提交 → 领槽事务里同一判定（robot_held）裁决本条不建，
+    按确证未发出收口（台账 aborted_before_write / approval_closed，不占槽、无发送记录），公告只读核对、移交只登一条。"""
+    from qianshu.feishu.trial_order import READONLY_CHECK, ROBOT_HELD
+    archived(order)
+    rename_first(order, VARIANTS["half_width_brackets"])
+    runner = order.orders()
+    admit = runner._admit
+
+    def record_lands_first(job, item, plan, key):
+        if item == 1:
+            prior_order(order, status)
+        return admit(job, item, plan, key)
+    runner._admit = record_lands_first
+    assert runner.run_once() is True
+    assert order.mingdao.sent == [2]
+    assert notices(order)["order_cancel:1"].endswith(ROBOT_HELD + "。")
+    assert events(order, 1) == ["create_reserved", "aborted_before_write", "approval_closed"]
+    assert ledger(order)[2]["reason"] == "held"
+    assert query(order.path, "SELECT count(*) FROM trial_order WHERE version=1 AND item=1") == [(0,)]
+    assert query(order.path, "SELECT * FROM trial_order_slot") == []
+    assert query(order.path, "SELECT registration,version,item,name_key,reason,cleared FROM trial_handoff") == [
+        (1, 1, 1, name_key(BASE), READONLY_CHECK, None)]
+
+
+@pytest.mark.parametrize("cause", ["no_approver", "no_contact", "x8a"])
+def test_readonly_card_hands_off_would_be_eligible_items_too(order, monkeypatch, cause):
+    """锁住 agy P1-1 不成立（G506 第 4 条）：缺审批人、缺配置负责人、存档用途 X8a 等使只读卡（readonly=True）的情形，
+    原本可拟建的条目也全部登记移交——出卡时 readonly 即清空 eligible（src/qianshu/mail/trial_cards.py:133-134），
+    card_handoffs 覆盖全部条目；同名已有机器人记录的条目写「只读核对」、移交标只读核对类。"""
+    import qianshu.mail.trial_cards as cards
+    from qianshu.feishu.trial_order import READONLY_CHECK, ROBOT_HELD, card_handoffs
+    archived(order)
+    prior_order(order, "verified", NAMES[0])
+    real = cards.decision_pages
+
+    def readonly(trial, row, text, details, parsed, policies, full_review, setup, blocked):
+        settings, snapshot, contact = setup
+        settings = dict(settings)
+        if cause == "no_approver":
+            settings.pop("MAIL_TRIAL_APPROVER_OPEN_IDS")
+        elif cause == "x8a":
+            settings["MAIL_TRIAL_ARCHIVE_PURPOSE"] = "X8a"
+        else:
+            contact = None
+        return real(trial, row, text, details, parsed, policies, full_review, (settings, snapshot, contact), blocked)
+    monkeypatch.setattr(cards, "decision_pages", readonly)
+    reissue(order, 2, eligible=(1, 2))
+    assert query(order.path, "SELECT readonly FROM trial_card WHERE version=2") == [(1,)]
+    snapshot = json.loads(query(order.path, "SELECT snapshot FROM trial_card WHERE version=2")[0][0])
+    assert snapshot["items"] == [1, 2] and snapshot["eligible"] == []
+    assert card_handoffs(snapshot) == [(1, name_key(NAMES[0])), (2, name_key(NAMES[1]))]
+    assert query(order.path, "SELECT item,name_key,reason,cleared FROM trial_handoff WHERE version=2 ORDER BY item") == [
+        (1, name_key(NAMES[0]), READONLY_CHECK, None), (2, name_key(NAMES[1]), None, None)]
+    lines, face = face_lines(order, 2)
+    assert ROBOT_HELD in lines[1] and "已转人工" not in lines[1] and lines[2].endswith("已转人工")
+    assert "本次拟建" not in face and '"button"' not in face
