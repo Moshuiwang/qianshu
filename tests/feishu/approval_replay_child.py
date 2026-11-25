@@ -52,10 +52,16 @@ def boot():
             return real_import(name, *args, **kwargs)
         with patch.object(builtins, "__import__", importing):
             return execute_cli()
-    from qianshu.feishu import trial_consumer, trial_listener
-    from qianshu.feishu.trial_approval import Journal
-    from qianshu.mail import trial
-    import httpx
+    import gc
+    # 仅回放夹具：载入依赖期间暂停循环垃圾回收以缩短用例耗时，生产入口不做此处理。
+    gc.disable()
+    try:
+        from qianshu.feishu import trial_consumer, trial_listener
+        from qianshu.feishu.trial_approval import Journal
+        from qianshu.mail import trial
+        import httpx
+    finally:
+        gc.enable()
 
     native = trial_consumer.Consumer
     fail = lambda: (case / "fault-on").exists()

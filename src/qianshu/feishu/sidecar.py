@@ -19,6 +19,14 @@ FRESH = 2.0
 POLL = 0.05
 
 
+def _inactive_file(group):
+    try:
+        with (group / "memory.stat").open() as stream:
+            return next((int(line.split()[1]) for line in stream if line.startswith("inactive_file ")), 0)
+    except (OSError, ValueError, IndexError):
+        return 0
+
+
 def child_memory_limit(ceiling_bytes=128 << 20):
     """在启动线程测当时的可用量，给转交保留至少四分之三。"""
     with Path("/proc/meminfo").open() as stream:
@@ -37,7 +45,9 @@ def child_memory_limit(ceiling_bytes=128 << 20):
         if ceiling.exists():
             value = ceiling.read_text().strip()
             if value != "max":
-                used = int((current / "memory.current").read_text())
+                # memory.current 含可回收的非活跃页缓存，按工作集计已用量，
+                # 与 MemAvailable 同口径；否则缓存涨满时子进程连依赖都载不进。
+                used = int((current / "memory.current").read_text()) - _inactive_file(current)
                 available = min(available, int(value) - used)
         if current == root:
             break
@@ -68,6 +78,11 @@ class Generation:
 
 
 class Sidecar:
+    # 生产子进程载入依赖较慢，首个快照前的等待上限。恢复退避为 1、2、4… 秒，封顶 BACKOFF_LIMIT。
+    startup_timeout = 60
+    snapshot_timeout = 5
+    BACKOFF_LIMIT = 60
+
     def __init__(self, directory: Path, *, fault_hook: Path | None = None, service_args=()):
         self.directory = directory
         self.fault_hook = fault_hook
@@ -207,7 +222,7 @@ class Sidecar:
                         break
                     if gen.waiting and now >= gen.waiting[0][2]:
                         break
-                    timeout = 60 if self.service_args and not gen.snapshot else 5
+                    timeout = self.startup_timeout if self.service_args and not gen.snapshot else self.snapshot_timeout
                     if now - (gen.snapshot or started) > timeout or now - self.beat > FRESH:
                         break
                     try:
@@ -253,7 +268,7 @@ class Sidecar:
                 if stable:
                     delay = 1
                 self.stopping.wait(delay)
-                delay = min(60, delay * 2)
+                delay = min(self.BACKOFF_LIMIT, delay * 2)
 
     def status(self):
         now = time.monotonic()

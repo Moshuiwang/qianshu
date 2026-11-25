@@ -24,6 +24,9 @@ def install():
             idx = command.index("-B") + 1
             command = list(command)
             command[idx] = str(Path(__file__).with_name("approval_replay_child.py"))
+            # 子进程的标准错误留在合成目录，失败时可直接读到栈。
+            with (replay.case / "child.stderr").open("ab") as log:
+                return popen(command, *args, **dict(kwargs, stderr=log))
         return popen(command, *args, **kwargs)
 
     sidecar.subprocess.Popen = launch

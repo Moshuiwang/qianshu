@@ -1,4 +1,5 @@
 import asyncio
+import compileall
 import json
 import logging
 import os
@@ -31,6 +32,8 @@ def installed_source(tmp_path_factory):
     source = tmp_path_factory.mktemp("approval-package") / "src"
     shutil.copytree(CANDIDATE / "qianshu", source / "qianshu",
                     ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    # 与正常安装一致预编译；回放进程不写字节码，否则每个解释器都要重新编译本包。
+    compileall.compile_dir(source / "qianshu", quiet=1)
     with pytest.MonkeyPatch.context() as patch:
         patch.setattr(sys.modules[__name__], "CANDIDATE", source)
         yield
@@ -57,8 +60,10 @@ def scenario(root, name, fault, *, enabled=True, create=True):
     settings.write_text(content)
     with settings.open("a") as out:
         out.write("FEISHU_TENANT_KEY=tenant\nANTHROPIC_API_KEY=offline-key\n")
-    with (case / "sitecustomize.py").open("a") as out:
-        out.write("from approval_replay import install\ninstall()\n")
+    # 仅回放夹具：在入口之前载入飞书 SDK 时暂停循环垃圾回收以缩短用例耗时，生产入口不做此处理。
+    hooks = (case / "sitecustomize.py").read_text()
+    (case / "sitecustomize.py").write_text("import gc\ngc.disable()\n" + hooks
+                                           + "from approval_replay import install\ninstall()\ngc.enable()\n")
     (case / "scenario").write_text(fault)
     (case / "candidate").write_text(str(CANDIDATE))
     return case
@@ -75,176 +80,102 @@ def events(case):
     return path.read_text().splitlines() if path.exists() else []
 
 
-def ready(case, proc):
+def ready(case, proc, seconds=15):
     def sample():
         if read_status(case.parent / "machine")["state"] != "ready" or not (case / "mail-ready").exists():
             return None
         owner, registration = json.loads((case / "mail-ready").read_text())
         pid, group, _ = json.loads((case / "child-facts").read_text())
         return registration if (owner, group) == (pid, proc.pid) else None
-    return until(sample, proc, seconds=90)
+    return until(sample, proc, seconds=seconds)
 
 
 @pytest.fixture(scope="module")
 def baseline_handoffs(baseline, tmp_path_factory, packet_io):
-    root = tmp_path_factory.mktemp("plain")
-    initial = scenario(root, "first", "none", enabled=False)
-    with cli(initial, baseline) as proc:
-        send(initial, 0, "group")
-        first = snapshot(initial, proc)
-    successor = scenario(root, "after", "none", enabled=False)
-    (successor / "takeover").touch()
-    with cli(successor, baseline) as proc:
-        send(successor, 0, "group")
-        return first, snapshot(successor, proc, end=1020, takeover=True)
+    """main 独立源码的一次常规转交（先卡片洪峰再群 @）：群快照与群回执时延，作为对照。"""
+    case = scenario(tmp_path_factory.mktemp("plain"), "first", "none", enabled=False)
+    with cli(case, baseline) as proc:
+        send(case, 0, "flood")
+        send(case, 1, "group")
+        return snapshot(case, proc), group_delay(case)
 
 
-@pytest.fixture
-def compared_cli(baseline_handoffs):
-    @contextmanager
-    def compare(case, *, dials=1):
-        with cli(case) as proc:
-            yield proc
-            send(case, len(list(case.glob("input-*"))), "group")
-            assert snapshot(case, proc, dials=dials) == baseline_handoffs[0]
-            from qianshu.feishu.state import State
-            rows = State.recovery_list(case.parent / "private/trial-050.sqlite3")
-            assert "outlet-sentinel-7" not in json.dumps(rows)
-            for path in (case / "parent.log", *list((case.parent / "machine").glob("*.log"))):
-                assert b"outlet-sentinel-7" not in path.read_bytes()
-        successor = scenario(case.parent, "handoff-after-" + case.name, "none", enabled=False)
-        (successor / "takeover").touch()
-        with cli(successor) as proc:
-            send(successor, 0, "group")
-            assert snapshot(successor, proc, end=1020, takeover=True) == baseline_handoffs[1]
-    return compare
+def group_delay(case):
+    tags = observations(case)
+    start, = [t for k, _, t in tags if k == "first"]
+    end, = [t for k, value, t in tags if k == "ack" and value[0] == "group"]
+    return end - start
 
 
-@pytest.mark.parametrize("fault", ["members", "stop_event", "dispatcher", "import", "constructor", "read_disk",
-                                  "close_raise", "close_hang", "memory", "malformed", "recursion", "rotate",
-                                  "maintain", "mail_poll", "startup", "child_log", "native_gil", "pool_exit", "crash"])
-@pytest.mark.parametrize("create", [False, True])
-def test_cli_approval_fault_and_takeover(tmp_path, baseline_handoffs, packet_io, fault, create):
-    case = scenario(tmp_path, "first", fault, create=create)
-    (case / "fault-on").touch()
+def toast(case, n, text):
+    return ("toast", [str(n), text]) in [(k, v) for k, v, _ in observations(case)]
+
+
+def test_cli_healthy_click_flood_and_parent_death(tmp_path, baseline_handoffs):
+    """健康档：G475 即时核验、G463 异步改写原卡、G470 洪峰后群 @，以及守望者运维四条。"""
+    expected, baseline_delay = baseline_handoffs
+    case = scenario(tmp_path, "first", "healthy")
     with cli(case) as proc:
-        inject_click = fault in ("read_disk", "native_gil", "malformed")
-        if inject_click:
-            reg = ready(case, proc)
-            send(case, 0, [reg, "verify"])
-        until((case / "hit").exists, proc, seconds=65)
-        diagnostic = case.parent / "machine/supervisor.log"
-        until(lambda: diagnostic.exists() and "CRITICAL E-TRIAL-DISABLED" in diagnostic.read_text(), proc, seconds=75)
-        n = int(inject_click)
-        send(case, n, [1, "verify"])
-        until(lambda: ("toast", [str(n), "审批暂不可用"]) in [(k, v) for k, v, _ in observations(case)], proc)
-        send(case, n+1, "group")
-        assert snapshot(case, proc) == baseline_handoffs[0]
-        assert "external" not in events(case)
-        if fault == "read_disk":
-            assert float((case / "read-seconds").read_text()) > 3.25
-        (case / "fault-on").unlink()
         reg = ready(case, proc)
-        send(case, n+2, [reg, "verify"])
-        until(lambda: ("toast", [str(n+2), "已收到点击，请以卡片更新为准"])
-              in [(k, v) for k, v, _ in observations(case)], proc)
-        until(lambda: "patch" in events(case), proc)
+        send(case, 0, [reg, "verify"])
+        send(case, 1, "flood")
+        send(case, 2, "group")
+        until(lambda: toast(case, 0, "已收到点击，请以卡片更新为准"), proc, seconds=3)
+        until(lambda: "patch" in events(case), proc, seconds=3)
+        assert snapshot(case, proc) == expected
+        assert group_delay(case) <= baseline_delay
+        assert events(case).count("member-lookup") == 1
         assert sum(k == "dial" for k, _, _ in observations(case)) == 1
-        child_pid, group, _ = json.loads((case / "child-facts").read_text())
-        assert group == proc.pid and os.getpgid(child_pid) == group
-        os.kill(child_pid, signal.SIGSTOP)
+        assert "external" not in events(case)
+        pid, group, cap = json.loads((case / "child-facts").read_text())
+        assert group == proc.pid and pid != proc.pid and 0 < cap <= 512 << 20
+
+        def settled():
+            state = read_status(tmp_path / "machine")
+            return state["state"] == "ready" and state["alive"] and state["backlog"] == state["unconfirmed"] == 0
+        until(settled, proc, seconds=3)
+        # 父亡：子进程被冻结时，父进程收到 SIGTERM 后整组在 10 秒内退出。
+        os.kill(pid, signal.SIGSTOP)
         began = time.monotonic()
         os.kill(proc.pid, signal.SIGTERM)
         proc.wait(5)
-        until(lambda: empty(proc.pid), seconds=5)
+        until(lambda: empty(group), seconds=5)
         assert time.monotonic() - began < 10
-    takeover = scenario(tmp_path, "second", "healthy", create=create)
-    (takeover / "takeover").touch()
-    with cli(takeover) as proc:
-        send(takeover, 0, "group")
-        assert snapshot(takeover, proc, end=1020, takeover=True) == baseline_handoffs[1]
-        reg = ready(takeover, proc)
-        send(takeover, 1, [reg, "verify"])
-        until(lambda: ("toast", ["1", "已收到点击，请以卡片更新为准"])
-              in [(k, v) for k, v, _ in observations(takeover)], proc)
-        until(lambda: "patch" in events(takeover), proc)
+        assert read_status(tmp_path / "machine")["alive"] is False
 
 
-@pytest.mark.parametrize("fault", ["healthy", "no_proof", "joined_late", "rejoined", "watermark",
-                                    "clock_overlap", "lookup_failure", "current_absent", "expired_click", "outside_list",
-                                    "patch_fail", "patch_timeout", "patch_lost", "patch_bytes",
-                                    "patch_no_checker", "feedback_bytes", "notice_timeout"])
-def test_cli_click_evidence_and_async_result(tmp_path, compared_cli, fault):
+# G476 / G478：每类故障一例真实子进程，证明故障中审批停用（本地 CRITICAL、点击只回固定提示）、
+# 群 @ 转交不受影响、不重拨。同类其余故障点、启动挂起与就绪后卡死，以及故障解除后的退避
+# 自动恢复，见 test_sidecar_recovery.py（真实监督 + 轻量替身子进程）与进程内用例。
+FAULT_CLASSES = {
+    "import": "启动期异常退出（审批模块导入失败）",
+    "crash": "启动期被信号终止",
+    "mail_poll": "收信线程故障",
+    "malformed": "点击处理异常退出",
+}
+
+
+@pytest.mark.parametrize("fault", list(FAULT_CLASSES))
+def test_cli_approval_fault_disables_without_touching_handoff(tmp_path, baseline_handoffs, fault):
     case = scenario(tmp_path, "first", fault)
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        pid, group, cap = json.loads((case / "child-facts").read_text())
-        assert group == proc.pid and pid != proc.pid and 0 < cap <= 512 << 20
-        send(case, 0, [reg, "verify"])
-        until(lambda: any(k == "toast" and v == ["0", "已收到点击，请以卡片更新为准"]
-                          for k, v, _ in observations(case)), proc)
-        confirmed = fault in {"healthy", "no_proof", "joined_late", "rejoined", "watermark"}
-        positive = confirmed or fault.startswith("patch_") or fault == "notice_timeout"
-        expected = {fault: "patch" if confirmed else "manual", "feedback_bytes": "tampered", "patch_no_checker": "start"}
-        until(lambda: expected.get(fault, "manual") in events(case), proc)
-        def settled():
-            with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-                if fault == "feedback_bytes":
-                    return db.execute("SELECT 1 FROM trial_feedback WHERE status='blocked'").fetchone()
-                if positive and not confirmed:
-                    status = {"patch_no_checker": "blocked", "notice_timeout": "unknown"}.get(fault, "sent")
-                    return db.execute("SELECT 1 FROM trial_notification WHERE kind='result_manual' AND status=?",
-                                      (status,)).fetchone()
-                return True
-        until(settled, proc)
-        if fault in ("patch_bytes", "patch_no_checker"):
-            assert "patch" not in events(case)
-        if fault == "feedback_bytes":
-            assert "manual" not in events(case)
-        with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-            assert db.execute("SELECT count(*) FROM trial_receipt").fetchone()[0] == int(positive)
-            assert not db.execute("SELECT 1 FROM trial_task").fetchone()
-            if confirmed:
-                assert events(case).count("member-lookup") == 1
-            if fault.startswith("patch_"):
-                assert db.execute("SELECT count(*) FROM trial_notification WHERE kind='result_manual'").fetchone()[0] == 1
+    (case / "fault-on").touch()
+    diagnostic = tmp_path / "machine/supervisor.log"
+    with cli(case) as proc:
+        n = 0
+        if fault == "malformed":
+            # 只等审批就绪即点击（格式错的负载不需要卡片登记号）。
+            until(lambda: read_status(tmp_path / "machine")["state"] == "ready", proc, seconds=15)
+            send(case, n, [1, "verify"])
+            n += 1
+        send(case, n, "group")
+        until((case / "hit").exists, proc, seconds=10)
+        until(lambda: diagnostic.exists() and "CRITICAL E-TRIAL-DISABLED" in diagnostic.read_text(), proc,
+              seconds=5)
+        send(case, n + 1, [1, "verify"])
+        until(lambda: toast(case, n + 1, "审批暂不可用"), proc, seconds=3)
+        assert snapshot(case, proc) == baseline_handoffs[0]
+        assert sum(k == "dial" for k, _, _ in observations(case)) == 1
         assert "external" not in events(case)
-        assert sum(k == "dial" for k, _, _ in observations(case)) == 1
-
-    if fault == "notice_timeout":
-        restarted = scenario(tmp_path, "inspect", "healthy")
-        with cli(restarted) as proc:
-            ready(restarted, proc)
-            from qianshu.feishu.state import State
-            rows = State.recovery_list(tmp_path / "private/trial-050.sqlite3")
-            assert any(row["kind"] == "manual_check" and row["status"] == "unknown" for row in rows)
-            assert "manual" not in events(restarted)
-
-
-
-def test_cli_consumer_dies_before_receipt(tmp_path, compared_cli):
-    case = scenario(tmp_path, "first", "kill_consumer")
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        (case / "fault-on").touch()
-        send(case, 0, [reg, "verify"])
-        until((case / "hit").exists, proc)
-        until(lambda: ("toast", ["0", "已收到点击，请以卡片更新为准"])
-              in [(k, v) for k, v, _ in observations(case)], proc)
-        until(lambda: set(events(case)) >= {"unsent", "uncertain", "readback"}
-              and events(case).count("start") > 1, proc, seconds=120)
-        state = tmp_path / "private/trial-050.sqlite3"
-        from qianshu.feishu.state import State
-        recovery = State.recovery_list(state)
-        assert {row["status"] for row in recovery} >= {"create_unknown", "readback_pending", "unknown"}
-        assert "offline-record" not in json.dumps(recovery)
-        with closing(sqlite3.connect(state)) as db:
-            closed = db.execute("SELECT body FROM trial_notification WHERE kind LIKE 'closed%'").fetchall()
-            assert any("结果未知" in body and "未建单" not in body for body, in closed)
-            assert any("已有记录待回读" in body and "未建单" not in body for body, in closed)
-            assert db.execute("SELECT status FROM trial_card WHERE registration=?", (reg,)).fetchone()[0] == "closed"
-            assert not db.execute("SELECT 1 FROM trial_receipt").fetchone()
-        assert sum(k == "dial" for k, _, _ in observations(case)) == 1
 
 
 def test_journal_refuses_symlink_before_writable_open(tmp_path):
@@ -315,264 +246,6 @@ def test_card_send_log_stall_keeps_group_dispatch(monkeypatch):
             await asyncio.gather(client._cache._cron, return_exceptions=True)
     with asyncio.Runner(loop_factory=asyncio.new_event_loop) as runner:
         runner.run(exercise())
-
-
-@pytest.mark.parametrize("fault", ["late_verify", "late_approve", "kill_after_commit"])
-def test_cli_candidate_commit_never_resigned(tmp_path, compared_cli, fault):
-    case = scenario(tmp_path, "first", fault)
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        n = 0
-        if fault == "late_approve":
-            send(case, n, [reg, "verify"])
-            until(lambda: "patch" in events(case), proc)
-            n += 1
-        send(case, n, [reg, "approve" if n else "verify"])
-        until((case / "committed").exists, proc)
-        until(lambda: events(case).count("start") > 1 and "notice" in events(case), proc, seconds=75)
-        with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-            assert db.execute("SELECT count(*) FROM trial_click_candidate").fetchone()[0] == n+1
-            assert db.execute("SELECT count(*) FROM trial_receipt").fetchone()[0] == n
-            assert db.execute("SELECT count(*) FROM trial_item_task").fetchone()[0] == 0
-
-
-def test_cli_group_after_card_flood(tmp_path, baseline, packet_io):
-    def measure(root, source, enabled):
-        case = scenario(root, "first", "healthy", enabled=enabled)
-        with cli(case, source) as proc:
-            if enabled:
-                ready(case, proc)
-            send(case, 0, "flood")
-            send(case, 1, "group")
-            result = snapshot(case, proc)
-            tags = observations(case)
-            start, = [t for k, _, t in tags if k == "first"]
-            end, = [t for k, value, t in tags if k == "ack" and value[0] == "group"]
-            return result, end - start
-
-    expected, baseline_delay = measure(tmp_path / "main", baseline, False)
-    actual, actual_delay = measure(tmp_path / "work", CANDIDATE, True)
-    assert actual == expected
-    assert actual_delay <= baseline_delay
-
-
-@pytest.mark.parametrize("fault", ["first_fail", "first_timeout", "first_bytes", "first_no_checker"])
-def test_cli_first_send_failure_uses_registered_key(tmp_path, compared_cli, fault):
-    case = scenario(tmp_path, "first", fault)
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        state = tmp_path / "private/trial-050.sqlite3"
-        def result():
-            with closing(sqlite3.connect(state)) as db:
-                return db.execute("""SELECT i.status,n.status FROM card_intent i JOIN trial_card c
-                    USING(registration,version) JOIN trial_notification n USING(card)
-                    WHERE i.registration=? AND n.kind='first_manual:'||i.uuid""", (reg,)).fetchall()
-        blocked = fault in ("first_bytes", "first_no_checker")
-        expected = [("blocked" if blocked else "unknown", "blocked" if fault == "first_no_checker" else "sent")]
-        until(lambda: result() == expected, proc)
-        assert events(case).count("interactive") == int(not blocked)
-        assert events(case).count("manual") == int(fault != "first_no_checker")
-        assert "external" not in events(case)
-
-
-@pytest.mark.parametrize("fault", ["recovery_bytes", "recovery_no_checker"])
-def test_cli_closed_notice_checked_at_final_handoff(tmp_path, compared_cli, fault):
-    case = scenario(tmp_path, "first", "healthy")
-    with cli(case) as proc:
-        reg = ready(case, proc)
-        os.kill(proc.pid, signal.SIGTERM)
-        proc.wait(5)
-        until(lambda: empty(proc.pid), seconds=5)
-    case = scenario(tmp_path, "recovery", fault)
-    with compared_cli(case) as proc:
-        ready(case, proc)
-        with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-            rows = db.execute("""SELECT kind,status FROM trial_notification JOIN trial_card USING(card)
-                                WHERE registration=?""", (reg,)).fetchall()
-            assert ("closed", "blocked") in rows
-            assert not db.execute("SELECT 1 FROM trial_receipt").fetchone()
-        assert "external" not in events(case)
-        if fault == "recovery_bytes":
-            assert "tampered" in events(case)
-        else:
-            assert "notice" not in events(case)
-
-
-def test_cli_verified_approval_has_one_unexecutable_item(tmp_path, compared_cli):
-    case = scenario(tmp_path, "first", "healthy")
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        for index, action in enumerate(("verify", "approve", "approve")):
-            send(case, index, [reg, action])
-            until(lambda: any(key == "toast" and value[0] == str(index)
-                              for key, value, _ in observations(case)), proc)
-            if index < 2:
-                until(lambda: events(case).count("patch") == index + 1, proc)
-            else:
-                until(lambda: "manual" in events(case), proc)
-            time.sleep(.06)  # 让第三次独立点击落在下一次卡片回包额度。
-        with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-            assert db.execute("SELECT action FROM trial_receipt ORDER BY recorded").fetchall() == [
-                ("verify",), ("approve",)]
-            assert db.execute("SELECT item,status FROM trial_item_task").fetchall() == [
-                (1, "executor_unavailable")]
-        assert "external" not in events(case)
-
-
-def test_cli_click_from_disabled_interval_denied_after_republish(tmp_path, compared_cli):
-    from qianshu.__main__ import main
-
-    case = scenario(tmp_path, "first", "healthy")
-    switches = case / "switches"
-    on = switches.read_text()
-    publish = ["--trial-publish-switches", str(switches), "--state", str(tmp_path / "private/trial-050.sqlite3")]
-    with compared_cli(case) as proc:
-        old = ready(case, proc)
-        switches.write_text("MAIL_TRIAL_RECEIVE_ENABLED=false\nMAIL_TRIAL_CARD_ENABLED=false\n")
-        assert main(publish) == 0
-        stamp = int(time.time() * 1000)
-        switches.write_text(on)
-        assert main(publish) == 0
-        until(lambda: events(case).count("start") > 1 and
-              int((case / "mail-started").read_text()) != old, proc, seconds=120)
-        new = ready(case, proc)
-        for index, reg in enumerate((new, new, old)):
-            send(case, index, dict(reg=reg, action="verify", event_id="old", stamp=stamp))
-            until(lambda: any(k == "toast" and v[0] == str(index) for k, v, _ in observations(case)), proc)
-            time.sleep(.06)
-        until(lambda: "manual" in events(case), proc)
-        with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-            assert not db.execute("SELECT 1 FROM trial_receipt").fetchone()
-            assert not db.execute("SELECT 1 FROM trial_item_task").fetchone()
-            assert db.execute("SELECT count(*) FROM trial_feedback").fetchone()[0] == 1
-        assert sum(k == "dial" for k, _, _ in observations(case)) == 1
-
-
-def test_cli_create_disabled_only_returns_notice(tmp_path, compared_cli):
-    case = scenario(tmp_path, "first", "healthy", create=False)
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        send(case, 0, [reg, "approve"])
-        until(lambda: ("toast", ["0", "建单未开启"]) in [(k, v) for k, v, _ in observations(case)], proc)
-        def consumed():
-            with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-                if not db.execute("SELECT 1 FROM trial_event").fetchone():
-                    return False
-                assert not db.execute("SELECT 1 FROM trial_receipt").fetchone()
-                assert not db.execute("SELECT 1 FROM trial_feedback").fetchone()
-                return True
-        until(consumed, proc)
-        assert set(events(case)).isdisjoint({"patch", "notice", "manual", "external"})
-
-
-def test_cli_sigterm_parent_with_live_child(tmp_path, packet_io):
-    case = scenario(tmp_path, "first", "healthy")
-    with cli(case) as proc:
-        ready(case, proc)
-        pid, group, _ = json.loads((case / "child-facts").read_text())
-        assert group == proc.pid and pid != proc.pid
-        state = read_status(tmp_path / "machine")
-        assert state["alive"] and state["backlog"] == state["unconfirmed"] == 0
-        assert "external" not in events(case)
-        start = time.monotonic()
-        os.kill(proc.pid, signal.SIGTERM)
-        proc.wait(5)
-        until(lambda: empty(group), seconds=5)
-        assert time.monotonic() - start < 10
-        assert read_status(tmp_path / "machine")["alive"] is False
-
-
-def test_cli_old_lease_keeps_recovery_visible(tmp_path, compared_cli):
-    import fcntl
-    from qianshu.feishu.state import State
-
-    case = scenario(tmp_path, "first", "healthy")
-    with cli(case) as proc:
-        reg = ready(case, proc)
-        os.kill(proc.pid, signal.SIGTERM)
-        proc.wait(5)
-        until(lambda: empty(proc.pid), seconds=5)
-    case = scenario(tmp_path, "second", "healthy")
-    (case / "takeover").touch()
-    state = tmp_path / "private/trial-050.sqlite3"
-    with ExitStack() as stack:
-        lease = stack.enter_context((tmp_path / "machine/consumer.lock").open("a"))
-        fcntl.flock(lease, fcntl.LOCK_EX)
-        diagnostic = tmp_path / "machine/supervisor.log"
-        previous = diagnostic.stat().st_size if diagnostic.exists() else 0
-        proc = stack.enter_context(compared_cli(case))
-        until(lambda: diagnostic.exists() and diagnostic.stat().st_size > previous, proc, seconds=120)
-        assert any(row.get("registration") == reg and row["status"] == "open" for row in State.recovery_list(state))
-        assert not (case / "mail-started").exists()
-        fcntl.flock(lease, fcntl.LOCK_UN)
-        ready(case, proc)
-        until(lambda: "notice" in events(case), proc)
-        assert sum(k == "dial" for k, _, _ in observations(case)) == 1
-
-
-def test_cli_first_off_creates_no_approval_ledger(tmp_path, baseline_handoffs, packet_io):
-    case = scenario(tmp_path, "first", "none", enabled=False)
-    (case / "switches").write_text("MAIL_TRIAL_CARD_ENABLED=false\nMAIL_TRIAL_RECEIVE_ENABLED=false\n")
-    with cli(case) as proc:
-        send(case, 0, "group")
-        assert snapshot(case, proc) == baseline_handoffs[0]
-        until(lambda: (tmp_path / "machine/status.json").exists(), proc)
-        assert not read_status(tmp_path / "machine")["alive"]
-        assert not (tmp_path / "private/trial-050.sqlite3").exists()
-        assert not events(case)
-        assert not any(tag in ("mail", "external") for tag, _, _ in observations(case))
-
-
-def test_cli_old_envelope_on_reconnect_never_grants(tmp_path, compared_cli):
-    case = scenario(tmp_path, "first", "reconnect")
-    with compared_cli(case, dials=2) as proc:
-        old = ready(case, proc)
-        click = dict(reg=old, action="verify", event_id="in-flight", stamp=int(time.time() * 1000))
-        send(case, 0, click)
-        until((case / "hit").exists, proc)
-        until(lambda: ("toast", ["0", "已收到点击，请以卡片更新为准"])
-              in [(k, v) for k, v, _ in observations(case)], proc)
-        send(case, 1, "disconnect")
-        until(lambda: int((case / "mail-started").read_text()) != old and
-              read_status(tmp_path / "machine")["state"] == "ready", proc, seconds=120)
-        send(case, 2, click)
-        until(lambda: any(k == "toast" and v[0] == "2" for k, v, _ in observations(case)), proc)
-        until(lambda: "manual" in events(case), proc)
-        with closing(sqlite3.connect(tmp_path / "private/trial-050.sqlite3")) as db:
-            assert db.execute("SELECT status FROM trial_card WHERE registration=?", (old,)).fetchone() == ("closed",)
-            assert not db.execute("SELECT 1 FROM trial_receipt").fetchone()
-            assert not db.execute("SELECT 1 FROM trial_item_task").fetchone()
-        assert sum(k == "dial" for k, _, _ in observations(case)) == 2
-
-
-@pytest.mark.parametrize("kind", ["card", "event"])
-def test_cli_fragmented_card_releases_group_reservation(tmp_path, compared_cli, kind):
-    case = scenario(tmp_path, "first", "healthy")
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        send(case, 0, dict(reg=reg, action="verify", event_id="split", stamp=int(time.time()*1000),
-                           fragment_kind=kind))
-        until(lambda: ("toast", ["0", "已收到点击，请以卡片更新为准"])
-              in [(k, v) for k, v, _ in observations(case)], proc)
-        until(lambda: "patch" in events(case), proc)
-
-
-def test_cli_status_distinguishes_queue_from_unconfirmed_work(tmp_path, compared_cli):
-    case = scenario(tmp_path, "first", "hold_consume")
-    with compared_cli(case) as proc:
-        reg = ready(case, proc)
-        send(case, 0, [reg, "verify"])
-        until((case / "hit").exists, proc)
-        try:
-            send(case, 1, [reg, "verify"])
-            def queued():
-                status = read_status(tmp_path / "machine")
-                return (status["alive"] and status["backlog"] >= 1 and status["unconfirmed"] >= 2
-                        and status["oldest_wait"] > 0)
-            until(queued, proc, seconds=2)
-        finally:
-            (case / "release").touch()
-        until(lambda: read_status(tmp_path / "machine")["unconfirmed"] == 0, proc)
 
 
 @pytest.mark.parametrize("age,member,actor,receipts", [

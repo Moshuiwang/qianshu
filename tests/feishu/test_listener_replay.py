@@ -273,6 +273,8 @@ def test_production_switches_match_main(tmp_path, versions, switches, request):
         if enabled:
             for case, source in ((baseline, main_source), (candidate, CANDIDATE)):
                 off = prepare(case.parent / "closed", switches=("false", "false"))
+                # 接管实例沿用前一实例的转交配置，否则转交库按配置指纹拒绝打开。
+                (off / "settings").write_text((case / "settings").read_text())
                 (off / "takeover").touch()
                 with cli(off, source) as proc:
                     resumed = snapshot(off, proc, end=1020, takeover=True)
