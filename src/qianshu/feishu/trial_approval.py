@@ -219,12 +219,21 @@ class Journal:
                AND i.closed IS NULL AND max(i.opened,e.opened)<=?""", (session, created)).fetchone() is not None
 
     def prepare(self, card, reg, version, session, country, snapshot, readonly, sent):
+        """卡片快照落盘；同一事务里给未列为拟建的条目逐条登记人工移交（特批第 3 轮第 1 条）。
+
+        收口不再靠公告组合给这些条目补移交；投递端逐条裁决照旧用于拟建条目，同一条目已有未销清移交时按现有去重
+        不重复登记。
+        """
+        from .trial_order import card_handoffs, record_handoff
         packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+        handoffs = card_handoffs(snapshot)
         with self.db:
             self.db.execute("""INSERT INTO trial_card VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                             (card, reg, version, CARD_FORMAT, session, country, packed,
                              sha256(packed.encode()).hexdigest(), int(readonly), sent,
                              (int(sent) // 86400 + 2) * 86400, "preparing"))
+            if handoffs:
+                record_handoff(self.db, card, handoffs, sent)
 
     def bind(self, card, now):
         row = self.db.execute("SELECT * FROM trial_card WHERE card=?", (card,)).fetchone()

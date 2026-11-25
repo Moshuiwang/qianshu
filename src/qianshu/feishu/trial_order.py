@@ -129,6 +129,18 @@ def _reviewed_name(snapshot, item):
         return None
 
 
+# 缺可信政策名的条目按「登记 × 版本 × 条目」登记移交：政策名键留空，不占用任何政策名。
+UNNAMED = ""
+
+
+def card_handoffs(snapshot):
+    """出卡即登记人工移交的条目（特批第 3 轮第 1 条）：快照里未列为拟建（`eligible`）的条目逐条按归一政策名占用；
+    缺可信政策名的留空名键，只按「登记 × 版本 × 条目」登记。返回 [(条目, 名键)]，与 record_handoff 同格式。"""
+    eligible = set(snapshot.get("eligible") or [])
+    return [(item, name_key(_reviewed_name(snapshot, item)) or UNNAMED)
+            for item in snapshot.get("items") or [] if item not in eligible]
+
+
 def notice_items(kind, snapshot):
     """「未建单」公告实际涉及的条目：与公告文案同一来源（审核 P1-1）。
 

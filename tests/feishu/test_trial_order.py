@@ -118,6 +118,9 @@ def _archived(env, names):
     for n, name in enumerate(names):
         reviewed[n]["policy_name"]["value"] = name
     rewrite_snapshot(env.path, eligible=[1, 2], reviewed=reviewed)
+    with journal_at(env.path) as j, j.db:
+        # 夹具把第 2 条改成出卡时即拟建：撤掉出卡时为它登记的人工移交（特批第 3 轮第 1 条），与「甲乙都拟建」一致。
+        j.db.execute("DELETE FROM trial_handoff")
     assert query(env.path, "SELECT item,status FROM trial_item_task ORDER BY item") == [
         (1, "archive_done"), (2, "archive_done")]
     return card
@@ -744,6 +747,153 @@ def test_release_clears_only_the_confirmed_registration(order, capsys):
     assert query(order.path, "SELECT version FROM trial_handoff WHERE cleared IS NULL") == [(2,)]
     assert query(order.path, "SELECT registration,version,item FROM trial_order_slot") == [(1, 2, 1)]
     assert NAMES[0] not in json.dumps([before, after], ensure_ascii=False)
+
+
+# ---------------------------------------------------------------- 出卡即登记人工移交（特批第 3 轮第 1 条）
+
+def issue(env, monkeypatch, eligible):
+    """真实出卡（decision_pages → Journal.prepare 原样执行）：两条政策名为甲、乙，eligible 内的条目用已验证组合（拟建），
+    其余用未验证组合（卡面「该类型尚未经真实回读验证」）。"""
+    import qianshu.mail.trial_cards as cards
+    real = cards.decision_pages
+
+    def named(trial, row, text, details, parsed, policies, *rest):
+        for n, policy in enumerate(policies, 1):
+            policy.draft.policy_name.value = NAMES[n - 1]
+            policy.draft.benefit_type.value = "组合0" if n in eligible else "组合1"
+        return real(trial, row, text, details, parsed, policies, *rest)
+    monkeypatch.setattr(cards, "decision_pages", named)
+
+
+def archive_success(env, card):
+    """存档成功（2c 已有专测）：只置存档链接与条目「存档完成、待建单」，省去真实存档的耗时。"""
+    with journal_at(env.path) as j, j.db:
+        j.db.execute("""INSERT INTO trial_archive(registration,version,card,status,purpose,url)
+                     VALUES(1,1,?,'success','X8b','https://feishu.cn/docx/Created')""", (card,))
+        j.db.execute("UPDATE trial_item_task SET status='archive_done' WHERE card=?", (card,))
+        j.db.execute("UPDATE trial_task SET status='archive_done' WHERE card=?", (card,))
+
+
+def handoffs(env):
+    return query(env.path, "SELECT registration,version,item,name_key,target,cleared FROM trial_handoff ORDER BY rowid")
+
+
+def occupied(env):
+    """同名占位：按归一政策名读移交与在途槽（与守望者回显同一函数）。"""
+    from qianshu.feishu.trial_order import handoff_state
+    with journal_at(env.path, readonly=True) as j:
+        return {name: (s["open_handoffs"], s["slot_held"])
+                for name in NAMES for s in [handoff_state(j.db, name_key(name))]}
+
+
+def card_face(env):
+    pages = json.loads(query(env.path, "SELECT snapshot FROM trial_card WHERE version=1")[0][0])["pages"]
+    return json.dumps(pages, ensure_ascii=False)
+
+
+def test_card_time_handoff_all_eligible_built_without_handoff(order, monkeypatch):
+    """全拟建：甲乙都拟建、都建成 → 无移交、无占位，建成公告覆盖甲乙各一次。"""
+    issue(order, monkeypatch, eligible=(1, 2))
+    card, _ = accept(order.path)
+    assert handoffs(order) == [] and "已转人工" not in card_face(order)
+    archive_success(order, card)
+    assert order.orders().run_once() is True and order.mingdao.sent == [1, 2]
+    listener, transport = deliver(order)
+    listener.maintain()
+    texts = sent(transport)
+    assert len(texts) == 1 and "条目 1、2 · " + ORDER_NOTICES["done"] in texts[0] and "未建单" not in texts[0]
+    assert handoffs(order) == [] and occupied(order) == {NAMES[0]: (0, False), NAMES[1]: (0, False)}
+
+
+def test_card_time_handoff_partial_registers_manual_item_at_card_time(order, monkeypatch):
+    """部分拟建（复核 P1-1）：甲拟建建成、乙待人工 → 乙出卡即有移交与占位、卡面「已转人工」；收口只公告甲建成，
+    乙仍在移交清单，且不因投递再登记第二条移交。"""
+    issue(order, monkeypatch, eligible=(1,))
+    card, _ = accept(order.path)
+    expected = [(1, 1, 2, name_key(NAMES[1]), None, None)]
+    assert handoffs(order) == expected
+    assert occupied(order) == {NAMES[0]: (0, False), NAMES[1]: (1, False)}
+    face = card_face(order)
+    assert "该类型尚未经真实回读验证，已转人工" in face and face.count("已转人工") == 1
+    archive_success(order, card)
+    assert order.orders().run_once() is True and order.mingdao.sent == [1]
+    assert notices(order) == {"order_done": "登记 1 · 版本 1 · 条目 1 · " + ORDER_NOTICES["done"]}
+    listener, transport = deliver(order)
+    listener.maintain()
+    text, = sent(transport)
+    assert "条目 1 · " + ORDER_NOTICES["done"] in text and "条目 2" not in text
+    assert query(order.path, "SELECT status FROM trial_card") == [("done",)]
+    assert handoffs(order) == expected
+    assert occupied(order) == {NAMES[0]: (0, False), NAMES[1]: (1, False)}
+    listed = [r for r in recovery_rows(order) if r["kind"] == "order_handoff"]
+    assert [(r["registration"], r["version"], r["item"], r["name_fp"]) for r in listed] == [
+        (1, 1, 2, name_fingerprint(name_key(NAMES[1])))]
+
+
+def test_card_time_handoff_not_registered_twice_when_batch_closes(order, monkeypatch):
+    """部分拟建的卡在建单前关闭：合批「未建单」公告照旧投递，甲按投递端裁决登记移交；乙出卡时已登记，不重复登记。"""
+    issue(order, monkeypatch, eligible=(1,))
+    accept(order.path)
+    with journal_at(order.path) as j:
+        j.rotate("session2", "审批到期")
+    assert "未建单" in notices(order)["closed"]
+    listener, transport = deliver(order)
+    listener.maintain()
+    text, = sent(transport)
+    assert "条目 1、2" in text and "需守望者核对后解除" in text
+    assert handoffs(order) == [(1, 1, 2, name_key(NAMES[1]), None, None), (1, 1, 1, name_key(NAMES[0]), None, None)]
+
+
+def recovery_rows(env):
+    with journal_at(env.path, readonly=True) as j:
+        return recovery(j.db)
+
+
+def test_card_time_handoff_none_eligible_hands_off_everything(order, monkeypatch):
+    """全不拟建：出卡即全部登记移交（卡片只读、整批转人工），建单 0、无收口公告。"""
+    from test_trial_paths import setup_card
+    issue(order, monkeypatch, eligible=())
+    store, _, _, _ = setup_card(order.path)
+    store.db.close()
+    assert handoffs(order) == [(1, 1, 1, name_key(NAMES[0]), None, None), (1, 1, 2, name_key(NAMES[1]), None, None)]
+    assert occupied(order) == {NAMES[0]: (1, False), NAMES[1]: (1, False)}
+    face = card_face(order)
+    assert face.count("该类型尚未经真实回读验证，已转人工") == 2 and '"button"' not in face
+    assert query(order.path, "SELECT readonly FROM trial_card") == [(1,)]
+    assert order.orders().run_once() is False and order.mingdao.sent == []
+    assert notices(order) == {} and query(order.path, "SELECT * FROM trial_order") == []
+
+
+def test_card_time_handoff_unnamed_item_registered_by_registration(order, monkeypatch):
+    """缺可信政策名的未拟建条目：按「登记 × 版本 × 条目」登记（名键留空），不占用任何政策名。"""
+    from test_trial_paths import setup_card
+    store, _, _, _ = setup_card(order.path)  # 仓内夹具的草稿不带政策名，第 2 条为未验证组合
+    store.db.close()
+    assert handoffs(order) == [(1, 1, 2, "", None, None)]
+    assert occupied(order) == {NAMES[0]: (0, False), NAMES[1]: (0, False)}
+
+
+def test_card_time_handoff_blocks_same_name_new_version(order):
+    """同名新版本（取舍 A）：旧版本出卡时乙未拟建、已登记未销清移交；同名新版本出卡且乙拟建 → 机器人对乙 0 发，
+    乙的公告写「需守望者核对后解除」。"""
+    from qianshu.feishu.trial_approval import Journal
+    archived(order)  # 版本 1：甲乙都拟建、存档完成
+    with journal_at(order.path) as j:
+        snapshot = json.loads(j.db.execute("SELECT snapshot FROM trial_card").fetchone()[0])
+        snapshot.update(items=[1, 2], eligible=[1])
+        old = str(uuid5(NS, "card-v0"))
+        Journal(j.db).prepare(old, 1, 0, "session", "区域甲", snapshot, False, NOW)
+        with j.db:
+            j.db.execute("UPDATE trial_card SET status='closed' WHERE card=?", (old,))
+    assert handoffs(order) == [(1, 0, 2, name_key(NAMES[1]), None, None)]
+    assert order.orders().run_once() is True and order.mingdao.sent == [1]
+    assert "须守望者销清移交" in notices(order)["order_cancel:2"]
+    listener, transport = deliver(order)
+    listener.maintain()
+    unbuilt = [t for t in sent(transport) if "条目 2" in t]
+    assert len(unbuilt) == 1 and "未建单" in unbuilt[0] and "需守望者核对后解除" in unbuilt[0]
+    assert [r[:3] for r in handoffs(order)] == [(1, 0, 2), (1, 1, 2)]
+    assert 2 not in order.mingdao.sent
 
 
 # ---------------------------------------------------------------- 守望者子命令与零装配

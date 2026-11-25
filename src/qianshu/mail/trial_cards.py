@@ -64,6 +64,13 @@ def archive_policy(parsed, body):
     return ArchivePolicy(parsed.policy_type.value, tuple(groups))
 
 
+def handed_text(reason):
+    """未拟建条目的卡面文案：原因后写明「已转人工」。"""
+    if reason in ("本次拟建", "转人工"):
+        return "已转人工"
+    return reason.removesuffix("，转人工") + "，已转人工"
+
+
 def decision_pages(trial, row, text, details, parsed, policies, full_review, setup, blocked):
     settings, snapshot, contact = setup
     countries = [d.field_results.get("country") for d in parsed]
@@ -123,6 +130,9 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
         eligible = []
     if readonly:
         lines = [CardLine(line.label, "转人工") if line.text == "本次拟建" else line for line in lines]
+    # 未列为拟建的条目出卡即登记人工移交（Journal.prepare 同一事务），卡面逐条写明「已转人工」。
+    handed = {f"条目 {n}" for n in items if n not in eligible}
+    lines = [CardLine(line.label, handed_text(line.text)) if line.label in handed else line for line in lines]
     details.extend(result_card(page) for page in detail_pages("试运行邮件", lines))
     final = result_card(detail_pages("试运行邮件", [CardLine("本批处理",
         "整批转人工" if readonly else "请在已发送中核对关联申请及本次无条件同意回复，再核验并决定。")])[0])
