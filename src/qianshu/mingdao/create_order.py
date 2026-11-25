@@ -3175,6 +3175,19 @@ def check_search_binding(config, official):
             "同名查询字段与建单政策名称不一致")
 
 
+@contextmanager
+def official_reader(official, token, app_id, *, check=None):
+    timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
+    with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
+        api = Official(official, token, app_id, client)
+        def check_request(request):
+            api.check_wire_request(request)
+            if check is not None:
+                check(api, request)
+        CheckedHTTPTransport(client, check_request)
+        yield api
+
+
 def resume_unknown(ledger, rows, guard, config, config_data, authorizations, official_token, official_app_id):
     state = creation_state(rows)
     require(state in {"attempt", "unknown", "conflict"}, "登记编号已使用")
@@ -3196,10 +3209,7 @@ def resume_unknown(ledger, rows, guard, config, config_data, authorizations, off
                 _UNKNOWN_STOP)
         official = config["official"]
         check_search_binding(config, official)
-        timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
-        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-            api = Official(official, official_token, official_app_id, client)
-            CheckedHTTPTransport(client, api.check_wire_request)
+        with official_reader(official, official_token, official_app_id) as api:
             reconcile_unknown(ledger, api)
     except CredentialConflict:
         raise
@@ -3210,16 +3220,12 @@ def resume_unknown(ledger, rows, guard, config, config_data, authorizations, off
     raise Stop(_UNKNOWN_STOP)
 
 
-def _run_registered(args, directory, clock, guard, config_data, authorizations):
-    config = decode(config_data)
-    login_path = directory / "mingdao-state.json"
-    login_data = private_bytes(login_path)
-    login = decode(login_data)
-    def read_settings():
-        with args.env_file.open(encoding="utf-8-sig") as stream:
-            return dotenv_values(stream=stream, interpolate=False)
+def read_x5_settings(env_file):
+    with env_file.open(encoding="utf-8-sig") as stream:
+        return dotenv_values(stream=stream, interpolate=False)
 
-    secrets = read_settings()
+
+def configure_x5_outlet(guard, secrets, config, login):
     official = config["official"]
 
     def official_setting(key):
@@ -3239,6 +3245,20 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
             credentials[("cookie", index)] = cookie["value"]
     guard.configure(credentials)
     check_configuration(guard, secrets, config)
+    return credentials, official_setting
+
+
+def _run_registered(args, directory, clock, guard, config_data, authorizations):
+    config = decode(config_data)
+    login_path = directory / "mingdao-state.json"
+    login_data = private_bytes(login_path)
+    login = decode(login_data)
+    def read_settings():
+        return read_x5_settings(args.env_file)
+
+    secrets = read_settings()
+    official = config["official"]
+    credentials, official_setting = configure_x5_outlet(guard, secrets, config, login)
     guard.check((_LOCAL_CONFLICT, "create_reserved", "create_attempt", "created", "create_unknown", "aborted_before_write",
                  "approval_closed", "card_published", "create_reconciled_read", "create_reconciled_read_unconfirmed",
                  "readback_unconfirmed", "readback_compared", "delete_attempt", "delete_unconfirmed", "delete_verified",
@@ -3339,10 +3359,7 @@ def _run_registered(args, directory, clock, guard, config_data, authorizations):
         summary = card_summary(values)
         require(not any(secret in summary for secret in (token, official_token, official_app_id)),
                 "展示字段与凭据冲突", CredentialConflict)
-        timeout = httpx.Timeout(_READ_TIMEOUT, connect=_CONNECT_TIMEOUT)
-        with httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False) as client:
-            api = Official(official, official_token, official_app_id, client)
-            CheckedHTTPTransport(client, api.check_wire_request)
+        with official_reader(official, official_token, official_app_id) as api:
             template_id = config["template"]["row_id"]
             require(uuid_record(template_id), "模板记录编号须为 UUID")
             cells = api.detail(api.read(template_id), template_id)
