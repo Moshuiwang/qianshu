@@ -784,37 +784,6 @@ class MingdaoBackend:
             result[spec["label"]] = O.digest(encoded.encode())[:16]
         return result
 
-    def card_face(self, snapshot, item, values):
-        """出卡时冻结的卡面业务值（快照 reviewed）逐项核对建单取值；有任何差异即停单、需重新审批（审核 P1-2）。
-
-        reviewed 是出卡时经校验的草稿（开始日期已按出卡当日顺延），与建单当日重算的取值逐字段比较，跨 UTC 日顺延即不符。
-        """
-        O = self.O
-        reason = "经卡片确认的取值已变化，需重新审批"
-        try:
-            reviewed = snapshot["reviewed"][item - 1]
-            shown = {key: field["value"] for key, field in reviewed.items()
-                     if key in O._ORDER_FIELDS and isinstance(field, dict) and field.get("value") is not None}
-        except (KeyError, IndexError, TypeError, AttributeError):
-            raise O.Stop(reason) from None
-        require(shown.keys() == values.keys() and all(compact(shown[k]) == compact(values[k]) for k in shown), reason)
-        return shown
-
-    def displayed(self, shown, controls, inactive):
-        """台账 displayed 指纹：草稿可变字段取卡面快照值编码；模板、平台与固定字段没有单独的卡面值，取请求值。"""
-        O = self.O
-        result = {}
-        for cell in controls:
-            if cell["controlId"] in self.skip:
-                continue
-            spec = self.config["fields"][cell["controlId"]]
-            key = spec.get("draft")
-            encoded = cell["value"]
-            if key in O._VARIABLE:
-                encoded = O.encode_cell(None if key in inactive else shown.get(key), spec)
-            result[spec["label"]] = O.digest(encoded.encode())[:16]
-        return result
-
     def _proof_window(self):
         O = self.O
         if self.tags:
@@ -836,7 +805,7 @@ class MingdaoBackend:
         projected, assembly = O.x5_projection(values, self.config, inactive)
         O.check_search_binding(self.config, self.config["official"])
         self._proof_window()
-        config = self.config
+        config, base_values = self.config, values
         create = O.CreateRequest(config["create"], evidence if self.evidence is not None
                                  else {"create_endpoint": config["create"]["endpoint"]}, self.login)
         with self._api() as api:
@@ -888,26 +857,55 @@ class MingdaoBackend:
                        for c in O.decode(payload)["receiveControls"] if c["controlId"] not in self.skip}
         fingerprints = self.displayed(shown, controls, inactive)
         require(fingerprints == sent_values, "经卡片确认的取值与请求不一致，需重新审批")
+        # 交接前来源复核的原值（照 X5 bound_sources：模板及关联、网页路径的平台来源）。
+        source = {"values": base_values, "catalog_rate": catalog_rate, "cells": cells, "relations": dict(relations),
+                  "platform": self._platform_digest(sources_read) if self.web else None}
         # 应回读的字段 = 全部已写控件（含 readback_skip：写入值均须回读，CREATE_ORDER.md）。
         written = list(dict.fromkeys(labels[c["controlId"]] for c in O.decode(payload)["receiveControls"]))
         return Plan(values["policy_name"], self.target, written, fingerprints, sent_values, payload,
                     {"controls": controls, "packages": values["packages"], "company": values["company"],
                      "config": config, "approved": approved, "tags": values["user_tags"], "selected": selected,
-                     "tag_version": tag_version})
+                     "tag_version": tag_version, "source": source})
+
+    def _platform_digest(self, sources):
+        """平台来源原值指纹（verified_order_rows 绑定的平台行、资费、标签、同期政策、升包任务）。"""
+        O = self.O
+        return O.digest(compact([[key, initial] for key, (initial, _) in sources.items()]).encode())
+
+    def _local(self):
+        for initial, read in self.bound:
+            require(read() == initial, "建单配置或授权登记已变化，需重新审批")
+
+    def _sources(self, api, source):
+        """照 X5 `_run_registered` 交接前核对：按原标识重读模板及关联；网页路径再以同一 `verified_order_rows`
+        重读并核对平台行、标签详情、资费、同期政策与适用的升包任务。来源变化或读不到即停单、需重新审批（修复轮 2 第 5 条）。"""
+        O = self.O
+        reason = "建单来源已变化，需重新审批"
+        template_id = self.config["template"]["row_id"]
+        cells = api.detail(api.read(template_id), template_id)
+        relations = {key: api.relations(template_id, key) for key in source["relations"]}
+        require(compact(cells) == compact(source["cells"]) and compact(relations) == compact(source["relations"]),
+                reason)
+        if self.web:
+            verified = O.verified_order_rows(api, self.config, self.evidence, source["values"], cells, relations,
+                                             source["catalog_rate"], self.clock)
+            require(self._platform_digest(verified.sources) == source["platform"], reason)
 
     def recheck(self, plan):
-        """交接前复核（照 X5 交接前核对）：证明有效期、标签全名唯一性版本；平台读取之后再核本地配置与授权登记。"""
+        """交接前复核（照 X5 交接前核对）：证明有效期；先核本地配置与授权登记（撤权后不按旧登记查平台）；重读模板及关联与
+        平台来源；标签全名唯一性版本；平台读取之后再核一次本地配置与授权登记。"""
         O = self.O
+        extra = plan.extra
         try:
             self._proof_window()
-            if self.tags:
-                extra = plan.extra
-                with self._api() as api:
+            self._local()
+            with self._api() as api:
+                self._sources(api, extra["source"])
+                if self.tags:
                     current = api.verified_tag_version(self.evidence.get("tag_scope"), extra["tags"],
                                                        extra["selected"], self.clock)
                     require(current == extra["tag_version"], "所选标签全名或版本已变化")
-            for initial, read in self.bound:
-                require(read() == initial, "建单配置或授权登记已变化，需重新审批")
+            self._local()
         except O.OutletConflict:
             raise
         except Exception:

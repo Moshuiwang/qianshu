@@ -136,6 +136,33 @@ def test_preconnect_past_deadline_never_writes(case, platform, business_cli, web
     assert stopped.value.code == "expired" and platform.create_count == 0
 
 
+@pytest.mark.parametrize("change", ["tariff", "template"])
+def test_source_change_during_preconnect_never_writes(case, platform, business_cli, web_order, monkeypatch, change):
+    """修复轮 2 第 5 条：真实 CreateRequest.prepare，预建连期间当前资费计费单位由日改为月（或模板单元格被改）→
+    交接前按 X5 同一路径重读来源，来源变化即停单，endheaders 0 次。"""
+    rules, _, _ = web_order
+    mingdao = backend(case)
+    plan = mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+
+    def slow(host, **kwargs):
+        connection = platform.connection(host, **kwargs)
+        connect = connection.connect
+
+        def preconnect():
+            connect()
+            if change == "tariff":
+                case.rate_rows[0].update(unit="月", cycle=0)
+            else:
+                platform.template[rules["文本"]["control"]] = "预建连期间改动"
+        connection.connect = preconnect
+        return connection
+    monkeypatch.setattr(order, "CreateRequest", partial(order.CreateRequest.func, connect=slow))
+    arm(case, platform)
+    with pytest.raises(NotSent) as stopped:
+        mingdao.send(plan, lambda: pytest.fail("来源变化仍进入交接"))
+    assert stopped.value.code == "plan" and platform.create_count == 0
+
+
 def test_readback_compares_approved_business_values(case, platform, business_cli, web_order):
     rules, _, _ = web_order
     mingdao = backend(case)
