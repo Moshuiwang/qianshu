@@ -756,7 +756,13 @@ def main(argv: list[str] | None = None) -> int:
             with closing(store.db):
                 if args.trial_reconcile:
                     scope, *numbers = args.trial_reconcile
-                    store.reconcile(scope, *map(int, numbers))
+                    from .mail.imap import trial_connect
+                    from .mail.trial import Recovery
+                    config = dict(load_config("MAIL_HOST", "MAIL_USER", "MAIL_PASSWORD",
+                                              env_file=args.business_env_file or args.env_file))
+                    config.setdefault("MAIL_PORT", "993")
+                    reader = Recovery(config, trial_connect, lambda: True)
+                    store.reconcile(scope, *map(int, numbers), refresh=reader.refresh)
                 else:
                     store.import_spend(args.trial_import_spend)
         except FormatHold as exc:
