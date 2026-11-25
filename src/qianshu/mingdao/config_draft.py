@@ -1,18 +1,19 @@
 """从 X5 已登记的表与模板读取 050 配置草稿。"""
+import codecs
 import logging
 import os
 import re
 import sys
 from datetime import UTC, datetime
+from functools import partial
+from io import StringIO
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from . import create_order as x5
 
 FILES = ("order-config.draft.json", "create-authorization.draft.json", "sources.json")
-HANDOFF = {"FEISHU_APP_ID", "FEISHU_APP_SECRET", "FEISHU_CHAT_ID", "FEISHU_BOT_OPEN_ID",
-           "FEISHU_TENANT_KEY", "FEISHU_HANDOFF_OWNER_OPEN_ID", "FEISHU_HANDOFF_MEMBER_OPEN_IDS",
-           "FEISHU_MENTION_LOG"}
+HANDOFF = {"FEISHU_HANDOFF_OWNER_OPEN_ID", "FEISHU_HANDOFF_MEMBER_OPEN_IDS", "FEISHU_MENTION_LOG"}
 OWNER = "待产品负责人确认"
 MISSING = "待人工核对："
 SCOPES = ("tag", "concurrent", "tariffs", "tasks", "products", "plans", "company_rows")
@@ -245,8 +246,63 @@ def authorization(cfg, scopes, app, sources):
     return evidence
 
 
+def handoff_key(name):
+    return name in HANDOFF or name.startswith("FEISHU_HANDOFF_")
+
+
+def official_bindings(stream, *, names):
+    """只为选中的赋值构造 dotenv 输入。跳过值时只扫描分隔符和引号。"""
+    selected = StringIO()
+    chars = codecs.iterdecode(iter(partial(stream.read, 1), b""), "utf-8-sig")
+    for first in chars:
+        char = first
+        header = []
+        while char and char not in "=#\r\n":
+            header.append(char)
+            char = next(chars, "")
+        key = "".join(header).strip()
+        if key:
+            match = re.fullmatch(r"(?:export\s+)?(?:'([^']+)'|([^\s']+))", key)
+            x5.require(match, "官方接口环境配置键无效")
+            key = match.group(1) or match.group(2)
+            x5.require(not handoff_key(key), "凭据文件含转交配置")
+        keep = key in names
+        if keep:
+            selected.write(key)
+        if char == "=":
+            if keep:
+                selected.write("=")
+            char = next(chars, "")
+            while char and char.isspace() and char not in "\r\n":
+                if keep:
+                    selected.write(char)
+                char = next(chars, "")
+            if char in ("'", '"'):
+                quote = char
+                if keep:
+                    selected.write(quote)
+                escaped = False
+                for char in chars:
+                    if keep:
+                        selected.write(char)
+                    if char == quote and not escaped:
+                        break
+                    escaped = char == "\\" and not escaped
+                else:
+                    raise x5.Stop("官方接口鉴权配置无效")
+                char = next(chars, "")
+        while char and char not in "\r\n":
+            if keep:
+                selected.write(char)
+            char = next(chars, "")
+        if keep:
+            selected.write("\n")
+    selected.seek(0)
+    return selected
+
+
 def run(args):
-    x5.require(not HANDOFF.intersection(os.environ), "环境含转交配置")
+    x5.require(not any(map(handoff_key, os.environ)), "环境含转交配置")
     directory = args.out_dir
     x5.require_private_directory(directory, "输出目录须为私有目录")
     for name in FILES:
@@ -258,9 +314,8 @@ def run(args):
     x5.check_search_binding(base, base["official"])
     sources = Sources()
     with x5.outlet_scope() as guard:
-        secrets = x5.read_x5_settings(args.env_file)
-        x5.require(not {"FEISHU_HANDOFF_OWNER_OPEN_ID", "FEISHU_HANDOFF_MEMBER_OPEN_IDS",
-                        "FEISHU_MENTION_LOG"}.intersection(secrets), "凭据文件含转交配置")
+        names = {base["official"][field] for field in ("token_key", "app_id_key")}
+        secrets = x5.read_x5_settings(args.env_file, filter_stream=partial(official_bindings, names=names))
         _, setting = x5.configure_x5_outlet(guard, secrets, base, {"cookies": []})
         guard.check(scopes)
         app = setting("app_id_key")

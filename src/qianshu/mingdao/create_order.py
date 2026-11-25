@@ -3220,7 +3220,10 @@ def resume_unknown(ledger, rows, guard, config, config_data, authorizations, off
     raise Stop(_UNKNOWN_STOP)
 
 
-def read_x5_settings(env_file):
+def read_x5_settings(env_file, *, filter_stream=None):
+    if filter_stream is not None:
+        with env_file.open("rb", buffering=0) as stream:
+            return dotenv_values(stream=filter_stream(stream), interpolate=False)
     with env_file.open(encoding="utf-8-sig") as stream:
         return dotenv_values(stream=stream, interpolate=False)
 

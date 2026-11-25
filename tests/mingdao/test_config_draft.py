@@ -118,3 +118,64 @@ def test_task_projection(invocation, case):
         {"id": task, "company": "合成主体", "package": "合成包", "状态": "合成状态"}]
     assert "私有姓名" not in data.decode()
     assert any(r.method == "GET" and r.url.path.endswith(task) for r in requests)
+
+
+def test_full_business_settings_select_only_official_values(case, invocation, monkeypatch, capsys):
+    args, out, requests = invocation
+    settings = case.private / "synthetic-settings"
+    identifiers = case.config["create"]["identifiers"]
+    business = {
+        "MINGDAO_BASE_URL": case.config["official"]["origin"],
+        "MINGDAO_WORKSHEET_ID": identifiers["worksheetId"],
+        "MINGDAO_VIEW_ID": identifiers["viewId"],
+        "MINGDAO_PROJECT_ID": identifiers["projectId"],
+        "FEISHU_ALLOWED_SENDER_IDS": case.config["configurator"]["id"],
+        "FEISHU_APP_ID": "synthetic-business",
+        **{f"BUSINESS_{i}": f"synthetic-business-{i}" for i in range(20)},
+    }
+    monkeypatch.setenv("FEISHU_APP_ID", business["FEISHU_APP_ID"])
+    with settings.open("a") as stream:
+        for key, value in business.items():
+            stream.write(f"{key}={value}\n")
+        stream.write("IGNORED='first line\nPLACEHOLDER_OFFICIAL_APP=wrong\nFEISHU_HANDOFF_FAKE=x'\n")
+
+    original = draft.x5.configure_x5_outlet
+    def configure(guard, secrets, config, login):
+        assert set(secrets) == {config["official"][k] for k in ("token_key", "app_id_key")}
+        return original(guard, secrets, config, login)
+    monkeypatch.setattr(draft.x5, "configure_x5_outlet", configure)
+    assert draft.main(args) == 0 and requests
+    assert set(path.name for path in out.iterdir()) == set(draft.FILES)
+    stdout, stderr = capsys.readouterr()
+    output = stdout + stderr + "".join((out / name).read_text() for name in draft.FILES)
+    assert all(value not in output for value in (case.official_token, case.ids["official_app"]))
+
+
+@pytest.mark.parametrize("field", ["token_key", "app_id_key"])
+@pytest.mark.parametrize("value", [None, '"bad value"'])
+def test_missing_or_invalid_auth_zero_requests(case, invocation, field, value):
+    args, out, requests = invocation
+    settings = case.private / "synthetic-settings"
+    name = case.config["official"][field]
+    lines = [line for line in settings.read_text().splitlines() if not line.startswith(name + "=")]
+    if value is not None:
+        lines.append(f"{name}={value}")
+    settings.write_text("\n".join(lines))
+    assert draft.main(args) != 0 and not requests and not list(out.iterdir())
+
+
+@pytest.mark.parametrize("name", ["FEISHU_HANDOFF_OWNER_OPEN_ID", "FEISHU_HANDOFF_FUTURE", "FEISHU_MENTION_LOG"])
+def test_handoff_key_in_file_zero_requests(case, invocation, name):
+    args, out, requests = invocation
+    with (case.private / "synthetic-settings").open("a") as stream:
+        stream.write(f"export '{name}' =\n")
+    assert draft.main(args) != 0 and not requests and not list(out.iterdir())
+
+
+def test_selected_credential_conflict_still_stops(case, invocation):
+    args, out, requests = invocation
+    path = case.private / "base.json"
+    base = draft.x5.decode(path.read_bytes())
+    base["configurator"]["id"] = case.official_token
+    path.write_text(draft.x5.compact(base))
+    assert draft.main(args) != 0 and not requests and not list(out.iterdir())
