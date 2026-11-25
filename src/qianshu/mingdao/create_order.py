@@ -219,7 +219,10 @@ class Outlet:
             lines.append(line)
             offset += len(line)
         self.check_text("".join(lines) + "\r\n", spans)
-        body = request.content.decode("utf-8", "surrogateescape")
+        self.check_body(request.content.decode("utf-8", "surrogateescape"), fields)
+
+    def check_body(self, body, fields=None):
+        """检查请求正文。fields 把顶层字段名映射到凭据位置；豁免区间只绑定该字段且值与凭据相同。"""
         if not fields or not body:
             self.check_text(body)
             return
@@ -2374,13 +2377,38 @@ def read_create_response(response):
 class CreateRequest:
     """单跳、预建连，只有一个不可撤销的请求交付点。"""
 
-    def __init__(self, spec, evidence, token, *, connect=http.client.HTTPSConnection):
+    def __init__(self, spec, evidence, token, *, connect=http.client.HTTPSConnection, app_owner=None):
         endpoint = spec["endpoint"]
         require(endpoint == {"host": _CREATE_HOST, "method": "POST", "path": _CREATE_PATH}
                 and endpoint == evidence["create_endpoint"], "建单写入入口与授权登记不符")
         self.endpoint, self.spec, self._token = endpoint.copy(), spec, token
         self.connect = connect
         self.started = False
+        # 正式单（#154）：建单请求体的 appId 与官方应用 ID 同值时，按该凭据的自有位置放行（字段级豁免）。
+        self.app_owner = app_owner
+
+    def _app_fields(self, guard, body):
+        """app_owner 登记时：顶层 appId 须与该凭据逐字相等且凭据不短于 8 字符，否则按凭据冲突即停。"""
+        if self.app_owner is None:
+            return None
+        app_id = guard.credentials.get(self.app_owner)
+        parsed = decode(body)
+        if not (isinstance(app_id, str) and len(app_id) >= 8 and len(app_id.strip()) >= 8
+                and isinstance(parsed, dict) and type(parsed.get("appId")) is str and parsed["appId"] == app_id):
+            guard.conflict = True
+            raise OutletConflict()
+        return {"appId": self.app_owner}
+
+    def check_body(self, body):
+        """建单请求体的出口检查（规划与预建连共用）。豁免只给顶层 appId 一个字段，其余位置照常按凭据拦截。"""
+        guard = _outlet.get()
+        if guard is None:
+            return
+        fields = self._app_fields(guard, body)
+        if fields is None:
+            guard.check((body, decode(body)))
+            return
+        guard.check_body(body.decode("utf-8", "surrogateescape") if isinstance(body, bytes) else body, fields)
 
     def payload(self, controls):
         identifiers = self.spec["identifiers"]
@@ -2392,9 +2420,10 @@ class CreateRequest:
     @contextmanager
     def prepare(self, body):
         require(not self.started and len(body) <= _LIMIT, "建单请求已尝试或正文过长")
-        check_outlet((self.endpoint, body, decode(body), "Authorization", "md_pss_id ",
+        check_outlet((self.endpoint, "Authorization", "md_pss_id ",
                       "Accept-Encoding", "identity", "Content-Type", "application/json; charset=utf-8",
                       "Content-Length", len(body)))
+        self.check_body(body)
         guard = _outlet.get()
         if guard:
             guard.check(self._token, guard.session_owner)
@@ -2419,7 +2448,8 @@ class CreateRequest:
                 require(not self.started and connection.sock is not None, "建单传输不可用")
                 if guard:
                     guard.require_clear()
-                    guard.check_http(request, headers={"authorization": (guard.session_owner, "md_pss_id ")})
+                    guard.check_http(request, headers={"authorization": (guard.session_owner, "md_pss_id ")},
+                                     fields=self._app_fields(guard, request.content))
                 check_approval()
                 if guard:
                     guard.require_clear()

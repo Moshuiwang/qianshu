@@ -754,6 +754,12 @@ class MingdaoBackend:
         O = self.O
         guard = O.Outlet()
         official = self.config["official"]
+        # 出口按 8 字符片段识别凭据：任一鉴权值短于 8 字符即无法拦截，按凭据冲突停；令牌与应用 ID 须分属两个位置，
+        # 否则建单请求体 appId 的字段级豁免会连带放行令牌。
+        if (official["token_key"] == official["app_id_key"]
+                or not all(isinstance(value, str) and len(value) >= 8 and len(value.strip()) >= 8
+                           for value in (*self.official, self.login))):
+            raise O.OutletConflict()
         guard.configure({official["token_key"]: self.official[0], official["app_id_key"]: self.official[1],
                          ("cookie", 0): self.login})
         guard.session_owner = ("cookie", 0)
@@ -837,7 +843,8 @@ class MingdaoBackend:
         self._proof_window()
         config, base_values = self.config, values
         create = O.CreateRequest(config["create"], evidence if self.evidence is not None
-                                 else {"create_endpoint": config["create"]["endpoint"]}, self.login)
+                                 else {"create_endpoint": config["create"]["endpoint"]}, self.login,
+                                 app_owner=config["official"]["app_id_key"])
         with self._api() as api:
             template_id = config["template"]["row_id"]
             require(O.uuid_record(template_id), "模板记录编号须为 UUID")
@@ -876,7 +883,8 @@ class MingdaoBackend:
             payload = create.payload(controls)
             O.verify_order_request(payload, config, request_cells, request_relations, values, inactive, self.sensitive,
                                    draft["field_results"]["packages"]["statement"])
-            check_outlet((payload, O.decode(payload)))
+            # 明道云建单请求体：只豁免顶层 appId（与官方应用 ID 逐字相等），其余位置照常按凭据拦截。
+            create.check_body(payload)
             require(O.decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
             approved = O.approved_names(controls, config, values, web, plan_names, request_cells) if self.web else None
             if self.web:
@@ -961,7 +969,8 @@ class MingdaoBackend:
         """预建连后先复核来源，再由 handoff 在实际交接处复核；不符或交接前失败均确证未写出。"""
         O = self.O
         create = O.CreateRequest(self.config["create"], self.evidence if self.evidence is not None
-                                 else {"create_endpoint": self.config["create"]["endpoint"]}, self.login)
+                                 else {"create_endpoint": self.config["create"]["endpoint"]}, self.login,
+                                 app_owner=self.config["official"]["app_id_key"])
 
         def check():
             self.recheck(plan)

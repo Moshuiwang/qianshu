@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
+from uuid import uuid4
 
 import pytest
 
@@ -20,6 +21,14 @@ from test_order_field_checks import registered_entry, web_order  # noqa: F401
 
 URL = "https://feishu.cn/docx/FormalArchive1"
 OPTIONS = (Path(order.__file__).resolve().parents[3] / "rules" / "parse-options.tsv").read_bytes()
+
+
+@pytest.fixture(autouse=True)
+def same_app_id(case):
+    """真实部署配置中建单请求体 appId 与官方应用 ID 同值（X5 配置结构所致）；本文件一律按同值配置（复核 rv-2d5 第 4 问）。
+    正式路径要求两者逐字相等，不等即停（另有专测）。"""
+    case.ids["appId"] = case.ids["official_app"]
+    case.config["create"]["identifiers"]["appId"] = case.ids["official_app"]
 
 
 @pytest.fixture(autouse=True)
@@ -274,3 +283,109 @@ def test_formal_authorization_bound_by_config_digest(case, platform, business_cl
     with pytest.raises(NotSent) as stopped:
         runner.backend.send(plan, lambda: pytest.fail("复核不符仍进入交接"))
     assert stopped.value.code == "plan" and platform.create_count == 0
+
+
+# ---------------------------------------------------------------- 建单请求体 appId 字段级豁免（复核 rv-2d5 第 4 问）
+
+def feishu_outlet(case, monkeypatch):
+    """群消息出口替身：与生产同一 checked_transport，试运行凭据含官方令牌与应用 ID；投递走进程内替身 HTTP。"""
+    from unittest.mock import AsyncMock
+
+    import httpx
+
+    from qianshu.feishu import sdk
+    from qianshu.feishu.trial_listener import ApprovalSettings, checked_transport
+    settings = ApprovalSettings("app", "private-app-key", "group", "bot", frozenset({"owner"}), trial_credentials=(
+        ("PLACEHOLDER_OFFICIAL_TOKEN", case.official_token), ("PLACEHOLDER_OFFICIAL_APP", case.ids["official_app"])),
+        trial_credentials_complete=True)
+    sender = checked_transport(settings)
+    sender._tenant_token = AsyncMock(return_value="tenant")
+    posts = []
+
+    def http(request):
+        posts.append(request.content.decode())
+        return httpx.Response(200, json={"code": 0, "data": {"message_id": "receipt"}})
+    client = httpx.AsyncClient
+    monkeypatch.setattr(sdk.httpx, "AsyncClient", lambda **kw: client(transport=httpx.MockTransport(http), **kw))
+    return sender, posts
+
+
+def test_same_app_id_formal_order_sends_once_and_feishu_outlets_still_block(case, platform, business_cli, web_order,
+                                                                           monkeypatch):
+    """同值配置：明道云建单请求体顶层 appId 与官方应用 ID 逐字相等 → 按该凭据自有位置放行，发 1 次、逐字段回读一致；
+    同一用例内，群公告 / 卡片带上该值仍按凭据拦截、0 投递，日志脱敏。"""
+    import io
+    import logging
+
+    from qianshu.feishu.trial_listener import send_trial_message
+    from qianshu.logs import JsonStreamHandler
+    app_id = case.ids["official_app"]
+    mingdao = backend(case)
+    plan = mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    assert json.loads(plan.payload)["appId"] == app_id and platform.create_count == 0
+    arm(case, platform)
+    handed = []
+    record_id = mingdao.send(plan, lambda: handed.append(1))
+    assert handed == [1] and platform.create_count == 1 and record_id == case.ids["created"]
+    verdict, checks = mingdao.readback(plan, record_id, 30)
+    assert verdict == "一致" and [c["字段名"] for c in checks] == plan.request_fields
+    assert all(c["结果"] == "一致" for c in checks)
+    # 飞书出口：同一值进群公告或卡片 → 按凭据拦截，不领投递、不发请求；对照公告照常投递。
+    sender, posts = feishu_outlet(case, monkeypatch)
+    claims = []
+    with pytest.raises(order.CredentialConflict):
+        send_trial_message(sender, "条目 1 · 建单完成，应用 " + app_id, "notice", False, lambda: claims.append(1))
+    with pytest.raises(order.CredentialConflict):
+        send_trial_message(sender, {"excerpt": "应用" + app_id}, "card", True, lambda: claims.append(1))
+    assert posts == [] and claims == []
+    assert send_trial_message(sender, "条目 1 · 建单完成", "plain", False, lambda: claims.append(1)) == "receipt"
+    assert len(posts) == 1 and app_id not in posts[0] and claims == [1]
+    stream = io.StringIO()
+    log = logging.getLogger("test.formal.same_app_id")
+    log.addHandler(JsonStreamHandler(stream, sensitive_values={"PLACEHOLDER_OFFICIAL_APP": app_id}))
+    log.propagate = False
+    log.warning("建单完成 %s", app_id)
+    assert stream.getvalue() and app_id not in stream.getvalue()
+
+
+@pytest.mark.parametrize("change", ["other_field", "partial", "token", "superset", "different"])
+def test_app_id_exemption_bounds_stop_before_sending(case, platform, business_cli, web_order, change):
+    """必停四种：同值进请求体其他字段；部分包含；官方令牌（PAT）进请求体；豁免字段不与应用 ID 逐字相等（超集或另一个值，
+    不是「不豁免但放行」）→ 规划阶段即按凭据冲突停，0 发。"""
+    app_id, identifiers = case.ids["official_app"], case.config["create"]["identifiers"]
+    if change == "other_field":
+        identifiers["projectId"] = app_id
+    elif change == "partial":
+        identifiers["projectId"] = "p-" + app_id[:12]
+    elif change == "token":
+        identifiers["projectId"] = case.official_token
+    elif change == "superset":
+        identifiers["appId"] = app_id + "0"
+    else:
+        identifiers["appId"] = str(uuid4())
+    assert identifiers["appId"] != app_id or change in ("other_field", "partial", "token")
+    with pytest.raises(order.OutletConflict):
+        backend(case).plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    assert platform.create_count == 0
+
+
+def test_short_credential_stops_before_any_request(case, platform, business_cli, web_order):
+    """任一鉴权值短于 8 字符（出口按 8 字符片段识别，短值无法拦截）→ 规划即停，官方读取与建单均 0 次。"""
+    case.config["create"]["identifiers"]["appId"] = "app1234"
+    with pytest.raises(order.OutletConflict):
+        backend(case, official_app_id="app1234").plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    assert platform.create_count == 0 and "template" not in platform.actions
+
+
+def test_send_exemption_bound_to_app_id_field(case, platform, business_cli, web_order):
+    """发送出口单独复演：规划通过后，请求体 projectId 被换成应用 ID（同值出现在豁免字段以外）→ 预建连出口按凭据冲突停，
+    确证未发出（NotSent），0 发。"""
+    mingdao = backend(case)
+    plan = mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    body = json.loads(plan.payload)
+    body["projectId"] = case.ids["official_app"]
+    plan.payload = order.compact(body).encode()
+    arm(case, platform)
+    with pytest.raises(NotSent):
+        mingdao.send(plan, lambda: pytest.fail("凭据冲突仍进入交接"))
+    assert platform.create_count == 0
