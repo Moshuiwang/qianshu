@@ -7,7 +7,7 @@ from pathlib import Path
 from qianshu.config import ConfigError
 
 
-def check_output_path(path: Path) -> None:
+def check_output_path(path: Path, *, git_env: dict[str, str] | None = None) -> None:
     """仓库内只允许 Git 忽略且尚未跟踪的路径。"""
     try:
         target = path.resolve()
@@ -25,9 +25,10 @@ def check_output_path(path: Path) -> None:
     if ".git" in relative.parts:
         raise ConfigError("输出路径不能位于 Git 元数据目录。")
     # 由输出所在目录定位工作树，使用该工作树的索引。
-    git_env = os.environ.copy()
-    for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
-        git_env.pop(name, None)
+    if git_env is None:
+        git_env = os.environ.copy()
+        for name in ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR"):
+            git_env.pop(name, None)
     try:
         result = subprocess.run(
             ["git", "-C", str(root), "check-ignore", "--quiet", "--", f"./{relative}"],

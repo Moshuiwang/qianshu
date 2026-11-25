@@ -195,30 +195,40 @@ class State:
             """, (self.scope,)).fetchall()
 
     @staticmethod
-    def recovery_list(path: Path) -> list[dict]:
+    @contextmanager
+    def recovery_connection(path: Path):
         """只读打开，即使服务窗口已关闭，也能从私有库交接。"""
         if path.is_symlink() or not path.is_file() or path.stat().st_mode & 0o077:
             raise ValueError("须指定私有入口状态文件。")
         with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as db:
             db.row_factory = sqlite3.Row
-            columns = {c[1] for c in db.execute("PRAGMA table_info(feishu_messages)")}
-            if "digest" not in columns:
-                raise ValueError("入口状态表不存在。")
-            if "stage" not in columns:
-                if "status" not in columns:
-                    return []
-                return [dict(row) for row in db.execute("""
-                    SELECT scope, digest, NULL AS created_ms, NULL AS expires,
-                           CASE WHEN status = 'notice_pending' THEN status ELSE 'legacy_unknown' END AS stage
-                    FROM feishu_messages WHERE status != 'done' ORDER BY scope, digest
-                """)]
+            yield db
+
+    @staticmethod
+    def recovery_list(path: Path) -> list[dict]:
+        with State.recovery_connection(path) as db:
+            return State.unfinished_records(db)
+
+    @staticmethod
+    def unfinished_records(db) -> list[dict]:
+        columns = {c[1] for c in db.execute("PRAGMA table_info(feishu_messages)")}
+        if "digest" not in columns:
+            raise ValueError("入口状态表不存在。")
+        if "stage" not in columns:
+            if "status" not in columns:
+                return []
             return [dict(row) for row in db.execute("""
-                SELECT scope, digest, created_ms, expires, COALESCE(stage, CASE WHEN status = 'notice_pending' THEN status ELSE 'legacy_unknown' END) AS stage
-                FROM feishu_messages
-                WHERE stage NOT IN ('done', 'manual_notified')
-                   OR (stage IS NULL AND status != 'done')
-                ORDER BY scope, created_ms, digest
+                SELECT scope, digest, NULL AS created_ms, NULL AS expires,
+                       CASE WHEN status = 'notice_pending' THEN status ELSE 'legacy_unknown' END AS stage
+                FROM feishu_messages WHERE status != 'done' ORDER BY scope, digest
             """)]
+        return [dict(row) for row in db.execute("""
+            SELECT scope, digest, created_ms, expires, COALESCE(stage, CASE WHEN status = 'notice_pending' THEN status ELSE 'legacy_unknown' END) AS stage
+            FROM feishu_messages
+            WHERE stage NOT IN ('done', 'manual_notified')
+               OR (stage IS NULL AND status != 'done')
+            ORDER BY scope, created_ms, digest
+        """)]
 
     def advance_message(self, digest: str, previous: str, stage: str) -> None:
         with self._write() as db:
