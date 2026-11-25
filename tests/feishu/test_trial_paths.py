@@ -155,3 +155,84 @@ def test_trial_outlet_blocks_before_token_and_sdk(tmp_path):
     with pytest.raises(RuntimeError, match="出口检查器"):
         send_trial_message(transport, "notice", "fixed", False, Mock())
     transport._tenant_token.assert_not_awaited()
+
+
+def test_single_connection_callback_then_disabled_cli_recovery(tmp_path, monkeypatch):
+    import sqlite3
+    from threading import Event
+    from qianshu import __main__ as cli
+    from qianshu.feishu import trial_consumer, trial_listener
+    from qianshu.feishu.state import State
+    from tests.feishu.startup_replay import observe
+    from tests.feishu.test_trial_approval import bind, click
+
+    path = tmp_path / "trial-050.sqlite3"
+    store = Store(path)
+    with store.write() as db:
+        from qianshu.feishu.trial_approval import Journal
+        db.execute("INSERT INTO mailbox(scope,state) VALUES('s','active')")
+        db.execute("INSERT INTO registration(id,scope,version,attachments,status) VALUES(1,'s',1,0,'done')")
+    journal = Journal(store.db)
+    journal.rotate("session", "连接")
+    bind(journal)
+    assert "已核验" in click(journal, "verify")
+    assert "执行器未就绪" in click(journal, "approve")
+    with store.write() as db:
+        db.execute("""UPDATE trial_card SET snapshot=json_set(snapshot,'$.contact','ou_config')""")
+    store.db.close()
+    assert {r["kind"] for r in State.recovery_list(path)} >= {"trial_task", "trial_card"}
+    switch_file = tmp_path / "switches"
+    switch_file.write_text("")
+    monkeypatch.setattr(cli, "load_handoff_settings", lambda *a, **k: (settings(), tmp_path / "mention"))
+    monkeypatch.setattr(trial_consumer, "load_approval_settings", lambda *_: (settings(), tmp_path / "mention"))
+    delivered = Event()
+    observe(monkeypatch, delivered)
+    deliveries = []
+
+    def send(transport, content, uuid, card, claim):
+        claim()
+        deliveries.append(content)
+        delivered.set()
+        return "ok"
+
+    monkeypatch.setattr(trial_listener, "send_trial_message", send)
+    assert cli.main(["--handoff-only", "--trial-switches", str(switch_file)]) == 0
+    with closing(sqlite3.connect(path)) as db:
+        assert db.execute("SELECT status FROM trial_task").fetchone()[0] == "closed"
+        bodies = db.execute("SELECT body FROM trial_notification").fetchall()
+        assert bodies and all("未建单" in row[0] for row in bodies)
+    assert delivered.is_set() and deliveries
+    assert all('<at user_id="ou_config">' in message for message in deliveries)
+
+
+def test_cli_recovery_lists_confirmations_and_approvals(tmp_path, monkeypatch, capsys):
+    # 同一试运行登记库：冻结确认请求与审批恢复事项须由守望者一次调用全部列出。
+    from qianshu import __main__ as cli
+    from qianshu.feishu.trial_approval import Journal
+    from qianshu.mail.trial_state import _REQUEST_SCHEMA
+    from tests.feishu.test_trial_approval import bind, click
+
+    path = tmp_path / "trial-050.sqlite3"
+    store = Store(path)
+    with store.write() as db:
+        db.execute("INSERT INTO mailbox(scope,state) VALUES('s','active')")
+        db.execute("INSERT INTO registration(id,scope,version,attachments,status) VALUES(1,'s',1,0,'done')")
+        db.execute(_REQUEST_SCHEMA)
+        db.execute("""INSERT INTO recovery_request(scope,generation,validity,cursor,freeze_id,actor,requested)
+            VALUES('s',1,1,1,0,0,'2030-01-01T00:00:00+00:00')""")
+    journal = Journal(store.db)
+    journal.rotate("session", "连接")
+    bind(journal)
+    assert "已核验" in click(journal, "verify")
+    assert "执行器未就绪" in click(journal, "approve")
+    store.db.close()
+    for key in ("MAIL_USER", "MAIL_PASSWORD", "MINGDAO_ACCOUNT", "MINGDAO_PASSWORD",
+                "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "AI_BACKUP_API_KEY", "OPENAI_API_KEY"):
+        monkeypatch.delenv(key, raising=False)
+    assert cli.main(["--state", str(path), "--list-recovery"]) == 0
+    output = capsys.readouterr()
+    rows = json.loads(output.out)
+    confirmations = [row for row in rows if "kind" not in row]
+    assert [(row["scope"], row["status"]) for row in confirmations] == [("s", "pending")]
+    assert {row["kind"] for row in rows if "kind" in row} >= {"trial_task", "trial_card"}
+    assert "确认请求数 1" in output.err and "审批恢复事项数" in output.err

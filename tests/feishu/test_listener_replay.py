@@ -161,27 +161,7 @@ def versions(tmp_path_factory):
     return roots
 
 
-def require_endpoint(kind):
-    a, b = socket.socketpair(type=kind)
-    with a, b:
-        try:
-            a.send(b"H")
-            assert b.recv(1) == b"H"
-            a.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 16384)
-            if kind == socket.SOCK_SEQPACKET:
-                a.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12)
-        except PermissionError:
-            pytest.skip(f"沙箱内未跑：{kind.name} 的 I/O 被拒绝")
-
-
-@pytest.fixture(scope="module")
-def stream_io():
-    require_endpoint(socket.SOCK_STREAM)
-
-
-@pytest.fixture(scope="module")
-def packet_io(stream_io):
-    require_endpoint(socket.SOCK_SEQPACKET)
+from ipc_fixtures import packet_io, require_endpoint, stream_io
 
 
 @pytest.fixture(scope="module")
@@ -263,14 +243,51 @@ def test_invalid_plain_config_matches_v040(tmp_path, versions):
 
 @pytest.mark.parametrize("switches", [None, ("false", "false"), ("false", "true"),
                                       ("true", "false"), ("true", "true")])
-def test_production_switches_match_main(tmp_path, versions, switches):
+def test_production_switches_match_main(tmp_path, versions, switches, request):
+    if switches and switches[1] == "true":
+        from test_approval_runtime import ready, scenario, send
+
+        enabled = switches[0] == "true"
+        if enabled:
+            request.getfixturevalue("packet_io")
+        main_source = request.getfixturevalue("baseline")
+        baseline = prepare(tmp_path / "main/first")
+        with cli(baseline, main_source) as proc:
+            expected = snapshot(baseline, proc)
+        candidate = scenario(tmp_path / "candidate", "first", "healthy", enabled=enabled)
+        if not enabled:
+            (candidate / "switches").write_text("MAIL_TRIAL_RECEIVE_ENABLED=false\nMAIL_TRIAL_CARD_ENABLED=true\n")
+        with cli(candidate) as proc:
+            send(candidate, 0, "group")
+            assert snapshot(candidate, proc) == expected
+            if enabled:
+                ready(candidate, proc)
+                pid, pgid, _ = json.loads((candidate / "child-facts").read_text())
+                assert pid != proc.pid and pgid == proc.pid
+            else:
+                diagnostic = candidate.parent / "machine/supervisor.log"
+                until(lambda: diagnostic.exists() and "CRITICAL E-TRIAL-DISABLED " in diagnostic.read_text(), proc)
+                send(candidate, 1, [1, "verify"])
+                until(lambda: any(k == "toast" and v == ["1", "审批暂不可用"]
+                                  for k, v, _ in observations(candidate)), proc)
+        if enabled:
+            for case, source in ((baseline, main_source), (candidate, CANDIDATE)):
+                off = prepare(case.parent / "closed", switches=("false", "false"))
+                # 接管实例沿用前一实例的转交配置，否则转交库按配置指纹拒绝打开。
+                (off / "settings").write_text((case / "settings").read_text())
+                (off / "takeover").touch()
+                with cli(off, source) as proc:
+                    resumed = snapshot(off, proc, end=1020, takeover=True)
+                    if case == baseline:
+                        expected = resumed
+                    else:
+                        assert resumed == expected
+                    assert not any(t == "mail" for t, _, _ in observations(off))
+        return
+
     def replay(root, source):
         case = prepare(root / "first", switches=switches)
         with cli(case, source) as proc:
-            if switches == ("false", "true"):
-                assert proc.wait(45) == 1
-                assert [row[0] for row in observations(case)] == ["installed"]
-                return 1
             result = snapshot(case, proc)
             replies = [value for tag, value, _ in observations(case) if tag == "ordinary"]
             assert [v["code"] for _, v in replies] == [200, 500]

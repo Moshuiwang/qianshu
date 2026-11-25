@@ -81,7 +81,7 @@ def fault_writer(path):
 
 
 @contextmanager
-def listener_logs(service_logger):
+def listener_logs(service_logger, *, socket_logs=False):
     # 监听和收信的业务线程可能正持锁，根处理器只由后台线程调用。
     def emit(record):
         if isinstance(record, logging.LogRecord):
@@ -94,9 +94,16 @@ def listener_logs(service_logger):
     loggers = [logging.getLogger(name) for name in
                ("qianshu.feishu.handoff", "qianshu.feishu.sdk", "qianshu.mail.trial")]
 
+    if socket_logs:
+        loggers.extend(logging.getLogger(name) for name in ("websockets.client", "asyncio"))
+
     def forward(record):
         if current_thread() is writer.thread:
             return True
+        if socket_logs and record.name in {"websockets.client", "asyncio"}:
+            # 套接字帧与循环异常可能带整帧、凭据或任务 repr，不转交原记录。
+            record = logging.LogRecord(record.name, record.levelno, "", 0, "feishu_connection_diagnostic",
+                                       (), None)
         writer.post(record)
         return False
 

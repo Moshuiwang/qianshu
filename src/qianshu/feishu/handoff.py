@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sqlite3
 import stat
 import time
@@ -475,7 +476,9 @@ class HandoffService:
     """常驻飞书监听。长连接仅注册收件事件，后台回扫与回复共用私有日志。"""
 
     _callback_response_margin = 0
-    _sidecar = None  # 2a 只由离线回放装配。
+    _sidecar = None
+    trial_runtime = None
+    initial_trial_mode = "starting"
 
     def __init__(self, store: MentionLog):
         self.settings = store.settings
@@ -506,6 +509,12 @@ class HandoffService:
         self._scan.set()
         if self._sidecar is not None:
             self._sidecar.connect()
+        elif self.trial_runtime and not self._status_started:
+            try:
+                _thread.start_new_thread(self._bootstrap_trial, ())
+                self._status_started = True
+            except RuntimeError:
+                pass
         elif not self._status_started:
             self._status_started = True
             try:
@@ -513,6 +522,29 @@ class HandoffService:
             except RuntimeError:
                 pass
         _LOG.info("feishu_handoff_connected")
+
+    def _bootstrap_trial(self):
+        delay = 1
+        while not self._stop.is_set():
+            try:
+                from .trial_supervisor import TrialSupervisor
+                supervisor = TrialSupervisor(*self.trial_runtime, self, self._trial_logs)
+                ws.loop.call_soon_threadsafe(self._activate_trial, supervisor)
+                return
+            except Exception:
+                try:
+                    with (_MACHINE_LEASE.parent / "supervisor.log").open("a") as stream:
+                        stream.write("CRITICAL E-TRIAL-DISABLED 1\n")
+                except OSError:
+                    pass
+                self._stop.wait(delay)
+                delay = min(delay * 2, 60)
+
+    def _activate_trial(self, supervisor):
+        if not self._stop.is_set():
+            self._sidecar = supervisor
+            if self._origin is not None:
+                supervisor.connect()
 
     @staticmethod
     def _publish_disabled(directory):
@@ -556,7 +588,8 @@ class HandoffService:
                     except Exception:
                         _LOG.warning("feishu_handoff_connect_failed")
                 if self._sidecar is not None:
-                    client._budget.expire(time.monotonic())
+                    if not client._trial_cards:
+                        client._budget.expire(time.monotonic())
                     self._sidecar.pulse()
                 await asyncio.sleep(1)
         finally:
@@ -570,12 +603,20 @@ class HandoffService:
                 await client._disconnect()
 
     def _connection(self):
+        if getattr(self, "trial_runtime", None):
+            from .trial_connection import TrialConnection
+            return TrialConnection(self)
         if self._sidecar is not None:
             from .injected_connection import InjectedConnection
             return InjectedConnection(self)
         return _Connection(self, approvals=False)
 
-    def run(self) -> None:
+    def run(self):
+        if self.trial_runtime:
+            return run_trial_handoff(self)
+        self._run()
+
+    def _run(self) -> None:
         client = self._connection()
         threads = (
             Thread(target=self._recover, name="feishu-handoff-history"),
@@ -599,6 +640,51 @@ class HandoffService:
             self._receipts.shutdown(wait=True, cancel_futures=True)
             for thread in threads:
                 thread.join()
+
+
+def run_trial_handoff(service):
+    from qianshu.mail.trial_diagnostics import listener_logs
+
+    interrupted = False
+
+    def interrupt(signum, frame):
+        nonlocal interrupted
+        interrupted = True
+
+    async def serve(client):
+        task = asyncio.create_task(original(client))
+        try:
+            while not interrupted:
+                done, _ = await asyncio.wait((task,), timeout=0.1)
+                if done:
+                    return task.result()
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    previous = signal.signal(signal.SIGINT, interrupt)
+    try:
+        with listener_logs(logging.getLogger("qianshu.mail.trial"), socket_logs=True) as logs:
+            service._trial_logs = logs
+            original = service._serve
+            service._serve = serve
+            try:
+                service._run()
+            finally:
+                supervisor = service._sidecar
+                if supervisor is not None and supervisor.mode == "receive" and not supervisor.receive_closed.wait(3):
+                    supervisor.close_failed = True
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    if logs.thread.is_alive():
+        return 130 if interrupted else 1
+    if supervisor is None:
+        return 0
+    if supervisor.mode == "receive" and interrupted:
+        if not supervisor.close_failed:
+            signal.raise_signal(signal.SIGINT)
+        return 130
+    return int(supervisor.close_failed)
 
 
 def _utc(ms: int) -> str:

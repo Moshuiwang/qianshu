@@ -2,14 +2,11 @@
 
 import asyncio
 import base64
-import fcntl
 import json
-import socket
-import struct
-import termios
 import time
 from http import HTTPStatus
 
+from .card_reply import try_card_write
 from .frame_budget import MESSAGE, FrameBudget, bounded_wire, current_app
 from .sdk import _CALLBACK_BUDGET, _Connection, _approval_warning, _before_send, ws
 
@@ -151,23 +148,5 @@ class InjectedConnection(_Connection):
         header.key, header.value = ws.HEADER_BIZ_RT, str(round((now - started) * 1000))
         frame.payload = ws.JSON.marshal(response).encode()
         encoded = frame.SerializeToString()
-        # asyncio 的 TLS 层和底层传输均须有完整余量。单循环中检查到
-        # write 之间无 await；Sans-I/O 同步接收整个帧，不进入 drain。
-        tls = getattr(transport, "_ssl_protocol", None)
-        raw = tls._transport if tls else transport
-        if (len(encoded) > 4096 or raw is None or any(
-                t.is_closing() or t.get_write_buffer_size() or t.get_write_buffer_limits()[1] < 16384
-                for t in (transport, raw))):
-            self._drop_card()
-            return
-        try:
-            sock = raw.get_extra_info("socket")
-            if (sock is None or sock.getsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF) // 2 < 16384
-                    or struct.unpack("i", fcntl.ioctl(sock, termios.TIOCOUTQ, bytes(4)))[0]):
-                self._drop_card()
-                return
-            _before_send(self.service, "callback_response", encoded)
-            origin.protocol.send_binary(encoded)
-            origin.send_data()
-        except Exception:
+        if not try_card_write(self.service, origin, encoded):
             self._drop_card()

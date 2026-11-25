@@ -1,6 +1,8 @@
 """试运行审批私有台账。格式 1 仅记录决定，执行器永不可消费。"""
 
 import json
+import os
+import stat
 import sqlite3
 from contextlib import closing, contextmanager
 from hashlib import sha256
@@ -9,8 +11,14 @@ from uuid import uuid4
 from .state import trial_batch
 
 CARD_FORMAT = 1
+MANUAL_NOTICE = "卡片结果未能确认，请配置负责人核对。"
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trial_session(id INTEGER PRIMARY KEY CHECK(id=1), session TEXT);
+CREATE TABLE IF NOT EXISTS trial_interval(session TEXT PRIMARY KEY, opened REAL, closed REAL);
+CREATE TABLE IF NOT EXISTS trial_switch_epoch(
+ epoch TEXT PRIMARY KEY, source TEXT NOT NULL, opened REAL NOT NULL, closed REAL, enabled INTEGER NOT NULL);
+CREATE UNIQUE INDEX IF NOT EXISTS trial_one_switch_epoch ON trial_switch_epoch((1)) WHERE closed IS NULL;
+CREATE TABLE IF NOT EXISTS trial_session_grant(session TEXT PRIMARY KEY, epoch TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS trial_card(
  card TEXT PRIMARY KEY, registration INTEGER, version INTEGER, format INTEGER, session TEXT,
  country TEXT, snapshot TEXT, fingerprint TEXT, readonly INTEGER, sent REAL, expires REAL,
@@ -23,31 +31,85 @@ CREATE TABLE IF NOT EXISTS trial_click_candidate(event TEXT PRIMARY KEY, card TE
 CREATE TABLE IF NOT EXISTS trial_receipt(card TEXT, action TEXT, event TEXT UNIQUE, actor TEXT,
  created REAL, recorded REAL, fingerprint TEXT, PRIMARY KEY(card,action));
 CREATE TABLE IF NOT EXISTS trial_task(card TEXT PRIMARY KEY, status TEXT);
+CREATE TABLE IF NOT EXISTS trial_update(
+ event TEXT PRIMARY KEY, card TEXT, action TEXT, status TEXT);
+CREATE TABLE IF NOT EXISTS trial_feedback(
+ event TEXT PRIMARY KEY, uuid TEXT UNIQUE, status TEXT);
+CREATE TABLE IF NOT EXISTS trial_item_task(
+ registration INTEGER, version INTEGER, item INTEGER, kind TEXT, card TEXT, status TEXT,
+ PRIMARY KEY(registration,version,item,kind));
+CREATE TABLE IF NOT EXISTS trial_known_record(
+ card TEXT, item INTEGER, record_id TEXT NOT NULL, PRIMARY KEY(card,item));
 CREATE TABLE IF NOT EXISTS trial_notification(card TEXT, kind TEXT, uuid TEXT UNIQUE, body TEXT,
  status TEXT, PRIMARY KEY(card,kind));
 """
 
 
 @contextmanager
-def journal_at(path):
-    with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=rw", uri=True, timeout=0.25)) as db:
+def journal_at(path, *, readonly=False):
+    # 先验证私有目录与登记文件，不用 resolve 把符号链接转换为合法目标。
+    path = path.absolute()
+    directory = path.parent.lstat()
+    meta = path.lstat()
+    if (not stat.S_ISDIR(directory.st_mode) or directory.st_uid != os.getuid()
+            or stat.S_IMODE(directory.st_mode) != 0o700 or path.parent.resolve() != path.parent
+            or not stat.S_ISREG(meta.st_mode) or stat.S_IMODE(meta.st_mode) != 0o600
+            or meta.st_uid != os.getuid() or meta.st_nlink != 1):
+        raise ValueError("审批登记库须为私有普通文件")
+    mode = "ro" if readonly else "rw"
+    with closing(sqlite3.connect(path.as_uri() + "?mode=" + mode, uri=True, timeout=0.25)) as db:
+        # SQLite 返回实际打开的主库路径。复核路径及原 inode 后再交出写能力。
+        opened = db.execute("PRAGMA database_list").fetchone()[2]
+        if opened != str(path) or not os.path.samestat(meta, path.lstat()):
+            raise ValueError("审批登记库在打开期间变更")
         db.row_factory = sqlite3.Row
         yield Journal(db)
 
 
+def has_approval_history(path):
+    if not path.exists():
+        return False
+    with journal_at(path, readonly=True) as journal:
+        return journal.db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_card'").fetchone() is not None
+
+
 def recovery(db):
-    rows = []
-    for table, condition in (("trial_card", "status IN ('preparing','open','accepted','partial')"),
-                             ("trial_task", "status!='closed'"),
-                             ("trial_notification", "status IN ('pending','unknown','blocked')")):
-        rows.extend(dict(row) for row in db.execute(
-            f"SELECT '{table}' AS kind, card, status FROM {table} WHERE {condition}"))
+    # 登记号与版本供人工定位，不将原卡、回调或通知标识送到 CLI。
+    rows = [dict(row) for row in db.execute("""
+        SELECT 'trial_card' AS kind, registration, version, status FROM trial_card
+        WHERE status IN ('preparing','open','accepted','partial')
+        UNION ALL SELECT 'trial_task', c.registration, c.version, t.status
+        FROM trial_task t JOIN trial_card c USING(card) WHERE t.status!='closed'
+        UNION ALL SELECT 'trial_notification', c.registration, c.version, n.status
+        FROM trial_notification n JOIN trial_card c USING(card)
+        WHERE n.status IN ('pending','unknown','blocked','missing_contact')
+        UNION ALL SELECT 'click_candidate', c.registration, c.version, 'manual'
+        FROM trial_click_candidate k JOIN trial_card c USING(card)
+        LEFT JOIN trial_receipt r USING(event) WHERE r.event IS NULL
+        UNION ALL SELECT 'card_intent', registration, version, status FROM card_intent
+        WHERE status IN ('pending','unknown','blocked')
+    """)]
     rows.extend(dict(row) for row in db.execute("""
-        SELECT 'card_intent' AS kind, registration, version, page, status FROM card_intent
-        WHERE status IN ('pending','unknown','blocked')"""))
-    rows.extend(dict(row) for row in db.execute("""
-        SELECT 'mail_notice' AS kind, registration, kind AS notice, status FROM notice
+        SELECT 'mail_notice' AS kind, registration, status FROM notice
         WHERE status IN ('pending','review','unknown','blocked')"""))
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_item_task'").fetchone():
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'item_task' AS kind, registration, version, item, status FROM trial_item_task
+            WHERE status!='closed'"""))
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_feedback'").fetchone():
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'update' AS kind, registration, version, u.status FROM trial_update u JOIN trial_card c
+            USING(card) WHERE u.status!='sent'"""))
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'click_feedback' AS kind, status, count(*) AS quantity FROM trial_feedback
+            WHERE status!='sent' GROUP BY status"""))
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'manual_check' AS kind, registration, version, n.status
+            FROM trial_notification n JOIN trial_card c USING(card) WHERE n.kind='result_manual' OR n.kind LIKE 'first_manual:%'"""))
+    if db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_known_record'").fetchone():
+        rows.extend(dict(row) for row in db.execute("""
+            SELECT 'known_record' AS kind, registration, version, r.item, 'readback_pending' AS status
+            FROM trial_known_record r JOIN trial_card c USING(card)"""))
     return rows
 
 
@@ -61,9 +123,25 @@ class Journal:
             if statement.strip():
                 self.db.execute(statement)
 
+    def notice_counts(self):
+        return self.db.execute("""SELECT
+            (SELECT count(*) FROM trial_notification WHERE kind='result_manual' OR kind GLOB 'first_manual:*'),
+            (SELECT count(*) FROM trial_notification WHERE status NOT IN ('sent','cancelled')) +
+            (SELECT count(*) FROM trial_feedback WHERE status!='sent')""").fetchone()
+
     def session(self):
         row = self.db.execute("SELECT session FROM trial_session WHERE id=1").fetchone()
         return row[0] if row else ""
+
+    def active_epoch(self, source):
+        row = self.db.execute("""SELECT epoch FROM trial_switch_epoch
+                              WHERE closed IS NULL AND enabled=1 AND source=?""", (source,)).fetchone()
+        return row[0] if row else None
+
+    def granted(self, session, created):
+        return self.db.execute("""SELECT 1 FROM trial_session_grant g JOIN trial_switch_epoch e USING(epoch)
+               JOIN trial_interval i USING(session) WHERE g.session=? AND e.enabled=1 AND e.closed IS NULL
+               AND i.closed IS NULL AND max(i.opened,e.opened)<=?""", (session, created)).fetchone() is not None
 
     def prepare(self, card, reg, version, session, country, snapshot, readonly, sent):
         packed = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
@@ -93,26 +171,65 @@ class Journal:
             raise ValueError("群消息回执未知")
         self.db.execute("INSERT INTO trial_delivery VALUES(?,?)", (key, message))
 
-    def notify(self, row, kind, reason):
+    def notify(self, row, kind, reason, *, items=None):
         snapshot = json.loads(row["snapshot"])
-        items = "、".join(str(i) for i in snapshot["items"])
+        items = "、".join(str(i) for i in (snapshot["items"] if items is None else items))
         missing = "、".join(snapshot["missing"]) or "无"
         body = f"登记 {row['registration']} · 条目 {items} · {reason}。待补项：{missing}。"
         self.db.execute("INSERT OR IGNORE INTO trial_notification VALUES(?,?,?,?,'pending')",
                         (row["card"], kind, str(uuid4()), body))
 
-    def close(self, row, reason):
-        self.db.execute("UPDATE trial_card SET status='closed' WHERE card=?", (row["card"],))
-        self.db.execute("UPDATE trial_task SET status='closed' WHERE card=?", (row["card"],))
-        self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
-                        AND kind='remind' AND status='pending'""", (row["card"],))
-        self.notify(row, "closed", reason + "，未建单，转人工")
+    def manual(self, card, request_id=None):
+        # 首发用已登记的请求键；原卡改写用只属于该登记版本的卡键。
+        kind = "result_manual" if request_id is None else "first_manual:" + request_id
+        self.db.execute("""INSERT OR IGNORE INTO trial_notification VALUES(
+            ?, ?, ?, ?, 'pending')""", (card, kind, str(uuid4()), MANUAL_NOTICE))
 
-    def rotate(self, session, reason):
+    def reconcile_updates(self):
+        for row in self.db.execute("SELECT DISTINCT card FROM trial_update WHERE status='pending'"):
+            self.manual(row[0])
+        self.db.execute("UPDATE trial_update SET status='manual' WHERE status='pending'")
+
+    def close(self, row, reason):
+        card = row["card"]
+        safe = {"executor_unavailable", "closed"}
+        legacy = self.db.execute("SELECT status FROM trial_task WHERE card=?", (card,)).fetchone()
+        tasks = dict(self.db.execute("SELECT item,status FROM trial_item_task WHERE card=?", (card,)))
+        known = {r[0] for r in self.db.execute("""SELECT item FROM trial_known_record
+                         WHERE card=? AND length(trim(record_id))>0""", (card,))}
+        uncertain = {item for item, status in tasks.items() if status not in safe}
+        self.db.execute("UPDATE trial_card SET status='closed' WHERE card=?", (card,))
+        self.db.execute("""UPDATE trial_item_task SET status='closed' WHERE card=? AND status='executor_unavailable'
+                        AND item NOT IN (SELECT item FROM trial_known_record WHERE card=?)""", (card, card))
+        self.db.execute("UPDATE trial_task SET status='closed' WHERE card=? AND status='executor_unavailable'", (card,))
+        self.db.execute("""UPDATE trial_notification SET status='cancelled' WHERE card=?
+                        AND kind='remind' AND status='pending'""", (card,))
+        if not known and not uncertain and (not legacy or legacy[0] in safe):
+            self.notify(row, "closed", reason + "，未建单，转人工")
+            return
+        for item in sorted(set(json.loads(row["snapshot"])["items"]) | known | uncertain):
+            if item in known:
+                detail = "已有记录待回读，请按私有登记只读核对"
+            elif item in uncertain or (legacy and legacy[0] not in safe):
+                detail = "结果未知，请人工到明道云核对"
+            else:
+                detail = "未建单，转人工"
+            self.notify(row, f"closed_{item}", reason + "，" + detail, items=[item])
+
+    def rotate(self, session, reason, *, instant=None):
         with self.db:
             self.db.execute("BEGIN IMMEDIATE")
             self.initialize()
+            self.reconcile_updates()
+            if instant is not None:
+                self.db.execute("UPDATE trial_interval SET closed=? WHERE closed IS NULL", (instant,))
+                if session:
+                    self.db.execute("INSERT INTO trial_interval VALUES(?,?,NULL)", (session, instant))
             for row in self.db.execute("SELECT * FROM trial_card WHERE status IN ('preparing','open','accepted','partial')"):
+                if row["status"] in ("preparing", "partial"):
+                    for key, in self.db.execute("""SELECT uuid FROM card_intent WHERE registration=? AND version=?
+                                                AND status!='sent'""", (row["registration"], row["version"])):
+                        self.manual(row["card"], key)
                 self.close(row, reason)
             self.db.execute("INSERT OR REPLACE INTO trial_session VALUES(1,?)", (session,))
 
@@ -136,7 +253,7 @@ class Journal:
             return self.db.execute("INSERT OR IGNORE INTO trial_event VALUES(?,0)", (event,)).rowcount == 1
 
     def action(self, session, card, reg, version, message, action, event, actor, created,
-               clock, current, member, switches, *, reason="", claimed=False):
+               clock, current, member, switches, *, reason="", claimed=False, queue_update=False):
         refused = "卡片绑定、身份或有效期不符"
         reload_switches = switches if callable(switches) else None
         if reload_switches:
@@ -148,6 +265,8 @@ class Journal:
             if not claim.rowcount:
                 return "该回调已处理"
             row = self.db.execute("SELECT * FROM trial_card WHERE card=?", (card,)).fetchone()
+            if (queue_update and not self.granted(session, created)):
+                return refused
             if (not row or row["format"] != CARD_FORMAT or not session or session != self.session()
                     or session != row["session"] or row["readonly"] or row["status"] != "open"
                     or (reg, version) != (row["registration"], row["version"])
@@ -189,7 +308,8 @@ class Journal:
                     return refused
                 if action == "approve" and latest.get("MAIL_TRIAL_CREATE_ENABLED") != "true":
                     return "建单未开启"
-            if not current() or clock() >= row["expires"] or session != self.session():
+            if (not current() or clock() >= row["expires"] or session != self.session()
+                    or (queue_update and not self.granted(session, created))):
                 return refused
             if not self.db.execute("SELECT 1 FROM trial_card WHERE card=? AND status='open'",
                                    (card,)).fetchone() or trial_batch(self.db, reg, version)[3]:
@@ -198,6 +318,8 @@ class Journal:
                     SELECT card,action,event,actor,created,recorded,fingerprint FROM trial_click_candidate
                     WHERE event=?""", (event,)).rowcount:
                 return "已记录"
+            if queue_update:
+                self.db.execute("INSERT INTO trial_update VALUES(?,?,?,'pending')", (event, card, action))
             if action == "verify":
                 return "邮件审批已核验"
             if action == "reject":
@@ -205,4 +327,6 @@ class Journal:
                 return "已驳回"
             self.db.execute("UPDATE trial_card SET status='accepted' WHERE card=?", (card,))
             self.db.execute("INSERT INTO trial_task VALUES(?,'executor_unavailable')", (card,))
+            self.db.executemany("""INSERT INTO trial_item_task VALUES(?,?,?,'formal',?,'executor_unavailable')""",
+                                ((reg, version, item, card) for item in snapshot["eligible"]))
             return "有效同意已记录，执行器未就绪"

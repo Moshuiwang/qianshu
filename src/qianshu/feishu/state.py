@@ -207,6 +207,9 @@ class State:
     @staticmethod
     def recovery_list(path: Path) -> list[dict]:
         with State.recovery_connection(path) as db:
+            if db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='trial_card'").fetchone():
+                from .trial_approval import recovery
+                return recovery(db)
             return State.unfinished_records(db)
 
     @staticmethod

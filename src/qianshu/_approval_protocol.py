@@ -5,3 +5,4 @@ from struct import Struct
 PACKET_LIMIT = 8192
 ENVELOPE = Struct("!QQdd")  # 原连接、消费代次、首片单调时刻、截止。
 SNAPSHOT = Struct("!dQQ")  # 采样单调时刻、已读、已办结。
+SERVICE_STATUS = Struct("!BQQ")  # 建单开关、人工核对数、待核通知数。

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 import pytest
 
 from qianshu.feishu import Settings, Window, fingerprint
+from ipc_fixtures import baseline, packet_io, stream_io
 
 
 @pytest.fixture

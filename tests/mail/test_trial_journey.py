@@ -1,4 +1,5 @@
 import json
+import logging
 import sqlite3
 import sys
 import unicodedata
@@ -11,6 +12,7 @@ from threading import Event
 import httpx
 import pytest
 
+from tests.feishu.startup_replay import observe
 from trial_segments import Inbox, Segments, fixture_item, synthetic
 
 from qianshu.ai import anthropic
@@ -319,7 +321,7 @@ def test_existing_listener_lease_precedes_trial_worker(tmp_path, monkeypatch):
     assert not (tmp_path / "trial-050.sqlite3").exists()
 
 
-def test_cli_disabled_trial_preserves_listener_and_skips_mail(tmp_path, monkeypatch):
+def test_cli_disabled_trial_preserves_listener_and_skips_mail(tmp_path, monkeypatch, caplog):
     from qianshu.__main__ import main
     from qianshu.feishu.handoff import HandoffService
     file = tmp_path / "handoff"
@@ -333,7 +335,20 @@ def test_cli_disabled_trial_preserves_listener_and_skips_mail(tmp_path, monkeypa
     argv = ["--env-file", str(file), "--business-env-file", str(file), "--handoff-only", "--trial-switches", str(switches)]
     assert main(argv) == 0 and called == [1]
     switches.write_text("MAIL_TRIAL_CARD_ENABLED=true\n")
-    assert main(argv) == 1 and called == [1]
+    monkeypatch.undo()
+    monkeypatch.setattr(logging.getLogger("qianshu"), "handlers", [caplog.handler])
+    from unittest.mock import Mock
+    from qianshu.feishu import trial_listener
+    from qianshu.mail import trial
+    forbidden = [Mock(side_effect=AssertionError) for _ in range(3)]
+    for target, name, probe in zip((trial, trial_listener, trial.Trial), ("mail_worker", "Listener", "run"), forbidden):
+        monkeypatch.setattr(target, name, probe)
+    listen, dial, socket = observe(monkeypatch)
+    assert main(argv) == 0
+    assert listen.call_count == dial.await_count == 1
+    assert any(r.levelno == logging.CRITICAL and r.getMessage() == "E-TRIAL-DISABLED" for r in caplog.records)
+    assert socket.callback_responses[-1]["toast"]["content"] == "审批暂不可用"
+    assert all(probe.call_count == 0 for probe in forbidden)
     assert not (tmp_path / "trial-050.sqlite3").exists()
 
 
@@ -482,7 +497,6 @@ def test_legacy_review_preserves_initial_boundary_without_reading_history(tmp_pa
 
 def test_cli_import_and_receive_only_service_use_same_private_ledger(tmp_path, monkeypatch):
     from qianshu import __main__ as entry
-    from qianshu.feishu.handoff import HandoffService
     state = tmp_path / "trial-050.sqlite3"
     assert entry.main(["--state", str(state), "--trial-import-spend", "1.25"]) == 0
     assert entry.main(["--state", str(state), "--trial-import-spend", "0"]) == 1
@@ -495,14 +509,6 @@ def test_cli_import_and_receive_only_service_use_same_private_ledger(tmp_path, m
     switches = tmp_path / "switches"
     switches.write_text("MAIL_TRIAL_RECEIVE_ENABLED=true\n")
     inbox, finished, notices, models = Inbox(), Event(), [], []
-
-    def init(service, store):
-        service.store = store
-        service.transport = object()
-
-    def listen(service):
-        with service.store.listener():
-            assert finished.wait(30)
 
     def two_polls(trial):
         try:
@@ -523,8 +529,7 @@ def test_cli_import_and_receive_only_service_use_same_private_ledger(tmp_path, m
             "content": [{"type": "text", "text": "是"}], "stop_reason": "end_turn",
             "usage": {"input_tokens": 20, "output_tokens": 1}})
 
-    monkeypatch.setattr(HandoffService, "__init__", init)
-    monkeypatch.setattr(HandoffService, "run", listen)
+    observe(monkeypatch, finished)
     monkeypatch.setattr(Trial, "run", two_polls)
     monkeypatch.setattr(anthropic, "_direct_transport", lambda _: httpx.MockTransport(response))
     monkeypatch.setattr(entry, "_send_trial_message", lambda transport, content, uid, card, check:

@@ -6,7 +6,7 @@ if __name__ == "__main__" and __spec__ is None:
     import sys
     from pathlib import Path
 
-    if len(sys.argv) not in (4, 5):
+    if len(sys.argv) not in (4, 5) and not (len(sys.argv) == 10 and sys.argv[4] == "--service"):
         raise SystemExit(1)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from qianshu._approval_child import run
@@ -753,6 +753,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--mingdao-config", type=Path, help="仅转交监听器用于定位官方接口令牌键名的明道云 JSON 配置。")
     parser.add_argument("--list-recovery", action="store_true", help="只读列出私有入口库未完成事项，供守望者上报。")
     parser.add_argument("--trial-switches", type=Path, help="常驻转交服务的试运行私有开关文件")
+    parser.add_argument("--trial-publish-switches", type=Path, help="在私有登记中发布经确认的本次试运行开关修订")
     parser.add_argument("--trial-import-spend", help="一次性登记已核定的开发期累计美元金额")
     parser.add_argument("--trial-reconcile", nargs=4, metavar=("SCOPE", "GEN", "VALIDITY", "NEXT"),
                         help="按已核准的代次与水位登记确认请求，由常驻收信服务复核")
@@ -762,6 +763,18 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(_GUARDIAN_HELP)
     if args.retry_of is not None and (not args.trial_reconcile or args.retry_of < 1):
         parser.error("--retry-of 需要确认命令及正整数编号。")
+    if args.trial_publish_switches:
+        if (args.state is None or args.state.name != "trial-050.sqlite3" or
+                any((args.inject, args.handoff_only, args.mail, args.trial_switches, args.list_recovery,
+                     args.trial_import_spend is not None, args.trial_reconcile))):
+            parser.error("试运行开关发布须独立指定 --state 私有目录/trial-050.sqlite3。")
+        from .feishu.trial_consumer import publish_switches
+        try:
+            publish_switches(args.trial_publish_switches, args.state)
+        except Exception:
+            print("试运行开关发布失败，请核对私有开关及登记库。", file=sys.stderr)
+            return 1
+        return 0
     if args.trial_import_spend is not None or args.trial_reconcile:
         if (args.state is None or args.state.name != "trial-050.sqlite3"
                 or any((args.mail, args.handoff_only, args.trial_switches, args.inject, args.list_recovery))
@@ -797,18 +810,29 @@ def main(argv: list[str] | None = None) -> int:
                 tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
                 if "feishu_messages" in tables:
                     rows = State.unfinished_records(db)
-                    label = "未完成记录数"
-                elif {"mailbox", "registration"} <= tables:
-                    from .mail.trial_state import Store
-                    rows = Store.confirmation_list(args.state, db)
-                    label = "确认请求数"
+                    label = f"未完成记录数 {len(rows)}"
                 else:
-                    raise ValueError("无法识别登记库。")
+                    # 试运行登记库同时承载收信确认与审批：确认请求在前（无 kind 字段），
+                    # 审批恢复事项随后（各带 kind），守望者一次调用即可看全。
+                    rows, counts = [], []
+                    if {"mailbox", "registration"} <= tables:
+                        from .mail.trial_state import Store
+                        confirmations = Store.confirmation_list(args.state, db)
+                        rows.extend(confirmations)
+                        counts.append(f"确认请求数 {len(confirmations)}")
+                    if "trial_card" in tables:
+                        from .feishu.trial_approval import recovery
+                        approvals = recovery(db)
+                        rows.extend(approvals)
+                        counts.append(f"审批恢复事项数 {len(approvals)}")
+                    if not counts:
+                        raise ValueError("无法识别登记库。")
+                    label = "；".join(counts)
         except (OSError, ValueError, sqlite3.Error):
             print("恢复清单读取失败，请核对私有入口库。", file=sys.stderr)
             return 1
         print(json.dumps(rows, ensure_ascii=False))
-        print(f"{label} {len(rows)}", file=sys.stderr)
+        print(label, file=sys.stderr)
         return 0
     if args.handoff_only:
         if any((args.window_start, args.window_end, args.state, args.inject, args.mail,
@@ -817,25 +841,34 @@ def main(argv: list[str] | None = None) -> int:
         try:
             from .feishu.handoff import HandoffService, MentionLog
 
+            args.mode_probe = None
+            if args.trial_switches:
+                try:
+                    from .config import TrialModeProbe
+                    args.mode_probe = TrialModeProbe(args.trial_switches)
+                except Exception:
+                    # 首连后由审批监督线程重新读取，普通转交仍可启动。
+                    pass
             settings, path = load_handoff_settings(
                 args.env_file, for_listener=True, business_env_file=args.business_env_file,
                 mingdao_config=args.mingdao_config,
             )
             setup_logging({"FEISHU_APP_SECRET": settings.app_secret})
-            if args.trial_switches:
-                from .config import trial_config
+            # 正常私有文件应在首连前确定档位；慢盘仍交给首连后的监督线程。
+            initial = args.mode_probe.values if args.mode_probe and args.mode_probe.done.wait(0.1) else None
+            if initial and initial["MAIL_TRIAL_RECEIVE_ENABLED"] == "true" and initial["MAIL_TRIAL_CARD_ENABLED"] == "false":
                 from .mail.trial import run_service
-                switches = trial_config(args.trial_switches)
-                if switches["MAIL_TRIAL_RECEIVE_ENABLED"] == "true":
-                    fault_code = run_service(args, settings, path, lambda: switches)
-                    if fault_code:
-                        # 租约及转交库已释放。故障退出不能在 logging.shutdown 再次等处理器锁。
-                        if __name__ == "__main__":
-                            os._exit(fault_code)
-                        return fault_code
-                    return 0
-            with MentionLog.listening(path, settings) as store:
-                HandoffService(store).run()
+                result = run_service(args, settings, path, lambda: initial) or 0
+            else:
+                with MentionLog.listening(path, settings) as store:
+                    service = HandoffService(store)
+                    if args.trial_switches:
+                        service.trial_runtime = (args, path)
+                        service.initial_trial_mode = "off" if initial and initial["MAIL_TRIAL_CARD_ENABLED"] == "false" else "starting"
+                    result = service.run() or 0
+            if result and __name__ == "__main__":
+                os._exit(result)
+            return result
         except ConfigError as error:
             print(error, file=sys.stderr)
             return 1

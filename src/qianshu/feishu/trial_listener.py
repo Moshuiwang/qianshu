@@ -15,7 +15,8 @@ from threading import Lock
 from uuid import uuid4
 
 from lark_oapi import RequestOption
-from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+from lark_oapi.api.im.v1 import (CreateMessageRequest, CreateMessageRequestBody, PatchMessageRequest,
+                                     PatchMessageRequestBody, PatchMessageResponse)
 
 from qianshu.config import ConfigError
 from qianshu.mail import _fingerprint
@@ -25,7 +26,7 @@ from .cards import mention
 from .sdk import P2CardActionTriggerResponse, _Transport
 from .settings import Settings
 from .state import CALLBACK_RESPONSE_MARGIN
-from .trial_approval import CARD_FORMAT, journal_at
+from .trial_approval import CARD_FORMAT, MANUAL_NOTICE, journal_at
 
 
 _LOG = logging.getLogger(__name__)
@@ -47,7 +48,8 @@ class OutletUnavailable(CredentialConflict):
 
 
 def send_trial_message(transport, content, request_id, card, check):
-    if (not getattr(transport, "order_http", None) or not callable(getattr(transport, "before_send", None))
+    if (not getattr(transport, "order_http", None) or transport.im.message is not transport.order_http
+            or not callable(getattr(transport, "before_send", None))
             or not callable(getattr(transport, "trial_action", None))):
         raise OutletUnavailable("缺少试运行凭据出口检查器")
     handed_off = False
@@ -135,7 +137,7 @@ def checked_transport(settings, private_dir=None):
             checker.sdk(outlet, value)
             if outlet == "message":
                 check_content(decode(value["content"]))
-            elif outlet == "http" and value[1] == "message":
+            elif outlet == "http" and value[1] in ("message", "patch"):
                 check_content(decode(decode(value[0].content)["content"]))
         if outlet == "http" and value[1] == "message":
             claim = claim_message.get()
@@ -186,6 +188,7 @@ def approval_setup(path, switches):
 class Listener:
     def __init__(self, path, settings, switches, *, clock=time.time, defer_rotation=False, transport=None):
         self.path, self.settings, self.switches, self.clock = path, settings, switches, clock
+        self.queue_updates = False
         self.origin, self.session, self.connected_at = None, "", 0
         self._rotation_lock = Lock()
         self._pending = None
@@ -221,10 +224,11 @@ class Listener:
                 journal.db.execute("INSERT OR IGNORE INTO trial_target VALUES(1,?)", (expected,))
                 if journal.db.execute("SELECT fingerprint FROM trial_target").fetchone()[0] != expected:
                     raise ConfigError("试运行审批登记与汇报群不匹配")
-            journal.rotate(session, reason)
+            opened = self.clock()
+            journal.rotate(session, reason, instant=opened)
         with self._rotation_lock:
             if self._pending is pending:
-                self.session, self.connected_at, self.origin = session, self.clock(), origin
+                self.session, self.connected_at, self.origin = session, opened, origin
                 self._pending = None
 
     def maintain(self):
@@ -232,7 +236,7 @@ class Listener:
         with journal_at(self.path) as j:
             if self.switches().get("MAIL_TRIAL_CARD_ENABLED") != "true":
                 if j.session():
-                    j.rotate("", "审批已关闭")
+                    j.rotate("", "审批已关闭", instant=self.clock())
             else:
                 j.scan(self.clock(), create_enabled=self.switches().get("MAIL_TRIAL_CREATE_ENABLED") == "true")
             for row in j.db.execute("""SELECT n.*, c.snapshot FROM trial_notification n JOIN trial_card c
@@ -244,7 +248,10 @@ class Listener:
                         if not j.db.execute("""UPDATE trial_notification SET status='unknown'
                             WHERE uuid=? AND status='pending'""", (row["uuid"],)).rowcount:
                             raise ValueError
+                needs_contact = row["kind"] == "remind" or row["kind"].startswith("closed")
                 body = (mention(target, "配置负责人") + " " if target else "") + row["body"]
+                if row["kind"] == "result_manual" or row["kind"].startswith("first_manual:"):
+                    body = MANUAL_NOTICE
                 try:
                     send_trial_message(self.transport, body, row["uuid"], False, claim)
                 except CredentialConflict:
@@ -253,14 +260,80 @@ class Listener:
                         j.db.execute("UPDATE trial_notification SET status='blocked' WHERE uuid=?", (row["uuid"],))
                         if row["kind"] != "manual":
                             j.db.execute("""INSERT OR IGNORE INTO trial_notification VALUES(
-                                ?, 'manual', ?, '本批群通知被拦截，未建单，转人工核对私有登记。', 'pending')""",
+                                ?, 'manual', ?, '本批群通知被拦截，请人工核对私有登记。', 'pending')""",
                                          (row["card"], str(uuid4())))
                     continue
                 with j.db:
-                    j.db.execute("UPDATE trial_notification SET status='sent' WHERE uuid=?", (row["uuid"],))
+                    j.db.execute("UPDATE trial_notification SET status=? WHERE uuid=?",
+                                 ("missing_contact" if needs_contact and not target else "sent", row["uuid"]))
+
+            for row in j.db.execute("SELECT * FROM trial_feedback WHERE status='pending'").fetchall():
+                def claim_feedback():
+                    with j.db:
+                        if not j.db.execute("""UPDATE trial_feedback SET status='unknown'
+                                WHERE uuid=? AND status='pending'""", (row["uuid"],)).rowcount:
+                            raise ValueError
+                try:
+                    send_trial_message(self.transport, MANUAL_NOTICE, row["uuid"], False, claim_feedback)
+                except CredentialConflict:
+                    with j.db:
+                        j.db.execute("UPDATE trial_feedback SET status='blocked' WHERE uuid=?", (row["uuid"],))
+                    continue
+                with j.db:
+                    j.db.execute("UPDATE trial_feedback SET status='sent' WHERE uuid=?", (row["uuid"],))
+
+    def refuse_click(self, data, *, notify=True):
+        event = data.header.event_id
+        if not isinstance(event, str) or not event:
+            raise ValueError("E-TRIAL-DISABLED")
+        with journal_at(self.path) as j, j.db:
+            key = _fingerprint(self.settings.app_id, event)
+            j.db.execute("INSERT OR IGNORE INTO trial_event VALUES(?,1)", (key,))
+            if notify and not j.db.execute("SELECT 1 FROM trial_receipt WHERE event=?", (key,)).fetchone():
+                j.db.execute("INSERT OR IGNORE INTO trial_feedback VALUES(?,?,'pending')",
+                             (key, str(uuid4())))
+
+    async def update_result(self, data):
+        # 只改已提交回执所绑定的原卡，从私有送达登记取得消息号与卡面。
+        key = _fingerprint(self.settings.app_id, data.header.event_id)
+        with journal_at(self.path) as j:
+            row = j.db.execute("""SELECT u.card, u.action, u.status, c.snapshot, d.message
+                FROM trial_update u JOIN trial_card c USING(card)
+                JOIN card_intent i ON i.registration=c.registration AND i.version=c.version
+                JOIN trial_delivery d USING(uuid)
+                WHERE u.event=? ORDER BY i.page DESC LIMIT 1""", (key,)).fetchone()
+            if not row:
+                return False
+            if row["status"] != "pending":
+                return True
+            try:
+                transport = self.transport
+                if not transport.order_http or not callable(transport.before_send):
+                    raise OutletUnavailable("缺少试运行凭据出口检查器")
+                page = json.loads(row["snapshot"])["pages"][-1]
+                if row["action"] != "verify":
+                    page["elements"] = [e for e in page["elements"] if e.get("tag") != "form"]
+                text = {"verify": "邮件审批已核验", "approve": "有效同意已记录，执行器未就绪",
+                        "reject": "已驳回"}[row["action"]]
+                page["elements"].append({"tag": "div", "text": {"tag": "plain_text", "content": text}})
+                with transport.trial_action():
+                    transport.before_send("patch_content", page)
+                    body = PatchMessageRequestBody.builder().content(json.dumps(page, ensure_ascii=False)).build()
+                    request = PatchMessageRequest.builder().message_id(row["message"]).request_body(body).build()
+                    option = RequestOption.builder().tenant_access_token(await transport._tenant_token()).build()
+                    await transport.order_http.async_request(request, option, "patch", PatchMessageResponse)
+            except Exception:
+                with j.db:
+                    j.manual(row["card"])
+                    j.db.execute("UPDATE trial_update SET status='manual' WHERE event=?", (key,))
+            else:
+                with j.db:
+                    j.db.execute("UPDATE trial_update SET status='sent' WHERE event=?", (key,))
+            return True
 
     async def record(self, data, origin, deadline):
-        deadline -= CALLBACK_RESPONSE_MARGIN
+        if not self.queue_updates:
+            deadline -= CALLBACK_RESPONSE_MARGIN
         event, header = data.event, data.header
         session = self.session
         def current():
@@ -279,15 +352,19 @@ class Listener:
                 or not all(isinstance(v, str) and v.strip() for v in (actor, msg, key, value.get("card")))
                 or value.get("action") not in ("verify", "approve", "reject")):
             return response("审批卡格式无效")
+        arrival = self.switches()
+        max_age = (int(arrival.get("MAIL_TRIAL_MEMBER_CHECK_SECONDS", "120")) if self.queue_updates
+                   else self.settings.callback_max_age)
         now = self.clock()
         raw = str(header.create_time)
         if not re.fullmatch(r"\d{1,18}", raw, re.ASCII):
             return response("回调时间不符")
         times = [int(raw)/unit for unit in (1, 1000, 1000000)]
-        times = [t for t in times if max(self.connected_at, now-self.settings.callback_max_age) <= t <= now]
+        times = [t for t in times if max(self.connected_at, now-max_age) <= t <= now]
         if len(times) != 1:
             return response("回调时间不符")
-        arrival = self.switches()
+        if self.queue_updates:
+            key = _fingerprint(self.settings.app_id, key)
 
         def claim_event():
             with journal_at(self.path) as journal:
@@ -310,6 +387,8 @@ class Listener:
         try:
             async with asyncio.timeout(max(0, deadline-time.monotonic())):
                 with getattr(self.transport, "trial_action", nullcontext)():
+                    if not 0 <= self.clock() - times[0] <= max_age:
+                        return response("回调时间不符")
                     member = await self.transport.is_member(actor)
         except Exception:
             return response("未能确认点击人是汇报群成员")
@@ -324,12 +403,15 @@ class Listener:
             except CredentialConflict:
                 _LOG.warning("E-CRED-STOP")
                 reason = "原因已拦截，请人工核对"
+            # 自由文本中的实名和内部编号没有完整字典。群内只回显登记的原因类别。
+            if reason.strip() and reason not in {"字段缺失", "申请材料不完整", "审批依据不足", "原因已拦截，请人工核对"}:
+                reason = "驳回说明请向点击人核对"
             reason = escape(reason.strip())
         def record():
             with journal_at(self.path) as j:
                 return j.action(session, value["card"], value["registration"], value["version"], msg,
                                 value["action"], key, actor, times[0], self.clock,
-                                lambda: current() and self.clock()-times[0] <= self.settings.callback_max_age,
-                                member, switches, reason=reason, claimed=True)
+                                lambda: current() and 0 <= self.clock()-times[0] <= max_age,
+                                member, switches, reason=reason, claimed=True, queue_update=self.queue_updates)
         async with asyncio.timeout(max(0, deadline-time.monotonic())):
             return response(await asyncio.to_thread(record))
