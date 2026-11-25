@@ -509,7 +509,7 @@ class Platform:
 
     @staticmethod
     def response(data, *, success=True, **envelope):
-        return httpx.Response(200, json={"success": success, "error_code": 0, "data": data, **envelope})
+        return httpx.Response(200, json={"success": success, "error_code": 1, "data": data, **envelope})
 
     def connection(self, host, **kwargs):
         platform = self
@@ -3612,3 +3612,25 @@ def test_reentry_gates(reentry, case, business_cli, platform, monkeypatch, mode)
             book.reserve()
     else:
         reentry.frozen()
+
+
+@pytest.mark.parametrize("code_fields", [{"error_code": 1}, {}], ids=["integer-one", "omitted"])
+def test_official_read_accepts_success_code(case, code_fields):
+    data = {"rowId": case.ids["template"]}
+    payload = {"success": True, "data": data, **code_fields}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    with httpx.Client(transport=transport) as client:
+        api = order.Official(case.config["official"], case.official_token, case.ids["official_app"], client)
+        assert api.read(case.ids["template"]) == data
+
+
+@pytest.mark.parametrize(("success", "code"), [
+    (True, 0), (True, 2), (True, True), (True, "1"), (False, 1), (True, 300107),
+])
+def test_official_read_rejects_unconfirmed_result(case, success, code):
+    payload = {"success": success, "data": {"rowId": case.ids["template"]}, "error_code": code}
+    transport = httpx.MockTransport(lambda request: httpx.Response(200, json=payload))
+    with httpx.Client(transport=transport) as client:
+        api = order.Official(case.config["official"], case.official_token, case.ids["official_app"], client)
+        with pytest.raises(order.Stop, match="^官方接口结果未确认$"):
+            api.read(case.ids["template"])

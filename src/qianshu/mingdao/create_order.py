@@ -709,8 +709,8 @@ class Official:
                 "官方接口结果未确认")
         if action == "logs":
             require(no_log_continuation(payload), "状态历史不能证明完整")
-        require(type(payload.get("error_code", 0)) is int and payload.get("error_code", 0) == 0,
-                "官方接口结果未确认")
+        error_code = payload.get("error_code", 1)
+        require(type(error_code) is int and error_code == 1, "官方接口结果未确认")
         data = payload.get("data")
         if action in ("search", "relations", "tariffs", "tag_search") and not row_path:
             require(isinstance(data, dict), "官方分页结果未确认")
