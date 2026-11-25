@@ -10,7 +10,7 @@ from uuid import uuid4
 from qianshu.draft import SourceExcerpt
 from qianshu.feishu.archive import ArchivePolicy, VerifiedArchiveBatch, _FIELDS, preview_archive_batch
 from qianshu.feishu.cards import CardLine, detail_pages, result_card
-from qianshu.feishu.trial_approval import CARD_FORMAT, Journal
+from qianshu.feishu.trial_approval import ARCHIVE_NOTICES, CARD_FORMAT, Journal
 from qianshu.mingdao.create_order import UnverifiedCombination, require_verified_combination
 from qianshu.parse.evidence import verified_value
 from qianshu.pipeline import _FIELD_LABELS
@@ -102,8 +102,13 @@ def decision_pages(trial, row, text, details, parsed, policies, full_review, set
                 reason = "本次拟建"
         lines.append(CardLine(f"条目 {n}", reason))
     preview = material = None
-    if domestic and row["attachments"] == 0 and not blocked and not full_review and policies:
+    if (domestic and row["attachments"] == 0 and not blocked and not full_review and policies
+            and settings.get("MAIL_TRIAL_ARCHIVE_PURPOSE") == "X8a"):
+        # X8a 只授权【测试】单的合成试写，普通申请不得据此发布：不出预览、卡片只读，整批转人工。
+        lines.append(CardLine("存档预览", ARCHIVE_NOTICES["unconfirmed"]))
+    elif domestic and row["attachments"] == 0 and not blocked and not full_review and policies:
         try:
+            # 普通申请只按首次真实发布（X8b）展示；执行时未登记 X8b 即不发布。
             batch = VerifiedArchiveBatch(str(reg), str(version), trial.clock().date(), country, "X8b",
                                          text, tuple(archive_policy(d, text) for d in parsed), True)
             preview = preview_archive_batch(batch, config=trial.config, sensitive_values=trial.sensitive)
