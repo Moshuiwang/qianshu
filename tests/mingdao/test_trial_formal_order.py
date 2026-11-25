@@ -411,3 +411,49 @@ def test_send_exemption_bound_to_app_id_field(case, platform, business_cli, web_
     with pytest.raises(NotSent):
         mingdao.send(plan, lambda: pytest.fail("凭据冲突仍进入交接"))
     assert platform.create_count == 0
+
+
+# ---------------------------------------------------------------- 真实形状合成用例（合入 main #187 / #188 后）
+
+def test_formal_order_real_shapes_list_company_and_error_code_one(case, platform, business_cli, web_order):
+    """真实形状：模板公司单元格为 `[{name, sid}]` 列表（顺序颠倒、sid 大小写不同）、官方接口成功返回为
+    `success=true` + `error_code=1`、建单请求体 appId 与官方应用 ID 同值 → 正式单规划通过、走到发送一次，
+    新单详情的关联单元格（公司、标签、节目包）也用列表形式，逐字段回读一致。"""
+    import httpx
+
+    company = case.control["company"]
+
+    def references(rows):
+        return [{"name": "合成显示名", "sid": row["rowId"].swapcase()} for row in reversed(rows)]
+
+    envelopes = []
+
+    def response(data, *, success=True, **envelope):
+        body = {"success": success, "error_code": 1, "data": data, **envelope}
+        envelopes.append(body)
+        return httpx.Response(200, json=body)
+    platform.response = response
+    platform.template[company] = references(platform.relations[company])
+    assert len(platform.template[company]) == 2
+
+    def detail(row):
+        for key, rows in platform.created_relations.items():
+            row[key] = references(rows)
+    platform.before_read = detail
+    mingdao = backend(case)
+    plan = mingdao.plan(card_snapshot(case), 1, URL, now=time.time(), sent=time.time())
+    assert json.loads(plan.payload)["appId"] == case.ids["official_app"] and platform.create_count == 0
+    cells = {c["controlId"]: c["value"] for c in plan.extra["controls"]}
+    selected, = json.loads(cells[company])
+    assert selected["sid"] in {row["rowId"] for row in platform.relations[company]}
+    arm(case, platform)
+    handed = []
+    record_id = mingdao.send(plan, lambda: handed.append(1))
+    assert handed == [1] and platform.create_count == 1 and record_id == case.ids["created"]
+    assert len(platform.created_relations[company]) == 1
+    verdict, checks = mingdao.readback(plan, record_id, 30)
+    assert verdict == "一致" and [c["字段名"] for c in checks] == plan.request_fields
+    assert all(c["结果"] == "一致" for c in checks)
+    record = platform.rows[record_id]
+    assert isinstance(record[company], list) and record[company][0]["sid"].lower() == selected["sid"].lower()
+    assert envelopes and all(body["success"] is True and body["error_code"] == 1 for body in envelopes)
