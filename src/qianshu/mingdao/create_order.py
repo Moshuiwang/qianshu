@@ -738,7 +738,7 @@ class Official:
                                  params={"pageIndex": page, "pageSize": _RELATION_PAGE_SIZE})
         return list(self.page_rows(fetch, _RELATION_PAGE_SIZE, relation=True))
 
-    def page_rows(self, fetch, requested, *, relation=False, snapshot=None):
+    def page_rows(self, fetch, requested, *, relation=False, snapshot=None, require_page_signal=False):
         reason = "官方关联行结果不完整，需人工" if relation else "官方查询结果不完整"
         total = capacity = None
         count = 0
@@ -760,7 +760,7 @@ class Official:
                 total = reported
             if snapshot is not None:
                 require(result.get("snapshotVersion") == snapshot and total is not None, reason)
-            if "tag_search" in self.config and not relation:
+            if require_page_signal or ("tag_search" in self.config and not relation):
                 require(total is not None or type(result.get("hasMore")) is bool, reason)
             for row in rows:
                 require(isinstance(row, dict) and uuid_record(row.get("rowId")),
@@ -803,7 +803,7 @@ class Official:
         require(status is not None, error)
         return Record(record_id, name, status, utc(raw["_updatedAt"], platform=True), state)
 
-    def find(self, name, fold=None):
+    def find(self, name, fold=None, *, require_page_signal=False):
         """官方同名查询：明道云端按原串精确查询。fold 为归一函数时（#154 正式单传入 `name_key`），查询前按它算出
         本条的归一名，返回后候选行名称按同一函数归一、与本条相同即算同名命中；未传时按原串逐字相等（X5 不变）。"""
         same = fold or (lambda value: value)
@@ -818,7 +818,7 @@ class Official:
                     "viewId": view, "pageSize": self.page_size, "pageIndex": page,
                     "filter": {"type": "group", "logic": "AND", "children": [condition]},
                 })
-            for row in self.page_rows(fetch, self.page_size):
+            for row in self.page_rows(fetch, self.page_size, require_page_signal=require_page_signal):
                 require(receipt(row.get(control)), "官方查询返回无效名称")
                 key = row["rowId"].lower()
                 previous = records.setdefault(key, (row["rowId"], row[control]))

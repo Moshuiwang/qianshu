@@ -915,7 +915,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--trial-dedupe-request", nargs=3, metavar=("REGISTRATION", "VERSION", "NAME_FP"),
                         help="守望者用：为开放移交登记官方只读查重请求，须带 --reason。")
     parser.add_argument("--trial-dedupe-status", nargs="?", const="", metavar="REGISTRATION",
-                        help="守望者用：读取查重结论与本地台账状态，可按登记号筛选。")
+                        help="守望者用：读取查重结论与本地台账状态，可按登记号筛选。"
+                             "平台有同名含候选行归一后命中。精确名未命中（全半角 / 空白变体未覆盖，需人工比对）"
+                             "须人工到明道云按归一名比对后再判定是否补建。查询异常或总数与续页标志均缺失时记查重失败。")
     parser.add_argument("--member", nargs=3, action="append", metavar=("ITEM", "NAME_FP", "DISPOSITION"),
                         help="按组销清的组成员：条目号、展示名指纹（恢复清单 members[].display_fp）与去向"
                              "（built 已建 / not_built 不建 / merged 合并）。")

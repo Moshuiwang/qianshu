@@ -16,7 +16,8 @@ from qianshu.feishu.trial_order import name_fingerprint, name_key
 from test_create_order import case  # noqa: F401
 
 
-NAMES = ("合成Ａ政策", "合成A政策")
+NAMES = ("合成Ａ 方案", "合成A　方案")
+MISS = "精确名未命中（全半角 / 空白变体未覆盖，需人工比对）"
 KEY = name_key(NAMES[0])
 FP = name_fingerprint(KEY)
 
@@ -39,7 +40,8 @@ def state(case):
 
 
 @pytest.mark.parametrize("mode,expected,count", [
-    ("hit", "平台有同名", 1), ("empty", "无同名", 0), ("partial", "查重失败", None),
+    ("hit", "平台有同名", 1), ("empty", MISS, 0), ("partial", "查重失败", None),
+    ("variant", MISS, 0), ("end_flag", MISS, 0), ("no_signal", "查重失败", None),
     ("conflict", "查重失败", None),
 ])
 def test_channel_uses_only_official_search(case, state, capsys, monkeypatch, mode, expected, count):
@@ -52,10 +54,24 @@ def test_channel_uses_only_official_search(case, state, capsys, monkeypatch, mod
         official["token_key"]: case.official_token, official["app_id_key"]: case.ids["official_app"]})
 
     def exchange(req):
-        name = json.loads(req.content)["filter"]["children"][0]["value"]
+        condition, = json.loads(req.content)["filter"]["children"]
+        assert condition["operator"] == "eq"
+        name = condition["value"]
         calls.append((req.method, req.url.path, name))
         rows = [] if mode == "empty" else [{"rowId": case.ids["created"], case.control["policy_name"]: KEY}]
-        data = {} if mode == "partial" and name == NAMES[1] else {"rows": rows, "total": len(rows)}
+        if mode == "variant":
+            stored = "合成A  方案"
+            assert name_key(stored) == name_key(name) and stored != name
+            rows = [row for row in [{"rowId": case.ids["created"], case.control["policy_name"]: stored}]
+                    if row[case.control["policy_name"]] == name]
+        data = {"rows": rows, "total": len(rows)}
+        if mode == "partial" and name == NAMES[1]:
+            data = {}
+        elif mode == "end_flag":
+            data = {"rows": [], "hasMore": False}
+        elif mode == "no_signal":
+            assert "tag_search" not in official
+            data = {"rows": []}
         return httpx.Response(200, json={"success": True, "data": data})
 
     monkeypatch.setattr(httpx, "Client", partial(httpx.Client, transport=httpx.MockTransport(exchange)))
@@ -76,7 +92,7 @@ def test_channel_uses_only_official_search(case, state, capsys, monkeypatch, mod
     dedupe.recover(state)
     dedupe.scan(state, lookup)
     assert calls == ([] if mode == "conflict" else [
-        ("POST", official["search"]["path"], name) for name in NAMES])
+        ("POST", official["search"]["path"], name) for name in (NAMES[:1] if mode == "no_signal" else NAMES)])
     assert cli.main([*common, "--trial-dedupe-status", "7"]) == 0
     output = capsys.readouterr().out
     assert all(n not in output for n in NAMES)
@@ -129,7 +145,7 @@ def test_worker_scans_without_write_runners(state):
     with archive_worker(None, dedupe=scan, interval=0.01, join=3):
         assert completed.wait(3)
     with journal_at(state, readonly=True) as j:
-        assert dedupe.status(j.db)[0]["status"] == "无同名"
+        assert dedupe.status(j.db)[0]["status"] == MISS
 
 
 def test_guardian_uses_only_registry(state, monkeypatch, capsys):
@@ -143,3 +159,12 @@ def test_guardian_uses_only_registry(state, monkeypatch, capsys):
             cli.main([*args, "--state", str(state)])
     with journal_at(state, readonly=True) as j:
         assert not j.db.execute("SELECT 1 FROM sqlite_schema WHERE name='trial_dedupe'").fetchone()
+
+
+def test_legacy_miss_without_pagination_evidence(state):
+    with journal_at(state) as j, j.db:
+        result = dedupe.request(j, 7, 2, FP, "合成原因")
+        j.db.execute("UPDATE trial_dedupe SET status='无同名', matches=0 WHERE id=?", (result["id"],))
+    with journal_at(state, readonly=True) as j:
+        row, = dedupe.status(j.db)
+    assert (row["status"], row["matches"]) == ("查重失败", None)

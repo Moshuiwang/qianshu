@@ -8,6 +8,9 @@ from .trial_approval import journal_at
 from .trial_order import _card_snapshot, _reviewed_name, group_of, name_fingerprint, name_key, robot_held
 
 
+EXACT_NAME_MISS = "精确名未命中（全半角 / 空白变体未覆盖，需人工比对）"
+
+
 def binding(db, registration, version, fingerprint):
     card, snapshot = _card_snapshot(db, registration, version)
     groups = group_of(snapshot or {})
@@ -36,6 +39,9 @@ def status(db, *, registration=None, request_id=None):
     results = []
     for row in rows:
         result = dict(row)
+        # 旧结论无法证明当次查询有分页结束信号。
+        if result["status"] == "无同名":
+            result.update(status="查重失败", matches=None)
         if result["order_states"] is not None:
             result["order_states"] = json.loads(result["order_states"])
             result["robot_record"] = bool(result["robot_record"])
@@ -75,7 +81,7 @@ def official_matches(config_path, settings, sensitive, names):
         ids = set()
         with O.official_reader(official, token, app) as api:
             for name in names:
-                ids.update(record.lower() for record in api.find(name, fold=name_key))
+                ids.update(record.lower() for record in api.find(name, fold=name_key, require_page_signal=True))
         return len(ids)
     finally:
         O._outlet.reset(scope)
@@ -112,7 +118,7 @@ def scan(path, lookup):
             count = lookup(names)
             if type(count) is not int or count < 0:
                 raise ValueError("官方查重计数不明")
-            conclusion = "平台有同名" if count else "无同名"
+            conclusion = "平台有同名" if count else EXACT_NAME_MISS
         except Exception:
             conclusion, count = "查重失败", None
         with db:
