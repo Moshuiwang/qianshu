@@ -680,13 +680,42 @@ class MingdaoBackend:
         require(not pending, "降包用户取消优惠须确认具体取值")
         return draft, sources, owners, values, inactive
 
+    def card_face(self, snapshot, item, values):
+        """出卡时冻结的卡面业务值（快照 reviewed）逐项核对建单取值；有任何差异即停单、需重新审批（审核 P1-2）。
+
+        reviewed 是出卡时经校验的草稿（开始日期已按出卡当日顺延），与建单当日重算的取值逐字段比较，跨 UTC 日顺延即不符。
+        """
+        O = self.O
+        reason = "经卡片确认的取值已变化，需重新审批"
+        try:
+            reviewed = snapshot["reviewed"][item - 1]
+            shown = {key: field["value"] for key, field in reviewed.items()
+                     if key in O._ORDER_FIELDS and isinstance(field, dict) and field.get("value") is not None}
+        except (KeyError, IndexError, TypeError, AttributeError):
+            raise O.Stop(reason) from None
+        require(shown.keys() == values.keys() and all(compact(shown[k]) == compact(values[k]) for k in shown), reason)
+        return shown
+
+    def displayed(self, shown, controls, inactive):
+        """台账 displayed 指纹：草稿可变字段取卡面快照值编码；模板、平台与固定字段没有单独的卡面值，取请求值。"""
+        O = self.O
+        result = {}
+        for cell in controls:
+            if cell["controlId"] in self.skip:
+                continue
+            spec = self.config["fields"][cell["controlId"]]
+            key = spec.get("draft")
+            encoded = cell["value"]
+            if key in O._VARIABLE:
+                encoded = O.encode_cell(None if key in inactive else shown.get(key), spec)
+            result[spec["label"]] = O.digest(encoded.encode())[:16]
+        return result
+
     def plan(self, snapshot, item, url, *, now, sent):
         O = self.O
         today = datetime.fromtimestamp(now, UTC).date()
         draft, sources, owners, values, inactive = self._values(snapshot, item, today)
-        # 卡片同意时展示的取值须与实际写入一致（如开始日期在出卡后又被顺延，即需重新审批）。
-        require(self._values(snapshot, item, datetime.fromtimestamp(sent, UTC).date())[3] == values,
-                "经卡片确认的取值已变化，需重新审批")
+        shown = self.card_face(snapshot, item, values)
         O.require_verified_combination(self.snapshot, values["policy_type"], values["benefit_type"])
         O.verify_company_inputs(draft, sources, owners, self.snapshot, self.config["template"]["country"]["value"])
         O.check_catalog(values, self.snapshot, draft["field_results"])
@@ -712,11 +741,11 @@ class MingdaoBackend:
             require(O.decode(payload)["receiveControls"] == controls, "请求与已核控件不一致")
             require(not api.find(values["policy_name"]), "已存在同名记录，需人工")
         labels = {c["controlId"]: self.config["fields"][c["controlId"]]["label"] for c in controls}
-        fingerprints = {labels[c["controlId"]]: O.digest(c["value"].encode())[:16] for c in controls
-                        if c["controlId"] not in self.skip}
         sent_values = {labels[c["controlId"]]: O.digest(c["value"].encode())[:16]
                        for c in O.decode(payload)["receiveControls"] if c["controlId"] not in self.skip}
-        return Plan(values["policy_name"], self.target, list(fingerprints), fingerprints, sent_values, payload,
+        fingerprints = self.displayed(shown, controls, inactive)
+        require(fingerprints == sent_values, "经卡片确认的取值与请求不一致，需重新审批")
+        return Plan(values["policy_name"], self.target, list(sent_values), fingerprints, sent_values, payload,
                     {"controls": controls, "packages": values["packages"], "company": values["company"]})
 
     def send(self, plan, handoff):
