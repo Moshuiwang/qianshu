@@ -1,5 +1,6 @@
 """建单来源与回读的合成验收。"""
 from copy import deepcopy
+from datetime import UTC, datetime
 import json
 
 import httpx
@@ -325,7 +326,26 @@ def test_trial_preflight_reproductions(case, platform, business_cli, web_order, 
         assert not queries
 
 
-def test_web_fields_card_request_and_complete_readback(case, platform, business_cli, web_order):
+@pytest.fixture
+def web_clock(request, monkeypatch):
+    if request.param is None:
+        return None
+    instant = datetime(2026, 11, request.param, 12, tzinfo=UTC)
+
+    class FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz):
+            return instant.astimezone(tz)
+
+    monkeypatch.setattr("test_create_order.datetime", FrozenDatetime)
+    return instant
+
+
+@pytest.mark.parametrize("web_clock", [None, 25, 26, 29], indirect=True,
+                         ids=["today", "11-25", "11-26", "11-29"])
+def test_web_fields_card_request_and_complete_readback(web_clock, case, platform, business_cli, web_order):
+    if web_clock is not None:
+        business_cli.now[0] = web_clock.timestamp()
     rules, _, queries = web_order
     code, error = business_cli.run()
     assert (code, error, platform.create_count) == (0, "", 1)
