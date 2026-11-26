@@ -37,9 +37,11 @@ class TrialSupervisor(Sidecar):
             if self.offer(payload, started, deadline - CALLBACK_RESPONSE_MARGIN):
                 if not self.create_enabled and isinstance(value, dict) and value.get("action") == "approve":
                     # 段 3（G516 乙）：子进程状态帧报告的当前有效测试卡只用来选文案；不写建单结果，以群公告为准。
+                    # 复核 rv-3 P2：「登记 × 版本」之外再核卡 UUID；缺失或不一致回「建单未开启」。
                     test = getattr(self, "test_card", None)
-                    if (test and type(value.get("registration")) is int and type(value.get("version")) is int
-                            and (value["registration"], value["version"]) == test[:2]):
+                    if (test and len(test) == 4 and type(value.get("registration")) is int
+                            and type(value.get("version")) is int and isinstance(value.get("card"), str)
+                            and (value["registration"], value["version"], value["card"]) == (test[0], test[1], test[3])):
                         return TEST_PENDING
                     return "建单未开启"
                 return "已收到点击，请以卡片更新为准"

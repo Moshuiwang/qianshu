@@ -64,14 +64,14 @@ def test_card(field):
     只用于监督进程选应答文案，放不放行仍只由子进程核对。"""
     if len(field) != TEST_CARD.size:
         return None
-    flag, registration, version, raw = TEST_CARD.unpack(field)
+    flag, registration, version, *raw = TEST_CARD.unpack(field)
     try:
-        key = raw.rstrip(b"\0").decode()
+        key, card = (value.rstrip(b"\0").decode() for value in raw)
     except UnicodeDecodeError:
         return None
-    if flag != 1 or not registration or not version or not key.strip() or "\0" in key:
+    if flag != 1 or not registration or not version or any(not v.strip() or "\0" in v for v in (key, card)):
         return None
-    return registration, version, key
+    return registration, version, key, card
 
 
 def process_birth(pid):
