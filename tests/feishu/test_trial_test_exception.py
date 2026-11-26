@@ -126,6 +126,7 @@ def runners(env, registry, fake):
     orders = OrderRunner(env.path, switches=lambda: env.switches, backend=fake, connected=lambda: True,
                          ledger_dir=env.tmp, clock=lambda: env.now, pause=pause, readback_seconds=5,
                          registry=registry)
+    archive.orders = orders  # 与生产装配（trial_consumer.assemble）一致：测试卡只在建单执行器已装配时认领
     return archive, orders
 
 
@@ -155,7 +156,7 @@ def test_bound_test_card_runs_once_with_create_off(env):
     with journal_at(env.path) as j:
         assert active_test_card(j.db, registry, NOW + 2) == (1, 1, KEY, card)
     supervisor = TrialSupervisor.__new__(TrialSupervisor)
-    supervisor.mode, supervisor.create_enabled, supervisor.test_card = "cards", False, (1, 1, KEY)
+    supervisor.mode, supervisor.create_enabled, supervisor.test_card = "cards", False, (1, 1, KEY, card)
     supervisor.offer = lambda *args: True
     value = {"action": "approve", "registration": 1, "version": 1, "card": card, "format": 1}
     reply = supervisor.click(b"{}", time.monotonic(), time.monotonic() + 5, {"event": {"action": {"value": value}}})
@@ -336,11 +337,12 @@ def frame(*tail):
 
 @pytest.mark.parametrize("tail,expected", [
     ((), None),
-    ((TEST_CARD.pack(1, 1, 1, KEY.encode()),), (1, 1, KEY)),
-    ((TEST_CARD.pack(2, 1, 1, KEY.encode()),), None),
-    ((TEST_CARD.pack(1, 0, 1, KEY.encode()),), None),
-    ((TEST_CARD.pack(1, 1, 1, b"\xff\xfe"),), None),
-    ((TEST_CARD.pack(1, 1, 1, b""),), None),
+    ((TEST_CARD.pack(1, 1, 1, KEY.encode(), b"live"),), (1, 1, KEY, "live")),
+    ((TEST_CARD.pack(2, 1, 1, KEY.encode(), b"live"),), None),
+    ((TEST_CARD.pack(1, 0, 1, KEY.encode(), b"live"),), None),
+    ((TEST_CARD.pack(1, 1, 1, b"\xff\xfe", b"live"),), None),
+    ((TEST_CARD.pack(1, 1, 1, b"", b"live"),), None),
+    ((TEST_CARD.pack(1, 1, 1, KEY.encode(), b""),), None),
 ])
 def test_frame_compatibility_defaults_to_create_off(tmp_path, tail, expected):
     parent, child = socket.socketpair(socket.AF_UNIX, socket.SOCK_SEQPACKET | socket.SOCK_NONBLOCK)
@@ -353,7 +355,7 @@ def test_frame_compatibility_defaults_to_create_off(tmp_path, tail, expected):
     supervisor = TrialSupervisor.__new__(TrialSupervisor)
     supervisor.mode, supervisor.create_enabled, supervisor.test_card = "cards", False, sidecar.test_card
     supervisor.offer = lambda *args: True
-    value = {"action": "approve", "registration": 1, "version": 1}
+    value = {"action": "approve", "registration": 1, "version": 1, "card": "live"}
     reply = supervisor.click(b"{}", time.monotonic(), time.monotonic() + 5, {"event": {"action": {"value": value}}})
     assert reply == (TEST_PENDING if expected else "建单未开启")
     other = dict(value, version=2)
@@ -447,11 +449,11 @@ def test_real_child_frame_selects_reply_and_old_frame_falls_back(tmp_path):
     parent.connect()
     parent.beat = time.monotonic() + 3600
     try:
-        until(lambda: parent.test_card == (1, 1, KEY))
+        until(lambda: parent.test_card == (1, 1, KEY, "live"))
 
         def reply(version, payload=b"{}"):
             now = time.monotonic()
-            value = {"action": "approve", "registration": 1, "version": version}
+            value = {"action": "approve", "registration": 1, "version": version, "card": "live"}
             return parent.click(payload, now, now + 5, {"event": {"action": {"value": value}}})
         assert reply(1) == TEST_PENDING
         assert reply(2) == "建单未开启"
@@ -463,3 +465,146 @@ def test_real_child_frame_selects_reply_and_old_frame_falls_back(tmp_path):
         until(lambda: not parent.alive)
         for child in parent.children:
             child.wait(5)
+
+
+# ---------------------------------------------------------------- 复核 rv-3：生产装配、X8a 截止、父进程核卡 UUID
+
+def production(env, monkeypatch, *, formal=True, test=None, switches=OFF):
+    """真实生产装配（trial_consumer.assemble → build_runner + build_order_runner）。正式单授权登记按配置摘要绑定
+    （formal 为假时删去）；test 为测试授权条目的改动（None 为不登记测试授权）。只替换飞书传输与时钟，明道云写入另行封住。"""
+    from qianshu.feishu.trial_consumer import assemble
+    from test_trial_order import assembly_inputs
+    monkeypatch.setattr("qianshu.mail.trial.business_config", lambda _: dict(CFG))
+    good, config, _, login = assembly_inputs(env.tmp)
+    registry = login / "create-authorizations.json"
+    entries = json.loads(registry.read_text()) if formal else {}
+    if test is not None:
+        entries[KEY] = {**dict(is_test=True, trial_registration=1, trial_version=1, test_name=NAME,
+                               policy_type="定向政策", benefit_type="组合0", expires="2030-01-02T00:00:00+00:00",
+                               owner_receipt="负责人当场确认"), **test}
+    registry.unlink()
+    registry.write_text(json.dumps(entries, ensure_ascii=False))
+    registry.chmod(0o600)
+    business = env.tmp / "business.env"
+    business.write_text("")
+    args = SimpleNamespace(business_env_file=business, mingdao_config=config)
+    archive, orders = assemble(args, good["settings"], env.path, env.tmp / "mention", switches=lambda: env.switches,
+                               connected=lambda: True, sensitive=())
+    if archive is not None:
+        archive.factory, archive.clock = (lambda cfg: env.fake), (lambda: env.now)
+    if orders is not None:
+        def forbidden(*args, **kwargs):
+            raise AssertionError("本用例不得进入明道云建单")
+        orders.backend.plan = orders.backend.send = forbidden
+    return registry, archive, orders
+
+
+def test_test_card_stops_before_consuming_when_order_runner_not_wired(env, monkeypatch):
+    """复核 rv-3 P1-1：只登记测试授权、未登记正式单授权 → 建单执行器不装配；测试卡在认领前停下，不消耗资格、
+    不发布 X8a，存档外写 0、建单 0，群里固定提示。"""
+    from qianshu.feishu import archive as A
+    from qianshu.feishu.trial_approval import ARCHIVE_NOTICES
+    env.switches = dict(OFF)
+    registry, archive, orders = production(env, monkeypatch, formal=False, test={})
+    assert archive is not None and orders is None and archive.orders is None
+    card, pages = issue(env.path, registry)
+    deliver(env.path, card, pages)
+    assert click(env.path, card, registry)[-1] == "有效同意已记录，将建存档"
+    consumed = Mock(side_effect=AssertionError("不得消耗测试资格"))
+    monkeypatch.setattr(TrialRegistration, "consume", consumed)
+    assert archive.run_once() is False
+    consumed.assert_not_called()
+    assert env.fake.writes == [] and env.fake.reads == []
+    assert query(env.path, "SELECT status, reason FROM trial_archive") == [("failed", "test_runner")]
+    assert query(env.path, "SELECT status FROM trial_card") == [("closed",)]
+    text, = [r[0] for r in query(env.path, "SELECT body FROM trial_notification WHERE kind='archive_failed'")]
+    assert text.endswith(ARCHIVE_NOTICES["test_runner"])
+    assert ARCHIVE_NOTICES["test_runner"] == ("测试单建单执行器未就绪（缺正式授权或配置），未存档未建单，"
+                                              "请守望者核对就绪自检。")
+    with A._database(env.ledger) as grants:
+        assert grants.execute("SELECT count(*) FROM grants").fetchone()[0] == 0
+    assert archive.run_once() is False and env.fake.writes == []
+
+
+def test_test_card_archives_when_formal_authorization_wires_order_runner(env, monkeypatch):
+    """同一装配补登正式单授权（config_sha256 与配置摘要相符）→ 建单执行器装配，测试卡照常认领 X8a。"""
+    env.switches = dict(OFF)
+    registry, archive, orders = production(env, monkeypatch, test={})
+    assert isinstance(orders, OrderRunner) and archive.orders is orders
+    card, pages = issue(env.path, registry)
+    deliver(env.path, card, pages)
+    click(env.path, card, registry)
+    assert archive.run_once() is True
+    assert query(env.path, "SELECT status, purpose FROM trial_archive") == [("success", "X8a")]
+    assert binding(env.path) == [(KEY, card, "consumed")]
+
+
+def test_x8a_writes_nothing_after_test_deadline_passes_during_target_read(env, monkeypatch):
+    """复核 rv-3 P1-2：认领时测试授权未到期，X8a 存档登记取测试授权与卡片截止中较早的一个；目的页只读核对期间
+    跨过测试截止 → 底层逐步写前检查拦下，存档外写 0，建单 0。"""
+    from qianshu.feishu import archive as A
+    deadline = NOW + 20
+    registry = authorize(env.tmp, expires=datetime.fromtimestamp(deadline, UTC).isoformat())
+    env.switches = dict(OFF)
+    card, pages = issue(env.path, registry)
+    deliver(env.path, card, pages)
+    click(env.path, card, registry)
+    card_expires, = query(env.path, "SELECT expires FROM trial_card")[0]
+    assert card_expires > NOW + 30  # 若按卡片截止登记，跨过测试截止后仍会放行写步骤
+    monkeypatch.setattr(A, "time", SimpleNamespace(time=lambda: env.now, monotonic=time.monotonic, sleep=time.sleep))
+
+    def cross(stage):
+        if stage == "target":
+            env.now = NOW + 30
+    env.fake.hook = cross
+    fake = FakeMingdao()
+    archive, orders = runners(env, registry, fake)
+    archive.run_once()
+    with A._database(env.ledger) as grants:
+        assert grants.execute("SELECT expires FROM grants").fetchone()[0] == deadline
+    assert "target" in env.fake.reads and env.fake.writes == []
+    assert query(env.path, "SELECT status FROM trial_archive") == [("failed",)]
+    assert orders.run_once() is False and fake.sent == []
+
+
+@pytest.mark.parametrize("case", ["ordinary", "unbound"])
+def test_formal_authorization_registered_create_off_still_zero(env, monkeypatch, case):
+    """守望者附加：正式单授权已有效登记（config_sha256 与配置摘要相符）、建单开关关闭，真实装配出两个执行器；
+    普通卡与未绑定卡均 0 存档、0 建单。"""
+    switches = dict(OFF, MAIL_TRIAL_ARCHIVE_PURPOSE="X8b") if case == "ordinary" else OFF
+    env.switches = dict(switches)
+    # 测试授权只登记给另一登记（使执行器在关建单时装配），本卡不命中。
+    registry, archive, orders = production(env, monkeypatch, test={"trial_registration": 9})
+    assert archive is not None and isinstance(orders, OrderRunner) and archive.orders is orders
+    if case == "ordinary":
+        card, pages = issue(env.path, registry, name="合成政策", switches=switches, verified=[("定向政策", "组合0")])
+    else:
+        card, pages = issue(env.path, registry)
+    assert SNAPSHOT_KEY not in json.loads(query(env.path, "SELECT snapshot FROM trial_card")[0][0])
+    deliver(env.path, card, pages)
+    texts = click(env.path, card, registry, at=NOW + 10, switches=switches)
+    assert not any("将建存档" in t for t in texts)
+    for _ in range(2):
+        archive.run_once()
+        orders.run_once()
+    assert env.fake.writes == [] and env.fake.reads == []
+    assert query(env.path, "SELECT count(*) FROM trial_archive WHERE status!='failed'") == [(0,)]
+    assert query(env.path, "SELECT count(*) FROM trial_order") == [(0,)]
+    assert binding(env.path) == []
+
+
+def test_parent_reply_requires_matching_card_uuid():
+    """复核 rv-3 P2：父进程选文案在「登记 × 版本」之外加核卡 UUID；缺失或不一致回「建单未开启」。"""
+    supervisor = TrialSupervisor.__new__(TrialSupervisor)
+    supervisor.mode, supervisor.create_enabled, supervisor.test_card = "cards", False, (1, 1, KEY, "live")
+    supervisor.offer = lambda *args: True
+
+    def reply(**card):
+        value = {"action": "approve", "registration": 1, "version": 1, **card}
+        return supervisor.click(b"{}", time.monotonic(), time.monotonic() + 5, {"event": {"action": {"value": value}}})
+    assert reply(card="live") == TEST_PENDING
+    assert reply() == "建单未开启"
+    assert reply(card="other") == "建单未开启"
+    assert reply(card=1) == "建单未开启"
+    supervisor.test_card = (1, 1, KEY)  # 旧形状（无卡 UUID）
+    assert reply(card="live") == "建单未开启"
