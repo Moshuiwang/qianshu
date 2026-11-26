@@ -13,7 +13,7 @@ import sys
 import time
 from pathlib import Path
 
-from ._approval_protocol import ENVELOPE, PACKET_LIMIT, SERVICE_STATUS, SNAPSHOT
+from ._approval_protocol import ENVELOPE, PACKET_LIMIT, SERVICE_STATUS, SNAPSHOT, TEST_CARD
 
 
 def snapshot(channel, read, done, consumer=None):
@@ -21,6 +21,9 @@ def snapshot(channel, read, done, consumer=None):
         packet = SNAPSHOT.pack(time.monotonic(), read, done)
         if consumer is not None:
             packet += SERVICE_STATUS.pack(consumer.create_enabled, consumer.manual_checks, consumer.pending_notices)
+            test = getattr(consumer, "test_card", None)
+            if test and len(test[2].encode()) <= 64 and len(test[3].encode()) <= 64:
+                packet += TEST_CARD.pack(1, test[0], test[1], test[2].encode(), test[3].encode())
         channel.send(packet)
     except BlockingIOError:
         pass

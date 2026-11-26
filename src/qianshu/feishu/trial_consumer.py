@@ -106,6 +106,8 @@ class Consumer:
         self.deadline = self.next_scan = 0.0
         self.ended = None
         self.manual_checks = self.pending_notices = 0
+        # 段 3（G516 乙）：当前有效测试卡（登记、版本、授权登记号、卡），随状态帧告知监督进程，只用于选应答文案。
+        self.test_card = None
 
     def switch_file(self):
         """只读开关文件（不含连接判断）：建单交接处与连接状态分开核对（G464）。文件换过或出卡关闭即拒绝。"""
@@ -129,6 +131,9 @@ class Consumer:
             self.listener.maintain()
             with journal_at(self.listener.path) as j, j.db:
                 self.manual_checks, self.pending_notices = j.notice_counts()
+                from .trial_test import active_test_card
+                self.test_card = (None if self.create_enabled else
+                                  active_test_card(j.db, self.listener.registry, self.listener.clock()))
                 epoch = j.active_epoch(self.initial)
                 if self.epoch_loaded and epoch != self.epoch:
                     raise ValueError("E-TRIAL-DISABLED")
@@ -150,7 +155,10 @@ class Consumer:
         if (not isinstance(value, dict) or type(value.get("format")) is not int
                 or value["format"] != CARD_FORMAT or value.get("action") not in ("verify", "approve", "reject")):
             return
-        if value["action"] == "approve" and not self.create_enabled:
+        test = getattr(self, "test_card", None)
+        if value["action"] == "approve" and not self.create_enabled and not (
+                test and (value.get("registration"), value.get("version"), value.get("card")) == (test[0], test[1], test[3])):
+            # 关建单开关：只有当前有效测试卡交审批门禁再核（唯一例外判定），其余照旧拒绝。
             self.listener.refuse_click(data, notify=False)
             return
         if self.epoch is not None:
@@ -162,6 +170,21 @@ class Consumer:
     def consume(self, payload, deadline):
         self.deadline = deadline
         asyncio.run(self.dispatcher._do_without_validation(payload))
+
+
+def assemble(args, settings, state, handoff_path, *, switches, connected, sensitive, switch_file=None):
+    """生产装配存档（2c）与建单（2d）执行器。
+
+    出卡与建单开关均开（或段 3 测试授权登记含测试条目）、配置已确认才装配存档执行器；否则同意后只记录，存档写为 0。
+    建单执行器只在存档执行器已装配、明道云配置与登录态、正式单授权登记就绪时装配；否则建单写为 0。
+    装配结果回填给存档执行器：测试卡只在建单执行器已装配时才认领 X8a（复核 rv-3 P1-1）。"""
+    runner = build_runner(args, settings, state, handoff_path, switches=switches, connected=connected,
+                          sensitive=sensitive)
+    orders = build_order_runner(args, settings, state, switches=switches, connected=connected, sensitive=sensitive,
+                                archive_runner=runner, switch_file=switch_file)
+    if runner is not None:
+        runner.orders = orders
+    return runner, orders
 
 
 @contextmanager
@@ -178,19 +201,18 @@ def running(arguments, connected):
         if state.with_suffix(".dirty").exists() and not state.exists():
             raise ValueError("E-TRIAL-DISABLED")
         consumer.tick()
+        # 查重恢复必须在收信线程启动前做完（#194 引入的启动竞争）：收信线程一启动就连续提交几次写事务，
+        # 每次提交都要落盘，合计可超过登记库 0.25 秒的锁等待，recover 被锁后审批就自我停用。
+        # 放在这里时本进程内没有并发写者；「查重中」只由其后启动的查重扫描写入，恢复语义不变。
+        trial_dedupe.recover(state)
         with mail_worker(args, settings, path, consumer.switches,
                          available=lambda: consumer.origin.close_code is None,
                          sender=consumer.listener.transport) as ended:
             consumer.ended = ended
-            # 出卡与建单开关均开、配置已确认才装配存档执行器；否则同意后只记录，存档写为 0。
-            runner = build_runner(args, settings, consumer.listener.path, path, switches=consumer.switches,
-                                  connected=connected, sensitive=consumer.listener.transport.sensitive_values)
+            runner, orders = assemble(args, settings, consumer.listener.path, path, switches=consumer.switches,
+                                      connected=connected, sensitive=consumer.listener.transport.sensitive_values,
+                                      switch_file=consumer.switch_file)
             consumer.listener.archive_wired = runner is not None
-            # 建单执行器（2d）只在存档执行器已装配、明道云配置与登录态就绪时装配；否则建单写为 0。
-            orders = build_order_runner(args, settings, consumer.listener.path, switches=consumer.switches,
-                                        connected=connected, sensitive=consumer.listener.transport.sensitive_values,
-                                        archive_runner=runner, switch_file=consumer.switch_file)
-            trial_dedupe.recover(state)
 
             def lookup(names):
                 return trial_dedupe.official_matches(args.mingdao_config, settings,

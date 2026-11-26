@@ -16,10 +16,13 @@ from hashlib import sha256
 from stat import S_ISREG
 
 from qianshu.draft import SourceExcerpt
+from qianshu.mingdao.create_order import utc
 
 from . import archive as A
 from .state import trial_batch
 from .trial_approval import ARCHIVE_NOTICES, CARD_FORMAT, DISCONNECT_NOTICES, journal_at
+from .trial_test import bound as test_bound, card_exception, close as close_test, consume as consume_test
+from .trial_test import has_test_entries, registry_of
 
 _LOG = logging.getLogger(__name__)
 PURPOSE_KEY = "MAIL_TRIAL_ARCHIVE_PURPOSE"
@@ -32,10 +35,14 @@ def ordinary_purpose(switches):
     """普通申请入口可用的存档发布用途：只认 X8b（首批真实明细首次发布），其余（含 X8a、未登记）返回 None。
 
     X8a（【测试】单批次合成试写）不得用于普通申请：它只是一次合成试写确认，不授权发布真实申请明细。
-    段 3 接入点：X8a 只能经【测试】单的一次性测试登记放行——由该入口核对 X8a 绑定的测试登记及其版本，
-    并在认领本批的同一事务内一次性消费该绑定（见 ArchiveRunner._claim）。本片未实现，普通入口一律拒绝 X8a。
+    X8a 只经 test_purpose 用于绑定了有效测试授权的那一张卡（段 3），普通入口一律拒绝 X8a。
     """
     return "X8b" if switches.get(PURPOSE_KEY) == "X8b" else None
+
+
+def test_purpose(switches):
+    """绑定了有效测试授权的那一张卡（段 3，G505 / G514）的存档发布用途：只认 X8a，与建单共用一次资格。"""
+    return "X8a" if switches.get(PURPOSE_KEY) == "X8a" else None
 
 
 class DisconnectGate:
@@ -114,6 +121,8 @@ class Job:
     snapshot: dict
     purpose: str
     key: str
+    # 存档授权登记的截止。测试卡取测试授权与卡片截止中较早的一个（复核 rv-3 P1-2），底层每步写前照此核对。
+    expires: float | None = None
 
 
 def _batch(material, purpose, key, version):
@@ -129,10 +138,14 @@ class ArchiveRunner:
     """每轮至多处理一张已同意的卡。同一「登记 × 版本」至多发起一次存档。"""
 
     def __init__(self, path, *, switches, config, sensitive, ledger, connected,
-                 clock=time.time, factory=A._SDK):
+                 clock=time.time, factory=A._SDK, registry=None):
         self.path, self.switches, self.config, self.sensitive = path, switches, config, tuple(sensitive)
         self.ledger, self.connected, self.clock, self.factory = ledger, connected, clock, factory
         self._purpose = None
+        self.registry = registry  # 段 3 测试授权登记；None 时例外判定一律不放行
+        self._test = None
+        # 同一装配里的建单执行器（trial_consumer.assemble 回填）。测试卡只在它已装配时才认领（复核 rv-3 P1-1）。
+        self.orders = None
 
     def run_once(self):
         if not self.connected():
@@ -150,7 +163,17 @@ class ArchiveRunner:
         except Exception:
             return "switch"
         self._purpose = ordinary_purpose(switches)
-        if (switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
+        self._test = None
+        if test_bound(json.loads(row["snapshot"])):
+            # 段 3：绑定测试授权的卡只走唯一例外判定（不论建单开关），用途只认 X8a；判定不放行即停批。
+            self._test = card_exception(j.db, self.registry, row, self.clock(), "archive")
+            self._purpose = test_purpose(switches)
+            if switches.get("MAIL_TRIAL_CARD_ENABLED") != "true" or self._test is None:
+                return "test" if switches.get("MAIL_TRIAL_CARD_ENABLED") == "true" else "switch"
+            if self.orders is None:
+                # 复核 rv-3 P1-1：建单执行器未装配（缺正式授权或配置）时不消耗资格、不发布 X8a，按固定提示停批。
+                return "test_runner"
+        elif (switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
                 or switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true"):
             return "switch"
         if (row["format"] != CARD_FORMAT or not row["country"] or row["readonly"]
@@ -172,7 +195,7 @@ class ArchiveRunner:
         if (not snapshot.get("preview") or not isinstance(material, dict) or not snapshot.get("eligible")
                 or material.get("country") != row["country"]):
             return "material"
-        if ordinary_purpose(switches) is None:
+        if self._purpose is None:
             return "unconfirmed"
         return ""
 
@@ -187,10 +210,20 @@ class ArchiveRunner:
             if row is None:
                 return None
             code = self._gate(j, row)
+            snapshot = json.loads(row["snapshot"])
+            if not code and self._test is not None:
+                # 段 3：X8a 与建单共用的一次性资格在认领本批的同一事务内消耗（TrialRegistration.consume）。
+                try:
+                    consume_test(j.db, self._test, snapshot, self.clock())
+                except Exception:
+                    code = "test"
             if code:
-                self._stop(j, row, "unconfirmed" if code == "unconfirmed" else "failed", "gate", code)
+                if test_bound(snapshot):
+                    close_test(j.db, snapshot)
+                if code == "test_runner":
+                    _LOG.warning(ARCHIVE_NOTICES["test_runner"])
+                self._stop(j, row, code if code in ("unconfirmed", "test_runner") else "failed", "gate", code)
                 return None
-            # 段 3 接入点：【测试】单的 X8a 一次性登记在此核对（绑定的测试登记与版本）并在本事务内消费。
             purpose = self._purpose
             reg, version, card = row["registration"], row["version"], row["card"]
             j.db.execute("INSERT INTO trial_archive(registration,version,card,status,purpose,started) "
@@ -198,7 +231,10 @@ class ArchiveRunner:
             j.db.execute("UPDATE trial_item_task SET status='archive_running' WHERE card=? AND status='archive_pending'",
                          (card,))
             j.db.execute("UPDATE trial_task SET status='archive_running' WHERE card=?", (card,))
-            return Job(row, json.loads(row["snapshot"]), purpose, f"{reg}-v{version}")
+            expires = row["expires"]
+            if self._test is not None:
+                expires = min(expires, utc(self._test.expires).timestamp())
+            return Job(row, json.loads(row["snapshot"]), purpose, f"{reg}-v{version}", expires)
 
     @staticmethod
     def _stop(j, row, kind, stage, reason):
@@ -233,7 +269,8 @@ class ArchiveRunner:
             if preview.fingerprint != snapshot["preview"]:
                 raise ValueError("preview")
             A.register_archive_batch(batch, ledger_path=self.ledger, approved_country=row["country"],
-                                     email_verified=True, owner_release=job.purpose, expires=row["expires"],
+                                     email_verified=True, owner_release=job.purpose,
+                                     expires=row["expires"] if job.expires is None else job.expires,
                                      sensitive_values=self.sensitive, preview_fingerprint=snapshot["preview"])
             gate = DisconnectGate(self.factory(self.config), self.connected, lambda: self._count(reg, version))
         except Exception:
@@ -323,11 +360,15 @@ def _uuid():
 
 
 def build_runner(args, settings, state, handoff_path, *, switches, connected, sensitive):
-    """未确认配置下不装配：出卡与建单开关须开，业务配置、凭据来源与存档授权库均已就绪。"""
+    """未确认配置下不装配：出卡与建单开关须开，业务配置、凭据来源与存档授权库均已就绪。
+
+    段 3：建单开关关闭时，只在测试授权登记可读且含测试条目时装配；此时只有判定放行的那一张测试卡能进存档。"""
     import os
     try:
+        config_path = getattr(args, "mingdao_config", None)
+        registry = registry_of(config_path.parent) if config_path is not None else None
         if (switches().get("MAIL_TRIAL_CARD_ENABLED") != "true"
-                or switches().get("MAIL_TRIAL_CREATE_ENABLED") != "true"):
+                or (switches().get("MAIL_TRIAL_CREATE_ENABLED") != "true" and not has_test_entries(registry))):
             return None
         if args.business_env_file is None or not settings.trial_credentials_complete:
             return None
@@ -342,7 +383,7 @@ def build_runner(args, settings, state, handoff_path, *, switches, connected, se
     except Exception:
         return None
     return ArchiveRunner(state, switches=switches, config=config, sensitive=sensitive, ledger=ledger,
-                         connected=connected)
+                         connected=connected, registry=registry)
 
 
 @contextmanager

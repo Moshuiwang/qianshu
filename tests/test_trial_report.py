@@ -1055,7 +1055,8 @@ def production_ledger(scoped, monkeypatch):
         db.execute("INSERT INTO trial_receipt(card,action,recorded) VALUES(?,'reject',?)",
                    (record_id("2"), tr.utc(AT).timestamp()))
     runner = trial_order.OrderRunner(db_path, switches=None, backend=None, connected=None, ledger_dir=path)
-    job = SimpleNamespace(row=dict(registration=1, version=1, country="A", card=card))
+    # 正式卡快照不含测试授权登记号（段 3 起 `_ledger()` 据 job.snapshot 判定 is_test）。
+    job = SimpleNamespace(row=dict(registration=1, version=1, country="A", card=card), snapshot={})
     fingerprints = {k: tr.digest(tr.plain_cell(v).encode())[:16] for k, v in DRAFT.items()}
     plan = trial_order.Plan("合成政策", "worksheet-fixture", list(DRAFT), fingerprints, fingerprints.copy())
 
