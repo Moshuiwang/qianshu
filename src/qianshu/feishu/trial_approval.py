@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS trial_order_slot(id INTEGER PRIMARY KEY CHECK(id=1), 
  version INTEGER NOT NULL, item INTEGER NOT NULL, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS trial_handoff(name_key TEXT NOT NULL, target TEXT, registration INTEGER, version INTEGER,
  item INTEGER, opened REAL NOT NULL, cleared REAL, reason TEXT);
+CREATE TABLE IF NOT EXISTS trial_dedupe(
+ id INTEGER PRIMARY KEY, registration INTEGER NOT NULL, version INTEGER NOT NULL, name_fp TEXT NOT NULL,
+ reason TEXT NOT NULL, status TEXT NOT NULL, matches INTEGER, order_states TEXT, robot_record INTEGER);
 CREATE TABLE IF NOT EXISTS trial_guardian_log(at REAL NOT NULL, action TEXT NOT NULL, reason TEXT NOT NULL);
 """
 

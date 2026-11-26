@@ -25,7 +25,8 @@ def _guardian_environment_blocked():
 
 _GUARDIAN_HELP = "守望者命令检测到业务凭据，请使用 scripts/guardian-trial.sh。"
 # 2c/2d 部署与巡检用的守望者命令：只用飞书转交配置，不读业务凭据；带业务凭据的环境拒绝运行。
-_DEPLOY_COMMANDS = {"--trial-init-archive-ledger", "--trial-halt", "--trial-release-handoff", "--trial-release-group"}
+_DEPLOY_COMMANDS = {"--trial-init-archive-ledger", "--trial-halt", "--trial-release-handoff", "--trial-release-group",
+                    "--trial-dedupe-request", "--trial-dedupe-status"}
 _DEPLOY_HELP = "守望者命令检测到业务凭据，请在不含业务凭据的环境中运行（env -i）。"
 if (__name__ == "__main__" and {"--trial-reconcile", "--list-recovery"}.intersection(sys.argv[1:])
         and _guardian_environment_blocked()):
@@ -764,6 +765,25 @@ def _guardian_deploy(parser, args, chosen):
         parser.error("守望者命令须指定 --state 私有目录/trial-050.sqlite3。")
     from .feishu.trial_approval import journal_at
     now = time.time()
+    if args.trial_dedupe_request is not None or args.trial_dedupe_status is not None:
+        from .feishu import trial_dedupe
+        raw = args.trial_dedupe_request
+        if raw is not None and (not args.reason or not args.reason.strip()):
+            parser.error("查重请求须带 --reason。")
+        if raw is None and args.reason is not None:
+            parser.error("查重状态不接受 --reason。")
+        try:
+            with journal_at(args.state, readonly=raw is None) as j:
+                if raw is None:
+                    reg = int(args.trial_dedupe_status) if args.trial_dedupe_status else None
+                    result = trial_dedupe.status(j.db, registration=reg)
+                else:
+                    result = trial_dedupe.request(j, int(raw[0]), int(raw[1]), raw[2], args.reason)
+        except Exception:
+            print("查重登记未确认，请核对私有登记库及开放移交。", file=sys.stderr)
+            return 1
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
     if args.trial_halt is not None:
         if (args.trial_halt == "status") != (args.reason is None) or (args.reason is not None and not args.reason.strip()):
             parser.error("停写位置位与清除须带 --reason；读回不带原因。")
@@ -892,13 +912,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="守望者用：按组销清同卡同名组的人工移交（恢复清单 order_group_handoff）。"
                              "此命令只在产品负责人当场明确同意时由守望者执行。须带登记 ID，并为组内每个成员各给一条"
                              " --member；成员不全、去向缺失或指纹不符即拒绝、零写入。")
+    parser.add_argument("--trial-dedupe-request", nargs=3, metavar=("REGISTRATION", "VERSION", "NAME_FP"),
+                        help="守望者用：为开放移交登记官方只读查重请求，须带 --reason。")
+    parser.add_argument("--trial-dedupe-status", nargs="?", const="", metavar="REGISTRATION",
+                        help="守望者用：读取查重结论与本地台账状态，可按登记号筛选。"
+                             "平台有同名含候选行归一后命中。精确名未命中（全半角 / 空白变体未覆盖，需人工比对）"
+                             "须人工到明道云按归一名比对后再判定是否补建。查询异常或总数与续页标志均缺失时记查重失败。")
     parser.add_argument("--member", nargs=3, action="append", metavar=("ITEM", "NAME_FP", "DISPOSITION"),
                         help="按组销清的组成员：条目号、展示名指纹（恢复清单 members[].display_fp）与去向"
                              "（built 已建 / not_built 不建 / merged 合并）。")
-    parser.add_argument("--reason", help="停写位置位 / 清除与销清移交的原因（写入登记库）")
+    parser.add_argument("--reason", help="停写位置位 / 清除、销清移交或请求查重的原因（写入登记库）")
     args = parser.parse_args(argv)
     deploy = [name for name in ("trial_init_archive_ledger", "trial_halt", "trial_release_handoff",
-                                "trial_release_group") if getattr(args, name) is not None]
+                                "trial_release_group", "trial_dedupe_request", "trial_dedupe_status")
+              if getattr(args, name) is not None]
     if args.member and args.trial_release_group is None:
         parser.error("--member 只与 --trial-release-group 一起使用。")
     if deploy:
