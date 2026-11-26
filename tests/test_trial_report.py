@@ -1221,3 +1221,48 @@ def test_missing_target_preserves_readback(scoped, production_ledger):
     public, _ = tr.report(*scoped, START, END)
     assert public["明道云写错"] == tr.UNKNOWN and public["明道云写错已核"] == 1
     assert public["已回读核对单数"] == 0
+
+
+@pytest.mark.parametrize("seconds_earlier,wrong", [(0, 0), (1, 1)])
+def test_pending_attempt_platform_second(scoped, production_ledger, seconds_earlier, wrong):
+    plan, write = production_ledger
+    write("create_attempt", approved=True, request_fields=plan.request_fields)
+    write("create_unknown")
+    begin = tr.utc(AT).replace(microsecond=100000)
+    rewrite_events(scoped[0], lambda row: row | {"utc": begin.isoformat()})
+    stamp = (tr.utc(AT) - timedelta(seconds=seconds_earlier)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    scoped[2].rows[record_id("1")].update(_createdAt=stamp, _updatedAt=stamp)
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN
+    assert public["明道云写错已核"] == wrong
+    assert private["建议"] == ("回退" if wrong else "维持")
+
+
+def test_formal_batch_delivery_pages(scoped, production_ledger):
+    write_compared(*production_ledger, "一致")
+    path, _, api = scoped
+    api.rows[record_id("1")].update(DRAFT)
+    api.rows[record_id("3")]["_updatedAt"] = AT
+    with sqlite3.connect(path / "trial-050.sqlite3") as db:
+        db.executemany("INSERT INTO card_intent VALUES(?,1,1,?,'sent',?)",
+                       [(record_id("4"), 2, AT), (record_id("5"), 3, AT)])
+    public, private = tr.report(*scoped, START, END)
+    assert public["无需修改"] == 1 and public["卡片核对未知"] == 0
+    assert public["出卡"] == 5 and public["建单国家卡片"] == 1
+    assert private["卡片样本数"] == 3
+
+
+@pytest.mark.parametrize("short", [True, False], ids=["missing-field", "complete"])
+def test_no_change_requires_verified_write(scoped, production_ledger, short):
+    write_compared(*production_ledger, "一致", short=short)
+    scoped[2].rows[record_id("1")].update(DRAFT)
+    scoped[2].rows[record_id("3")]["_updatedAt"] = AT
+    public, _ = tr.report(*scoped, START, END)
+    if short:
+        assert public["明道云写错"] == public["无需修改"] == tr.UNKNOWN
+        assert public["无需修改已核"] == 0 and public["卡片核对未知"] == 1
+        assert public["无需修改原因"] == [tr.Reason.WRITE]
+    else:
+        assert public["明道云写错"] == 0
+        assert public["无需修改已核"] == public["无需修改"] == 1
+        assert public["卡片核对未知"] == 0

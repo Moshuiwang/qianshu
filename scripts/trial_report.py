@@ -38,6 +38,7 @@ class Reason(StrEnum):
     MANIFEST = "字段清单无独立来源"
     SNAPSHOT = "字段快照核对不完整"
     APPROVAL = "建单同意证据不完整"
+    WRITE = "该单写入核对不完整"
     READ = "回读未完成"
     COUNTRY = "建单国家归属无法核实"
     CREATOR = "建单身份无法核实"
@@ -157,7 +158,8 @@ class OrderLedger:
     def possible_attempt(self, rid, stamp, registration, worksheet):
         reg = optional_id(registration, "registration")
         return self.unreadable or any(
-            (a.begin is None or a.begin <= stamp) and reg in (None, a.owner, a.trial_registration)
+            (a.begin is None or a.begin.replace(microsecond=0) <= stamp)
+            and reg in (None, a.owner, a.trial_registration)
             and (worksheet is None or a.worksheet in (None, worksheet))
             and a.target_id in (None, rid) and a.candidate in (None, rid) for a in self.pending
         )
@@ -748,6 +750,20 @@ def local_counts(directory, config, trial, start, end, published, ledger_ok):
                     SELECT 1 FROM card_intent i WHERE i.registration=c.registration
                     AND i.version=c.version AND i.status='sent')"""))
             batches = {(str(r[0]), r[1]): r[2] for r in db.execute("SELECT registration,version,card FROM trial_card")}
+            # 正式出卡在明细后追加说明页和末页。正式任务只会在整批送达后登记。
+            last_pages = {(str(reg), version): size for reg, version, size in db.execute("""
+                SELECT c.registration,c.version,coalesce(
+                    CASE WHEN json_valid(c.snapshot) THEN json_array_length(c.snapshot,'$.pages') END,
+                    (SELECT max(i.page) FROM card_intent i WHERE i.registration=c.registration
+                     AND i.version=c.version AND i.status='sent' AND EXISTS (
+                         SELECT 1 FROM trial_item_task t WHERE t.card=c.card AND t.kind='formal'
+                         AND t.registration=c.registration AND t.version=c.version)))
+                FROM trial_card c""")}
+            for c in cards:
+                last = last_pages.get((c["registration"], c["version"]))
+                if (last and last >= 3 and c["status"] == "sent" and c["page"] in (last - 1, last)
+                        and not config.get("cards", {}).get(c["uuid"], {}).get("policy")):
+                    c["delivery_only"] = True
             sent_batches = {batches.get((c["registration"], c["version"])) for c in cards if c["status"] == "sent"}
             receipts_ok = None not in sent_batches and all(c["status"] in {"pending", "sent"} for c in cards)
             for card, at in db.execute("SELECT card,recorded FROM trial_receipt WHERE action='reject'"):
@@ -783,11 +799,14 @@ def local_counts(directory, config, trial, start, end, published, ledger_ok):
     scope = {r["id"] for r in today if r["id"] in apps}
     sent = [c for c in cards if c["status"] == "sent"]
     daily = [c for c in sent if inside(c["at"])]
+    delivered = len(daily)
+    cards = [c for c in cards if not c.get("delivery_only")]
+    daily = [c for c in daily if not c.get("delivery_only")]
     public = {
         "收到申请": len(scope), "申请判定未知": sum(r["verdict"] not in {"是", "否", "拿不准"} for r in today),
         "建单国家申请": sum(country(n) == build for n in scope),
         "申请国家未知": sum(not country(n) for n in scope),
-        "出卡": len(daily), "建单国家卡片": sum(country(c["registration"]) == build for c in daily),
+        "出卡": delivered, "建单国家卡片": sum(country(c["registration"]) == build for c in daily),
         "卡片国家未知": sum(not country(c["registration"]) for c in daily),
         "卡片送达未知": sum(c["status"] == "unknown" and inside(c["at"]) for c in cards),
         "解析中途停止已转人工": sum(
@@ -1019,7 +1038,7 @@ def report(directory, config, api, start, end):
         except ERRORS:
             final = None
             unknown_returns += int(where in (None, build) and (order is not None or bot))
-        observations[key].append((order, final, where, creator, bot, in_period))
+        observations[key].append((rid, final, where, creator, bot, in_period))
     for rid in archived - wrong:
         write_reasons.add(Reason.HISTORY)
         differences.setdefault(rid, []).append("已确认写错，本次未能重证")
@@ -1027,8 +1046,8 @@ def report(directory, config, api, start, end):
     wrong.update(archived)
     for key, matches in observations.items():
         if policy_cards[key] and len(matches) > 1:
-            ambiguous = sum(order is None and not bot and bool(creator) and in_period
-                                  for order, _, _, creator, bot, in_period in matches)
+            ambiguous = sum(rid not in ledger.orders and not bot and bool(creator) and in_period
+                                  for rid, _, _, creator, bot, in_period in matches)
 
             if ambiguous:
                 unknown_misses += ambiguous
@@ -1043,7 +1062,8 @@ def report(directory, config, api, start, end):
         counts = None
         if (all(key) and key[0] not in failed_links and key[0] not in incomplete_links
                 and len(rows) == len(policy_cards[key]) == 1):
-            order, final, where, creator, bot, _ = rows[0]
+            rid, final, where, creator, bot, _ = rows[0]
+            order = ledger.orders.get(rid)
             fields = proof.get("fields")
             if order is not None and order.trial_item:
                 reg, version, *_ = order.trial_item
@@ -1057,7 +1077,9 @@ def report(directory, config, api, start, end):
                 draft = proof.get("draft")
                 baseline = draft if isinstance(draft, dict) and isinstance(baseline, dict) and all(
                     baseline.get(k) == digest(plain_cell(v).encode())[:16] for k, v in draft.items()) else None
-            if where == country(c["registration"]) and (
+            if order is not None and rid in differences:
+                card_reasons.add(Reason.WRITE)
+            elif where == country(c["registration"]) and (
                     order is not None or (where and where != build and creator and not bot)):
                 counts = field_counts(fields, baseline, final)
                 if counts is None:
