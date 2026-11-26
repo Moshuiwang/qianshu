@@ -172,6 +172,21 @@ class Consumer:
         asyncio.run(self.dispatcher._do_without_validation(payload))
 
 
+def assemble(args, settings, state, handoff_path, *, switches, connected, sensitive, switch_file=None):
+    """生产装配存档（2c）与建单（2d）执行器。
+
+    出卡与建单开关均开（或段 3 测试授权登记含测试条目）、配置已确认才装配存档执行器；否则同意后只记录，存档写为 0。
+    建单执行器只在存档执行器已装配、明道云配置与登录态、正式单授权登记就绪时装配；否则建单写为 0。
+    装配结果回填给存档执行器：测试卡只在建单执行器已装配时才认领 X8a（复核 rv-3 P1-1）。"""
+    runner = build_runner(args, settings, state, handoff_path, switches=switches, connected=connected,
+                          sensitive=sensitive)
+    orders = build_order_runner(args, settings, state, switches=switches, connected=connected, sensitive=sensitive,
+                                archive_runner=runner, switch_file=switch_file)
+    if runner is not None:
+        runner.orders = orders
+    return runner, orders
+
+
 @contextmanager
 def running(arguments, connected):
     env, business, config, switches, expected = arguments
@@ -190,14 +205,10 @@ def running(arguments, connected):
                          available=lambda: consumer.origin.close_code is None,
                          sender=consumer.listener.transport) as ended:
             consumer.ended = ended
-            # 出卡与建单开关均开、配置已确认才装配存档执行器；否则同意后只记录，存档写为 0。
-            runner = build_runner(args, settings, consumer.listener.path, path, switches=consumer.switches,
-                                  connected=connected, sensitive=consumer.listener.transport.sensitive_values)
+            runner, orders = assemble(args, settings, consumer.listener.path, path, switches=consumer.switches,
+                                      connected=connected, sensitive=consumer.listener.transport.sensitive_values,
+                                      switch_file=consumer.switch_file)
             consumer.listener.archive_wired = runner is not None
-            # 建单执行器（2d）只在存档执行器已装配、明道云配置与登录态就绪时装配；否则建单写为 0。
-            orders = build_order_runner(args, settings, consumer.listener.path, switches=consumer.switches,
-                                        connected=connected, sensitive=consumer.listener.transport.sensitive_values,
-                                        archive_runner=runner, switch_file=consumer.switch_file)
             trial_dedupe.recover(state)
 
             def lookup(names):

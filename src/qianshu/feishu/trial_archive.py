@@ -16,6 +16,7 @@ from hashlib import sha256
 from stat import S_ISREG
 
 from qianshu.draft import SourceExcerpt
+from qianshu.mingdao.create_order import utc
 
 from . import archive as A
 from .state import trial_batch
@@ -120,6 +121,8 @@ class Job:
     snapshot: dict
     purpose: str
     key: str
+    # 存档授权登记的截止。测试卡取测试授权与卡片截止中较早的一个（复核 rv-3 P1-2），底层每步写前照此核对。
+    expires: float | None = None
 
 
 def _batch(material, purpose, key, version):
@@ -141,6 +144,8 @@ class ArchiveRunner:
         self._purpose = None
         self.registry = registry  # 段 3 测试授权登记；None 时例外判定一律不放行
         self._test = None
+        # 同一装配里的建单执行器（trial_consumer.assemble 回填）。测试卡只在它已装配时才认领（复核 rv-3 P1-1）。
+        self.orders = None
 
     def run_once(self):
         if not self.connected():
@@ -165,6 +170,9 @@ class ArchiveRunner:
             self._purpose = test_purpose(switches)
             if switches.get("MAIL_TRIAL_CARD_ENABLED") != "true" or self._test is None:
                 return "test" if switches.get("MAIL_TRIAL_CARD_ENABLED") == "true" else "switch"
+            if self.orders is None:
+                # 复核 rv-3 P1-1：建单执行器未装配（缺正式授权或配置）时不消耗资格、不发布 X8a，按固定提示停批。
+                return "test_runner"
         elif (switches.get("MAIL_TRIAL_CARD_ENABLED") != "true"
                 or switches.get("MAIL_TRIAL_CREATE_ENABLED") != "true"):
             return "switch"
@@ -212,7 +220,9 @@ class ArchiveRunner:
             if code:
                 if test_bound(snapshot):
                     close_test(j.db, snapshot)
-                self._stop(j, row, "unconfirmed" if code == "unconfirmed" else "failed", "gate", code)
+                if code == "test_runner":
+                    _LOG.warning(ARCHIVE_NOTICES["test_runner"])
+                self._stop(j, row, code if code in ("unconfirmed", "test_runner") else "failed", "gate", code)
                 return None
             purpose = self._purpose
             reg, version, card = row["registration"], row["version"], row["card"]
@@ -221,7 +231,10 @@ class ArchiveRunner:
             j.db.execute("UPDATE trial_item_task SET status='archive_running' WHERE card=? AND status='archive_pending'",
                          (card,))
             j.db.execute("UPDATE trial_task SET status='archive_running' WHERE card=?", (card,))
-            return Job(row, json.loads(row["snapshot"]), purpose, f"{reg}-v{version}")
+            expires = row["expires"]
+            if self._test is not None:
+                expires = min(expires, utc(self._test.expires).timestamp())
+            return Job(row, json.loads(row["snapshot"]), purpose, f"{reg}-v{version}", expires)
 
     @staticmethod
     def _stop(j, row, kind, stage, reason):
@@ -256,7 +269,8 @@ class ArchiveRunner:
             if preview.fingerprint != snapshot["preview"]:
                 raise ValueError("preview")
             A.register_archive_batch(batch, ledger_path=self.ledger, approved_country=row["country"],
-                                     email_verified=True, owner_release=job.purpose, expires=row["expires"],
+                                     email_verified=True, owner_release=job.purpose,
+                                     expires=row["expires"] if job.expires is None else job.expires,
                                      sensitive_values=self.sensitive, preview_fingerprint=snapshot["preview"])
             gate = DisconnectGate(self.factory(self.config), self.connected, lambda: self._count(reg, version))
         except Exception:
