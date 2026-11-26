@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from email.message import Message
@@ -19,14 +20,28 @@ from qianshu.feishu.settings import Settings, Window
 from qianshu.mingdao import create_order as order
 
 
+def assert_date_safe_credentials(credentials):
+    # 按字符集排除四字片段，覆盖 2026–2035 每一天及任意时分秒、偏移和小数秒。
+    for name, value in credentials.items():
+        assert not re.search(r"[0-9TtZz +:./-]{4}", value), f"{name} 含日期时间形状的四字片段"
+
+
 @pytest.fixture
 def case(tmp_path):
+    credentials = {
+        "official_app": "cccccccc-dddd-4eee-aaaa-bbbbbbbbbbbb",
+        "session_token": "zq-sens-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "official_token": "vx-auth-efefefefefefefefefefefefefefefef",
+    }
+    assert_date_safe_credentials(credentials)
+
     ids = {key: str(uuid4()) for key in (
         "template", "created", "tag", "option", "member", "package", "gift_package",
         "worksheetId", "appId", "viewId", "projectId", "registration",
-        "additional_view", "tag_name", "tag_alias", "official_app",
+        "additional_view", "tag_name", "tag_alias",
         "new_status", "pending_status", "configuring_status", "configured_status",
     )}
+    ids["official_app"] = credentials["official_app"]
     fields = {}
     control = {}
 
@@ -128,8 +143,8 @@ def case(tmp_path):
         statuses=statuses, status_labels=status_labels,
         cells={control[key]: value for key, value in template.items()}, private=private, window=window,
         relations=relations,
-        session_token="zq-sens-" + uuid4().hex,
-        official_token="vx-auth-" + uuid4().hex,
+        session_token=credentials["session_token"],
+        official_token=credentials["official_token"],
     )
 
 
@@ -1581,16 +1596,18 @@ def test_cli_with_private_registration(case, platform, mode, monkeypatch, capsys
         "domain": ".mingdao.com", "path": "/", "secure": False, "expires": -1,
     }]})
     official_key = case.config["official"]["token_key"]
-    env_file.write_text("\n".join([
-        f"{official_key}={case.official_token}",
-        f"{case.config['official']['app_id_key']}={case.ids['official_app']}",
-        f"FEISHU_APP_ID={uuid4()}",
-        f"FEISHU_APP_SECRET={uuid4()}",
-        f"FEISHU_CHAT_ID={uuid4()}",
-        f"FEISHU_BOT_OPEN_ID={uuid4()}",
-        f"FEISHU_ALLOWED_SENDER_IDS={uuid4()}",
-        f"FEISHU_APPROVED_FINGERPRINT={'f' * 64}",
-    ]))
+    settings = {
+        official_key: case.official_token,
+        case.config["official"]["app_id_key"]: case.ids["official_app"],
+        "FEISHU_APP_ID": "abababab-abab-4bab-abab-abababababab",
+        "FEISHU_APP_SECRET": "bcbcbcbc-bcbc-4cbc-bcbc-bcbcbcbcbcbc",
+        "FEISHU_CHAT_ID": "cdcdcdcd-cdcd-4dcd-adcd-cdcdcdcdcdcd",
+        "FEISHU_BOT_OPEN_ID": "dededede-dede-4ede-bede-dededededede",
+        "FEISHU_ALLOWED_SENDER_IDS": "fafafafa-fafa-4afa-8afa-fafafafafafa",
+        "FEISHU_APPROVED_FINGERPRINT": "f" * 64,
+    }
+    assert_date_safe_credentials(settings)
+    env_file.write_text("\n".join(f"{key}={value}" for key, value in settings.items()))
     env_file.chmod(0o600)
     case.evidence["policy_id"] = "p1"
     for key, path in (("config", config_path), ("draft", draft_path), ("login", login_path)):
@@ -1719,7 +1736,7 @@ def synthetic_uuids(monkeypatch):
     from random import Random
     from uuid import UUID
 
-    # 每个用例重放同一组合成凭据和字段 ID，使两者的片段检查与运行顺序无关。
+    # 每个用例重放同一组记录和字段 ID，使片段检查与运行顺序无关。
     random = Random(57)
     monkeypatch.setitem(globals(), "uuid4", lambda: UUID(int=random.getrandbits(128), version=4))
 
@@ -2887,8 +2904,8 @@ def test_identifier_contiguous_credential_gate(case, platform, business_cli, mon
 
 @pytest.fixture
 def outlet_case(case):
-    case.session_token = "x" + uuid4().hex
-    case.official_token = "y" + uuid4().hex
+    case.session_token = case.session_token.replace("zq-sens-", "x")
+    case.official_token = case.official_token.replace("vx-auth-", "y")
     return case
 
 
