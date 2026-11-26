@@ -201,6 +201,10 @@ def running(arguments, connected):
         if state.with_suffix(".dirty").exists() and not state.exists():
             raise ValueError("E-TRIAL-DISABLED")
         consumer.tick()
+        # 查重恢复必须在收信线程启动前做完（#194 引入的启动竞争）：收信线程一启动就连续提交几次写事务，
+        # 每次提交都要落盘，合计可超过登记库 0.25 秒的锁等待，recover 被锁后审批就自我停用。
+        # 放在这里时本进程内没有并发写者；「查重中」只由其后启动的查重扫描写入，恢复语义不变。
+        trial_dedupe.recover(state)
         with mail_worker(args, settings, path, consumer.switches,
                          available=lambda: consumer.origin.close_code is None,
                          sender=consumer.listener.transport) as ended:
@@ -209,7 +213,6 @@ def running(arguments, connected):
                                       connected=connected, sensitive=consumer.listener.transport.sensitive_values,
                                       switch_file=consumer.switch_file)
             consumer.listener.archive_wired = runner is not None
-            trial_dedupe.recover(state)
 
             def lookup(names):
                 return trial_dedupe.official_matches(args.mingdao_config, settings,
