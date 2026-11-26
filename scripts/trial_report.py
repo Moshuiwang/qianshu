@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from contextlib import closing, contextmanager
 from copy import deepcopy
@@ -20,7 +21,7 @@ from uuid import UUID
 import httpx
 
 from qianshu.mail.trial_state import BODY_NOTICE_COUNTS_SQL, FORMAT_VERSION, ledger_matches
-from qianshu.mingdao.create_order import Official, Stop, creation_state, no_log_continuation, private_bytes, utc
+from qianshu.mingdao.create_order import Official, Stop, creation_state, digest, no_log_continuation, plain_cell, private_bytes, utc
 
 
 UNKNOWN = "未知"
@@ -127,6 +128,18 @@ class Order:
     covered: bool
     fields: dict | None
     written: dict | None
+    trial_item: tuple | None
+    exempt: int
+
+
+@dataclass
+class PendingAttempt:
+    owner: str
+    begin: datetime | None
+    target_id: str | None
+    candidate: str | None = None
+    trial_registration: str | None = None
+    worksheet: str | None = None
 
 
 @dataclass
@@ -141,12 +154,27 @@ class OrderLedger:
     reasons: set = field(default_factory=set)
     conflicts: dict = field(default_factory=dict)
 
-    def possible_attempt(self, rid, stamp, registration):
+    def possible_attempt(self, rid, stamp, registration, worksheet):
         reg = optional_id(registration, "registration")
         return self.unreadable or any(
-            (begin is None or begin <= stamp) and (target is None or target == rid)
-            and (reg is None or reg == owner) for owner, begin, target in self.pending
+            (a.begin is None or a.begin <= stamp) and reg in (None, a.owner, a.trial_registration)
+            and (worksheet is None or a.worksheet in (None, worksheet))
+            and a.target_id in (None, rid) and a.candidate in (None, rid) for a in self.pending
         )
+
+
+def trial_identity(row):
+    """正式单的 target 是工作表，只有旧格式的 target_id 指向记录。"""
+    reg = row["registration"]
+    keys = ("trial_registration", "trial_version", "item")
+    if not any(k in row for k in (*keys, "target")) and not re.fullmatch(r"trial-\d+-v\d+-i\d+", reg):
+        return None
+    parts = tuple(row.get(k) for k in keys)
+    if (not all(type(n) is int and n > 0 for n in parts)
+            or reg != "trial-%d-v%d-i%d" % parts or not row.get("card_uuid")
+            or not isinstance(row.get("target"), str) or not row["target"].strip()):
+        raise ValueError()
+    return (*parts, row["target"], row["card_uuid"])
 
 
 def read_orders(path, start, end):
@@ -178,11 +206,18 @@ def read_orders(path, start, end):
             for key, kind in (("record_id", "record"), ("card_uuid", "card")):
                 if row.get(key) is not None:
                     row[key] = normalized_id(row[key], kind)
-            identity = (reg, test)
-            info = context[identity]
             rid = row.get("record_id")
-            if rid is not None and (not isinstance(rid, str) or not rid.strip()):
-                raise ValueError()
+            if rid and event in {"readback_compared", "readback_unconfirmed"} and row.get("结论") == "写错":
+                wrong_readbacks.add(rid)
+            try:
+                trial_item = None if test else trial_identity(row)
+            except ValueError:
+                # 仍归并本记录的独立差异；残缺的正式身份不能提供请求清单。
+                trial_item = ()
+            owner = str(trial_item[0]) if trial_item else None
+            sheet = trial_item[3] if trial_item else None
+            identity = (reg, test, trial_item)
+            info = context[identity]
             if (rid is not None and event in {"create_reserved", "create_attempt", "approval_closed",
                                               "card_published", "create_unknown", "aborted_before_write"}):
                 raise ValueError()
@@ -190,17 +225,30 @@ def read_orders(path, start, end):
                 result.published.append(row)
             if test:
                 test_events[identity].append(row)
+            if event.startswith("create_reconciled_") or (event == "readback_unconfirmed"
+                    and identity in pending and (identity, rid) not in records):
+                attempts = pending[identity]
+                if not attempts:
+                    attempts.append(PendingAttempt(reg, None, None, trial_registration=owner, worksheet=sheet))
+                if len(attempts) == 1 and rid:
+                    attempts[0].candidate = rid
+                continue
+            if event == "create_reserved" and trial_item:
+                info["reserved_fields"] = row.get("request_fields")
             if event == "create_attempt":
+                target_id = row.get("target_id")
+                if target_id is not None:
+                    target_id = normalized_id(target_id, "record")
+                pending[identity].append(PendingAttempt(reg, stamp, target_id, trial_registration=owner, worksheet=sheet))
                 info.pop("expected", None)
                 manifest = row.get("request_fields")
                 if (isinstance(manifest, list) and manifest and all(isinstance(k, str) and k for k in manifest)
-                        and len(set(manifest)) == len(manifest)):
+                        and len(set(manifest)) == len(manifest)
+                        and info.get("reserved_fields", manifest) == manifest):
                     info["expected"] = set(manifest)
                 if "attempt" in info:
                     info["uncertain"] = True
                 info["attempt"] = stamp
-            if rid and event in {"readback_compared", "readback_unconfirmed"} and row.get("结论") == "写错":
-                wrong_readbacks.add(rid)
             if rid:
                 if event == "created":
                     if (identity, rid) in records:
@@ -209,7 +257,15 @@ def read_orders(path, start, end):
                         records[identity, rid] = deepcopy(info)
                     ids[reg].add(rid)
                     owners[rid].add(identity)
-                    pending.pop(identity, None)
+                    attempts = pending.get(identity, [])
+                    bound = (len(attempts) == 1 and attempts[0].begin is not None
+                             and attempts[0].begin <= stamp and attempts[0].target_id in (None, rid)
+                             and attempts[0].candidate in (None, rid))
+                    if bound and trial_item != ():
+                        pending.pop(identity)
+                    else:
+                        records[identity, rid].pop("expected", None)
+                    context.pop(identity, None)
                 if (identity, rid) not in records:
                     raise ValueError()
                 info = records[identity, rid]
@@ -219,14 +275,13 @@ def read_orders(path, start, end):
                 if not rid:
                     raise ValueError()
                 info.setdefault("created", stamp)
-            if event in {"create_attempt", "create_unknown", "create_reconciled_candidate",
-                         "create_reconciled_read", "create_reconciled_read_unconfirmed"}:
-                if event == "create_attempt" or identity not in pending:
-                    pending[identity].append((reg, info.get("attempt"), optional_id(row.get("target_id"), "record")))
+            if event == "create_unknown" and identity not in pending:
+                pending[identity].append(PendingAttempt(reg, None, None, trial_registration=owner, worksheet=sheet))
             if event == "aborted_before_write":
                 if type(row.get("allowed_writes")) is not int or row["allowed_writes"] != 0:
                     raise ValueError()
                 pending.pop(identity, None)
+                context.pop(identity, None)
             if event in {"readback_compared", "readback_unconfirmed"}:
                 if not rid:
                     raise ValueError()
@@ -235,7 +290,13 @@ def read_orders(path, start, end):
                 info["compared"] = complete
                 if complete:
                     info["covered"] = True
+                    info["equal_fields"] = {item["字段名"] for item in row["逐项核对"] if item["结果"] == "一致"}
                 if verdict == "写错":
+                    info["wrong"] = True
+                if trial_item and isinstance(row.get("逐项核对"), list) and any(
+                    isinstance(item, dict) and item.get("字段名") in (info.get("expected") or ())
+                    and item.get("结果") == "不一致" for item in row["逐项核对"]
+                ):
                     info["wrong"] = True
                 info["range_gap"] = event == "readback_compared" and not complete
             if test:
@@ -271,7 +332,8 @@ def read_orders(path, start, end):
     if result.conflicts:
         result.reasons.add(Reason.CONFLICT)
     for rid, identities in owners.items():
-        formal = [records[i, rid] for i in sorted(identities) if not i[1]]
+        formal_ids = sorted((i for i in identities if not i[1]), key=lambda i: (i[0], i[2] or ()))
+        formal = [records[i, rid] for i in formal_ids]
         if not formal:
             identity = next(iter(identities))
             events = test_events[identity]
@@ -283,7 +345,7 @@ def read_orders(path, start, end):
                 gaps += 1
             continue
         info = formal[0]
-        uncertain = (len(identities) > 1 or any(reg in result.conflicts for reg, _ in identities)
+        uncertain = (len(identities) > 1 or any(i[0] in result.conflicts for i in identities)
                      or any(r.get("uncertain") for r in formal))
         reasons = {Reason.CONFLICT} if uncertain else set()
         card = info.get("card_uuid")
@@ -291,19 +353,24 @@ def read_orders(path, start, end):
         if not info.get("compared"):
             reasons.add(Reason.RANGE if info.get("range_gap") else Reason.READ)
         snapshots = [info.get(k) for k in ("written", "displayed")]
+        trial_item = formal_ids[0][2]
+        exempt = 0
         if not expected:
             reasons.add(Reason.MANIFEST)
         if (not all(isinstance(v, dict) for v in snapshots)
-                or snapshots[0].keys() != snapshots[1].keys()
-                or expected and expected != snapshots[0].keys()):
+                or expected and any(v.keys() - expected for v in snapshots)
+                or not trial_item and (snapshots[0].keys() != snapshots[1].keys()
+                                       or expected and expected != snapshots[0].keys())):
             reasons.add(Reason.SNAPSHOT)
+        elif trial_item and info.get("compared") and expected and not uncertain:
+            exempt = len(info["equal_fields"] - (snapshots[0].keys() & snapshots[1].keys()))
         if type(info.get("approved")) is not bool:
             reasons.add(Reason.APPROVAL)
         result.orders[rid] = Order(
             info["created"], frozenset().union(*(r.get("countries", ()) for r in formal)),
             rid in wrong_readbacks or any(r.get("wrong") for r in formal), frozenset(reasons), card,
             bool(info.get("covered")) and not reasons - {Reason.READ, Reason.RANGE},
-            info.get("fields"), info.get("written"))
+            info.get("fields"), info.get("written"), trial_item, exempt)
     result.gaps = gaps + len(pending) + len(result.conflicts)
     return result
 
@@ -528,6 +595,12 @@ def previous_errors(directory, trial, start, end, evidence):
         ids, old = previous["写错"], previous["新发现的历史异常"]
         if not all(isinstance(items, list) for items in (ids, old)):
             raise ValueError("历史日报异常记录无法核对")
+        unresolved = previous.get("归档未解析", [])
+        if not isinstance(unresolved, list) or any(k not in ("明道云写错", "卡片驳回") for k in unresolved):
+            raise ValueError("历史日报未解析标记无效")
+        for key in unresolved:
+            if key == "明道云写错" or day >= start:
+                evidence.reasons[key].add(Reason.ID)
         normalized = []
         for items in (ids, old):
             known = set()
@@ -666,6 +739,26 @@ def local_counts(directory, config, trial, start, end, published, ledger_ok):
         cards = [dict(row, uuid=optional_id(row["uuid"], "card"),
                       registration=optional_id(row["registration"], "registration"))
                  for row in db.execute("SELECT * FROM card_intent") if observed(row["at"])]
+        trial_items = set()
+        has_trial_cards = db.execute("SELECT 1 FROM sqlite_schema WHERE type='table' AND name='trial_card'").fetchone()
+        if has_trial_cards:
+            trial_items.update(tuple(r) for r in db.execute("""
+                SELECT t.registration,t.version,t.item,c.card FROM trial_item_task t JOIN trial_card c
+                USING(registration,version,card) WHERE t.kind='formal' AND EXISTS (
+                    SELECT 1 FROM card_intent i WHERE i.registration=c.registration
+                    AND i.version=c.version AND i.status='sent')"""))
+            batches = {(str(r[0]), r[1]): r[2] for r in db.execute("SELECT registration,version,card FROM trial_card")}
+            sent_batches = {batches.get((c["registration"], c["version"])) for c in cards if c["status"] == "sent"}
+            receipts_ok = None not in sent_batches and all(c["status"] in {"pending", "sent"} for c in cards)
+            for card, at in db.execute("SELECT card,recorded FROM trial_receipt WHERE action='reject'"):
+                if type(at) not in (float, int):
+                    receipts_ok = False
+                elif start.timestamp() <= at < end.timestamp():
+                    card = optional_id(card, "card")
+                    if card and card in sent_batches:
+                        evidence.rejected.add(card)
+                    else:
+                        receipts_ok = False
         notices = list(db.execute("SELECT kind,status,at,registration FROM notice"))
         interruptions = {normalized_id(r["registration"], "registration"): r["at"] for r in notices
                          if r["kind"] == "interrupted" and optional_id(r["registration"], "registration") is not None}
@@ -707,10 +800,13 @@ def local_counts(directory, config, trial, start, end, published, ledger_ok):
     public["未解析附件批次"] = sum(r["attachments"] != 0 for r in today if r["id"] in apps)
     for status, label in (("pending", "待发"), ("sent", "已发"), ("unknown", "结果未知")):
         public["冻结通知" + label] = sum(r["kind"] == "freeze" and r["status"] == status for r in notices)
-    public["卡片驳回"] = rejection_counts(directory, config, cards, published, start, end, evidence, ledger_ok)
+    if has_trial_cards:
+        public["卡片驳回"] = len(evidence.rejected) if receipts_ok else UNKNOWN
+    else:
+        public["卡片驳回"] = rejection_counts(directory, config, cards, published, start, end, evidence, ledger_ok)
     if public["卡片驳回"] == UNKNOWN:
         evidence.reasons["卡片驳回"].add(Reason.REJECTIONS)
-    return public, apps, cards, daily, evidence
+    return public, apps, cards, daily, evidence, trial_items
 
 
 def report(directory, config, api, start, end):
@@ -719,8 +815,15 @@ def report(directory, config, api, start, end):
     trial = utc(config["trial_start"])
     check_window(trial, start, end)
     ledger = read_orders(directory / "trial-orders.jsonl", trial, end)
-    public, apps, cards, daily, evidence = local_counts(
+    public, apps, cards, daily, evidence, trial_items = local_counts(
         directory, config, trial, start, end, ledger.published, ledger.gaps == 0)
+    def bound_card(order):
+        if order.trial_item is None:
+            return True
+        if not order.trial_item:
+            return False
+        reg, version, item, _, card = order.trial_item
+        return (reg, version, item, card) in trial_items
     meta = config.get("registrations", {})
     build = config["build_country"]
 
@@ -730,6 +833,9 @@ def report(directory, config, api, start, end):
     if not isinstance(config["bot_account"], str) or not config["bot_account"]:
         raise ValueError("机器人账号未登记")
     spec = config["controls"]
+    list_path = api.config.get("search", {}).get("path", "")
+    table = re.fullmatch(r"/v3/app/worksheets/([A-Za-z0-9_-]+)/rows/list", list_path)
+    worksheet = table[1] if table else None
     proofs = config.get("cards", {})
     links = {meta.get(n, {}).get("link") for n in apps}
     failed_links = {link for link in links if not link}
@@ -837,6 +943,9 @@ def report(directory, config, api, start, end):
             where = build if build in order.countries else next(iter(order.countries), None)
             stamp = order.created
             issues = []
+            if not bound_card(order):
+                write_reasons.add(Reason.CARD)
+                issues.append("卡片与建单条目待核对")
             if order.reasons:
                 write_reasons.update(order.reasons)
                 issues.append("台账身份或字段证据待核对")
@@ -876,7 +985,7 @@ def report(directory, config, api, start, end):
         if where == build and (order is not None or bot):
             if in_period:
                 created.add(rid)
-            if order is None and ledger.possible_attempt(rid, stamp, row.get("registration")):
+            if order is None and ledger.possible_attempt(rid, stamp, row.get("registration"), worksheet):
                 unknown_writes += 1
             elif (order is None or order.wrong) and (in_period or rid not in seen):
                 wrong.add(rid)
@@ -936,9 +1045,18 @@ def report(directory, config, api, start, end):
                 and len(rows) == len(policy_cards[key]) == 1):
             order, final, where, creator, bot, _ = rows[0]
             fields = proof.get("fields")
-            if order is not None and order.card_uuid is not None:
+            if order is not None and order.trial_item:
+                reg, version, *_ = order.trial_item
+                if not bound_card(order) or (str(reg), version) != (c["registration"], c["version"]):
+                    fields = None
+            elif order is not None and order.card_uuid is not None:
                 fields = (order.fields or fields) if order.card_uuid == c["uuid"] else None
             baseline = order.written if order is not None else proof.get("draft")
+            if order is not None and order.trial_item:
+                # 正式 written 保存编码后请求值的指纹。只使用可逐项重证的草稿值。
+                draft = proof.get("draft")
+                baseline = draft if isinstance(draft, dict) and isinstance(baseline, dict) and all(
+                    baseline.get(k) == digest(plain_cell(v).encode())[:16] for k, v in draft.items()) else None
             if where == country(c["registration"]) and (
                     order is not None or (where and where != build and creator and not bot)):
                 counts = field_counts(fields, baseline, final)
@@ -982,6 +1100,7 @@ def report(directory, config, api, start, end):
     reasons["漏条"].update(miss_reasons)
 
     period_orders = [order for order in ledger.orders.values() if start <= order.created < end]
+    public["免快照字段数"] = sum(o.exempt for o in period_orders if bound_card(o))
     coverage = {}
     for prefix in ("", "建单国家"):
         eligible = [o for o in period_orders if not prefix or o.countries == {build}]
@@ -994,7 +1113,7 @@ def report(directory, config, api, start, end):
             if prefix and any((not o.countries or build in o.countries and len(o.countries) > 1)
                               and (not verified or o.covered) for o in period_orders):
                 reasons[key].add(Reason.COUNTRY)
-            coverage[key] = UNKNOWN if reasons[key] else sum(not verified or o.covered for o in eligible)
+            coverage[key] = UNKNOWN if reasons[key] else sum(not verified or o.covered and bound_card(o) for o in eligible)
     public.update(coverage)
     private_metrics = dict(coverage)
     for key, value in list(public.items()):
@@ -1005,10 +1124,12 @@ def report(directory, config, api, start, end):
     advice = recommendation(wrong, unknown_writes or unknown_creates, public["建单国家申请"],
                             public["建单国家卡片"], totals["建单国家至多两处"],
                             public["卡片国家未知"] + public["卡片送达未知"])
-    return public, {"指标": private_metrics, "建议": advice, "未知卡片数": totals["未知"], "卡片样本数": len(daily), "卡片": details, "退回公告": announcements,
+    note = f"卡片驳回 {public['卡片驳回']}（驳回数仅供参考）。免快照字段数 {public['免快照字段数']}。换配置后人工抽查一次免快照字段。"
+    return public, {"指标": private_metrics, "说明": note, "建议": advice, "未知卡片数": totals["未知"], "卡片样本数": len(daily), "卡片": details, "退回公告": announcements,
                     "试运行起点": trial.isoformat(), "窗口起点": start.isoformat(),
                     "窗口终点": end.isoformat(), "写入差异核对": differences, "登记冲突": ledger.conflicts,
                     "已核用量": evidence.charges, "费用证据冲突": sorted(evidence.disputed_models),
+                    "归档未解析": [k for k in ("明道云写错", "卡片驳回") if Reason.ID in reasons[k]],
                     "已核驳回": sorted(evidence.rejected),
                     "新发现的历史异常": sorted(historical), "漏条": sorted(missed), "写错": sorted(wrong)}
 
@@ -1143,6 +1264,7 @@ def generate(directory, args):
         public["明道云只读请求数"] = requests
         publish(private)
     print(json.dumps(public, ensure_ascii=False))
+    print(private["说明"], file=sys.stderr)
 
 
 if __name__ == "__main__":
