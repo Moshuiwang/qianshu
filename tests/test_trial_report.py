@@ -1028,3 +1028,241 @@ def test_round3_swap_after_serialization(scoped, monkeypatch, capsys):
         tr.main()
     assert target.samefile(source) and source.read_bytes() == before
     assert capsys.readouterr().out == "" and list(target.parent.iterdir()) == [target]
+
+
+@pytest.fixture
+def production_ledger(scoped, monkeypatch):
+    from qianshu.feishu import trial_order
+    from qianshu.feishu.trial_approval import Journal
+    from qianshu.mingdao import create_order
+
+    path, _, _ = scoped
+    (path / "trial-orders.jsonl").write_text("")
+    class FixtureTime(tr.datetime):
+        @classmethod
+        def now(cls, tz):
+            return cls.fromisoformat(AT).astimezone(tz)
+
+    monkeypatch.setattr(trial_order, "datetime", FixtureTime)
+    monkeypatch.setattr(create_order, "datetime", FixtureTime)
+    db_path = path / "trial-050.sqlite3"
+    card = record_id("visible")
+    with sqlite3.connect(db_path) as db:
+        Journal(db).initialize()
+        db.executemany("INSERT INTO trial_card(card,registration,version) VALUES(?,?,1)",
+                       [(card, 1), (record_id("2"), 2), (record_id("3"), 3)])
+        db.execute("INSERT INTO trial_item_task VALUES(1,1,1,'formal',?,'order_done')", (card,))
+        db.execute("INSERT INTO trial_receipt(card,action,recorded) VALUES(?,'reject',?)",
+                   (record_id("2"), tr.utc(AT).timestamp()))
+    runner = trial_order.OrderRunner(db_path, switches=None, backend=None, connected=None, ledger_dir=path)
+    job = SimpleNamespace(row=dict(registration=1, version=1, country="A", card=card))
+    fingerprints = {k: tr.digest(tr.plain_cell(v).encode())[:16] for k, v in DRAFT.items()}
+    plan = trial_order.Plan("合成政策", "worksheet-fixture", list(DRAFT), fingerprints, fingerprints.copy())
+
+    def write(event, rid=None, **extra):
+        runner._ledger(job, 1, plan, event, rid, **extra)
+
+    return plan, write
+
+
+def write_compared(plan, write, verdict, *, short=False):
+    rid = record_id("1")
+    write("create_reserved", request_fields=plan.request_fields, displayed=plan.displayed)
+    write("create_attempt", request_fields=plan.request_fields, approved=True)
+    write("created", rid, displayed=plan.displayed, written=plan.written, disconnect=False)
+    checks = readback(verdict)
+    if short:
+        checks = dict(total=1, counts={"一致": 1}, 逐项核对=[{"字段名": "y", "结果": "一致"}])
+    write("readback_compared", rid, 结论=verdict, **checks)
+
+
+@pytest.mark.parametrize("skip,short,verdict,wrong,verified,exempt", [
+    (False, False, "一致", 0, 1, 0),
+    (True, False, "一致", 0, 1, 1),
+    (False, True, "一致", tr.UNKNOWN, 0, 0),
+    (True, True, "一致", tr.UNKNOWN, 0, 0),
+    (False, False, "写错", 1, 1, 0),
+    (True, False, "写错", 1, 1, 0),
+])
+def test_production_readback(scoped, production_ledger, skip, short, verdict, wrong, verified, exempt):
+    plan, write = production_ledger
+    if skip:
+        del plan.displayed["x"], plan.written["x"]
+    write_compared(plan, write, verdict, short=short)
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == wrong
+    assert public["明道云写错已核"] == (verdict == "写错")
+    assert public["建单"] == public["机器人建单台账总单数"] == 1
+    assert public["已回读核对单数"] == public["建单国家已回读核对单数"] == verified
+    assert public["免快照字段数"] == exempt
+    assert "换配置后人工抽查一次免快照字段" in private["说明"]
+    assert public["卡片驳回"] == 1 and "卡片驳回 1（驳回数仅供参考）" in private["说明"]
+
+
+def test_production_abort(scoped, production_ledger):
+    plan, write = production_ledger
+    scoped[2].rows.pop(record_id("1"))
+    write("create_reserved", request_fields=plan.request_fields, displayed=plan.displayed)
+    write("create_attempt", approved=True, request_fields=plan.request_fields)
+    write("aborted_before_write", allowed_writes=0)
+    write("approval_closed", reason="expired")
+    public, _ = tr.report(*scoped, START, END)
+    assert public["建单"] == public["明道云写错"] == public["机器人建单台账总单数"] == 0
+    assert public["卡片驳回"] == 1
+
+
+def test_mixed_x5_test_excluded(scoped, production_ledger):
+    from qianshu.mingdao.create_order import ledger_open
+
+    write_compared(*production_ledger, "一致")
+    path, _, api = scoped
+    api.add("test", "outside", "q", "A", "robot")
+    with ledger_open(path, "x5-fixture", "【测试】合成") as ledger:
+        ledger.append("create_reserved")
+        ledger.append("card_published")
+        ledger.append("create_attempt")
+        ledger.append("created", record_id("test"))
+        ledger.append("readback_compared", record_id("test"), 结论="写错", **readback("写错"))
+    public, _ = tr.report(*scoped, START, END)
+    assert public["建单"] == public["机器人建单台账总单数"] == public["已回读核对单数"] == 1
+    assert public["明道云写错"] == 0
+
+
+@pytest.mark.parametrize("later,match", [(True, True), (False, False), (False, True)])
+def test_reconciled_candidate_per_attempt(scoped, production_ledger, later, match):
+    plan, write = production_ledger
+    write("create_reserved", request_fields=plan.request_fields, displayed=plan.displayed)
+    write("create_attempt", approved=True, request_fields=plan.request_fields)
+    write("create_unknown")
+    # 正式端当前只记未知；单候选对账行沿用 X5 reconcile_unknown 的字段。
+    write("create_reconciled_read", record_id("1" if match else "other"), candidates=1)
+    if later:
+        rewrite_events(scoped[0], lambda r: r | {"utc": END.isoformat()})
+    start = END if later else START
+    public, private = tr.report(*scoped, start, start + tr.DAY)
+    assert public["明道云写错"] == tr.UNKNOWN
+    assert public["明道云写错已核"] == int(later or not match)
+    assert public["已回读核对单数"] == public["机器人建单台账总单数"] == 0
+    assert tr.Reason.LEDGER not in public["明道云写错原因"]
+    assert private["建议"] == ("回退" if later or not match else "维持")
+
+
+@pytest.mark.parametrize("change", [
+    {"target": "other-sheet"}, {"target_id": record_id("other")}, {"card_uuid": record_id("other")},
+    {"trial_version": 2, "registration": "trial-1-v2-i1"}, {"item": 2, "registration": "trial-1-v1-i2"},
+])
+@pytest.mark.parametrize("verdict", ["一致", "写错"])
+def test_manifest_attempt_binding(scoped, production_ledger, change, verdict):
+    write_compared(*production_ledger, verdict)
+    rewrite_events(scoped[0], lambda r: r | change if r["event"] == "create_attempt" else r)
+    public, _ = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN
+    assert public["明道云写错已核"] == (verdict == "写错")
+    assert public["已回读核对单数"] == 0
+
+
+def test_card_item_binding(scoped, production_ledger):
+    write_compared(*production_ledger, "写错")
+    with sqlite3.connect(scoped[0] / "trial-050.sqlite3") as db:
+        db.execute("UPDATE trial_item_task SET item=2")
+    public, _ = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN and public["明道云写错已核"] == 1
+    assert public["已回读核对单数"] == 0
+
+
+def test_archive_unresolved_reruns(scoped):
+    public, private = tr.report(*scoped, START, END)
+    private["写错"].append("?")
+    private["已核驳回"].append("!")
+    archive = tr.locations(scoped[0], START, False)[0]
+    archive.touch(mode=0o600)
+    for _ in range(3):
+        archive.write_text(json.dumps(private))
+        public, private = tr.report(*scoped, START, END)
+        assert public["明道云写错"] == public["卡片驳回"] == tr.UNKNOWN
+        assert public["写入核对未知"] > 0
+        assert private["写错"] == [] and private["归档未解析"] == ["明道云写错", "卡片驳回"]
+
+
+def test_x5_unknown_reconciliation(scoped, production_ledger):
+    from qianshu.mingdao.create_order import ledger_open, reconcile_unknown
+
+    write_compared(*production_ledger, "一致")
+    path, _, api = scoped
+    api.add("extra", "outside", "q", "A", "robot")
+    with ledger_open(path, "x5-fixture", "【测试】合成") as ledger:
+        for event in ("create_reserved", "card_published", "create_attempt", "create_unknown"):
+            ledger.append(event)
+        reconcile_unknown(ledger, SimpleNamespace(find=lambda _: [record_id("test")]))
+    public, private = tr.report(*scoped, START, END)
+    assert public["建单"] == public["明道云写错"] == tr.UNKNOWN
+    assert public["明道云写错已核"] == public["已回读核对单数"] == 1
+    assert public["机器人建单台账总单数"] == 1 and private["建议"] == "回退"
+
+
+def test_pending_other_worksheet(scoped, production_ledger, monkeypatch):
+    plan, write = production_ledger
+    write("create_attempt", request_fields=plan.request_fields, approved=True)
+    write("create_unknown")
+    monkeypatch.setitem(scoped[2].config["search"], "path", "/v3/app/worksheets/other/rows/list")
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN and public["明道云写错已核"] == 1
+    assert private["建议"] == "回退"
+
+
+def test_missing_target_preserves_readback(scoped, production_ledger):
+    write_compared(*production_ledger, "写错")
+
+    def drop_target(row):
+        row.pop("target")
+        return row
+
+    rewrite_events(scoped[0], drop_target)
+    public, _ = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN and public["明道云写错已核"] == 1
+    assert public["已回读核对单数"] == 0
+
+
+@pytest.mark.parametrize("seconds_earlier,wrong", [(0, 0), (1, 1)])
+def test_pending_attempt_platform_second(scoped, production_ledger, seconds_earlier, wrong):
+    plan, write = production_ledger
+    write("create_attempt", approved=True, request_fields=plan.request_fields)
+    write("create_unknown")
+    begin = tr.utc(AT).replace(microsecond=100000)
+    rewrite_events(scoped[0], lambda row: row | {"utc": begin.isoformat()})
+    stamp = (tr.utc(AT) - timedelta(seconds=seconds_earlier)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    scoped[2].rows[record_id("1")].update(_createdAt=stamp, _updatedAt=stamp)
+    public, private = tr.report(*scoped, START, END)
+    assert public["明道云写错"] == tr.UNKNOWN
+    assert public["明道云写错已核"] == wrong
+    assert private["建议"] == ("回退" if wrong else "维持")
+
+
+def test_formal_batch_delivery_pages(scoped, production_ledger):
+    write_compared(*production_ledger, "一致")
+    path, _, api = scoped
+    api.rows[record_id("1")].update(DRAFT)
+    api.rows[record_id("3")]["_updatedAt"] = AT
+    with sqlite3.connect(path / "trial-050.sqlite3") as db:
+        db.executemany("INSERT INTO card_intent VALUES(?,1,1,?,'sent',?)",
+                       [(record_id("4"), 2, AT), (record_id("5"), 3, AT)])
+    public, private = tr.report(*scoped, START, END)
+    assert public["无需修改"] == 1 and public["卡片核对未知"] == 0
+    assert public["出卡"] == 5 and public["建单国家卡片"] == 1
+    assert private["卡片样本数"] == 3
+
+
+@pytest.mark.parametrize("short", [True, False], ids=["missing-field", "complete"])
+def test_no_change_requires_verified_write(scoped, production_ledger, short):
+    write_compared(*production_ledger, "一致", short=short)
+    scoped[2].rows[record_id("1")].update(DRAFT)
+    scoped[2].rows[record_id("3")]["_updatedAt"] = AT
+    public, _ = tr.report(*scoped, START, END)
+    if short:
+        assert public["明道云写错"] == public["无需修改"] == tr.UNKNOWN
+        assert public["无需修改已核"] == 0 and public["卡片核对未知"] == 1
+        assert public["无需修改原因"] == [tr.Reason.WRITE]
+    else:
+        assert public["明道云写错"] == 0
+        assert public["无需修改已核"] == public["无需修改"] == 1
+        assert public["卡片核对未知"] == 0
